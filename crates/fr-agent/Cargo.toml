@@ -1,0 +1,13 @@
+[package]
+name = "fr-agent"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# 服务端程序：经 SSH 的 stdin/stdout 收发 JSON 消息，在服务器上执行 git。
+# 只能依赖纯 Rust 的库，才能从 Windows 直接交叉编译出 Linux 静态程序。
+[dependencies]
+fr-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "fr-app"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+fr-core.workspace = true
+anyhow.workspace = true
+gpui-kit.workspace = true
+gpui-pre.workspace = true
+chrono = "0.4"
+log = "0.4"

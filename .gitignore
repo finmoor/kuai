@@ -1,0 +1,3 @@
+/target
+# 测试用的大仓库，由 tools/gen-test-repo.py 生成，不进版本库
+/.testdata
