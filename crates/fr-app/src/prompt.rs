@@ -1,0 +1,132 @@
+//! 密码弹窗：本机的 git、连接服务器的 ssh、服务器上的 git 要密码或密钥口令时，弹窗让用户填。
+//!
+//! 请求来自后台线程（见 `fr_channel::init_prompts`），那边一直等到这里回答；
+//! 用户取消或者关掉弹窗就回答「取消」，对应的 git 或 ssh 会放弃这次认证。
+
+use std::sync::mpsc::Sender;
+
+use futures::StreamExt as _;
+use futures::channel::mpsc::{self, UnboundedReceiver};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::DialogFooter;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::{ActiveTheme as _, WindowExt as _, v_flex};
+use gpui_kit::prelude::*;
+use gpui_kit::*;
+
+/// 一个密码请求：提示文字，和把回答送回去的口子（None 表示取消）。
+pub struct Request {
+    prompt: String,
+    reply: Sender<Option<String>>,
+}
+
+/// 等界面处理的密码请求。
+pub type Prompts = UnboundedReceiver<Request>;
+
+/// 程序启动时调用：登记密码请求的处理函数，返回界面这头接收请求的口子。
+pub fn init() -> Prompts {
+    let (tx, rx) = mpsc::unbounded();
+    let started = fr_channel::init_prompts(move |prompt| {
+        let (reply, answer) = std::sync::mpsc::channel();
+        tx.unbounded_send(Request {
+            prompt: prompt.to_string(),
+            reply,
+        })
+        .ok()?;
+        // 弹窗没回答就被关掉时 reply 被丢弃，这里收到错误，当作取消
+        answer.recv().ok().flatten()
+    });
+    if let Err(err) = started {
+        log::error!("密码弹窗不可用，要密码的操作会直接失败：{err:#}");
+    }
+    rx
+}
+
+/// 在这个窗口里依次弹出收到的密码请求。返回的任务要留着，丢弃就不再弹。
+pub fn show_in<T: 'static>(
+    mut prompts: Prompts,
+    window: &mut Window,
+    cx: &mut Context<T>,
+) -> Task<()> {
+    cx.spawn_in(window, async move |_, cx| {
+        while let Some(request) = prompts.next().await {
+            let shown = cx.update(|window, cx| {
+                // 窗口在后面时提到前面，不然用户不知道在等他
+                window.activate_window();
+                open(request, window, cx);
+            });
+            if shown.is_err() {
+                return;
+            }
+        }
+    })
+}
+
+fn open(request: Request, window: &mut Window, cx: &mut App) {
+    let Request { prompt, reply } = request;
+    let secret = fr_core::askpass::is_secret(&prompt);
+    let input = cx.new(|cx| InputState::new(window, cx).masked(secret));
+    let prompt: SharedString = prompt.trim().to_string().into();
+
+    let submit = {
+        let (input, reply) = (input.clone(), reply.clone());
+        move |window: &mut Window, cx: &mut App| {
+            let _ = reply.send(Some(input.read(cx).value().to_string()));
+            window.close_dialog(cx);
+        }
+    };
+    // 输入框里按回车等于点确定
+    let on_enter = submit.clone();
+    let enter = window.subscribe(&input, cx, move |_, event: &InputEvent, window, cx| {
+        if matches!(event, InputEvent::PressEnter { .. }) {
+            on_enter(window, cx);
+        }
+    });
+
+    let first_build = std::cell::Cell::new(true);
+    window.open_dialog(cx, move |dialog, window, cx| {
+        // 订阅跟着弹窗活着
+        let _ = &enter;
+        if first_build.replace(false) {
+            input.focus_handle(cx).focus(window, cx);
+        }
+        let muted = cx.theme().muted_foreground;
+        let (submit, reply) = (submit.clone(), reply.clone());
+        dialog
+            .title(if secret {
+                "需要密码"
+            } else {
+                "需要输入"
+            })
+            .w(px(520.))
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(div().text_sm().child(prompt.clone()))
+                    .child(Input::new(&input))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("这是 git 或 ssh 的原始提示。填的内容只交给它，不会保存。"),
+                    ),
+            )
+            .footer(
+                DialogFooter::new()
+                    .child(
+                        Button::new("cancel")
+                            .label("取消")
+                            .on_click(move |_, window, cx| {
+                                let _ = reply.send(None);
+                                window.close_dialog(cx);
+                            }),
+                    )
+                    .child(
+                        Button::new("ok")
+                            .primary()
+                            .label("确定")
+                            .on_click(move |_, window, cx| submit(window, cx)),
+                    ),
+            )
+    });
+}

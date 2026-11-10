@@ -1,5 +1,9 @@
 # 从 Windows 交叉编译 Linux 版 agent：用 Rust 自带的 rust-lld 链接 musl 静态程序，
 # 不需要另装 gcc 或 zig。前提是 agent 只依赖纯 Rust 的库。
+[alias]
+# 编译 Linux 版 agent，客户端连接服务器时从 target/x86_64-unknown-linux-musl/release/ 取它上传
+build-agent = "build --release -p fr-agent --bin fr-agent --target x86_64-unknown-linux-musl"
+
 [target.x86_64-unknown-linux-musl]
 linker = "rust-lld"
 

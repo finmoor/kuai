@@ -9,3 +9,9 @@ publish.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# 文件监听：Windows 用 ReadDirectoryChangesW，Linux 用 inotify，都是纯 Rust
+notify = "8"
+
+[target.'cfg(unix)'.dependencies]
+# 只用来给进程组发信号（取消 git 时连子进程一起杀）
+libc = "0.2"

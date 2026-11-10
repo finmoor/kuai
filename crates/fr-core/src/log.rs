@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 pub struct Commit {
     /// 完整哈希（十六进制）
     pub id: Box<str>,
-    /// 父提交在列表里的下标；不在已读取范围内的父提交不记
+    /// 父提交在列表里的下标。不在列表里的父提交给一个 >= 提交数的占位下标（同一个父提交用同一个），
+    /// 这样只读了前一段时，泳道照样等着它，前一段的布局和读完全部时一致
     pub parents: Vec<u32>,
     pub author: Box<str>,
     /// 作者时间，Unix 秒
@@ -38,17 +39,10 @@ pub const LOG_ARGS: &[&str] = &[
     FORMAT,
 ];
 
-/// 取一个提交改动的 `git show` 参数，后面再接提交哈希。
-/// 合并提交只和第一个父提交比较，和 Fork 默认的显示一致。
-pub const SHOW_ARGS: &[&str] = &[
-    "show",
-    "--format=",
-    "--patch",
-    "--no-ext-diff",
-    "--diff-merges=first-parent",
-    "-M",
-    "-U3",
-];
+/// [`LOG_ARGS`] 的 `String` 版，给通道接口用。
+pub fn log_args() -> Vec<String> {
+    LOG_ARGS.iter().map(|s| s.to_string()).collect()
+}
 
 /// 在本机执行 `git log` 并解析。
 pub fn load(repo: &Path) -> Result<Vec<Commit>> {
@@ -95,18 +89,24 @@ pub fn parse(out: &[u8]) -> Vec<Commit> {
         });
     }
 
-    let index: HashMap<&str, u32> = raws
+    let mut index: HashMap<&str, u32> = raws
         .iter()
         .enumerate()
         .map(|(i, raw)| (raw.id, i as u32))
         .collect();
+    let mut next_missing = raws.len() as u32;
     raws.iter()
         .map(|raw| Commit {
             id: raw.id.into(),
             parents: raw
                 .parents
                 .split_ascii_whitespace()
-                .filter_map(|p| index.get(p).copied())
+                .map(|p| {
+                    *index.entry(p).or_insert_with(|| {
+                        next_missing += 1;
+                        next_missing - 1
+                    })
+                })
                 .collect(),
             author: raw.author.into(),
             time: raw.time,
@@ -114,6 +114,18 @@ pub fn parse(out: &[u8]) -> Vec<Commit> {
             subject: raw.subject.into(),
         })
         .collect()
+}
+
+/// 第 `n` 条记录结束（第 `n` 个 NUL 之后）的位置；不够 `n` 条时返回 None。读历史时先显示前一页用。
+pub fn nth_record_end(out: &[u8], n: usize) -> Option<usize> {
+    if n == 0 {
+        return Some(0);
+    }
+    out.iter()
+        .enumerate()
+        .filter(|(_, b)| **b == 0)
+        .nth(n - 1)
+        .map(|(i, _)| i + 1)
 }
 
 #[cfg(test)]
@@ -135,8 +147,48 @@ mod tests {
     }
 
     #[test]
-    fn 不在范围内的父提交被忽略() {
-        let out = "bbb\x1fzzz\x1fA\x1f1\x1f\x1fx\0";
-        assert!(parse(out.as_bytes())[0].parents.is_empty());
+    fn 不在列表里的父提交用同一个占位下标() {
+        let out = "bbb\x1fzzz\x1fA\x1f1\x1f\x1fx\0ccc\x1fzzz yyy\x1fA\x1f1\x1f\x1fy\0";
+        let commits = parse(out.as_bytes());
+        assert_eq!(commits[0].parents, vec![2]);
+        assert_eq!(commits[1].parents, vec![2, 3]);
+    }
+
+    #[test]
+    fn 只读前一段时布局和读完全部时一致() {
+        // 两条分支来回合并，前一段里有父提交在后面
+        let history = [
+            ("m4", "m3 f3"),
+            ("f3", "f2"),
+            ("m3", "m2"),
+            ("g1", "m2"),
+            ("f2", "f1 m2"),
+            ("m2", "m1"),
+            ("f1", "m1"),
+            ("m1", "m0"),
+            ("m0", ""),
+        ];
+        let out: String = history
+            .iter()
+            .map(|(id, parents)| format!("{id}\x1f{parents}\x1fA\x1f1\x1f\x1fs\0"))
+            .collect();
+        let full = crate::graph::Graph::build(&parse(out.as_bytes()));
+        for n in 1..history.len() {
+            let end = nth_record_end(out.as_bytes(), n).unwrap();
+            let prefix = crate::graph::Graph::build(&parse(&out.as_bytes()[..end]));
+            for row in 0..n {
+                assert_eq!(
+                    prefix.rows[row].lane, full.rows[row].lane,
+                    "前 {n} 条，第 {row} 行"
+                );
+                assert_eq!(prefix.rows[row].color, full.rows[row].color);
+                assert_eq!(
+                    prefix.segments(row),
+                    full.segments(row),
+                    "前 {n} 条，第 {row} 行"
+                );
+            }
+        }
+        assert_eq!(nth_record_end(out.as_bytes(), 100), None);
     }
 }

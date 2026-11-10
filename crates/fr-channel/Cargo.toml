@@ -1,0 +1,13 @@
+[package]
+name = "fr-channel"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# 客户端的仓库通道：本机仓库在进程内执行 git，服务器上的仓库经 ssh 交给 agent。
+# 不依赖界面，客户端和测试工具 fr-probe 共用。
+[dependencies]
+fr-core.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+futures.workspace = true

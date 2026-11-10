@@ -1,8 +1,14 @@
-//! fork-remote 的核心逻辑：调用 git、解析输出、计算提交图布局。
-//!
-//! 这一层不依赖界面：本机仓库由客户端在进程内直接调用，服务器上的仓库由 agent 调用。
+//! 核心逻辑：调用 git、解析输出、计算提交图布局、通信协议。不依赖界面，客户端和 agent 共用。
 
+pub mod askpass;
+pub mod dir;
+pub mod exec;
 pub mod git;
 pub mod graph;
 pub mod log;
+pub mod patch;
 pub mod protocol;
+pub mod refs;
+pub mod show;
+pub mod status;
+pub mod watch;

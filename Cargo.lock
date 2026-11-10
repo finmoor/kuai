@@ -1699,7 +1699,7 @@ dependencies = [
 
 [[package]]
 name = "fr-agent"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "fr-core",
@@ -1709,21 +1709,37 @@ dependencies = [
 
 [[package]]
 name = "fr-app"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "fr-channel",
  "fr-core",
+ "futures",
  "gpui-kit",
  "gpui-pre",
  "log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fr-channel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fr-core",
+ "futures",
+ "serde_json",
 ]
 
 [[package]]
 name = "fr-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
+ "notify",
  "serde",
  "serde_json",
 ]
