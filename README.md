@@ -25,6 +25,18 @@ Windows 上界面和操作习惯接近 Fork 的 Git 客户端，最终目标是�
 | `tools/gen-test-repo.py` | 生成性能测试用的大仓库 |
 | `tools/ui-test/` | 界面测试脚本：建测试仓库、截窗口、往测试窗口投递点击和输入（不动真实鼠标） |
 | `tools/package.ps1` | 打发布包：客户端加 Linux 版 agent，输出到 `dist/` |
+| `tools/make-icon.py` | 画应用图标，输出 `crates/fr-app/assets/icon.ico` |
+
+## 快捷键
+
+| 按键 | 作用 |
+|---|---|
+| F5 | 重读当前仓库的状态和提交历史 |
+| Ctrl+Enter | 提交（焦点在提交说明框里时） |
+| Ctrl+F | 搜索提交 |
+| Ctrl+P | 快速打开仓库 |
+| Ctrl+W | 关掉当前标签页 |
+| Ctrl+Tab、Ctrl+Shift+Tab | 下一个、上一个标签页 |
 
 ## 构建与运行
 

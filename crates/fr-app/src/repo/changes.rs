@@ -10,6 +10,7 @@ use fr_core::status::{Entry, Kind, Status};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
@@ -322,12 +323,22 @@ impl RepoView {
         }
     }
 
-    fn stage_file(&mut self, entry: &Entry, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn stage_file(
+        &mut self,
+        entry: &Entry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let args = vec!["add".into(), "--".into(), entry.path.clone()];
         self.run_op("暂存", args, None, window, cx, |_, _, _, _| {});
     }
 
-    fn unstage_file(&mut self, entry: &Entry, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn unstage_file(
+        &mut self,
+        entry: &Entry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mut args: Vec<String> =
             vec!["reset".into(), "-q".into(), "--".into(), entry.path.clone()];
         // 改名的文件：原路径也要恢复
@@ -335,7 +346,12 @@ impl RepoView {
         self.run_op("取消暂存", args, None, window, cx, |_, _, _, _| {});
     }
 
-    fn discard_file(&mut self, entry: &Entry, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn discard_file(
+        &mut self,
+        entry: &Entry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let untracked = entry.unstaged == Some(Kind::Untracked);
         let base: &[&str] = if untracked {
             &["clean", "-f", "-q", "--"]
@@ -667,9 +683,18 @@ impl RepoView {
                     None => (String::new(), entry.path.clone()),
                 };
                 let path = entry.path.clone();
+                let menu = self.file_menu(area, entry, cx);
+                let menu_path = entry.path.clone();
                 Some(
                     h_flex()
                         .id(ix)
+                        // 点右键先选中这个文件
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, _, _, cx| {
+                                this.select_file(area, menu_path.clone(), ix, cx)
+                            }),
+                        )
                         .h(px(FILE_ROW_HEIGHT))
                         .w_full()
                         .px_2()
@@ -703,6 +728,7 @@ impl RepoView {
                                 .text_color(c.muted)
                                 .child(dir),
                         )
+                        .context_menu(menu)
                         .into_any_element(),
                 )
             })
@@ -757,6 +783,13 @@ impl RepoView {
     }
 
     fn render_stage_diff(&mut self, c: Colors, cx: &mut Context<Self>) -> AnyElement {
+        // 语法高亮的颜色跟着主题走：第一次显示、换了深浅色主题时（重新）算一遍
+        let dark = cx.theme().is_dark();
+        if let Some(diff) = &mut self.changes.diff
+            && diff.highlighted_dark != Some(dark)
+        {
+            diff.highlight(&cx.theme().highlight_theme, dark);
+        }
         let Some(diff) = &self.changes.diff else {
             let text = if self.changes.unstaged.is_empty() && self.changes.staged.is_empty() {
                 "工作区和暂存区都没有改动"
@@ -1041,7 +1074,18 @@ impl RepoView {
                             .child(line_number(line.old_no, c))
                             .child(line_number(line.new_no, c))
                             .child(div().w(px(16.)).flex_none().text_color(c.muted).child(sign))
-                            .child(div().flex_none().whitespace_nowrap().child(text))
+                            .child(
+                                div().flex_none().whitespace_nowrap().child(
+                                    match diff.highlights.get(ix) {
+                                        Some(highlights) if !highlights.is_empty() => {
+                                            StyledText::new(text)
+                                                .with_highlights(highlights.iter().cloned())
+                                                .into_any_element()
+                                        }
+                                        _ => text.into_any_element(),
+                                    },
+                                ),
+                            )
                             .into_any_element()
                     }
                 })

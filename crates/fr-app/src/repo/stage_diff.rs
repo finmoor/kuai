@@ -4,15 +4,24 @@
 //! 双击选中整块。只有增加、删除的行能选，上下文行不能选。
 
 use std::collections::HashSet;
+use std::ops::Range;
 
 use fr_core::patch::{self, FileDiff, LineKind};
 use fr_core::status::Entry;
-use gpui_kit::{SharedString, UniformListScrollHandle};
+use gpui_kit::component::Rope;
+use gpui_kit::component::highlighter::{HighlightTheme, SyntaxHighlighter};
+use gpui_kit::{HighlightStyle, SharedString, UniformListScrollHandle};
 
 use super::changes::Area;
 
 /// 一行最多显示这么多字符，超长的行（比如压缩过的 js）后面截掉；生成补丁时用的是原样字节，不受影响
 const MAX_CHARS: usize = 4000;
+
+/// 代码行加起来超过这么多字节就不做语法高亮（高亮在界面线程上算）
+const MAX_HIGHLIGHT_BYTES: usize = 400_000;
+
+/// 一行里的语法高亮：字节范围和样式
+pub(super) type LineHighlights = Vec<(Range<usize>, HighlightStyle)>;
 
 /// 头部里值得显示的行
 const SHOWN_HEADERS: [&[u8]; 10] = [
@@ -44,6 +53,10 @@ pub(super) struct StageDiff {
     pub(super) rows: Vec<Row>,
     /// 每行显示的文字
     pub(super) texts: Vec<SharedString>,
+    /// 每行的语法高亮；没有高亮时是空的
+    pub(super) highlights: Vec<LineHighlights>,
+    /// 高亮是按深色还是浅色主题算的；还没算过时为空
+    pub(super) highlighted_dark: Option<bool>,
     pub(super) selected: Vec<bool>,
     anchor: Option<usize>,
     pub(super) dragging: bool,
@@ -120,6 +133,8 @@ impl StageDiff {
             file,
             rows,
             texts,
+            highlights: Vec::new(),
+            highlighted_dark: None,
             selected,
             anchor: None,
             dragging: false,
@@ -149,6 +164,8 @@ impl StageDiff {
             file: FileDiff::default(),
             rows: Vec::new(),
             texts: Vec::new(),
+            highlights: Vec::new(),
+            highlighted_dark: None,
             selected: Vec::new(),
             anchor: None,
             dragging: false,
@@ -159,6 +176,63 @@ impl StageDiff {
             error: Some(error),
             source: Vec::new(),
         }
+    }
+
+    /// 给代码行加语法高亮。按文件扩展名认语言，不认识的不高亮。
+    ///
+    /// 把所有代码行（新旧两边混在一起）接成一段文字交给高亮器，再按行拆开。
+    /// diff 只是文件的片段，语法树不完整，但 tree-sitter 能容错，关键字、字符串、注释都认得出来。
+    pub(super) fn highlight(&mut self, theme: &HighlightTheme, dark: bool) {
+        self.highlighted_dark = Some(dark);
+        let Some(language) = language_for(&self.entry.path) else {
+            return;
+        };
+        if !self.editable() {
+            return;
+        }
+        let mut text = String::new();
+        let mut spans: Vec<(usize, Range<usize>)> = Vec::new();
+        for (ix, row) in self.rows.iter().enumerate() {
+            if let Row::Line(..) = row {
+                let start = text.len();
+                text.push_str(&self.texts[ix]);
+                spans.push((ix, start..text.len()));
+                text.push('\n');
+            }
+        }
+        if text.len() > MAX_HIGHLIGHT_BYTES {
+            return;
+        }
+        let mut highlighter = SyntaxHighlighter::new(language);
+        highlighter.update(None, &Rope::from_str(&text), None);
+        let styles = highlighter.styles(&(0..text.len()), theme);
+
+        let mut highlights = vec![LineHighlights::new(); self.rows.len()];
+        let mut first = 0;
+        for (row, span) in spans {
+            while first < styles.len() && styles[first].0.end <= span.start {
+                first += 1;
+            }
+            let line = &self.texts[row];
+            let mut covered = 0;
+            for (range, style) in styles[first..]
+                .iter()
+                .take_while(|(range, _)| range.start < span.end)
+            {
+                let start = range.start.max(span.start) - span.start;
+                let end = range.end.min(span.end) - span.start;
+                // 范围要一个接一个、落在字符边界上，不然画文字时会出错
+                if start >= covered
+                    && start < end
+                    && line.is_char_boundary(start)
+                    && line.is_char_boundary(end)
+                {
+                    highlights[row].push((start..end, *style));
+                    covered = end;
+                }
+            }
+        }
+        self.highlights = highlights;
     }
 
     /// 能不能按块、按行操作。
@@ -279,8 +353,58 @@ impl StageDiff {
 }
 
 /// 显示用的文字：不是 UTF-8 的字节显示成替换字符，Tab 换成 4 个空格，去掉行尾的 `\r`。
+/// 按文件扩展名（或文件名）认语言，返回高亮器认识的名字。
+fn language_for(path: &str) -> Option<&'static str> {
+    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    let by_name = match name.as_str() {
+        "makefile" | "gnumakefile" => Some("make"),
+        "cmakelists.txt" => Some("cmake"),
+        "dockerfile" | ".bashrc" | ".zshrc" | ".profile" => Some("bash"),
+        "cargo.lock" => Some("toml"),
+        _ => None,
+    };
+    if by_name.is_some() {
+        return by_name;
+    }
+    let (_, extension) = name.rsplit_once('.')?;
+    Some(match extension {
+        "rs" => "rust",
+        "py" | "pyi" => "python",
+        "js" | "mjs" | "cjs" | "jsx" => "javascript",
+        "ts" | "mts" | "cts" => "typescript",
+        "tsx" => "tsx",
+        "go" => "go",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
+        "cs" => "csharp",
+        "java" => "java",
+        "kt" | "kts" => "kotlin",
+        "rb" => "ruby",
+        "php" => "php",
+        "swift" => "swift",
+        "scala" => "scala",
+        "lua" => "lua",
+        "zig" => "zig",
+        "ex" | "exs" => "elixir",
+        "sh" | "bash" | "zsh" => "bash",
+        "sql" => "sql",
+        "json" | "jsonc" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "md" | "mdx" | "markdown" => "markdown",
+        "html" | "htm" | "vue" => "html",
+        "css" | "scss" => "css",
+        "svelte" => "svelte",
+        "proto" => "proto",
+        "graphql" | "gql" => "graphql",
+        "cmake" => "cmake",
+        "mk" => "make",
+        _ => return None,
+    })
+}
+
 fn display(bytes: &[u8]) -> SharedString {
-    let text = String::from_utf8_lossy(bytes);
+    let text = crate::text::decode(bytes);
     let text = text.strip_suffix('\r').unwrap_or(&text);
     let mut out = String::with_capacity(text.len());
     for (i, ch) in text.chars().enumerate() {

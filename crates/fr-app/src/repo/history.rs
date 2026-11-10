@@ -1,5 +1,8 @@
 //! 提交历史：提交图列表、提交详情、所选提交的改动。
 //!
+//! 上面有搜索框：按说明、作者、哈希找提交，不匹配的行变淡，回车跳到下一个匹配。
+//! 「文件历史」模式下只列出改过某个文件的提交，改动也只显示这个文件的。
+//!
 //! 第一次读历史时边读边显示：读到前 300 个提交就先画出来（布局和读完全部时的前一段一致，
 //! 见 `fr_core::log::Commit::parents`），读完再整个换上。重读（比如提交之后）时等读完再换，
 //! 免得滚动位置跳回顶上。
@@ -14,8 +17,11 @@ use fr_core::log::{self as gitlog, Commit};
 use fr_core::show::{self, Details};
 use futures::StreamExt as _;
 use futures::channel::mpsc;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffFile, DiffState};
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
@@ -71,6 +77,15 @@ pub(super) struct History {
     reloading: bool,
     selected: Option<usize>,
     scroll: UniformListScrollHandle,
+    /// 文件历史模式：只看改过这个文件的提交
+    file: Option<String>,
+    search: Entity<InputState>,
+    /// 搜索的内容（小写）；空表示没在搜索
+    needle: String,
+    /// 匹配的提交的下标，从小到大
+    matches: Vec<usize>,
+    /// 现在跳到了第几个匹配
+    match_pos: Option<usize>,
     details: Option<Details>,
     diff: Entity<DiffState>,
     diff_info: SharedString,
@@ -83,13 +98,32 @@ pub(super) struct History {
 }
 
 impl History {
-    pub(super) fn new(cx: &mut Context<RepoView>) -> Self {
-        Self {
+    pub(super) fn new(
+        window: &mut Window,
+        cx: &mut Context<RepoView>,
+    ) -> (Self, Vec<Subscription>) {
+        let search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("搜索提交：说明、作者、哈希"));
+        let subscriptions = vec![cx.subscribe_in(
+            &search,
+            window,
+            |this, _, event: &InputEvent, _, cx| match event {
+                InputEvent::Change => this.update_search(true, cx),
+                InputEvent::PressEnter { .. } => this.next_match(1, cx),
+                _ => {}
+            },
+        )];
+        let history = Self {
             load: Load::Idle,
             load_task: None,
             reloading: false,
             selected: None,
             scroll: UniformListScrollHandle::new(),
+            file: None,
+            search,
+            needle: String::new(),
+            matches: Vec::new(),
+            match_pos: None,
             details: None,
             diff: cx.new(|cx| DiffState::new(Vec::new(), cx)),
             diff_info: "点选一个提交查看改动".into(),
@@ -97,6 +131,14 @@ impl History {
             last_rows_build: (Duration::ZERO, 0),
             bench: None,
             hooks_applied: false,
+        };
+        (history, subscriptions)
+    }
+
+    pub(super) fn commit_at(&self, ix: usize) -> Option<&Commit> {
+        match &self.load {
+            Load::Ready { data, .. } => data.commits.get(ix),
+            _ => None,
         }
     }
 
@@ -144,7 +186,13 @@ impl RepoView {
             self.history.load = Load::Loading;
         }
         self.history.reloading = showing;
-        let mut stream = channel.git_stream(&self.entry.path, gitlog::log_args());
+        // 文件历史：只要改过这个文件的提交，跟着改名往回找
+        let file_mode = self.history.file.is_some();
+        let log_args = match &self.history.file {
+            Some(path) => gitlog::file_log_args(path),
+            None => gitlog::log_args(),
+        };
+        let mut stream = channel.git_stream(&self.entry.path, log_args);
         let (tx, mut rx) = mpsc::unbounded();
         // 收数据、解析和布局都在后台线程；界面线程只在第一页和读完时各更新一次
         let worker = cx.background_executor().spawn(async move {
@@ -157,14 +205,20 @@ impl RepoView {
                         buf.extend_from_slice(&chunk);
                         if !page_sent && let Some(end) = gitlog::nth_record_end(&buf, FIRST_PAGE) {
                             page_sent = true;
-                            let page = build_loaded(&buf[..end], started.elapsed(), None);
+                            let page =
+                                build_loaded(&buf[..end], started.elapsed(), None, file_mode);
                             let _ = tx.unbounded_send(Progress::Page(page));
                         }
                     }
                     Some(Ok(StreamItem::Progress(_))) => {}
                     Some(Ok(StreamItem::Done(out))) => {
                         break if out.success() {
-                            Ok(build_loaded(&buf, started.elapsed(), Some(out.elapsed)))
+                            Ok(build_loaded(
+                                &buf,
+                                started.elapsed(),
+                                Some(out.elapsed),
+                                file_mode,
+                            ))
                         } else {
                             Err(out.stderr)
                         };
@@ -218,6 +272,7 @@ impl RepoView {
                     (Some(_), None) => self.clear_commit_selection(cx),
                     (None, None) => {}
                 }
+                self.update_search(false, cx);
                 self.apply_test_hooks(cx);
             }
             Progress::Done(Err(err)) => {
@@ -279,8 +334,87 @@ impl RepoView {
         }
     }
 
+    /// 文件历史：提交列表只留改过这个文件的提交。
+    pub(super) fn show_file_history(&mut self, path: String, cx: &mut Context<Self>) {
+        self.history.file = Some(path);
+        self.sidebar_select_history();
+        self.restart_history(cx);
+    }
+
+    pub(super) fn close_file_history(&mut self, cx: &mut Context<Self>) {
+        if self.history.file.take().is_some() {
+            self.restart_history(cx);
+        }
+    }
+
+    /// 换了要看的范围（全部提交或某个文件）：清掉选中，从头读。
+    fn restart_history(&mut self, cx: &mut Context<Self>) {
+        self.clear_commit_selection(cx);
+        self.history.load = Load::Idle;
+        self.history.matches.clear();
+        self.history.match_pos = None;
+        self.history.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.reload_history(cx);
+        cx.notify();
+    }
+
+    /// 按搜索框里的内容重新找匹配的提交。`jump` 为真时滚到第一个匹配。
+    fn update_search(&mut self, jump: bool, cx: &mut Context<Self>) {
+        let needle = self.history.search.read(cx).value().trim().to_lowercase();
+        self.history.matches = match &self.history.load {
+            Load::Ready { data, .. } if !needle.is_empty() => data
+                .commits
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    c.subject.to_lowercase().contains(&needle)
+                        || c.author.to_lowercase().contains(&needle)
+                        || c.id.starts_with(&needle)
+                })
+                .map(|(ix, _)| ix)
+                .collect(),
+            _ => Vec::new(),
+        };
+        self.history.needle = needle;
+        if jump {
+            self.history.match_pos = None;
+            if let Some(&first) = self.history.matches.first() {
+                self.history
+                    .scroll
+                    .scroll_to_item(first, ScrollStrategy::Center);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 跳到下一个（`step` 为 1）或上一个（-1）匹配的提交并选中。
+    pub(super) fn next_match(&mut self, step: isize, cx: &mut Context<Self>) {
+        let count = self.history.matches.len() as isize;
+        if count == 0 {
+            return;
+        }
+        let pos = match self.history.match_pos {
+            Some(pos) => (pos as isize + step).rem_euclid(count) as usize,
+            None if step < 0 => (count - 1) as usize,
+            None => 0,
+        };
+        self.history.match_pos = Some(pos);
+        let ix = self.history.matches[pos];
+        self.history
+            .scroll
+            .scroll_to_item(ix, ScrollStrategy::Center);
+        self.select_commit(ix, cx);
+    }
+
+    /// 把键盘焦点放到搜索框（Ctrl+F）。
+    pub(super) fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_select_history();
+        self.history.search.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
     pub(super) fn select_commit(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let (Load::Ready { data, .. }, Some(channel)) = (&self.history.load, &self.channel) else {
+        let Load::Ready { data, .. } = &self.history.load else {
             return;
         };
         let Some(commit) = data.commits.get(ix) else {
@@ -288,10 +422,27 @@ impl RepoView {
         };
         self.history.selected = Some(ix);
         let id = commit.id.to_string();
+        self.load_details(id, cx);
+    }
+
+    /// 显示不在提交列表里的东西（比如贮藏）的详情和改动；列表里不选中任何提交。
+    pub(super) fn show_object(&mut self, id: String, cx: &mut Context<Self>) {
+        self.history.selected = None;
+        self.load_details(id, cx);
+    }
+
+    fn load_details(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        let mut show_args = show::args(&id);
+        if let Some(path) = &self.history.file {
+            show_args.extend(["--".into(), path.clone()]);
+        }
         self.history.diff_info = format!("正在读取 {} 的改动…", &id[..id.len().min(10)]).into();
 
         let started = Instant::now();
-        let request = channel.git(&self.entry.path, show::args(&id));
+        let request = channel.git(&self.entry.path, show_args);
         // 换选中提交时旧任务随 Task 一起丢弃：本机的 git 进程被杀掉，远程的请求发取消
         self.history.diff_task = Some(cx.spawn(async move |this, cx| {
             let out = request.await.and_then(|out| out.ok());
@@ -303,7 +454,7 @@ impl RepoView {
                         let started = Instant::now();
                         let (details, patch) = show::parse(&bytes);
                         this.history.details = Some(details);
-                        let text = String::from_utf8_lossy(patch);
+                        let text = crate::text::decode(patch);
                         match DiffFile::parse(&text) {
                             Err(err) => {
                                 this.history.diff_info =
@@ -349,6 +500,7 @@ impl RepoView {
             return Vec::new();
         };
         let graph_width = graph_paint::column_width(data.graph.max_lanes);
+        let searching = !self.history.needle.is_empty();
         let rows: Vec<AnyElement> = range
             .clone()
             .filter(|ix| *ix < data.commits.len())
@@ -356,7 +508,10 @@ impl RepoView {
                 let commit = &data.commits[ix];
                 let row = data.graph.rows[ix];
                 let selected = self.history.selected == Some(ix);
-                h_flex()
+                // 搜索时不匹配的提交变淡，提交图照常画
+                let dim = searching && self.history.matches.binary_search(&ix).is_err();
+                let menu = self.commit_menu(ix, cx);
+                let line = h_flex()
                     .id(ix)
                     .h(px(ROW_HEIGHT))
                     .w_full()
@@ -364,9 +519,19 @@ impl RepoView {
                     .gap_2()
                     .text_sm()
                     .cursor_pointer()
+                    .when(dim, |d| d.opacity(0.35))
                     .when(selected, |d| d.bg(colors.selected))
                     .when(!selected, |d| d.hover(|s| s.bg(colors.hover)))
                     .on_click(cx.listener(move |this, _, _, cx| this.select_commit(ix, cx)))
+                    // 点右键先选中这一行，菜单里的操作都是对它做的
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, _, _, cx| {
+                            if this.history.selected != Some(ix) {
+                                this.select_commit(ix, cx);
+                            }
+                        }),
+                    )
                     .child(graph_paint::graph_cell(
                         data.graph.segments(ix).to_vec(),
                         row.lane,
@@ -407,8 +572,11 @@ impl RepoView {
                             .child(SharedString::from(
                                 commit.id[..8.min(commit.id.len())].to_string(),
                             )),
-                    )
-                    .into_any_element()
+                    );
+                match menu {
+                    Some(menu) => line.context_menu(menu).into_any_element(),
+                    None => line.into_any_element(),
+                }
             })
             .collect();
         let elapsed = started.elapsed();
@@ -526,8 +694,81 @@ impl RepoView {
                 }
             };
 
+        let match_info: SharedString = if self.history.needle.is_empty() {
+            "".into()
+        } else if self.history.matches.is_empty() {
+            "没有匹配的提交".into()
+        } else {
+            match self.history.match_pos {
+                Some(pos) => format!("{} / {}", pos + 1, self.history.matches.len()).into(),
+                None => format!("{} 个匹配，回车跳到第一个", self.history.matches.len()).into(),
+            }
+        };
+        let has_matches = !self.history.matches.is_empty();
+
         v_flex()
             .size_full()
+            .when_some(self.history.file.clone(), |view, path| {
+                view.child(
+                    h_flex()
+                        .h(px(30.))
+                        .flex_none()
+                        .px_3()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(border)
+                        .text_sm()
+                        .child(div().text_color(muted).child("文件历史"))
+                        .child(div().flex_1().min_w_0().truncate().child(path.clone()))
+                        .child(
+                            Button::new("file-blame")
+                                .xsmall()
+                                .label("逐行追溯")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.show_blame(path.clone(), cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("close-file-history")
+                                .xsmall()
+                                .label("回到所有提交")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.close_file_history(cx)),
+                                ),
+                        ),
+                )
+            })
+            .child(
+                h_flex()
+                    .h(px(34.))
+                    .flex_none()
+                    .px_2()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(
+                        div()
+                            .w(px(360.))
+                            .child(Input::new(&self.history.search).small().cleanable(true)),
+                    )
+                    .child(div().text_xs().text_color(muted).child(match_info))
+                    .when(has_matches, |bar| {
+                        bar.child(
+                            Button::new("match-prev")
+                                .xsmall()
+                                .ghost()
+                                .label("上一个")
+                                .on_click(cx.listener(|this, _, _, cx| this.next_match(-1, cx))),
+                        )
+                        .child(
+                            Button::new("match-next")
+                                .xsmall()
+                                .ghost()
+                                .label("下一个")
+                                .on_click(cx.listener(|this, _, _, cx| this.next_match(1, cx))),
+                        )
+                    }),
+            )
             .child(
                 h_flex()
                     .h(px(24.))
@@ -704,9 +945,22 @@ fn summarize(name: &str, values: &mut [Duration]) -> String {
 }
 
 /// 解析 git log 的输出并计算布局，在后台线程执行。`git_time` 为空表示这是先显示的前一页。
-fn build_loaded(out: &[u8], fetch_time: Duration, git_time: Option<Duration>) -> Loaded {
+fn build_loaded(
+    out: &[u8],
+    fetch_time: Duration,
+    git_time: Option<Duration>,
+    linear: bool,
+) -> Loaded {
     let t0 = Instant::now();
-    let commits = gitlog::parse(out);
+    let mut commits = gitlog::parse(out);
+    if linear {
+        // 文件历史里的提交互相不一定是父子：连成一条线来画
+        let count = commits.len() as u32;
+        for (ix, commit) in commits.iter_mut().enumerate() {
+            let next = ix as u32 + 1;
+            commit.parents = if next < count { vec![next] } else { Vec::new() };
+        }
+    }
     let t1 = Instant::now();
     let graph = Graph::build(&commits);
     let t2 = Instant::now();
@@ -731,6 +985,17 @@ fn build_loaded(out: &[u8], fetch_time: Duration, git_time: Option<Duration>) ->
         graph: Arc::new(graph),
         stats: stats.into(),
     }
+}
+
+/// 只要日期，逐行追溯里用。
+pub(super) fn format_date(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+        .unwrap_or_default()
 }
 
 fn format_time(ts: i64) -> SharedString {

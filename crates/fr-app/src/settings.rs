@@ -1,4 +1,4 @@
-//! 设置：服务器列表、仓库列表、上次打开的标签页。
+//! 设置：服务器列表、仓库列表、上次打开的标签页、主题、窗口位置。
 //!
 //! 存在 `%APPDATA%\fork-remote\settings.json`，不存密码。环境变量 FR_SETTINGS 可以指定别的文件（测试用）。
 
@@ -19,6 +19,43 @@ pub struct Settings {
     /// 上次选中的标签页：0 是仓库管理器，1 起是 `open_tabs` 里的
     #[serde(default)]
     pub active_tab: usize,
+    #[serde(default)]
+    pub theme: ThemeChoice,
+    /// 上次关闭时窗口的位置和大小
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<WindowState>,
+}
+
+/// 用哪套主题。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeChoice {
+    /// 跟着 Windows 的深色、浅色设置走
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemeChoice {
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemeChoice::System => "跟随系统",
+            ThemeChoice::Light => "浅色",
+            ThemeChoice::Dark => "深色",
+        }
+    }
+}
+
+/// 窗口的位置和大小（逻辑像素）。最大化时记的是还原后的位置。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindowState {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    #[serde(default)]
+    pub maximized: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

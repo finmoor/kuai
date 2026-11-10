@@ -8,18 +8,22 @@
 //! 仓库有变化时（在编辑器里存了文件、在终端里提交了），都重读工作区状态、引用和贮藏；
 //! 引用或 HEAD 变了才重读提交历史。
 
+mod blame;
 mod changes;
 mod dialogs;
 mod history;
+mod menus;
 mod ops;
 mod sidebar;
 mod stage_diff;
 
 use fr_channel::Channel;
 use fr_core::refs::{self, Refs};
+use fr_core::state::{self, InProgress};
 use fr_core::status::{self, Status};
 use futures::StreamExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -32,7 +36,17 @@ use crate::settings::RepoEntry;
 enum Mode {
     Changes,
     History,
+    /// 逐行追溯，盖在上面两个视图之上
+    Blame,
 }
+
+/// 仓库页发给工作区的事件。
+pub enum RepoEvent {
+    /// 在新标签页里打开另一个仓库（子模块）
+    Open(RepoEntry),
+}
+
+impl EventEmitter<RepoEvent> for RepoView {}
 
 pub struct RepoView {
     entry: RepoEntry,
@@ -46,7 +60,12 @@ pub struct RepoView {
     /// 是不是当前显示的标签页
     visible: bool,
     status: Option<Status>,
+    /// 停在一半的合并、变基、挑拣或还原
+    in_progress: Option<InProgress>,
     refs: Refs,
+    /// 子模块的路径（相对仓库根）
+    submodules: Vec<String>,
+    blame: Option<blame::BlameView>,
     /// 上次读历史时的引用快照（所有分支、标签加 HEAD），变了才重读历史
     history_key: Option<Vec<u8>>,
     refresh_task: Option<Task<()>>,
@@ -81,7 +100,8 @@ impl RepoView {
                 this.refresh(cx);
             }
         }));
-        let history = history::History::new(cx);
+        let (history, history_subscriptions) = history::History::new(window, cx);
+        subscriptions.extend(history_subscriptions);
         let mut this = Self {
             entry,
             app,
@@ -92,7 +112,10 @@ impl RepoView {
             mode: Mode::History,
             visible: false,
             status: None,
+            in_progress: None,
             refs: Refs::default(),
+            submodules: Vec::new(),
+            blame: None,
             history_key: None,
             refresh_task: None,
             refreshing: false,
@@ -196,10 +219,18 @@ impl RepoView {
         let read_status = channel.git(&repo, status::args());
         let read_refs = channel.git(&repo, refs::args());
         let read_stashes = channel.git(&repo, refs::stash_args());
+        let read_state = channel.git_with_input(&repo, state::args(), Some(state::stdin()));
+        let read_submodules = channel.git(&repo, menus::submodule_args());
         self.refreshing = true;
         self.refresh_again = false;
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
-            let (st, rf, sh) = futures::join!(read_status, read_refs, read_stashes);
+            let (st, rf, sh, state, sm) = futures::join!(
+                read_status,
+                read_refs,
+                read_stashes,
+                read_state,
+                read_submodules
+            );
             this.update(cx, |this, cx| {
                 this.refreshing = false;
                 if std::mem::take(&mut this.refresh_again) {
@@ -218,6 +249,13 @@ impl RepoView {
                     }
                 };
                 this.error = None;
+                this.in_progress = state.ok().and_then(|out| state::parse(&out.stdout));
+                // 没有 .gitmodules 时这条命令失败，就是没有子模块
+                this.submodules = sm
+                    .ok()
+                    .filter(|out| out.success())
+                    .map(|out| menus::parse_submodules(&out.stdout))
+                    .unwrap_or_default();
                 let head = parsed.head.clone().unwrap_or_default();
                 this.apply_status(parsed, cx);
                 let refs_out = rf.and_then(|out| out.ok()).unwrap_or_default();
@@ -236,6 +274,17 @@ impl RepoView {
             })
             .ok();
         }));
+    }
+
+    /// 丢掉缓存，重读状态和提交历史（F5 和「刷新」按钮）。
+    pub fn refresh_now(&mut self, cx: &mut Context<Self>) {
+        self.history_key = None;
+        self.refresh(cx);
+    }
+
+    /// 切到提交历史，把键盘焦点放到搜索框（Ctrl+F）。
+    pub fn find_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_search(window, cx);
     }
 
     /// 仓库在哪：本机或服务器名。
@@ -354,17 +403,51 @@ impl RepoView {
                         .child(err),
                 )
             })
+            // 这三个按钮点右键有不常用的选项
             .child(
-                tool_button("fetch", "获取", "git fetch --all", running("获取"), idle)
-                    .on_click(cx.listener(|this, _, window, cx| this.fetch(window, cx))),
+                div()
+                    .id("fetch-menu")
+                    .child(
+                        tool_button(
+                            "fetch",
+                            "获取",
+                            "git fetch --all；右键有更多选项",
+                            running("获取"),
+                            idle,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.fetch(window, cx))),
+                    )
+                    .context_menu(self.fetch_menu(cx)),
             )
             .child(
-                tool_button("pull", "拉取", "git pull", running("拉取"), idle)
-                    .on_click(cx.listener(|this, _, window, cx| this.pull(window, cx))),
+                div()
+                    .id("pull-menu")
+                    .child(
+                        tool_button(
+                            "pull",
+                            "拉取",
+                            "git pull；右键有更多选项",
+                            running("拉取"),
+                            idle,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.pull(window, cx))),
+                    )
+                    .context_menu(self.pull_menu(cx)),
             )
             .child(
-                tool_button("push", "推送", "git push", running("推送"), idle)
-                    .on_click(cx.listener(|this, _, window, cx| this.push(window, cx))),
+                div()
+                    .id("push-menu")
+                    .child(
+                        tool_button(
+                            "push",
+                            "推送",
+                            "git push；右键有更多选项",
+                            running("推送"),
+                            idle,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.push(window, cx))),
+                    )
+                    .context_menu(self.push_menu(cx)),
             )
             .child(div().w(px(1.)).h(px(20.)).mx_1().bg(border))
             .child(
@@ -392,15 +475,122 @@ impl RepoView {
                 .on_click(cx.listener(|this, _, window, cx| this.new_branch_dialog(window, cx))),
             )
             .child(div().w(px(1.)).h(px(20.)).mx_1().bg(border))
+            .child(self.render_open_button(cx))
             .child(
                 Button::new("refresh")
                     .small()
                     .ghost()
                     .label("刷新")
-                    .tooltip("重读状态和提交历史")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.history_key = None;
-                        this.refresh(cx);
+                    .tooltip("重读状态和提交历史（F5）")
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh_now(cx))),
+            )
+    }
+
+    /// 「打开」按钮：把仓库交给终端、VS Code 或资源管理器。
+    fn render_open_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let dir = self.entry.path.clone();
+        let destination = self
+            .entry
+            .server
+            .as_deref()
+            .and_then(|id| self.app.read(cx).server(id))
+            .map(|server| server.destination.clone());
+        Button::new("open-in")
+            .small()
+            .ghost()
+            .label("打开")
+            .tooltip("在终端、VS Code 或资源管理器里打开这个仓库")
+            .dropdown_menu(move |menu, _, _| {
+                let (a, b, c) = (dir.clone(), dir.clone(), dir.clone());
+                match destination.clone() {
+                    // 服务器上的仓库：终端经 ssh 登录，VS Code 走 Remote-SSH
+                    Some(dest) => {
+                        let dest2 = dest.clone();
+                        menu.item(
+                            PopupMenuItem::new("在终端里打开（ssh）").on_click(move |_, _, _| {
+                                crate::shell::open_terminal_ssh(&dest, &a)
+                            }),
+                        )
+                        .item(
+                            PopupMenuItem::new("在 VS Code 里打开（Remote-SSH）").on_click(
+                                move |_, _, _| crate::shell::open_vscode_remote(&dest2, &b),
+                            ),
+                        )
+                    }
+                    None => menu
+                        .item(
+                            PopupMenuItem::new("在终端里打开")
+                                .on_click(move |_, _, _| crate::shell::open_terminal(&a)),
+                        )
+                        .item(
+                            PopupMenuItem::new("在 VS Code 里打开")
+                                .on_click(move |_, _, _| crate::shell::open_vscode(&b)),
+                        )
+                        .item(
+                            PopupMenuItem::new("在资源管理器里打开")
+                                .on_click(move |_, _, _| crate::shell::open_folder(&c)),
+                        ),
+                }
+            })
+    }
+
+    /// 合并、变基、挑拣、还原停在一半时的横幅：说明状态，给出继续、跳过、中止。
+    fn render_in_progress(&self, state: InProgress, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (border, warning) = (theme.border, theme.warning);
+        let conflicts = self.status.as_ref().map_or(0, |s| {
+            s.entries
+                .iter()
+                .filter(|e| e.unstaged == Some(status::Kind::Conflicted))
+                .count()
+        });
+        let idle = self.op.is_none();
+        let text = if conflicts > 0 {
+            format!(
+                "{}停在一半：还有 {conflicts} 个文件有冲突。在「本地修改」里解决后点继续。",
+                state.name()
+            )
+        } else {
+            format!("{}停在一半：冲突都解决了，点继续。", state.name())
+        };
+        h_flex()
+            .h(px(34.))
+            .flex_none()
+            .px_3()
+            .gap_2()
+            .border_b_1()
+            .border_color(border)
+            .bg(warning.opacity(0.15))
+            .text_sm()
+            .child(div().flex_1().min_w_0().truncate().child(text))
+            .child(
+                Button::new("op-continue")
+                    .small()
+                    .primary()
+                    .label("继续")
+                    .disabled(!idle || conflicts > 0)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.continue_in_progress(state, window, cx)
+                    })),
+            )
+            .when(state != InProgress::Merge, |bar| {
+                bar.child(
+                    Button::new("op-skip")
+                        .small()
+                        .label("跳过这个提交")
+                        .disabled(!idle)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.skip_in_progress(state, window, cx)
+                        })),
+                )
+            })
+            .child(
+                Button::new("op-abort")
+                    .small()
+                    .label("中止")
+                    .disabled(!idle)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.abort_in_progress(state, window, cx)
                     })),
             )
     }
@@ -480,14 +670,22 @@ impl Render for RepoView {
             match self.mode {
                 Mode::Changes => self.render_changes(cx),
                 Mode::History => self.render_history(cx),
+                Mode::Blame => self.render_blame(cx),
             }
         };
-        v_flex().size_full().child(self.render_toolbar(cx)).child(
-            h_flex()
-                .flex_1()
-                .min_h_0()
-                .child(self.render_sidebar(cx))
-                .child(div().flex_1().min_w_0().h_full().child(main)),
-        )
+        let banner = self
+            .in_progress
+            .map(|state| self.render_in_progress(state, cx).into_any_element());
+        v_flex()
+            .size_full()
+            .child(self.render_toolbar(cx))
+            .children(banner)
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.render_sidebar(cx))
+                    .child(div().flex_1().min_w_0().h_full().child(main)),
+            )
     }
 }

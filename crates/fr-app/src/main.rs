@@ -2,12 +2,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app_state;
+mod appearance;
 mod browser;
+mod clone;
 mod graph_paint;
 mod manager;
 mod prompt;
 mod repo;
 mod settings;
+mod shell;
+mod text;
 mod workspace;
 
 use std::path::PathBuf;
@@ -18,7 +22,44 @@ use crate::app_state::AppState;
 use crate::settings::RepoEntry;
 use crate::workspace::Workspace;
 
-gpui_kit::actions!(fork_remote, [ToggleFrameOverlay]);
+gpui_kit::actions!(
+    fork_remote,
+    [
+        ToggleFrameOverlay,
+        Refresh,
+        CloseTab,
+        NextTab,
+        PrevTab,
+        FindCommit,
+        QuickOpen
+    ]
+);
+
+/// 主窗口里的工作区，全局的快捷键靠它找到要操作的对象。
+struct MainWorkspace(WeakEntity<Workspace>, AnyWindowHandle);
+
+impl Global for MainWorkspace {}
+
+/// 登记一个全局快捷键动作：在工作区上执行 `f`。
+/// 动作是在窗口处理按键的过程中触发的，这时窗口正被占用，所以推迟到这一轮处理完再执行。
+fn workspace_action<A: Action>(
+    cx: &mut App,
+    f: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + Copy + 'static,
+) {
+    cx.on_action(move |_: &A, cx: &mut App| {
+        cx.defer(move |cx| {
+            let Some(MainWorkspace(workspace, handle)) = cx.try_global::<MainWorkspace>() else {
+                return;
+            };
+            let (workspace, handle) = (workspace.clone(), *handle);
+            handle
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |ws, cx| f(ws, window, cx)).ok();
+                })
+                .ok();
+        });
+    });
+}
 
 /// 设置 FR_LOG=1 时把日志打到标准错误，比如 GPUI 选用了哪块显卡。
 struct StderrLogger;
@@ -85,7 +126,21 @@ fn main() {
         .run(move |cx| {
             gpui_kit::init(cx);
             // Ctrl+Shift+F：切换 GPUI 的帧耗时浮层（隐藏 → 简要 → 详细）
-            cx.bind_keys([KeyBinding::new("ctrl-shift-f", ToggleFrameOverlay, None)]);
+            cx.bind_keys([
+                KeyBinding::new("ctrl-shift-f", ToggleFrameOverlay, None),
+                KeyBinding::new("f5", Refresh, None),
+                KeyBinding::new("ctrl-w", CloseTab, None),
+                KeyBinding::new("ctrl-tab", NextTab, None),
+                KeyBinding::new("ctrl-shift-tab", PrevTab, None),
+                KeyBinding::new("ctrl-f", FindCommit, None),
+                KeyBinding::new("ctrl-p", QuickOpen, None),
+            ]);
+            workspace_action::<Refresh>(cx, |ws, _, cx| ws.refresh_active(cx));
+            workspace_action::<CloseTab>(cx, |ws, _, cx| ws.close_active(cx));
+            workspace_action::<NextTab>(cx, |ws, _, cx| ws.cycle_tab(1, cx));
+            workspace_action::<PrevTab>(cx, |ws, _, cx| ws.cycle_tab(-1, cx));
+            workspace_action::<FindCommit>(cx, |ws, window, cx| ws.find_commit(window, cx));
+            workspace_action::<QuickOpen>(cx, |ws, window, cx| ws.quick_open(window, cx));
             cx.on_action(|_: &ToggleFrameOverlay, cx: &mut App| {
                 for handle in cx.windows() {
                     handle
@@ -94,10 +149,10 @@ fn main() {
                 }
             });
 
+            let (theme, saved_window) = (settings.theme, settings.window);
             let app = cx.new(|_| AppState::new(settings));
-            let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
             let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_bounds: Some(appearance::initial_bounds(saved_window, cx)),
                 titlebar: Some(TitlebarOptions {
                     title: Some("fork-remote".into()),
                     ..Default::default()
@@ -108,7 +163,10 @@ fn main() {
                 if std::env::var("FR_M0_OVERLAY").is_ok_and(|v| v == "1") {
                     window.set_debug_frame_overlay_mode(DebugFrameOverlayMode::Minimal);
                 }
-                cx.new(|cx| Workspace::new(app, prompts, window, cx))
+                appearance::apply_theme(theme, window, cx);
+                let workspace = cx.new(|cx| Workspace::new(app, prompts, window, cx));
+                cx.set_global(MainWorkspace(workspace.downgrade(), window.window_handle()));
+                workspace
             })
             .expect("打开窗口失败");
             cx.activate(true);

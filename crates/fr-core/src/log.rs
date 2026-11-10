@@ -44,6 +44,15 @@ pub fn log_args() -> Vec<String> {
     LOG_ARGS.iter().map(|s| s.to_string()).collect()
 }
 
+/// 文件历史的参数：从 HEAD 往回，只要改过这个文件的提交，跟着改名往回找。
+pub fn file_log_args(path: &str) -> Vec<String> {
+    ["log", "--follow", "-z", FORMAT, "HEAD", "--"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([path.to_string()])
+        .collect()
+}
+
 /// 在本机执行 `git log` 并解析。
 pub fn load(repo: &Path) -> Result<Vec<Commit>> {
     let out = crate::git::run(repo, LOG_ARGS)?;

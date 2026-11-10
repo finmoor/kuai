@@ -9,7 +9,7 @@ use futures::StreamExt as _;
 use futures::channel::mpsc::{self, UnboundedReceiver};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -75,23 +75,14 @@ fn open(request: Request, window: &mut Window, cx: &mut App) {
             window.close_dialog(cx);
         }
     };
-    // 输入框里按回车等于点确定
-    let on_enter = submit.clone();
-    let enter = window.subscribe(&input, cx, move |_, event: &InputEvent, window, cx| {
-        if matches!(event, InputEvent::PressEnter { .. }) {
-            on_enter(window, cx);
-        }
-    });
-
     let first_build = std::cell::Cell::new(true);
     window.open_dialog(cx, move |dialog, window, cx| {
-        // 订阅跟着弹窗活着
-        let _ = &enter;
         if first_build.replace(false) {
             input.focus_handle(cx).focus(window, cx);
         }
         let muted = cx.theme().muted_foreground;
         let (submit, reply) = (submit.clone(), reply.clone());
+        let (on_enter, on_dismiss) = (submit.clone(), reply.clone());
         dialog
             .title(if secret {
                 "需要密码"
@@ -99,6 +90,16 @@ fn open(request: Request, window: &mut Window, cx: &mut App) {
                 "需要输入"
             })
             .w(px(520.))
+            // 回车等于点确定（submit 里会关掉弹窗）
+            .on_ok(move |_, window, cx| {
+                on_enter(window, cx);
+                false
+            })
+            // 按 Esc 或点右上角的叉：明确回答「取消」
+            .on_cancel(move |_, _, _| {
+                let _ = on_dismiss.send(None);
+                true
+            })
             .child(
                 v_flex()
                     .gap_3()

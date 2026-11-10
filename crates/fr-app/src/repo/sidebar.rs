@@ -8,6 +8,7 @@ use std::ops::Range;
 
 use fr_core::refs::Refs;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -23,6 +24,7 @@ pub(super) enum SideSection {
     Remotes,
     Tags,
     Stashes,
+    Submodules,
 }
 
 impl SideSection {
@@ -32,6 +34,7 @@ impl SideSection {
             SideSection::Remotes => "远程",
             SideSection::Tags => "标签",
             SideSection::Stashes => "贮藏",
+            SideSection::Submodules => "子模块",
         }
     }
 }
@@ -45,6 +48,7 @@ pub(super) enum SideItem {
     Remote(usize),
     Tag(usize),
     Stash(usize),
+    Submodule(usize),
 }
 
 pub(super) struct Sidebar {
@@ -72,8 +76,13 @@ impl RepoView {
             (SideSection::Remotes, self.refs.remotes.len()),
             (SideSection::Tags, self.refs.tags.len()),
             (SideSection::Stashes, self.refs.stashes.len()),
+            (SideSection::Submodules, self.submodules.len()),
         ];
         for (section, count) in sections {
+            // 没有子模块的仓库不显示这一组
+            if section == SideSection::Submodules && count == 0 {
+                continue;
+            }
             items.push(SideItem::Header(section));
             if self.sidebar.collapsed.contains(&section) {
                 continue;
@@ -83,6 +92,7 @@ impl RepoView {
                 SideSection::Remotes => SideItem::Remote(i),
                 SideSection::Tags => SideItem::Tag(i),
                 SideSection::Stashes => SideItem::Stash(i),
+                SideSection::Submodules => SideItem::Submodule(i),
             }));
         }
         items
@@ -144,7 +154,25 @@ impl RepoView {
                     .when(!selected, |d| d.hover(|s| s.bg(hover)))
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         this.click_sidebar(item, event.click_count(), window, cx)
-                    }));
+                    }))
+                    // 点右键先选中这一项，菜单里的操作都是对它做的
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, _, _, cx| {
+                            if matches!(
+                                item,
+                                SideItem::Branch(_)
+                                    | SideItem::Remote(_)
+                                    | SideItem::Tag(_)
+                                    | SideItem::Stash(_)
+                                    | SideItem::Submodule(_)
+                            ) {
+                                this.sidebar.selected = item;
+                                cx.notify();
+                            }
+                        }),
+                    );
+                let menu = self.sidebar_menu(item, cx);
                 let row = match item {
                     SideItem::Changes => row
                         .child(div().flex_1().child("本地修改"))
@@ -158,6 +186,7 @@ impl RepoView {
                             SideSection::Remotes => self.refs.remotes.len(),
                             SideSection::Tags => self.refs.tags.len(),
                             SideSection::Stashes => self.refs.stashes.len(),
+                            SideSection::Submodules => self.submodules.len(),
                         };
                         let arrow = if self.sidebar.collapsed.contains(&section) {
                             "▸"
@@ -249,6 +278,11 @@ impl RepoView {
                         row.pl(px(32.))
                             .child(div().flex_1().min_w_0().truncate().child(tag.name.clone()))
                     }
+                    SideItem::Submodule(i) => {
+                        let path = self.submodules.get(i)?;
+                        row.pl(px(32.))
+                            .child(div().flex_1().min_w_0().truncate().child(path.clone()))
+                    }
                     SideItem::Stash(i) => {
                         let stash = self.refs.stashes.get(i)?;
                         let row = row.pl(px(32.)).child(
@@ -301,7 +335,10 @@ impl RepoView {
                         }
                     }
                 };
-                Some(row.into_any_element())
+                Some(match menu {
+                    Some(menu) => row.context_menu(menu).into_any_element(),
+                    None => row.into_any_element(),
+                })
             })
             .collect()
     }
@@ -336,8 +373,14 @@ impl RepoView {
         };
         self.sidebar.selected = found.unwrap_or(match self.mode {
             Mode::Changes => SideItem::Changes,
-            Mode::History => SideItem::History,
+            Mode::History | Mode::Blame => SideItem::History,
         });
+    }
+
+    /// 切到提交历史，侧栏选中「所有提交」。
+    pub(super) fn sidebar_select_history(&mut self) {
+        self.sidebar.selected = SideItem::History;
+        self.mode = Mode::History;
     }
 
     /// 切到本地修改；还没选文件就选第一个。
@@ -366,6 +409,8 @@ impl RepoView {
             SideItem::History => {
                 self.sidebar.selected = item;
                 self.mode = Mode::History;
+                // 正在看文件历史时，点「所有提交」回到全部提交
+                self.close_file_history(cx);
             }
             SideItem::Branch(i) => {
                 let Some(branch) = self.refs.branches.get(i).cloned() else {
@@ -399,7 +444,22 @@ impl RepoView {
                 self.mode = Mode::History;
                 self.reveal_commit(&tag.target, cx);
             }
-            SideItem::Stash(_) => self.sidebar.selected = item,
+            SideItem::Submodule(i) => {
+                self.sidebar.selected = item;
+                // 双击：在新标签页里打开这个子模块
+                if clicks >= 2 {
+                    self.open_submodule(i, cx);
+                }
+            }
+            SideItem::Stash(i) => {
+                let Some(stash) = self.refs.stashes.get(i).cloned() else {
+                    return;
+                };
+                // 在提交详情的位置显示贮藏里的改动
+                self.sidebar.selected = item;
+                self.mode = Mode::History;
+                self.show_object(stash.target, cx);
+            }
         }
         cx.notify();
     }

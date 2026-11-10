@@ -8,6 +8,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
@@ -15,6 +16,7 @@ use gpui_kit::*;
 
 use crate::app_state::{AppState, ConnStatus};
 use crate::browser::{BrowserEvent, RemoteBrowser};
+use crate::clone::{CloneEvent, CloneView};
 use crate::settings::RepoEntry;
 
 pub enum ManagerEvent {
@@ -116,6 +118,14 @@ impl ManagerView {
             };
             dialog
                 .title("添加服务器")
+                // 回车等于点确定；关不关对话框由 submit 自己决定
+                .on_ok({
+                    let submit = submit.clone();
+                    move |event, window, cx| {
+                        submit(event, window, cx);
+                        false
+                    }
+                })
                 .w(px(560.))
                 .child(
                     v_flex()
@@ -156,6 +166,73 @@ impl ManagerView {
         });
     }
 
+    /// 克隆仓库到本机（`server` 为空）或者某台服务器上，克隆完打开。
+    fn clone_dialog(
+        &mut self,
+        server: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = match server
+            .as_deref()
+            .and_then(|id| self.app.read(cx).server(id))
+        {
+            Some(s) => format!("克隆到 {}", s.name),
+            None => "克隆到本机".into(),
+        };
+        let app = self.app.clone();
+        let view = cx.new(|cx| CloneView::new(app, server, window, cx));
+        cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
+            CloneEvent::Done(entry) => {
+                window.close_dialog(cx);
+                this.app
+                    .update(cx, |app, cx| app.add_repo(entry.clone(), cx));
+                this.open(entry.clone(), cx);
+            }
+        })
+        .detach();
+        let first_build = Cell::new(true);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if first_build.replace(false) {
+                view.update(cx, |view, cx| view.focus(window, cx));
+            }
+            let on_enter = view.clone();
+            dialog
+                .title(title.clone())
+                .w(px(620.))
+                // 回车开始克隆，不关对话框
+                .on_ok(move |_, window, cx| {
+                    on_enter.update(cx, |view, cx| view.start(window, cx));
+                    false
+                })
+                .child(view.clone())
+        });
+    }
+
+    /// 选主题的按钮：跟随系统、浅色、深色。
+    fn render_theme_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::settings::ThemeChoice;
+        let current = self.app.read(cx).settings.theme;
+        let app = self.app.clone();
+        Button::new("theme")
+            .ghost()
+            .label(format!("主题：{}", current.label()))
+            .dropdown_menu(move |mut menu, _, _| {
+                for choice in [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark] {
+                    let app = app.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(choice.label())
+                            .checked(choice == current)
+                            .on_click(move |_, window, cx| {
+                                app.update(cx, |app, cx| app.set_theme(choice, cx));
+                                crate::appearance::apply_theme(choice, window, cx);
+                            }),
+                    );
+                }
+                menu
+            })
+    }
+
     fn open_remote_dialog(&mut self, server: String, window: &mut Window, cx: &mut Context<Self>) {
         let title = self
             .app
@@ -178,6 +255,8 @@ impl ManagerView {
             dialog
                 .title(title.clone())
                 .w(px(680.))
+                // 回车是「前往」输入的路径，不是关掉对话框
+                .on_ok(|_, _, _| false)
                 .child(browser.clone())
         });
     }
@@ -275,6 +354,9 @@ impl Render for ManagerView {
                 .gap_2()
                 .child(div().font_weight(FontWeight::SEMIBOLD).child("本机"))
                 .child(div().flex_1())
+                .child(Button::new("clone-local").small().label("克隆…").on_click(
+                    cx.listener(|this, _, window, cx| this.clone_dialog(None, window, cx)),
+                ))
                 .child(
                     Button::new("add-local")
                         .small()
@@ -316,6 +398,7 @@ impl Render for ManagerView {
                 .collect();
             let (id_open, id_retry, id_remove) =
                 (server.id.clone(), server.id.clone(), server.id.clone());
+            let id_clone = server.id.clone();
             let header = h_flex()
                 .gap_2()
                 .child(
@@ -343,6 +426,14 @@ impl Render for ManagerView {
                             })),
                     )
                 })
+                .child(
+                    Button::new(SharedString::from(format!("clone-{}", server.id)))
+                        .small()
+                        .label("克隆…")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.clone_dialog(Some(id_clone.clone()), window, cx)
+                        })),
+                )
                 .child(
                     Button::new(SharedString::from(format!("open-{}", server.id)))
                         .small()
@@ -388,6 +479,7 @@ impl Render for ManagerView {
                                 .child("仓库"),
                         )
                         .child(div().flex_1())
+                        .child(self.render_theme_button(cx))
                         .child(
                             Button::new("add-server")
                                 .primary()

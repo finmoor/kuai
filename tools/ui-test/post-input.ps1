@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory)] [int]$ProcessId,
-    # click | dblclick | drag | move | type
+    # click | dblclick | rclick | drag | move | type | key | activate
     [Parameter(Mandatory)] [string]$Action,
     # 截图里的坐标（窗口矩形左上角为原点的物理像素，和 capture-printwindow.ps1 的图一致）
     [int]$X, [int]$Y, [int]$X2, [int]$Y2,
@@ -55,6 +55,19 @@ switch ($Action) {
         Post $WM_LBUTTONUP ([IntPtr]0) (LParam $X $Y)
         Post $WM_LBUTTONDOWN $MK_LBUTTON (LParam $X $Y)
         Post $WM_LBUTTONUP ([IntPtr]0) (LParam $X $Y)
+    }
+    'rclick' {
+        # 右键：弹出右键菜单
+        Post $WM_MOUSEMOVE ([IntPtr]0) (LParam $X $Y)
+        Post 0x0204 ([IntPtr]2) (LParam $X $Y)
+        Post 0x0205 ([IntPtr]0) (LParam $X $Y)
+    }
+    'key' {
+        # 不带修饰键的按键：-Text 给名字（enter、esc、f5、up、down、tab、delete）
+        $vk = @{ enter = 0x0D; esc = 0x1B; f5 = 0x74; up = 0x26; down = 0x28; tab = 0x09; delete = 0x2E }[$Text.ToLower()]
+        if (-not $vk) { throw "不认识的按键 $Text" }
+        Post 0x0100 ([IntPtr]$vk) ([IntPtr]1)
+        Post 0x0101 ([IntPtr]$vk) ([IntPtr]0xC0000001)
     }
     'drag' {
         Post $WM_MOUSEMOVE ([IntPtr]0) (LParam $X $Y)

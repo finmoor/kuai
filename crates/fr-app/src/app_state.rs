@@ -9,7 +9,7 @@ use futures::FutureExt as _;
 use futures::future::{LocalBoxFuture, Shared};
 use gpui_kit::*;
 
-use crate::settings::{self, RepoEntry, Server, Settings};
+use crate::settings::{self, RepoEntry, Server, Settings, ThemeChoice, WindowState};
 
 /// 正在进行或已经结束的连接；多处等同一个连接时共用。
 type Connecting = Shared<Task<Result<Arc<Connection>, SharedString>>>;
@@ -25,6 +25,8 @@ pub enum ConnStatus {
 pub struct AppState {
     pub settings: Settings,
     conns: HashMap<String, Connecting>,
+    /// 过一会儿再存设置的任务（拖动窗口时位置一直在变，不每次都写文件）
+    save_later: Option<Task<()>>,
 }
 
 impl AppState {
@@ -32,6 +34,7 @@ impl AppState {
         Self {
             settings,
             conns: HashMap::new(),
+            save_later: None,
         }
     }
 
@@ -166,6 +169,26 @@ impl AppState {
             self.settings.active_tab = active;
             self.save();
         }
+    }
+
+    pub fn set_theme(&mut self, theme: ThemeChoice, cx: &mut Context<Self>) {
+        self.settings.theme = theme;
+        self.save();
+        cx.notify();
+    }
+
+    /// 记下窗口的位置和大小，稍后存盘。
+    pub fn set_window_state(&mut self, state: WindowState, cx: &mut Context<Self>) {
+        if self.settings.window == Some(state) {
+            return;
+        }
+        self.settings.window = Some(state);
+        self.save_later = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(800))
+                .await;
+            this.update(cx, |this, _| this.save()).ok();
+        }));
     }
 
     /// 标签页上显示的名字：本机仓库是目录名，服务器上的再加服务器名。

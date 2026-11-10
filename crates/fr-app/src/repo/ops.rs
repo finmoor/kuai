@@ -5,6 +5,7 @@
 use std::rc::Rc;
 
 use fr_channel::{GitOutput, StreamItem};
+use fr_core::state;
 use futures::StreamExt as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::ButtonVariant;
@@ -63,6 +64,30 @@ impl RepoView {
         );
     }
 
+    /// 依次执行几条 git 命令，算一个写操作；有一条失败就停。成功时调用 `on_success`（给的是最后一条的输出）。
+    pub(super) fn run_seq(
+        &mut self,
+        label: &'static str,
+        steps: Vec<Vec<String>>,
+        progress: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        on_success: impl FnOnce(&mut Self, &GitOutput, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let steps = steps.into_iter().map(|args| (args, None)).collect();
+        self.run_steps(
+            label,
+            steps,
+            progress,
+            window,
+            cx,
+            move |this, result, window, cx| match result {
+                Ok(out) => on_success(this, &out, window, cx),
+                Err(text) => failure(window, cx, label, text),
+            },
+        );
+    }
+
     /// 执行一个写操作，做完把结果交给 `on_done`（失败时是给用户看的报错），然后刷新状态。
     /// `progress` 为真时边做边显示标准错误里的进度（此时不能带标准输入）。
     #[allow(clippy::too_many_arguments)]
@@ -71,6 +96,20 @@ impl RepoView {
         label: impl Into<SharedString>,
         args: Vec<String>,
         stdin: Option<Vec<u8>>,
+        progress: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        on_done: impl FnOnce(&mut Self, Result<GitOutput, String>, &mut Window, &mut Context<Self>)
+        + 'static,
+    ) {
+        self.run_steps(label, vec![(args, stdin)], progress, window, cx, on_done);
+    }
+
+    /// 写操作的实现：依次执行 `steps`（参数和标准输入），有一条失败就停。
+    fn run_steps(
+        &mut self,
+        label: impl Into<SharedString>,
+        steps: Vec<(Vec<String>, Option<Vec<u8>>)>,
         progress: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -88,38 +127,61 @@ impl RepoView {
         let Some(channel) = self.channel.clone() else {
             return;
         };
-        log::info!("{}：git {}", self.entry.path, args.join(" "));
+        for (args, _) in &steps {
+            log::info!("{}：git {}", self.entry.path, args.join(" "));
+        }
         let repo = self.entry.path.clone();
+        let was_in_progress = self.in_progress.is_some();
         self.op = Some(label);
         self.op_progress = progress.then(SharedString::default);
         self.op_task = Some(cx.spawn_in(window, async move |this, cx| {
-            let result = if progress {
-                let mut stream = channel.git_progress(&repo, args);
-                let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-                loop {
-                    match stream.next().await {
-                        Some(Ok(StreamItem::Chunk(chunk))) => stdout.extend_from_slice(&chunk),
-                        Some(Ok(StreamItem::Progress(chunk))) => {
-                            stderr.extend_from_slice(&chunk);
-                            let line = last_progress_line(&stderr);
-                            let shown = this.update(cx, |this, cx| {
-                                this.op_progress = Some(line.into());
-                                cx.notify();
-                            });
-                            if shown.is_err() {
-                                return;
+            let mut result = Ok(GitOutput {
+                code: Some(0),
+                ..Default::default()
+            });
+            for (args, stdin) in steps {
+                result = if progress {
+                    let mut stream = channel.git_progress(&repo, args);
+                    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+                    loop {
+                        match stream.next().await {
+                            Some(Ok(StreamItem::Chunk(chunk))) => stdout.extend_from_slice(&chunk),
+                            Some(Ok(StreamItem::Progress(chunk))) => {
+                                stderr.extend_from_slice(&chunk);
+                                let line = last_progress_line(&stderr);
+                                let shown = this.update(cx, |this, cx| {
+                                    this.op_progress = Some(line.into());
+                                    cx.notify();
+                                });
+                                if shown.is_err() {
+                                    return;
+                                }
                             }
+                            Some(Ok(StreamItem::Done(mut out))) => {
+                                out.stdout = stdout;
+                                break Ok(out);
+                            }
+                            Some(Err(err)) => break Err(err),
+                            None => break Err(anyhow::anyhow!("连接中断")),
                         }
-                        Some(Ok(StreamItem::Done(mut out))) => {
-                            out.stdout = stdout;
-                            break Ok(out);
-                        }
-                        Some(Err(err)) => break Err(err),
-                        None => break Err(anyhow::anyhow!("连接中断")),
                     }
+                } else {
+                    channel.git_with_input(&repo, args, stdin).await
+                };
+                if !matches!(&result, Ok(out) if out.success()) {
+                    break;
                 }
+            }
+            // 失败了：看看是不是合并、变基这类操作遇到冲突停下了。那不算出错，换一种提示
+            let failed = !matches!(&result, Ok(out) if out.success());
+            let stopped = if failed && !was_in_progress {
+                channel
+                    .git_with_input(&repo, state::args(), Some(state::stdin()))
+                    .await
+                    .ok()
+                    .and_then(|out| state::parse(&out.stdout))
             } else {
-                channel.git_with_input(&repo, args, stdin).await
+                None
             };
             this.update_in(cx, |this, window, cx| {
                 this.op = None;
@@ -130,7 +192,18 @@ impl RepoView {
                     Ok(out) => Err(output_text(&out)),
                     Err(err) => Err(format!("{err:#}")),
                 };
-                on_done(this, result, window, cx);
+                match stopped {
+                    Some(state) => {
+                        this.in_progress = Some(state);
+                        this.show_changes(cx);
+                        let note = Notification::warning(
+                            "在「本地修改」里解决冲突，然后点上面的「继续」；不想做了点「中止」。",
+                        )
+                        .title(format!("{}遇到冲突，停下了", state.name()));
+                        window.push_notification(note, cx);
+                    }
+                    None => on_done(this, result, window, cx),
+                }
                 this.refresh(cx);
                 cx.notify();
             })
@@ -412,7 +485,7 @@ impl RepoView {
     }
 }
 
-fn args(list: &[&str]) -> Vec<String> {
+pub(super) fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| s.to_string()).collect()
 }
 

@@ -42,7 +42,10 @@ pub fn command<S: AsRef<OsStr>>(repo: &Path, args: &[S]) -> Command {
         // 输出接到管道时 git 默认每个提交刷新一次，20 万个提交就是 20 万次写；让它按块缓冲
         .env("GIT_FLUSH", "0")
         // 路径一律按字面理解：文件名里有 * 或 [ 也不当通配符
-        .env("GIT_LITERAL_PATHSPECS", "1");
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        // 没有终端可以开编辑器：要编辑说明的地方（合并、继续变基、挑拣）直接用现成的说明。
+        // git 经 sh 启动编辑器，Git for Windows 自带的 sh 里也有 true
+        .env("GIT_EDITOR", "true");
     if let Some(extra) = EXTRA_ENV.get() {
         cmd.envs(extra.iter().map(|(k, v)| (k, v)));
     }
