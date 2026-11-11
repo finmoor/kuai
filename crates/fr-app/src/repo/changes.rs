@@ -2,7 +2,13 @@
 //!
 //! 和 Fork 一样：单击文件看改动，双击暂存或取消暂存；改动里按块、按行暂存、取消暂存或丢弃；
 //! 提交说明框里 Ctrl+Enter 提交。
+//!
+//! 文件列表可以多选（Ctrl、Shift 加点击）和用键盘操作：上下键换文件，空格或回车暂存、取消暂存，
+//! Delete 丢弃，Ctrl+A 全选这一栏，Ctrl+Enter 提交。
 
+use fr_core::i18n::tr;
+use fr_core::tf;
+use std::collections::BTreeSet;
 use std::ops::Range;
 
 use fr_core::patch::{self, LineKind};
@@ -18,6 +24,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+use super::ops::Step;
 use super::stage_diff::{Row, StageDiff};
 use super::{Mode, RepoView};
 
@@ -41,6 +48,14 @@ pub(super) struct Changes {
     selected: Option<(Area, String)>,
     /// 选中文件在它那一栏的位置；文件从这一栏消失后选同一位置的下一个
     selected_ix: usize,
+    /// 多选时选中的全部文件（都在 `selected` 那一栏，也包括它）；只选了一个时是空的
+    multi: BTreeSet<String>,
+    /// Shift 连选的起点
+    anchor: usize,
+    /// 文件列表的键盘焦点
+    focus: FocusHandle,
+    /// 右边改动内容的键盘焦点：上下键在改动行之间走，空格暂存选中的行
+    diff_focus: FocusHandle,
     unstaged_scroll: UniformListScrollHandle,
     staged_scroll: UniformListScrollHandle,
     diff: Option<StageDiff>,
@@ -60,7 +75,8 @@ impl Changes {
         cx: &mut Context<RepoView>,
     ) -> (Self, Vec<Subscription>) {
         let message = cx.new(|cx| {
-            TextareaState::new(window, cx).placeholder("提交说明，第一行是标题。Ctrl+Enter 提交")
+            TextareaState::new(window, cx)
+                .placeholder(tr("提交说明，第一行是标题。Ctrl+Enter 提交"))
         });
         let subscription = cx.subscribe_in(
             &message,
@@ -79,6 +95,10 @@ impl Changes {
             staged: Vec::new(),
             selected: None,
             selected_ix: 0,
+            multi: BTreeSet::new(),
+            anchor: 0,
+            focus: cx.focus_handle(),
+            diff_focus: cx.focus_handle(),
             unstaged_scroll: UniformListScrollHandle::new(),
             staged_scroll: UniformListScrollHandle::new(),
             diff: None,
@@ -110,6 +130,71 @@ impl Changes {
     pub(super) fn settle(&mut self) {
         self.diff_stale = false;
     }
+
+    /// 提交说明框里现在的内容（去掉首尾空白）。
+    pub(super) fn message_text(&self, cx: &App) -> String {
+        self.message.read(cx).value().trim().to_string()
+    }
+
+    pub(super) fn clear_message(&mut self, window: &mut Window, cx: &mut Context<RepoView>) {
+        self.message.update(cx, |m, cx| m.set_value("", window, cx));
+        self.amend = false;
+        self.amend_message = None;
+    }
+
+    fn scroll(&self, area: Area) -> &UniformListScrollHandle {
+        match area {
+            Area::Unstaged => &self.unstaged_scroll,
+            Area::Staged => &self.staged_scroll,
+        }
+    }
+
+    /// 现在选中的文件：多选时是全部，否则是那一个。
+    fn selected_entries(&self) -> Option<(Area, Vec<Entry>)> {
+        let (area, path) = self.selected.as_ref()?;
+        let entries: Vec<Entry> = self
+            .list(*area)
+            .iter()
+            .filter(|e| {
+                if self.multi.is_empty() {
+                    e.path == *path
+                } else {
+                    self.multi.contains(&e.path)
+                }
+            })
+            .cloned()
+            .collect();
+        (!entries.is_empty()).then_some((*area, entries))
+    }
+
+    /// 这一栏里多选了几个文件；没有多选时是 0。
+    fn multi_count(&self, area: Area) -> usize {
+        match &self.selected {
+            Some((a, _)) if *a == area => self.multi.len(),
+            _ => 0,
+        }
+    }
+}
+
+/// 一串路径接成 `--pathspec-from-file=- --pathspec-file-nul` 要的标准输入。
+fn nul_paths<'a>(paths: impl Iterator<Item = &'a str>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for path in paths {
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.push(0);
+    }
+    bytes
+}
+
+/// 确认框里列文件：最多列 8 个，多的写「等 N 个」。
+fn name_list(entries: &[Entry]) -> String {
+    let mut names: Vec<&str> = entries.iter().take(8).map(|e| e.path.as_str()).collect();
+    let more = entries.len().saturating_sub(names.len());
+    let tail = tf!("……等 {entries} 个文件", entries = entries.len());
+    if more > 0 {
+        names.push(&tail);
+    }
+    names.join("\n")
 }
 
 /// 这个界面用到的颜色，每帧取一次。
@@ -166,6 +251,21 @@ impl RepoView {
 
     /// 状态变了以后：选中的文件还在就重读它的改动；不在了就选同一位置的下一个文件。
     fn sync_file_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some((area, _)) = &self.changes.selected {
+            let area = *area;
+            let still: BTreeSet<String> = self
+                .changes
+                .list(area)
+                .iter()
+                .filter(|e| self.changes.multi.contains(&e.path))
+                .map(|e| e.path.clone())
+                .collect();
+            self.changes.multi = if still.len() > 1 {
+                still
+            } else {
+                BTreeSet::new()
+            };
+        }
         let Some((area, path)) = self.changes.selected.clone() else {
             if self.mode == Mode::Changes {
                 self.select_first_file(cx);
@@ -210,6 +310,14 @@ impl RepoView {
         self.changes.selected.is_none()
     }
 
+    pub(super) fn focus_file_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.changes.focus.focus(window, cx);
+    }
+
+    pub(super) fn changes_selected_entries(&self) -> Option<(Area, Vec<Entry>)> {
+        self.changes.selected_entries()
+    }
+
     /// 切到本地修改时还没选文件：选第一个。
     pub(super) fn select_first_file(&mut self, cx: &mut Context<Self>) {
         let first = self
@@ -237,10 +345,350 @@ impl RepoView {
         let same = self.changes.selected.as_ref() == Some(&(area, path.clone()));
         self.changes.selected = Some((area, path));
         self.changes.selected_ix = ix;
+        if !same {
+            self.changes.diff = None;
+        }
         if !same || self.changes.diff.is_none() {
             self.load_file_diff(cx);
         }
         cx.notify();
+    }
+
+    /// 点了一个文件：普通点击只选它；Ctrl 加点击把它加进多选或从多选里去掉；Shift 加点击连选一段。
+    fn click_file(
+        &mut self,
+        area: Area,
+        path: String,
+        ix: usize,
+        modifiers: Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.changes.focus.focus(window, cx);
+        let same_area = matches!(&self.changes.selected, Some((a, _)) if *a == area);
+        if modifiers.shift && same_area {
+            let (lo, hi) = (self.changes.anchor.min(ix), self.changes.anchor.max(ix));
+            let list = self.changes.list(area);
+            let hi = hi.min(list.len().saturating_sub(1));
+            let picked: BTreeSet<String> = list[lo.min(hi)..=hi]
+                .iter()
+                .map(|e| e.path.clone())
+                .collect();
+            self.changes.multi = picked;
+            self.select_file(area, path, ix, cx);
+        } else if (modifiers.control || modifiers.platform) && same_area {
+            if self.changes.multi.is_empty()
+                && let Some((_, current)) = &self.changes.selected
+            {
+                self.changes.multi.insert(current.clone());
+            }
+            if self.changes.multi.contains(&path) && self.changes.multi.len() > 1 {
+                self.changes.multi.remove(&path);
+                // 去掉的正好是右边显示的那个：换成多选里的第一个
+                if matches!(&self.changes.selected, Some((_, p)) if *p == path) {
+                    let next = self
+                        .changes
+                        .multi
+                        .iter()
+                        .next()
+                        .cloned()
+                        .unwrap_or_default();
+                    let at = self
+                        .changes
+                        .list(area)
+                        .iter()
+                        .position(|e| e.path == next)
+                        .unwrap_or(0);
+                    self.select_file(area, next, at, cx);
+                }
+            } else {
+                self.changes.multi.insert(path.clone());
+                self.select_file(area, path, ix, cx);
+            }
+            self.changes.anchor = ix;
+        } else {
+            self.changes.multi.clear();
+            self.changes.anchor = ix;
+            self.select_file(area, path, ix, cx);
+        }
+        if self.changes.multi.len() <= 1 {
+            self.changes.multi.clear();
+        }
+        cx.notify();
+    }
+
+    /// 文件列表上的按键。
+    fn changes_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.changes.focus.is_focused(window) {
+            return;
+        }
+        let (key, m) = (event.keystroke.key.as_str(), event.keystroke.modifiers);
+        match key {
+            "up" => self.move_file_selection(false, m.shift, cx),
+            "down" => self.move_file_selection(true, m.shift, cx),
+            "enter" if m.control || m.platform => self.commit(window, cx),
+            "space" | "enter" => self.toggle_selected_files(window, cx),
+            "delete" => self.discard_selected_files(window, cx),
+            // 右键：到右边的改动里按行操作
+            "right" => {
+                self.changes.diff_focus.focus(window, cx);
+                self.step_diff_row(true, false, cx);
+            }
+            "a" if m.control || m.platform => {
+                if let Some((area, _)) = &self.changes.selected {
+                    let all: BTreeSet<String> = self
+                        .changes
+                        .list(*area)
+                        .iter()
+                        .map(|e| e.path.clone())
+                        .collect();
+                    self.changes.multi = if all.len() > 1 { all } else { BTreeSet::new() };
+                    cx.notify();
+                }
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
+    /// 右边改动内容上的按键：上下键在改动行之间走（Shift 连选），空格、回车暂存或取消暂存选中的行，
+    /// Delete 丢弃选中的行（会先问），左键回到文件列表。
+    fn diff_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.changes.diff_focus.is_focused(window) {
+            return;
+        }
+        let (key, m) = (event.keystroke.key.as_str(), event.keystroke.modifiers);
+        match key {
+            "up" => self.step_diff_row(false, m.shift, cx),
+            "down" => self.step_diff_row(true, m.shift, cx),
+            "enter" if m.control || m.platform => self.commit(window, cx),
+            "space" | "enter" => self.apply_selection(None, window, cx),
+            "delete" => {
+                if self
+                    .changes
+                    .diff
+                    .as_ref()
+                    .is_some_and(|d| d.area == Area::Unstaged && d.selected_count() > 0)
+                {
+                    self.discard_selection(None, window, cx);
+                }
+            }
+            "left" => self.changes.focus.focus(window, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
+    fn step_diff_row(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) {
+        let Some(diff) = &mut self.changes.diff else {
+            return;
+        };
+        if let Some(row) = diff.step(down, extend) {
+            diff.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
+            cx.notify();
+        }
+    }
+
+    /// 上下键换文件：到一栏的头尾就跨到另一栏。`extend`（按着 Shift）时在这一栏里连选。
+    fn move_file_selection(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) {
+        let Some((area, _)) = self.changes.selected.clone() else {
+            self.select_first_file(cx);
+            return;
+        };
+        let (ix, len) = (self.changes.selected_ix, self.changes.list(area).len());
+        let target = if down && ix + 1 < len {
+            Some((area, ix + 1))
+        } else if !down && ix > 0 {
+            Some((area, ix - 1))
+        } else if extend {
+            None
+        } else if down && area == Area::Unstaged && !self.changes.staged.is_empty() {
+            Some((Area::Staged, 0))
+        } else if !down && area == Area::Staged && !self.changes.unstaged.is_empty() {
+            Some((Area::Unstaged, self.changes.unstaged.len() - 1))
+        } else {
+            None
+        };
+        let Some((area, ix)) = target else {
+            return;
+        };
+        let path = self.changes.list(area)[ix].path.clone();
+        if extend {
+            let (lo, hi) = (self.changes.anchor.min(ix), self.changes.anchor.max(ix));
+            let list = self.changes.list(area);
+            let hi = hi.min(list.len() - 1);
+            self.changes.multi = list[lo.min(hi)..=hi]
+                .iter()
+                .map(|e| e.path.clone())
+                .collect();
+            if self.changes.multi.len() <= 1 {
+                self.changes.multi.clear();
+            }
+        } else {
+            self.changes.multi.clear();
+            self.changes.anchor = ix;
+        }
+        self.changes
+            .scroll(area)
+            .scroll_to_item(ix, ScrollStrategy::Nearest);
+        self.select_file(area, path, ix, cx);
+    }
+
+    /// 空格、回车：暂存或取消暂存选中的文件。
+    fn toggle_selected_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((area, entries)) = self.changes.selected_entries() else {
+            return;
+        };
+        match area {
+            Area::Unstaged => self.stage_files(entries, window, cx),
+            Area::Staged => self.unstage_files(entries, window, cx),
+        }
+    }
+
+    fn discard_selected_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((Area::Unstaged, entries)) = self.changes.selected_entries() {
+            self.discard_files(entries, window, cx);
+        }
+    }
+
+    /// 暂存几个文件。有冲突的不在里面：暂存它等于标记为已解决，要一个一个来。
+    pub(super) fn stage_files(
+        &mut self,
+        entries: Vec<Entry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let [entry] = entries.as_slice() {
+            self.stage_file(entry, window, cx);
+            return;
+        }
+        let (conflicted, rest): (Vec<Entry>, Vec<Entry>) = entries
+            .into_iter()
+            .partition(|e| e.unstaged == Some(Kind::Conflicted));
+        let skipped = conflicted.len();
+        let note = move |window: &mut Window, cx: &mut App| {
+            if skipped > 0 {
+                let text = tf!(
+                    "有 {skipped} 个文件还有冲突，没有暂存。解决后在文件上点右键，选「标记为已解决」。",
+                    skipped
+                );
+                window.push_notification(Notification::warning(text), cx);
+            }
+        };
+        if rest.is_empty() {
+            note(window, cx);
+            return;
+        }
+        let args = vec![
+            "add".into(),
+            "-A".into(),
+            "--pathspec-from-file=-".into(),
+            "--pathspec-file-nul".into(),
+        ];
+        let stdin = nul_paths(rest.iter().map(|e| e.path.as_str()));
+        self.run_op(
+            tr("暂存"),
+            args,
+            Some(stdin),
+            window,
+            cx,
+            move |_, _, window, cx| note(window, cx),
+        );
+    }
+
+    pub(super) fn unstage_files(
+        &mut self,
+        entries: Vec<Entry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let [entry] = entries.as_slice() {
+            self.unstage_file(entry, window, cx);
+            return;
+        }
+        let args = vec![
+            "reset".into(),
+            "-q".into(),
+            "--pathspec-from-file=-".into(),
+            "--pathspec-file-nul".into(),
+        ];
+        // 改名的文件：原路径也要恢复
+        let paths = entries
+            .iter()
+            .flat_map(|e| std::iter::once(e.path.as_str()).chain(e.orig_path.as_deref()));
+        let stdin = nul_paths(paths);
+        self.run_op(
+            tr("取消暂存"),
+            args,
+            Some(stdin),
+            window,
+            cx,
+            |_, _, _, _| {},
+        );
+    }
+
+    /// 丢弃几个文件在工作区里的改动（未跟踪的是删除）。有冲突的丢弃不了，跳过。
+    pub(super) fn discard_files(
+        &mut self,
+        entries: Vec<Entry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entries: Vec<Entry> = entries
+            .into_iter()
+            .filter(|e| e.unstaged != Some(Kind::Conflicted))
+            .collect();
+        if let [entry] = entries.as_slice() {
+            self.discard_file(entry, window, cx);
+            return;
+        }
+        if entries.is_empty() {
+            return;
+        }
+        let (untracked, tracked): (Vec<Entry>, Vec<Entry>) = entries
+            .iter()
+            .cloned()
+            .partition(|e| e.unstaged == Some(Kind::Untracked));
+        let description = tf!(
+            "这 {entries} 个文件在工作区里没暂存的改动会被丢弃，其中未跟踪的 {untracked} 个会被删除。不能撤销。\n\n{entries2}",
+            entries = entries.len(),
+            untracked = untracked.len(),
+            entries2 = name_list(&entries)
+        );
+        self.confirm(
+            tf!("丢弃 {entries} 个文件的改动？", entries = entries.len()),
+            description,
+            tr("丢弃"),
+            window,
+            cx,
+            move |this, window, cx| {
+                let mut steps = Vec::new();
+                if !tracked.is_empty() {
+                    steps.push(Step {
+                        args: vec![
+                            "checkout".into(),
+                            "-q".into(),
+                            "--pathspec-from-file=-".into(),
+                            "--pathspec-file-nul".into(),
+                        ],
+                        stdin: Some(nul_paths(tracked.iter().map(|e| e.path.as_str()))),
+                        net: false,
+                    });
+                }
+                if !untracked.is_empty() {
+                    // -d：未跟踪的目录在状态里是一项，要连目录一起删
+                    let mut clean: Vec<String> =
+                        ["clean", "-f", "-d", "-q", "--"].map(String::from).to_vec();
+                    clean.extend(untracked.iter().map(|e| e.path.clone()));
+                    steps.push(Step::local(clean));
+                }
+                let count = tracked.len() + untracked.len();
+                this.run_seq(tr("丢弃"), steps, window, cx, move |_, _, window, cx| {
+                    let text = tf!("已丢弃 {count} 个文件的改动", count);
+                    window.push_notification(Notification::success(text), cx);
+                });
+            },
+        );
     }
 
     fn load_file_diff(&mut self, cx: &mut Context<Self>) {
@@ -330,7 +778,7 @@ impl RepoView {
         cx: &mut Context<Self>,
     ) {
         let args = vec!["add".into(), "--".into(), entry.path.clone()];
-        self.run_op("暂存", args, None, window, cx, |_, _, _, _| {});
+        self.run_op(tr("暂存"), args, None, window, cx, |_, _, _, _| {});
     }
 
     pub(super) fn unstage_file(
@@ -343,7 +791,7 @@ impl RepoView {
             vec!["reset".into(), "-q".into(), "--".into(), entry.path.clone()];
         // 改名的文件：原路径也要恢复
         args.extend(entry.orig_path.clone());
-        self.run_op("取消暂存", args, None, window, cx, |_, _, _, _| {});
+        self.run_op(tr("取消暂存"), args, None, window, cx, |_, _, _, _| {});
     }
 
     pub(super) fn discard_file(
@@ -354,37 +802,64 @@ impl RepoView {
     ) {
         let untracked = entry.unstaged == Some(Kind::Untracked);
         let base: &[&str] = if untracked {
-            &["clean", "-f", "-q", "--"]
+            // -d：未跟踪的目录在状态里是一项，要连目录一起删
+            &["clean", "-f", "-d", "-q", "--"]
         } else {
             &["checkout", "-q", "--"]
         };
         let mut args: Vec<String> = base.iter().map(|s| s.to_string()).collect();
         args.push(entry.path.clone());
         let description = if untracked {
-            format!("未跟踪的文件 {} 会被删除，不能撤销。", entry.path)
+            tf!(
+                "未跟踪的文件 {path} 会被删除，不能撤销。",
+                path = entry.path
+            )
         } else {
-            format!("{} 在工作区里没暂存的改动会被丢弃，不能撤销。", entry.path)
+            tf!(
+                "{path} 在工作区里没暂存的改动会被丢弃，不能撤销。",
+                path = entry.path
+            )
         };
         self.confirm(
-            "丢弃改动？",
+            tr("丢弃改动？"),
             description,
-            "丢弃",
+            tr("丢弃"),
             window,
             cx,
             move |this, window, cx| {
-                this.run_op("丢弃", args.clone(), None, window, cx, |_, _, _, _| {});
+                this.run_op(
+                    tr("丢弃"),
+                    args.clone(),
+                    None,
+                    window,
+                    cx,
+                    |_, _, window, cx| {
+                        window.push_notification(Notification::success(tr("已丢弃")), cx);
+                    },
+                );
             },
         );
     }
 
     fn stage_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 有冲突的文件不跟着暂存：暂存它等于说「已经解决了」，带着冲突标记提交进去就坏了
+        let conflicts = self
+            .changes
+            .unstaged
+            .iter()
+            .any(|e| e.unstaged == Some(Kind::Conflicted));
+        if conflicts {
+            let entries = self.changes.unstaged.clone();
+            self.stage_files(entries, window, cx);
+            return;
+        }
         let args = vec!["add".into(), "-A".into()];
-        self.run_op("暂存", args, None, window, cx, |_, _, _, _| {});
+        self.run_op(tr("暂存"), args, None, window, cx, |_, _, _, _| {});
     }
 
     fn unstage_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let args = vec!["reset".into(), "-q".into()];
-        self.run_op("取消暂存", args, None, window, cx, |_, _, _, _| {});
+        self.run_op(tr("取消暂存"), args, None, window, cx, |_, _, _, _| {});
     }
 
     /// 暂存（未暂存一栏）或取消暂存（已暂存一栏）选中的行；给了 `hunk` 就是整块。
@@ -404,7 +879,11 @@ impl RepoView {
         let Some(bytes) = diff.patch(reverse, hunk) else {
             return;
         };
-        let label = if reverse { "取消暂存" } else { "暂存" };
+        let label = if reverse {
+            tr("取消暂存")
+        } else {
+            tr("暂存")
+        };
         self.run_op(
             label,
             patch::apply_cached_args(reverse),
@@ -438,30 +917,40 @@ impl RepoView {
             Some(h) => diff.hunk_changed_count(h),
             None => diff.selected_count(),
         };
-        let description = format!(
-            "{} 里的 {count} 行改动会从工作区丢弃，不能撤销。",
-            diff.entry.path
+        let description = tf!(
+            "{path} 里的 {count} 行改动会从工作区丢弃，不能撤销。",
+            path = diff.entry.path,
+            count
         );
         self.confirm(
-            "丢弃改动？",
+            tr("丢弃改动？"),
             description,
-            "丢弃",
+            tr("丢弃"),
             window,
             cx,
             move |this, window, cx| {
                 this.run_op(
-                    "丢弃",
+                    tr("丢弃"),
                     patch::discard_args(),
                     Some(bytes.clone()),
                     window,
                     cx,
-                    |_, _, _, _| {},
+                    |_, _, window, cx| {
+                        window.push_notification(Notification::success(tr("已丢弃")), cx);
+                    },
                 );
             },
         );
     }
 
-    fn press_diff_row(&mut self, row: usize, event: &MouseDownEvent, cx: &mut Context<Self>) {
+    fn press_diff_row(
+        &mut self,
+        row: usize,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.changes.diff_focus.focus(window, cx);
         let Some(diff) = &mut self.changes.diff else {
             return;
         };
@@ -536,41 +1025,72 @@ impl RepoView {
         if self.op.is_some() {
             return;
         }
-        let message = self.changes.message.read(cx).value().trim().to_string();
+        // 提交期间用户可能接着打字：记下交出去的原文，成功后内容没变才清空
+        let sent = self.changes.message.read(cx).value().to_string();
+        let message = sent.trim().to_string();
         if message.is_empty() {
-            window.push_notification(Notification::warning("先写提交说明"), cx);
+            window.push_notification(Notification::warning(tr("先写提交说明")), cx);
             return;
         }
         let amend = self.changes.amend;
         if !amend && self.changes.staged.is_empty() {
-            window.push_notification(Notification::warning("没有已暂存的改动"), cx);
+            window.push_notification(Notification::warning(tr("没有已暂存的改动")), cx);
             return;
         }
         let mut args: Vec<String> = vec!["commit".into(), "-F".into(), "-".into()];
         if amend {
             args.push("--amend".into());
         }
-        let label = if amend { "修改提交" } else { "提交" };
+        let label = if amend {
+            tr("修改提交")
+        } else {
+            tr("提交")
+        };
         self.run_op(
             label,
             args,
             Some(message.into_bytes()),
             window,
             cx,
-            |this, _, window, cx| {
-                this.changes
-                    .message
-                    .update(cx, |m, cx| m.set_value("", window, cx));
-                this.changes.amend = false;
-                this.changes.amend_message = None;
+            move |this, _, window, cx| {
+                let unchanged = this.changes.message.read(cx).value().as_ref() == sent.as_str();
+                if unchanged {
+                    this.changes.clear_message(window, cx);
+                } else {
+                    // 说明在提交期间又改过：留着，只把「修改上次提交」取消掉
+                    this.changes.amend = false;
+                    this.changes.amend_message = None;
+                    let text = tr("已提交。说明框里的内容在提交期间改过，留着没清。");
+                    window.push_notification(Notification::info(text), cx);
+                }
             },
         );
+    }
+
+    /// 提交说明的草稿，关标签页时由工作区取走，再打开这个仓库时放回来。
+    pub fn draft(&self, cx: &App) -> String {
+        self.changes.message.read(cx).value().to_string()
+    }
+
+    pub fn set_draft(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.changes
+            .message
+            .update(cx, |m, cx| m.set_value(text, window, cx));
+    }
+
+    /// 换了界面语言：提交说明框里的提示文字要重新设一遍。
+    pub(super) fn retranslate_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.changes.message.update(cx, |state, cx| {
+            state.set_placeholder(tr("提交说明，第一行是标题。Ctrl+Enter 提交"), window, cx)
+        });
     }
 
     pub(super) fn render_changes(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let c = colors(cx);
         h_flex()
             .size_full()
+            .track_focus(&self.changes.focus)
+            .on_key_down(cx.listener(Self::changes_key))
             .child(
                 v_flex()
                     .w(px(LIST_WIDTH))
@@ -594,10 +1114,21 @@ impl RepoView {
 
     fn render_file_section(&mut self, area: Area, c: Colors, cx: &mut Context<Self>) -> AnyElement {
         let count = self.changes.list(area).len();
+        let picked = self.changes.multi_count(area);
         let busy = self.op.is_some();
         let (title, action, empty, id) = match area {
-            Area::Unstaged => ("未暂存", "全部暂存", "工作区没有改动", "unstaged"),
-            Area::Staged => ("已暂存", "全部取消暂存", "还没有暂存的改动", "staged"),
+            Area::Unstaged => (
+                tr("未暂存"),
+                tr("全部暂存"),
+                tr("工作区没有改动"),
+                "unstaged",
+            ),
+            Area::Staged => (
+                tr("已暂存"),
+                tr("全部取消暂存"),
+                tr("还没有暂存的改动"),
+                "staged",
+            ),
         };
         let scroll = match area {
             Area::Unstaged => self.changes.unstaged_scroll.clone(),
@@ -638,22 +1169,53 @@ impl RepoView {
                     .border_color(c.border)
                     .child(
                         div()
-                            .text_sm()
+                            .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(format!("{title}（{count}）")),
+                            .text_color(c.muted)
+                            .child(title),
                     )
+                    .child(crate::ui::count_pill(count, false, cx))
                     .child(div().flex_1())
-                    .child(
-                        Button::new(SharedString::from(format!("{id}-all")))
-                            .xsmall()
-                            .ghost()
-                            .label(action)
-                            .disabled(busy || count == 0)
-                            .on_click(cx.listener(move |this, _, window, cx| match area {
-                                Area::Unstaged => this.stage_all(window, cx),
-                                Area::Staged => this.unstage_all(window, cx),
-                            })),
-                    ),
+                    .when(picked > 1, |bar| {
+                        let label = match area {
+                            Area::Unstaged => tf!("暂存选中的 {picked} 个", picked),
+                            Area::Staged => tf!("取消暂存选中的 {picked} 个", picked),
+                        };
+                        bar.child(
+                            Button::new(SharedString::from(format!("{id}-picked")))
+                                .xsmall()
+                                .label(label)
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_selected_files(window, cx)
+                                })),
+                        )
+                        .when(area == Area::Unstaged, |bar| {
+                            bar.child(
+                                Button::new("unstaged-picked-discard")
+                                    .xsmall()
+                                    .ghost()
+                                    .label(tr("丢弃…"))
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.discard_selected_files(window, cx)
+                                    })),
+                            )
+                        })
+                    })
+                    .when(picked <= 1, |bar| {
+                        bar.child(
+                            Button::new(SharedString::from(format!("{id}-all")))
+                                .xsmall()
+                                .ghost()
+                                .label(action)
+                                .disabled(busy || count == 0)
+                                .on_click(cx.listener(move |this, _, window, cx| match area {
+                                    Area::Unstaged => this.stage_all(window, cx),
+                                    Area::Staged => this.unstage_all(window, cx),
+                                })),
+                        )
+                    }),
             )
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
@@ -668,6 +1230,7 @@ impl RepoView {
     ) -> Vec<AnyElement> {
         let list = self.changes.list(area);
         let selected = self.changes.selected.clone();
+        let multi = self.changes.multi_count(area) > 1;
         range
             .filter_map(|ix| {
                 let entry = list.get(ix)?;
@@ -675,24 +1238,39 @@ impl RepoView {
                     Area::Unstaged => entry.unstaged,
                     Area::Staged => entry.staged,
                 }?;
-                let is_selected = selected
+                let is_primary = selected
                     .as_ref()
                     .is_some_and(|(a, p)| *a == area && *p == entry.path);
+                let in_multi = multi && self.changes.multi.contains(&entry.path);
+                let is_selected = is_primary || in_multi;
                 let (dir, name) = match entry.path.rsplit_once('/') {
                     Some((dir, name)) => (dir.to_string(), name.to_string()),
                     None => (String::new(), entry.path.clone()),
                 };
                 let path = entry.path.clone();
-                let menu = self.file_menu(area, entry, cx);
+                let menu = if in_multi {
+                    self.multi_file_menu(area, cx)
+                } else {
+                    self.file_menu(area, entry, cx)
+                };
                 let menu_path = entry.path.clone();
                 Some(
                     h_flex()
                         .id(ix)
-                        // 点右键先选中这个文件
+                        // 点右键先选中这个文件；点在多选的文件上就保持多选
                         .on_mouse_down(
                             MouseButton::Right,
-                            cx.listener(move |this, _, _, cx| {
-                                this.select_file(area, menu_path.clone(), ix, cx)
+                            cx.listener(move |this, _, window, cx| {
+                                if !in_multi {
+                                    this.click_file(
+                                        area,
+                                        menu_path.clone(),
+                                        ix,
+                                        Modifiers::default(),
+                                        window,
+                                        cx,
+                                    );
+                                }
                             }),
                         )
                         .h(px(FILE_ROW_HEIGHT))
@@ -703,21 +1281,44 @@ impl RepoView {
                         .cursor_pointer()
                         .when(is_selected, |d| d.bg(c.selected))
                         .when(!is_selected, |d| d.hover(|s| s.bg(c.hover)))
+                        // 右边显示的是哪个文件：左边一条色带，多选时也分得出来
+                        .border_l_2()
+                        .border_color(if is_primary {
+                            c.info
+                        } else {
+                            gpui_kit::transparent_black()
+                        })
                         .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                             if event.click_count() >= 2 {
                                 this.toggle_file(area, &path, window, cx);
                             } else {
-                                this.select_file(area, path.clone(), ix, cx);
+                                this.click_file(
+                                    area,
+                                    path.clone(),
+                                    ix,
+                                    event.modifiers(),
+                                    window,
+                                    cx,
+                                );
                             }
                         }))
-                        .child(
+                        // 改动的种类：一个带底色的小方块，里面一个字母，颜色分新增、修改、删除
+                        .child({
+                            let color = kind_color(kind, c);
                             div()
-                                .w(px(12.))
+                                .size(px(16.))
                                 .flex_none()
+                                .rounded(px(4.))
+                                .bg(color.opacity(0.16))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(10.5))
+                                .line_height(px(16.))
                                 .font_weight(FontWeight::BOLD)
-                                .text_color(kind_color(kind, c))
-                                .child(kind.letter()),
-                        )
+                                .text_color(color)
+                                .child(kind.letter())
+                        })
                         .child(div().flex_none().max_w(px(220.)).truncate().child(name))
                         .child(
                             div()
@@ -739,14 +1340,17 @@ impl RepoView {
         let busy = self.op.is_some();
         let amend = self.changes.amend;
         let staged = self.changes.staged.len();
-        let committing = matches!(self.op.as_deref(), Some("提交" | "修改提交"));
+        let committing = self
+            .op
+            .as_deref()
+            .is_some_and(|op| op == tr("提交") || op == tr("修改提交"));
         let view = cx.entity().downgrade();
         let label: SharedString = if amend {
-            "修改上次提交".into()
+            tr("修改上次提交").into()
         } else if staged > 0 {
-            format!("提交（{staged} 个文件）").into()
+            tf!("提交（{staged} 个文件）", staged).into()
         } else {
-            "提交".into()
+            tr("提交").into()
         };
         v_flex()
             .flex_none()
@@ -760,8 +1364,9 @@ impl RepoView {
                     .gap_2()
                     .child(
                         Checkbox::new("amend")
-                            .label("修改上次提交")
+                            .label(tr("修改上次提交"))
                             .checked(amend)
+                            .disabled(busy)
                             .on_click(move |checked, window, cx| {
                                 view.update(cx, |this, cx| this.set_amend(*checked, window, cx))
                                     .ok();
@@ -792,11 +1397,11 @@ impl RepoView {
         }
         let Some(diff) = &self.changes.diff else {
             let text = if self.changes.unstaged.is_empty() && self.changes.staged.is_empty() {
-                "工作区和暂存区都没有改动"
+                tr("工作区和暂存区都没有改动")
             } else if self.changes.selected.is_some() {
-                "正在读取改动…"
+                tr("正在读取改动…")
             } else {
-                "选一个文件查看改动"
+                tr("选一个文件查看改动")
             };
             return div()
                 .size_full()
@@ -843,13 +1448,37 @@ impl RepoView {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(title),
             );
-        if count > 0 {
-            bar = match area {
+        // 选中行以后的按钮单独占一行，不和文件名、「暂存文件」挤在一起：窗口窄的时候那一行放不下。
+        // 这一行一直在（没选中时写怎么选），选中、取消选中时下面的改动不会上下跳。
+        let select_bar = diff.editable().then(|| {
+            let bar = h_flex()
+                .h(px(30.))
+                .flex_none()
+                .px_3()
+                .gap_2()
+                .border_b_1()
+                .border_color(c.border)
+                .text_xs()
+                .text_color(c.muted);
+            if count == 0 {
+                return bar.child(div().min_w_0().truncate().child(match area {
+                    Area::Unstaged => tr("点改动的行选中，Shift 连选；空格暂存，Delete 丢弃"),
+                    Area::Staged => tr("点改动的行选中，Shift 连选；空格取消暂存"),
+                }));
+            }
+            let bar = bar.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(tf!("选中了 {count} 行", count)),
+            );
+            match area {
                 Area::Unstaged => bar
                     .child(
                         Button::new("stage-lines")
-                            .small()
-                            .label(format!("暂存选中的 {count} 行"))
+                            .xsmall()
+                            .label(tr("暂存这几行"))
                             .disabled(!line_ops)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.apply_selection(None, window, cx)
@@ -857,9 +1486,9 @@ impl RepoView {
                     )
                     .child(
                         Button::new("discard-lines")
-                            .small()
+                            .xsmall()
                             .ghost()
-                            .label(format!("丢弃选中的 {count} 行…"))
+                            .label(tr("丢弃这几行…"))
                             .disabled(!line_ops)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.discard_selection(None, window, cx)
@@ -867,15 +1496,15 @@ impl RepoView {
                     ),
                 Area::Staged => bar.child(
                     Button::new("unstage-lines")
-                        .small()
-                        .label(format!("取消暂存选中的 {count} 行"))
+                        .xsmall()
+                        .label(tr("取消暂存这几行"))
                         .disabled(!line_ops)
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.apply_selection(None, window, cx)
                         })),
                 ),
-            };
-        }
+            }
+        });
         bar = match area {
             Area::Unstaged => {
                 let conflicted = entry.unstaged == Some(Kind::Conflicted);
@@ -885,9 +1514,9 @@ impl RepoView {
                         .small()
                         .primary()
                         .label(if conflicted {
-                            "标记为已解决"
+                            tr("标记为已解决")
                         } else {
-                            "暂存文件"
+                            tr("暂存文件")
                         })
                         .disabled(!idle)
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -899,7 +1528,7 @@ impl RepoView {
                         Button::new("discard-file")
                             .small()
                             .ghost()
-                            .label("丢弃文件…")
+                            .label(tr("丢弃文件…"))
                             .disabled(!idle)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.discard_file(&discard, window, cx)
@@ -910,7 +1539,7 @@ impl RepoView {
             Area::Staged => bar.child(
                 Button::new("unstage-file")
                     .small()
-                    .label("取消暂存文件")
+                    .label(tr("取消暂存文件"))
                     .disabled(!idle)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.unstage_file(&entry, window, cx)
@@ -940,7 +1569,10 @@ impl RepoView {
         };
         v_flex()
             .size_full()
+            .track_focus(&self.changes.diff_focus)
+            .on_key_down(cx.listener(Self::diff_key))
             .child(bar)
+            .children(select_bar)
             .when_some(notice, |d, notice| {
                 d.child(
                     div()
@@ -985,6 +1617,13 @@ impl RepoView {
                         .child(text)
                         .into_any_element(),
                     Row::Hunk(h) => {
+                        // 按钮在前、标题在后：窗口窄、标题长的时候按钮不会被挤到右边看不见的地方
+                        let title = div()
+                            .flex_none()
+                            .font_family(MONO)
+                            .text_size(px(12.))
+                            .text_color(c.muted)
+                            .child(text);
                         let mut row = h_flex()
                             .id(ix)
                             .h(px(DIFF_ROW_HEIGHT))
@@ -993,22 +1632,14 @@ impl RepoView {
                             .gap_2()
                             .bg(c.hunk)
                             .border_t_1()
-                            .border_color(c.border)
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .font_family(MONO)
-                                    .text_size(px(12.))
-                                    .text_color(c.muted)
-                                    .child(text),
-                            );
+                            .border_color(c.border);
                         if editable {
                             row = match area {
                                 Area::Unstaged => row
                                     .child(
                                         Button::new(("stage-hunk", h))
                                             .xsmall()
-                                            .label("暂存此块")
+                                            .label(tr("暂存此块"))
                                             .disabled(!line_ops)
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 this.apply_selection(Some(h), window, cx)
@@ -1018,7 +1649,7 @@ impl RepoView {
                                         Button::new(("discard-hunk", h))
                                             .xsmall()
                                             .ghost()
-                                            .label("丢弃此块…")
+                                            .label(tr("丢弃此块…"))
                                             .disabled(!line_ops)
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 this.discard_selection(Some(h), window, cx)
@@ -1027,7 +1658,7 @@ impl RepoView {
                                 Area::Staged => row.child(
                                     Button::new(("unstage-hunk", h))
                                         .xsmall()
-                                        .label("取消暂存此块")
+                                        .label(tr("取消暂存此块"))
                                         .disabled(!line_ops)
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.apply_selection(Some(h), window, cx)
@@ -1035,7 +1666,7 @@ impl RepoView {
                                 ),
                             };
                         }
-                        row.into_any_element()
+                        row.child(title).into_any_element()
                     }
                     Row::Line(h, l) => {
                         let line = &diff.file.hunks[h].lines[l];
@@ -1058,8 +1689,8 @@ impl RepoView {
                             .when_some(bg, |d, bg| d.bg(bg))
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                    this.press_diff_row(ix, event, cx)
+                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                    this.press_diff_row(ix, event, window, cx)
                                 }),
                             )
                             .on_mouse_move(cx.listener(

@@ -7,6 +7,8 @@
 //! Windows 上整个仓库只要一个递归监听；Linux 的 inotify 要每个目录一个，
 //! 所以自己遍历目录，跳过被忽略的。
 
+use crate::i18n::tr;
+use crate::tf;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -46,14 +48,14 @@ impl Drop for Watcher {
 /// 开始监听仓库，有变化时在后台线程里调用 `on_change`。
 pub fn watch(repo: &Path, on_change: impl FnMut() + Send + 'static) -> Result<Watcher> {
     if !repo.is_dir() {
-        anyhow::bail!("目录不存在：{}", repo.display());
+        anyhow::bail!("{}", tf!("目录不存在：{repo}", repo = repo.display()));
     }
     let (tx, rx) = mpsc::channel();
     let events = tx.clone();
     let watcher = notify::recommended_watcher(move |event| {
         let _ = events.send(Msg::Event(event));
     })
-    .context("无法监听文件变化")?;
+    .context(tr("无法监听文件变化"))?;
     let mut state = State::new(repo.to_path_buf(), watcher);
     std::thread::Builder::new()
         .name("fr-watch".into())
@@ -61,7 +63,7 @@ pub fn watch(repo: &Path, on_change: impl FnMut() + Send + 'static) -> Result<Wa
             state.start();
             run(rx, state, on_change);
         })
-        .context("无法启动监听线程")?;
+        .context(tr("无法启动监听线程"))?;
     Ok(Watcher { tx })
 }
 

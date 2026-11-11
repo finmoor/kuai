@@ -1,5 +1,8 @@
 //! 逐行追溯（blame）：左边是每一行最后改它的提交，右边是文件内容。点一行跳到那个提交。
+//! 键盘：上下键、PageUp、PageDown、Home、End 换行，回车跳到改这一行的提交，Esc 关闭。
 
+use fr_core::i18n::tr;
+use fr_core::tf;
 use std::ops::Range;
 
 use fr_core::blame::{self, Blame};
@@ -21,6 +24,11 @@ pub(super) struct BlameView {
     texts: Vec<SharedString>,
     error: Option<SharedString>,
     scroll: UniformListScrollHandle,
+    /// 键盘选中的行
+    selected: Option<usize>,
+    focus: FocusHandle,
+    /// 刚打开，还没把键盘焦点拿过来
+    grab_focus: bool,
     /// 关掉以后回到哪个视图
     back: Mode,
     _task: Task<()>,
@@ -57,7 +65,9 @@ impl RepoView {
                             .collect();
                         view.data = Some(data);
                     }
-                    Err(err) => view.error = Some(format!("读取失败：{err:#}").into()),
+                    Err(err) => {
+                        view.error = Some(tf!("读取失败：{err}", err = format!("{:#}", err)).into())
+                    }
                 }
                 cx.notify();
             })
@@ -73,6 +83,9 @@ impl RepoView {
             texts: Vec::new(),
             error: None,
             scroll: UniformListScrollHandle::new(),
+            selected: None,
+            focus: cx.focus_handle(),
+            grab_focus: true,
             back,
             _task: task,
         });
@@ -87,8 +100,55 @@ impl RepoView {
         cx.notify();
     }
 
+    /// 刚打开逐行追溯时把键盘焦点放上去，上下键马上能用。
+    pub(super) fn focus_blame_if_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = &mut self.blame
+            && std::mem::take(&mut view.grab_focus)
+        {
+            view.focus.focus(window, cx);
+        }
+    }
+
+    fn blame_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = &mut self.blame else {
+            return;
+        };
+        if !view.focus.is_focused(window) {
+            return;
+        }
+        let count = view.data.as_ref().map_or(0, |d| d.lines.len());
+        const PAGE: usize = 20;
+        let current = view.selected;
+        let next = match event.keystroke.key.as_str() {
+            "escape" => {
+                cx.stop_propagation();
+                self.close_blame(cx);
+                return;
+            }
+            "enter" => {
+                cx.stop_propagation();
+                if let Some(line) = current {
+                    self.blame_jump(line, window, cx);
+                }
+                return;
+            }
+            _ if count == 0 => return,
+            "down" => current.map_or(0, |ix| (ix + 1).min(count - 1)),
+            "up" => current.map_or(0, |ix| ix.saturating_sub(1)),
+            "pagedown" => current.map_or(0, |ix| (ix + PAGE).min(count - 1)),
+            "pageup" => current.map_or(0, |ix| ix.saturating_sub(PAGE)),
+            "home" => 0,
+            "end" => count - 1,
+            _ => return,
+        };
+        cx.stop_propagation();
+        view.selected = Some(next);
+        view.scroll.scroll_to_item(next, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
     /// 点一行：回到提交历史，选中改这一行的提交。
-    fn blame_jump(&mut self, line: usize, cx: &mut Context<Self>) {
+    fn blame_jump(&mut self, line: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(commit) = self.blame.as_ref().and_then(|view| {
             let data = view.data.as_ref()?;
             data.commits.get(data.lines.get(line)?.commit)
@@ -101,8 +161,9 @@ impl RepoView {
         let id = commit.id.clone();
         self.blame = None;
         self.sidebar_select_history();
-        // 正在看文件历史时列表里不一定有这个提交：先回到全部提交
-        self.close_file_history(cx);
+        // 正在看文件历史时列表里不一定有这个提交：先回到全部提交。
+        // 列表要重读，reveal_commit 会先记着，读到了再定位
+        self.close_file_history(window, cx);
         self.reveal_commit(&id, cx);
         cx.notify();
     }
@@ -124,7 +185,7 @@ impl RepoView {
                 .p_3()
                 .text_sm()
                 .text_color(muted)
-                .child("正在读取…")
+                .child(tr("正在读取…"))
                 .into_any_element(),
             (Some(data), None) => uniform_list(
                 "blame",
@@ -146,22 +207,24 @@ impl RepoView {
                     .border_b_1()
                     .border_color(border)
                     .text_sm()
-                    .child(div().text_color(muted).child("逐行追溯"))
+                    .child(div().text_color(muted).child(tr("逐行追溯")))
                     .child(div().flex_1().min_w_0().truncate().child(view.path.clone()))
                     .child(
                         div()
                             .text_xs()
                             .text_color(muted)
-                            .child("点一行跳到改它的提交"),
+                            .child(tr("点一行跳到改它的提交；上下键选行，回车跳转")),
                     )
                     .child(
                         Button::new("close-blame")
                             .xsmall()
-                            .label("关闭")
+                            .label(tr("关闭"))
                             .on_click(cx.listener(|this, _, _, cx| this.close_blame(cx))),
                     ),
             )
             .child(div().flex_1().min_h_0().child(body))
+            .track_focus(&view.focus)
+            .on_key_down(cx.listener(Self::blame_key))
             .into_any_element()
     }
 
@@ -171,10 +234,16 @@ impl RepoView {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let theme = cx.theme();
-        let (border, muted, hover) = (theme.border, theme.muted_foreground, theme.list_hover);
+        let (border, muted, hover, active) = (
+            theme.border,
+            theme.muted_foreground,
+            theme.list_hover,
+            theme.list_active,
+        );
         let Some(view) = &self.blame else {
             return Vec::new();
         };
+        let selected = view.selected;
         let Some(data) = &view.data else {
             return Vec::new();
         };
@@ -186,7 +255,7 @@ impl RepoView {
                 let (who, what): (SharedString, SharedString) = if !line.first {
                     ("".into(), "".into())
                 } else if commit.uncommitted() {
-                    ("".into(), "还没提交".into())
+                    ("".into(), tr("还没提交").into())
                 } else {
                     (
                         format!(
@@ -205,11 +274,14 @@ impl RepoView {
                         .w_full()
                         .text_xs()
                         .cursor_pointer()
+                        .when(selected == Some(ix), |row| row.bg(active))
                         .hover(|s| s.bg(hover))
                         .when(line.first && ix > 0, |row| {
                             row.border_t_1().border_color(border)
                         })
-                        .on_click(cx.listener(move |this, _, _, cx| this.blame_jump(ix, cx)))
+                        .on_click(
+                            cx.listener(move |this, _, window, cx| this.blame_jump(ix, window, cx)),
+                        )
                         .child(
                             div()
                                 .w(px(150.))

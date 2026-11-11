@@ -5,6 +5,8 @@
 //!
 //! 线程：一个写线程把请求依次写进 ssh 的标准输入；一个读线程读响应，按编号交给等待的 future。
 
+use fr_core::i18n::tr;
+use fr_core::tf;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
@@ -96,10 +98,10 @@ impl Connection {
                 }
                 Started::Missing { os, arch } => {
                     if installed {
-                        bail!("上传 agent 后还是启动不了");
+                        bail!(tr("上传 agent 后还是启动不了"));
                     }
                     if os != "Linux" {
-                        bail!("暂时只支持 Linux 服务器，这台是 {os}");
+                        bail!("{}", tf!("暂时只支持 Linux 服务器，这台是 {os}", os));
                     }
                     install(destination, &dir, &agents.binary_for(&arch)?)?;
                     installed = true;
@@ -111,15 +113,15 @@ impl Connection {
     /// 直接启动一个 agent 进程（测试用，比如本机的 `fr-agent --stdio`）。
     pub fn spawn_agent(cmd: Command) -> Result<Connection> {
         let started = Instant::now();
-        match start(cmd, false, "本机 agent")? {
+        match start(cmd, false, tr("本机 agent"))? {
             Started::Ready(inner, hello) => Ok(Connection {
-                destination: "本机 agent".into(),
+                destination: tr("本机 agent").into(),
                 hello,
                 connect_time: started.elapsed(),
                 installed: false,
                 inner,
             }),
-            Started::Missing { .. } => bail!("agent 没有启动"),
+            Started::Missing { .. } => bail!(tr("agent 没有启动")),
         }
     }
 
@@ -137,7 +139,7 @@ impl Connection {
         let call = self.call("list_dir", json!({ "path": path }), Vec::new());
         async move {
             let (result, _) = call.await?;
-            serde_json::from_value(result).context("agent 返回的目录格式不对")
+            serde_json::from_value(result).context(tr("agent 返回的目录格式不对"))
         }
         .boxed()
     }
@@ -156,7 +158,7 @@ impl Connection {
         async move {
             let (result, stdout) = call.await?;
             let result: GitResult =
-                serde_json::from_value(result).context("agent 返回的结果格式不对")?;
+                serde_json::from_value(result).context(tr("agent 返回的结果格式不对"))?;
             Ok(GitOutput {
                 code: result.code,
                 stdout,
@@ -252,7 +254,7 @@ impl Connection {
         async move {
             let result = rx.await;
             drop(guard);
-            result.unwrap_or_else(|_| Err(anyhow!("与服务器的连接已断开")))
+            result.unwrap_or_else(|_| Err(anyhow!(tr("与服务器的连接已断开"))))
         }
         .boxed()
     }
@@ -276,10 +278,10 @@ impl Inner {
 
     fn send(&self, request: Request, payload: Vec<u8>) -> Result<()> {
         let outgoing = self.outgoing.lock().unwrap();
-        let sender = outgoing.as_ref().context("连接已关闭")?;
+        let sender = outgoing.as_ref().context(tr("连接已关闭"))?;
         sender
             .send((request, payload))
-            .map_err(|_| anyhow!("与服务器的连接已断开"))
+            .map_err(|_| anyhow!(tr("与服务器的连接已断开")))
     }
 
     /// agent 替服务器上的 git 要密码：在另一个线程里问用户（要等用户填），再把回答发回去。
@@ -338,7 +340,7 @@ impl Inner {
             Pending::Stream(tx) => {
                 let item = outcome.and_then(|result| {
                     let result: GitResult =
-                        serde_json::from_value(result).context("agent 返回的结果格式不对")?;
+                        serde_json::from_value(result).context(tr("agent 返回的结果格式不对"))?;
                     Ok(StreamItem::Done(GitOutput {
                         code: result.code,
                         stdout: Vec::new(),
@@ -360,7 +362,7 @@ impl Inner {
         let message = if tail.is_empty() {
             reason
         } else {
-            format!("{reason}：{tail}")
+            tf!("{reason}：{tail}", reason, tail)
         };
         for (_, waiter) in self.pending.lock().unwrap().drain() {
             match waiter {
@@ -406,12 +408,15 @@ fn start(mut cmd: Command, expect_marker: bool, destination: &str) -> Result<Sta
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     no_window(&mut cmd);
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("无法启动 {}", cmd.get_program().to_string_lossy()))?;
-    let mut stdin = child.stdin.take().context("拿不到 ssh 的标准输入")?;
-    let stdout = child.stdout.take().context("拿不到 ssh 的标准输出")?;
-    let stderr_tail = collect_stderr(child.stderr.take().context("拿不到 ssh 的标准错误")?);
+    let mut child = cmd.spawn().with_context(|| {
+        tf!(
+            "无法启动 {to_string_lossy}",
+            to_string_lossy = cmd.get_program().to_string_lossy()
+        )
+    })?;
+    let mut stdin = child.stdin.take().context(tr("拿不到 ssh 的标准输入"))?;
+    let stdout = child.stdout.take().context(tr("拿不到 ssh 的标准输出"))?;
+    let stderr_tail = collect_stderr(child.stderr.take().context(tr("拿不到 ssh 的标准错误"))?);
 
     // 握手请求先发出去，省一次往返。没装 agent 时远程的 sh 不读它，丢掉就是了
     let hello = Request {
@@ -454,14 +459,18 @@ fn start(mut cmd: Command, expect_marker: bool, destination: &str) -> Result<Sta
         bail!("{}", connect_error(destination, &stderr_tail, &[]));
     };
     if let Some(err) = response.error {
-        bail!("agent 握手失败：{err}");
+        bail!("{}", tf!("agent 握手失败：{err}", err));
     }
     let hello: Hello = serde_json::from_value(response.result.unwrap_or_default())
-        .context("agent 握手结果格式不对")?;
+        .context(tr("agent 握手结果格式不对"))?;
     if hello.protocol != PROTOCOL_VERSION {
         bail!(
-            "agent 的协议版本是 {}，客户端是 {PROTOCOL_VERSION}",
-            hello.protocol
+            "{}",
+            tf!(
+                "agent 的协议版本是 {protocol}，客户端是 {PROTOCOL_VERSION}",
+                protocol = hello.protocol,
+                PROTOCOL_VERSION
+            )
         );
     }
 
@@ -499,8 +508,8 @@ fn read_loop(inner: Weak<Inner>, mut reader: BufReader<ChildStdout>) {
                 Some(inner) => inner.dispatch(response, payload),
                 None => return,
             },
-            Ok(None) => break "与服务器的连接已断开".to_string(),
-            Err(err) => break format!("与服务器的连接出错：{err:#}"),
+            Ok(None) => break tr("与服务器的连接已断开").to_string(),
+            Err(err) => break tf!("与服务器的连接出错：{err}", err = format!("{:#}", err)),
         }
     };
     if let Some(inner) = inner.upgrade() {
@@ -538,26 +547,26 @@ fn connect_error(destination: &str, stderr_tail: &Mutex<String>, noise: &[String
     std::thread::sleep(Duration::from_millis(50));
     let stderr = stderr_tail.lock().unwrap().trim().to_string();
     let hint = if stderr.contains("Permission denied") {
-        "登录被拒绝：密钥不被接受，或者密码不对、取消了输入"
+        tr("登录被拒绝：密钥不被接受，或者密码不对、取消了输入")
     } else if stderr.contains("Could not resolve hostname") {
-        "找不到这个主机名"
+        tr("找不到这个主机名")
     } else if stderr.contains("timed out") {
-        "连接超时"
+        tr("连接超时")
     } else if stderr.contains("Connection refused") {
-        "对方拒绝连接，检查 SSH 服务和端口"
+        tr("对方拒绝连接，检查 SSH 服务和端口")
     } else if stderr.contains("Host key verification failed")
         || stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
     {
-        "服务器的主机密钥和 known_hosts 里记录的不一致，先在终端里用 ssh 确认"
+        tr("服务器的主机密钥和 known_hosts 里记录的不一致，先在终端里用 ssh 确认")
     } else {
-        "连接失败"
+        tr("连接失败")
     };
-    let mut message = format!("连接 {destination}：{hint}");
+    let mut message = tf!("连接 {destination}：{hint}", destination, hint);
     if !stderr.is_empty() {
-        message.push_str(&format!("（ssh：{stderr}）"));
+        message.push_str(&tf!("（ssh：{stderr}）", stderr));
     }
     if !noise.is_empty() {
-        message.push_str(&format!("（服务器输出：{}）", noise.join(" / ")));
+        message.push_str(&tf!("（服务器输出：{join}）", join = noise.join(" / ")));
     }
     message
 }
@@ -628,20 +637,23 @@ fn install(destination: &str, dir: &str, binary: &[u8]) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     no_window(&mut cmd);
-    let mut child = cmd.spawn().context("无法启动 ssh")?;
-    let mut stdin = child.stdin.take().context("拿不到 ssh 的标准输入")?;
+    let mut child = cmd.spawn().context(tr("无法启动 ssh"))?;
+    let mut stdin = child.stdin.take().context(tr("拿不到 ssh 的标准输入"))?;
     let data = binary.to_vec();
     let writer = std::thread::spawn(move || stdin.write_all(&data));
-    let out = child.wait_with_output().context("上传 agent 失败")?;
+    let out = child.wait_with_output().context(tr("上传 agent 失败"))?;
     let written = writer.join();
     if !out.status.success() {
         bail!(
-            "上传 agent 失败：{}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            "{}",
+            tf!(
+                "上传 agent 失败：{stderr}",
+                stderr = String::from_utf8_lossy(&out.stderr).trim()
+            )
         );
     }
     if !matches!(written, Ok(Ok(()))) {
-        bail!("上传 agent 时连接中断");
+        bail!(tr("上传 agent 时连接中断"));
     }
     Ok(())
 }

@@ -3,6 +3,8 @@
 //! 目录名是 `<版本>-<程序内容的哈希>`：开发时版本号不变、程序在变，
 //! 靠哈希区分，服务器上的旧程序会被换掉。
 
+use fr_core::i18n::tr;
+use fr_core::tf;
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, bail};
@@ -24,16 +26,16 @@ impl Agents {
         let mut build = FNV_OFFSET;
         for (arch, triple) in TARGETS {
             if let Some(path) = candidates(triple).into_iter().find(|p| p.is_file()) {
-                let bytes =
-                    std::fs::read(&path).with_context(|| format!("读不了 {}", path.display()))?;
+                let bytes = std::fs::read(&path)
+                    .with_context(|| tf!("读不了 {path}", path = path.display()))?;
                 build = fnv1a(build, &bytes);
                 found.push((*arch, path));
             }
         }
         if found.is_empty() {
-            bail!(
+            bail!(tr(
                 "找不到 Linux 版 agent 程序。开发时先运行 `cargo build-agent`；也可以用环境变量 FR_AGENT_DIR 指定目录"
-            );
+            ));
         }
         Ok(Agents { found, build })
     }
@@ -50,9 +52,15 @@ impl Agents {
     /// 读出给某种 CPU 架构用的程序。
     pub fn binary_for(&self, arch: &str) -> Result<Vec<u8>> {
         let Some((_, path)) = self.found.iter().find(|(a, _)| *a == arch) else {
-            bail!("服务器的 CPU 架构是 {arch}，没有这个架构的 agent 程序");
+            bail!(
+                "{}",
+                tf!(
+                    "服务器的 CPU 架构是 {arch}，没有这个架构的 agent 程序",
+                    arch
+                )
+            );
         };
-        std::fs::read(path).with_context(|| format!("读不了 {}", path.display()))
+        std::fs::read(path).with_context(|| tf!("读不了 {path}", path = path.display()))
     }
 }
 

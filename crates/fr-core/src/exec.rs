@@ -1,5 +1,7 @@
 //! 启动 git 进程、读它的输出，并且能从别的线程取消。agent 和客户端的本机通道共用这一套。
 
+use crate::i18n::tr;
+use crate::tf;
 use std::io::{ErrorKind, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdout, Stdio};
@@ -107,9 +109,9 @@ pub fn spawn_with(
     let started = Instant::now();
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("无法启动 git {}", args.join(" ")))?;
-    let stdout = child.stdout.take().context("拿不到 git 的标准输出")?;
-    let mut stderr = child.stderr.take().context("拿不到 git 的标准错误")?;
+        .with_context(|| tf!("无法启动 git {join}", join = args.join(" ")))?;
+    let stdout = child.stdout.take().context(tr("拿不到 git 的标准输出"))?;
+    let mut stderr = child.stderr.take().context(tr("拿不到 git 的标准错误"))?;
     let stdin_writer = match (stdin, child.stdin.take()) {
         (Some(data), Some(mut pipe)) => Some(std::thread::spawn(move || {
             // git 提前退出时这里会写失败，结果以退出码为准
@@ -159,7 +161,7 @@ impl Running {
                 Ok(0) => break,
                 Ok(n) => on_chunk(&buf[..n]),
                 Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-                Err(err) => return Err(err).context("读取 git 的输出失败"),
+                Err(err) => return Err(err).context(tr("读取 git 的输出失败")),
             }
         }
         if let Some(writer) = self.stdin_writer.take() {
@@ -169,9 +171,9 @@ impl Running {
         let status = self
             .child
             .lock()
-            .map_err(|_| anyhow!("git 进程状态损坏"))?
+            .map_err(|_| anyhow!(tr("git 进程状态损坏")))?
             .wait()
-            .context("等待 git 结束失败")?;
+            .context(tr("等待 git 结束失败"))?;
         Ok(Finished {
             code: status.code(),
             stderr: String::from_utf8_lossy(&stderr).trim_end().to_string(),

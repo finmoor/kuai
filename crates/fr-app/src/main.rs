@@ -3,15 +3,21 @@
 
 mod app_state;
 mod appearance;
+mod autostart;
 mod browser;
 mod clone;
 mod graph_paint;
 mod manager;
+mod palette;
 mod prompt;
 mod repo;
 mod settings;
+mod settings_page;
 mod shell;
 mod text;
+mod tray;
+mod ui;
+mod win;
 mod workspace;
 
 use std::path::PathBuf;
@@ -31,7 +37,10 @@ gpui_kit::actions!(
         NextTab,
         PrevTab,
         FindCommit,
-        QuickOpen
+        QuickOpen,
+        ShowChanges,
+        ShowHistory,
+        OpenSettings
     ]
 );
 
@@ -85,6 +94,17 @@ impl log::Log for StderrLogger {
 
 static LOGGER: StderrLogger = StderrLogger;
 
+/// 在主窗口上做一件事（设置页里出了错要弹通知之类）。推迟到这一轮处理完再做。
+pub(crate) fn with_main_window(cx: &mut App, f: impl FnOnce(&mut Window, &mut App) + 'static) {
+    cx.defer(move |cx| {
+        let Some(MainWorkspace(_, handle)) = cx.try_global::<MainWorkspace>() else {
+            return;
+        };
+        let handle = *handle;
+        handle.update(cx, |_, window, cx| f(window, cx)).ok();
+    });
+}
+
 fn main() {
     // 被 git 或 ssh 当作 askpass 启动时：去问已经开着的主程序，打出回答就退出
     if let Some(code) = fr_core::askpass::run_helper() {
@@ -95,8 +115,15 @@ fn main() {
     }
 
     let mut settings = settings::load();
+    // 语言在画任何界面之前就定下来
+    fr_core::i18n::set_lang(settings.language.resolve());
+    // 开机自启带的参数：有托盘就直接收进托盘
+    let start_minimized = std::env::args().any(|arg| arg == autostart::MINIMIZED_FLAG);
     // 命令行给了仓库路径：加进本机仓库列表并打开，和 Fork 的 `fork <路径>` 一样
-    if let Some(arg) = std::env::args_os().nth(1) {
+    let repo_arg = std::env::args_os()
+        .skip(1)
+        .find(|arg| !arg.to_string_lossy().starts_with("--"));
+    if let Some(arg) = repo_arg {
         let path = PathBuf::from(arg);
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         let path = path.to_string_lossy();
@@ -107,24 +134,27 @@ fn main() {
         if !settings.repos.contains(&entry) {
             settings.repos.push(entry.clone());
         }
-        let ix = match settings.open_tabs.iter().position(|e| *e == entry) {
+        let group = settings.workspace_mut();
+        let ix = match group.tabs.iter().position(|e| *e == entry) {
             Some(ix) => ix,
             None => {
-                settings.open_tabs.push(entry);
-                settings.open_tabs.len() - 1
+                group.tabs.push(entry);
+                group.tabs.len() - 1
             }
         };
-        settings.active_tab = ix + 1;
+        group.active = ix + 1;
     }
 
     // git、ssh 要密码时交给界面弹窗
     let prompts = prompt::init();
 
-    // 组件库的图标（勾选框的勾、通知的图标和关闭按钮等）要注册了资源才显示
+    // 图标要注册了资源才显示。用整套 Lucide 图标（程序大 1 MB 左右），界面上用到哪个不用再登记
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            // 组件库自带的文字（输入框的右键菜单、对话框的关闭按钮等）跟着界面语言
+            gpui_kit::component::set_locale(fr_core::i18n::lang().code());
             // Ctrl+Shift+F：切换 GPUI 的帧耗时浮层（隐藏 → 简要 → 详细）
             cx.bind_keys([
                 KeyBinding::new("ctrl-shift-f", ToggleFrameOverlay, None),
@@ -134,9 +164,19 @@ fn main() {
                 KeyBinding::new("ctrl-shift-tab", PrevTab, None),
                 KeyBinding::new("ctrl-f", FindCommit, None),
                 KeyBinding::new("ctrl-p", QuickOpen, None),
+                KeyBinding::new("ctrl-1", ShowChanges, None),
+                KeyBinding::new("ctrl-2", ShowHistory, None),
+                KeyBinding::new("ctrl-,", OpenSettings, None),
             ]);
+            workspace_action::<OpenSettings>(cx, |ws, _, cx| ws.toggle_settings(cx));
             workspace_action::<Refresh>(cx, |ws, _, cx| ws.refresh_active(cx));
-            workspace_action::<CloseTab>(cx, |ws, _, cx| ws.close_active(cx));
+            workspace_action::<CloseTab>(cx, |ws, window, cx| ws.close_active(window, cx));
+            workspace_action::<ShowChanges>(cx, |ws, window, cx| {
+                ws.show_in_active(true, window, cx)
+            });
+            workspace_action::<ShowHistory>(cx, |ws, window, cx| {
+                ws.show_in_active(false, window, cx)
+            });
             workspace_action::<NextTab>(cx, |ws, _, cx| ws.cycle_tab(1, cx));
             workspace_action::<PrevTab>(cx, |ws, _, cx| ws.cycle_tab(-1, cx));
             workspace_action::<FindCommit>(cx, |ws, window, cx| ws.find_commit(window, cx));
@@ -149,23 +189,28 @@ fn main() {
                 }
             });
 
-            let (theme, saved_window) = (settings.theme, settings.window);
+            let saved_window = settings.window;
             let app = cx.new(|_| AppState::new(settings));
+            // 标题栏自己画（标签页放在里面），所以用组件库配套的窗口选项
             let options = WindowOptions {
                 window_bounds: Some(appearance::initial_bounds(saved_window, cx)),
+                window_min_size: Some(size(px(appearance::MIN_SIZE.0), px(appearance::MIN_SIZE.1))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("fork-remote".into()),
-                    ..Default::default()
+                    ..gpui_kit::component::TitleBar::title_bar_options()
                 }),
-                ..Default::default()
+                ..gpui_kit::component::TitleBar::window_options()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
                 if std::env::var("FR_M0_OVERLAY").is_ok_and(|v| v == "1") {
                     window.set_debug_frame_overlay_mode(DebugFrameOverlayMode::Minimal);
                 }
-                appearance::apply_theme(theme, window, cx);
+                // 主题、语言、托盘都由工作区按设置应用
                 let workspace = cx.new(|cx| Workspace::new(app, prompts, window, cx));
                 cx.set_global(MainWorkspace(workspace.downgrade(), window.window_handle()));
+                if start_minimized {
+                    workspace.update(cx, |ws, _| ws.start_in_tray());
+                }
                 workspace
             })
             .expect("打开窗口失败");

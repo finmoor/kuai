@@ -3,6 +3,7 @@
 //! 选行和 Fork 一样：单击选一行，Shift 加单击选一段，Ctrl 加单击增减一行，按住拖动选一段，
 //! 双击选中整块。只有增加、删除的行能选，上下文行不能选。
 
+use fr_core::i18n::tr;
 use std::collections::HashSet;
 use std::ops::Range;
 
@@ -59,6 +60,8 @@ pub(super) struct StageDiff {
     pub(super) highlighted_dark: Option<bool>,
     pub(super) selected: Vec<bool>,
     anchor: Option<usize>,
+    /// 键盘上下键现在停在哪一行
+    cursor: Option<usize>,
     pub(super) dragging: bool,
     last_drag: Option<usize>,
     /// 最长的一行，列表按它定宽度，长行可以横向滚动
@@ -109,14 +112,14 @@ impl StageDiff {
             }
         }
         let notice: Option<SharedString> = if file.is_combined() {
-            Some("这个文件有冲突：在编辑器里解决后，点「标记为已解决」暂存它".into())
+            Some(tr("这个文件有冲突：在编辑器里解决后，点「标记为已解决」暂存它").into())
         } else if file.is_binary() {
-            Some("二进制文件，只能整个文件操作".into())
+            Some(tr("二进制文件，只能整个文件操作").into())
         } else if file.hunks.is_empty() {
             Some(if out.is_empty() {
-                "没有内容改动".into()
+                tr("没有内容改动").into()
             } else {
-                "没有文本改动（比如只改了权限），只能整个文件操作".into()
+                tr("没有文本改动（比如只改了权限），只能整个文件操作").into()
             })
         } else {
             None
@@ -137,6 +140,7 @@ impl StageDiff {
             highlighted_dark: None,
             selected,
             anchor: None,
+            cursor: None,
             dragging: false,
             last_drag: None,
             widest,
@@ -168,6 +172,7 @@ impl StageDiff {
             highlighted_dark: None,
             selected: Vec::new(),
             anchor: None,
+            cursor: None,
             dragging: false,
             last_drag: None,
             widest: None,
@@ -282,6 +287,32 @@ impl StageDiff {
         }
         self.dragging = true;
         self.last_drag = Some(row);
+        self.cursor = Some(row);
+    }
+
+    /// 键盘上下键：挪到上一个、下一个改动行并选中它；`extend`（按着 Shift）时从起点连选到这里。
+    /// 返回挪到的行，用来滚动；已经到头返回 None。
+    pub(super) fn step(&mut self, down: bool, extend: bool) -> Option<usize> {
+        if !self.editable() {
+            return None;
+        }
+        let rows = self.rows.len();
+        let next = match (self.cursor.or(self.anchor), down) {
+            (None, true) => (0..rows).find(|row| self.selectable(*row)),
+            (None, false) => (0..rows).rev().find(|row| self.selectable(*row)),
+            (Some(at), true) => (at + 1..rows).find(|row| self.selectable(*row)),
+            (Some(at), false) => (0..at.min(rows)).rev().find(|row| self.selectable(*row)),
+        }?;
+        self.clear();
+        match self.anchor {
+            Some(anchor) if extend => self.select_range(anchor, next),
+            _ => {
+                self.selected[next] = true;
+                self.anchor = Some(next);
+            }
+        }
+        self.cursor = Some(next);
+        Some(next)
     }
 
     /// 按住拖到某一行：选中从起点到这一行。选择变了返回 true。
@@ -482,6 +513,22 @@ mod tests {
         // 暂存时没选中的 +two 去掉（暂存区里本来没有它），不是变成上下文
         assert!(patch.contains(" 1\n-2\n 3\n"), "{patch}");
         assert!(patch.contains("+x\n"));
+    }
+
+    #[test]
+    fn 上下键在改动行之间走() {
+        let mut diff = view();
+        let first = diff.step(true, false).unwrap();
+        assert!(diff.selectable(first));
+        assert_eq!(diff.selected_count(), 1);
+        let second = diff.step(true, false).unwrap();
+        assert!(second > first && diff.selected[second] && !diff.selected[first]);
+        // 按着 Shift 往回走：从起点连选
+        let back = diff.step(false, true).unwrap();
+        assert_eq!(back, first);
+        assert_eq!(diff.selected_count(), 2);
+        // 到头了不动
+        assert_eq!(diff.step(false, false), None);
     }
 
     #[test]

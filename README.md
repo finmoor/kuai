@@ -18,7 +18,7 @@ Windows 上界面和操作习惯接近 Fork 的 Git 客户端，最终目标是�
 
 | 路径 | 内容 |
 |---|---|
-| `crates/fr-core` | 调用 git、解析输出、计算提交图布局、agent 通信协议；不依赖界面，客户端和 agent 共用 |
+| `crates/fr-core` | 调用 git、解析输出、计算提交图布局、agent 通信协议、界面语言（`i18n.rs`，英文译文在 `locales/en.json`）；不依赖界面，客户端和 agent 共用 |
 | `crates/fr-channel` | 仓库通道：本机仓库在进程内执行 git，服务器上的仓库经 ssh 交给 agent（连接复用、自动安装 agent）；测试工具 `fr-probe` |
 | `crates/fr-app` | GPUI 客户端 |
 | `crates/fr-agent` | 服务端程序 `fr-agent` |
@@ -32,11 +32,23 @@ Windows 上界面和操作习惯接近 Fork 的 Git 客户端，最终目标是�
 | 按键 | 作用 |
 |---|---|
 | F5 | 重读当前仓库的状态和提交历史 |
-| Ctrl+Enter | 提交（焦点在提交说明框里时） |
+| Ctrl+Enter | 提交（焦点在提交说明框、文件列表、改动内容里都行） |
+| Ctrl+1、Ctrl+2 | 切到本地修改、所有提交，键盘焦点跟过去 |
 | Ctrl+F | 搜索提交 |
-| Ctrl+P | 快速打开仓库 |
-| Ctrl+W | 关掉当前标签页 |
+| Ctrl+P | 快速打开仓库（上下键选，回车打开） |
+| Ctrl+, | 打开、关掉设置页 |
+| Ctrl+W | 关掉当前标签页（有操作在做会先拦一下） |
 | Ctrl+Tab、Ctrl+Shift+Tab | 下一个、上一个标签页 |
+
+列表里的按键（先点一下列表或者用 Ctrl+1、Ctrl+2 把焦点放过去）：
+
+| 在哪 | 按键 |
+|---|---|
+| 本地修改的文件列表 | 上下键换文件，Shift+上下连选，Ctrl+A 全选这一栏；空格或回车暂存、取消暂存；Delete 丢弃（会先问）；右键头进到改动内容里。鼠标 Ctrl、Shift 加点击也能多选 |
+| 改动内容 | 上下键在改动行之间走，Shift+上下连选；空格或回车暂存、取消暂存选中的行；Delete 丢弃选中的行（会先问）；左键头回文件列表 |
+| 提交列表 | 上下键、PageUp、PageDown、Home、End |
+| 侧栏 | 上下键换选中的项，回车等于双击（切换分支）；选中文件夹时左键头收起、右键头展开 |
+| 逐行追溯 | 上下键、PageUp、PageDown、Home、End 选行，回车跳到改这一行的提交，Esc 关闭 |
 
 ## 构建与运行
 
@@ -61,4 +73,6 @@ cargo test --workspace
 pwsh tools/package.ps1
 ```
 
-设置存在 `%APPDATA%\fork-remote\settings.json`；环境变量 `FR_SETTINGS` 可以换成别的文件，测试时不碰自己的设置。在 Git Bash 里给 Windows 程序传 `/data/...` 这类路径会被改写，所以上面测服务器那条要加 `MSYS_NO_PATHCONV=1`。
+设置存在 `%APPDATA%\fork-remote\settings.json`；环境变量 `FR_SETTINGS` 可以换成别的文件，测试时不碰自己的设置（开机自启写的是注册表，测试时用 `FR_AUTOSTART_KEY` 换一个键）。
+
+界面上新加一句话：源码里直接写中文、包上 `tr("…")`（带变量用 `tf!`），再到 `crates/fr-core/locales/en.json` 里补英文；没补的话 `cargo test -p fr-core` 会把缺的列出来。在 Git Bash 里给 Windows 程序传 `/data/...` 这类路径会被改写，所以上面测服务器那条要加 `MSYS_NO_PATHCONV=1`。

@@ -9,6 +9,8 @@ mod agents;
 mod local;
 mod remote;
 
+use fr_core::i18n::tr;
+use fr_core::tf;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
@@ -42,9 +44,9 @@ impl GitOutput {
     pub fn ok(self) -> Result<Vec<u8>> {
         match self.code {
             Some(0) => Ok(self.stdout),
-            Some(code) if self.stderr.is_empty() => bail!("git 退出码 {code}"),
+            Some(code) if self.stderr.is_empty() => bail!("{}", tf!("git 退出码 {code}", code)),
             Some(_) => bail!("{}", self.stderr),
-            None => bail!("git 被中止"),
+            None => bail!(tr("git 被中止")),
         }
     }
 }
@@ -103,7 +105,7 @@ pub fn init_prompts(
 ) -> Result<()> {
     let handler: PromptHandler = Arc::new(handler);
     if PROMPT_HANDLER.set(handler.clone()).is_err() {
-        bail!("init_prompts 只能调用一次");
+        bail!(tr("init_prompts 只能调用一次"));
     }
     let exe = std::env::current_exe()?;
     let env = fr_core::askpass::serve(&exe, move |prompt| handler(prompt))?;

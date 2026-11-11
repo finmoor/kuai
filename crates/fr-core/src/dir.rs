@@ -1,5 +1,6 @@
 //! 浏览目录：打开服务器上的仓库时列出目录。agent 和客户端的本机通道共用。
 
+use crate::tf;
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
@@ -23,9 +24,10 @@ pub fn list_dir(path: &str) -> Result<DirListing> {
             None => p.to_string(),
         },
     };
-    let dir = std::fs::canonicalize(&path).with_context(|| format!("打不开 {path}"))?;
+    let dir = std::fs::canonicalize(&path).with_context(|| tf!("打不开 {path}", path))?;
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(&dir).with_context(|| format!("读不了 {}", show(&dir)))? {
+    for entry in std::fs::read_dir(&dir).with_context(|| tf!("读不了 {dir}", dir = show(&dir)))?
+    {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') {

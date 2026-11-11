@@ -1,5 +1,6 @@
 //! 全局状态：设置和各台服务器的连接。界面各部分共用一个 [`AppState`] 实体。
 
+use fr_core::i18n::tr;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,7 +10,7 @@ use futures::FutureExt as _;
 use futures::future::{LocalBoxFuture, Shared};
 use gpui_kit::*;
 
-use crate::settings::{self, RepoEntry, Server, Settings, ThemeChoice, WindowState};
+use crate::settings::{self, RepoEntry, Server, Settings, TabGroup, WindowState};
 
 /// 正在进行或已经结束的连接；多处等同一个连接时共用。
 type Connecting = Shared<Task<Result<Arc<Connection>, SharedString>>>;
@@ -47,7 +48,7 @@ impl AppState {
             None => ConnStatus::Idle,
             Some(None) => ConnStatus::Connecting,
             Some(Some(Ok(conn))) if conn.is_alive() => ConnStatus::Ready(conn.clone()),
-            Some(Some(Ok(_))) => ConnStatus::Failed("连接已断开".into()),
+            Some(Some(Ok(_))) => ConnStatus::Failed(tr("连接已断开").into()),
             Some(Some(Err(err))) => ConnStatus::Failed(err.clone()),
         }
     }
@@ -65,7 +66,8 @@ impl AppState {
         let connecting = cx
             .background_executor()
             .spawn(async move {
-                let server = server.ok_or_else(|| SharedString::from("找不到这台服务器的设置"))?;
+                let server =
+                    server.ok_or_else(|| SharedString::from(tr("找不到这台服务器的设置")))?;
                 let options = ConnectOptions {
                     forward_agent: server.forward_agent,
                 };
@@ -137,6 +139,31 @@ impl AppState {
         id
     }
 
+    /// 改一台服务器的名字、地址、转发选项；id 和它名下登记的仓库都留着。
+    /// 返回连接参数变没变：变了就丢掉原来的连接，下次用的时候按新参数重连。
+    pub fn update_server(
+        &mut self,
+        id: &str,
+        name: String,
+        destination: String,
+        forward_agent: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(server) = self.settings.servers.iter_mut().find(|s| s.id == id) else {
+            return false;
+        };
+        let reconnect = server.destination != destination || server.forward_agent != forward_agent;
+        server.name = name;
+        server.destination = destination;
+        server.forward_agent = forward_agent;
+        if reconnect {
+            self.conns.remove(id);
+        }
+        self.save();
+        cx.notify();
+        reconnect
+    }
+
     /// 从列表里去掉服务器和它的仓库；服务器上的东西不动。
     pub fn remove_server(&mut self, id: &str, cx: &mut Context<Self>) {
         self.settings.servers.retain(|s| s.id != id);
@@ -163,18 +190,87 @@ impl AppState {
         cx.notify();
     }
 
+    /// 记下当前工作区开着的标签页和选中的那一个。
     pub fn set_open_tabs(&mut self, tabs: Vec<RepoEntry>, active: usize) {
-        if self.settings.open_tabs != tabs || self.settings.active_tab != active {
-            self.settings.open_tabs = tabs;
-            self.settings.active_tab = active;
+        let group = self.settings.workspace_mut();
+        if group.tabs != tabs || group.active != active {
+            group.tabs = tabs;
+            group.active = active;
             self.save();
         }
     }
 
-    pub fn set_theme(&mut self, theme: ThemeChoice, cx: &mut Context<Self>) {
-        self.settings.theme = theme;
+    /// 改设置里的几项（语言、主题、托盘……）并存盘。
+    pub fn update_settings(&mut self, cx: &mut Context<Self>, edit: impl FnOnce(&mut Settings)) {
+        edit(&mut self.settings);
+        self.settings.normalize();
         self.save();
         cx.notify();
+    }
+
+    /// 新建一个空的工作区，返回它是第几个。名字和已有的重了就在后面加数字。
+    pub fn add_workspace(&mut self, name: &str, cx: &mut Context<Self>) -> usize {
+        let name = unique_name(
+            name,
+            self.settings.workspaces.iter().map(|g| g.name.as_str()),
+        );
+        self.settings.workspaces.push(TabGroup {
+            name,
+            tabs: Vec::new(),
+            active: 0,
+        });
+        self.save();
+        cx.notify();
+        self.settings.workspaces.len() - 1
+    }
+
+    pub fn rename_workspace(&mut self, ix: usize, name: &str, cx: &mut Context<Self>) {
+        let others = self
+            .settings
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != ix)
+            .map(|(_, g)| g.name.as_str());
+        let name = unique_name(name, others);
+        if let Some(group) = self.settings.workspaces.get_mut(ix) {
+            group.name = name;
+            self.save();
+            cx.notify();
+        }
+    }
+
+    /// 删掉一个工作区（至少留一个）。里面登记的仓库还在仓库列表里，只是不再开着。
+    pub fn remove_workspace(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.settings.workspaces.len() <= 1 || ix >= self.settings.workspaces.len() {
+            return;
+        }
+        self.settings.workspaces.remove(ix);
+        if self.settings.active_workspace > ix {
+            self.settings.active_workspace -= 1;
+        }
+        self.settings.normalize();
+        self.save();
+        cx.notify();
+    }
+
+    pub fn set_active_workspace(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix < self.settings.workspaces.len() && self.settings.active_workspace != ix {
+            self.settings.active_workspace = ix;
+            self.save();
+            cx.notify();
+        }
+    }
+
+    /// 往另一个工作区里加一个标签页（把标签页移过去时用）。
+    pub fn push_tab_to_workspace(&mut self, ix: usize, entry: RepoEntry, cx: &mut Context<Self>) {
+        if let Some(group) = self.settings.workspaces.get_mut(ix) {
+            if !group.tabs.contains(&entry) {
+                group.tabs.push(entry);
+            }
+            self.save();
+            cx.notify();
+        }
     }
 
     /// 记下窗口的位置和大小，稍后存盘。
@@ -208,5 +304,34 @@ impl AppState {
         if let Err(err) = settings::save(&self.settings) {
             log::error!("{err:#}");
         }
+    }
+}
+
+/// 名字去掉首尾空白；空的话叫「工作区」；和已有的重了就加上 2、3……
+fn unique_name<'a>(name: &str, existing: impl Iterator<Item = &'a str>) -> String {
+    let base = match name.trim() {
+        "" => fr_core::i18n::tr("工作区"),
+        name => name,
+    };
+    let existing: Vec<&str> = existing.collect();
+    if !existing.contains(&base) {
+        return base.to_string();
+    }
+    (2..)
+        .map(|n| format!("{base} {n}"))
+        .find(|candidate| !existing.contains(&candidate.as_str()))
+        .unwrap_or_else(|| base.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unique_name;
+
+    #[test]
+    fn 工作区的名字不重复() {
+        let existing = ["默认", "工作", "工作 2"];
+        assert_eq!(unique_name(" 新的 ", existing.iter().copied()), "新的");
+        assert_eq!(unique_name("工作", existing.iter().copied()), "工作 3");
+        assert_eq!(unique_name("  ", existing.iter().copied()), "工作区");
     }
 }

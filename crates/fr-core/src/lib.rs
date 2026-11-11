@@ -6,6 +6,7 @@ pub mod dir;
 pub mod exec;
 pub mod git;
 pub mod graph;
+pub mod i18n;
 pub mod ignore;
 pub mod log;
 pub mod patch;

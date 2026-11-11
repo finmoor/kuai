@@ -1,5 +1,6 @@
 //! 本机仓库：在进程内启动 git，每个调用一个线程收输出。
 
+use fr_core::i18n::tr;
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
@@ -42,7 +43,7 @@ pub(crate) fn git(
     });
     let mut guard = KillOnDrop(Some(killer));
     async move {
-        let result = rx.await.map_err(|_| anyhow!("git 线程意外退出"));
+        let result = rx.await.map_err(|_| anyhow!(tr("git 线程意外退出")));
         guard.disarm();
         let (stdout, finished) = result??;
         Ok(GitOutput {
@@ -114,5 +115,5 @@ pub(crate) fn list_dir(path: &str) -> BoxFuture<'static, Result<DirListing>> {
     std::thread::spawn(move || {
         let _ = tx.send(fr_core::dir::list_dir(&path));
     });
-    async move { rx.await.map_err(|_| anyhow!("读目录的线程意外退出"))? }.boxed()
+    async move { rx.await.map_err(|_| anyhow!(tr("读目录的线程意外退出")))? }.boxed()
 }

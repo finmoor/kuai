@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # 建一个界面测试用的仓库：有改动、未跟踪、删除、已暂存的文件，有分支、标签、贮藏、远程，main 领先远程 1 个提交。
-# 用法：make-ui-repo.sh <目录>，会先删掉这个目录。远程是同目录下的裸仓库 origin.git，推送、拉取都在本地。
+# 用法：make-ui-repo.sh <目录>，会先删掉里面的 ui-repo 和 origin.git（目录里别的东西不动）。远程是同目录下的裸仓库 origin.git，推送、拉取都在本地。
 # 服务器上：ssh <目标> 'bash -s -- <目录>' < make-ui-repo.sh
 set -euo pipefail
-root="$1"
-rm -rf "$root"
+root="${1:?用法：make-ui-repo.sh <目录>}"
 mkdir -p "$root"
+# 只删自己建的两个子目录，不动目录里别的东西：参数给错时不至于把整个目录清掉
+rm -rf "$root/ui-repo" "$root/origin.git"
 git init -q --bare "$root/origin.git"
 # 裸仓库的 HEAD 默认指向 master，改成 main，别处克隆时才有东西可检出
 git -C "$root/origin.git" symbolic-ref HEAD refs/heads/main

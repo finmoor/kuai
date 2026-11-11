@@ -3,6 +3,8 @@
 //! 这些操作遇到冲突停下来时，git 目录里会留下 `MERGE_HEAD` 之类的伪引用。
 //! 用一条 `git cat-file --batch-check` 把它们都问一遍，本机和服务器上的仓库都能用。
 
+use crate::i18n::tr;
+
 /// 进行到一半的操作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InProgress {
@@ -15,10 +17,10 @@ pub enum InProgress {
 impl InProgress {
     pub fn name(self) -> &'static str {
         match self {
-            InProgress::Merge => "合并",
-            InProgress::Rebase => "变基",
-            InProgress::CherryPick => "挑拣",
-            InProgress::Revert => "还原",
+            InProgress::Merge => tr("合并"),
+            InProgress::Rebase => tr("变基"),
+            InProgress::CherryPick => tr("挑拣"),
+            InProgress::Revert => tr("还原"),
         }
     }
 

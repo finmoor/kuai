@@ -1,5 +1,6 @@
 //! 执行 git 命令。
 
+use crate::tf;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -63,12 +64,15 @@ pub fn run(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let out = command(repo, args)
         .stdin(Stdio::null())
         .output()
-        .with_context(|| format!("无法启动 git {}", args.join(" ")))?;
+        .with_context(|| tf!("无法启动 git {join}", join = args.join(" ")))?;
     if !out.status.success() {
         bail!(
-            "git {} 失败：{}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
+            "{}",
+            tf!(
+                "git {join} 失败：{stderr}",
+                join = args.join(" "),
+                stderr = String::from_utf8_lossy(&out.stderr).trim()
+            )
         );
     }
     Ok(out.stdout)

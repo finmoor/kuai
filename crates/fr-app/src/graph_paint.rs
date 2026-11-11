@@ -48,8 +48,11 @@ fn paint_row(
     let mid = top + bounds.size.height / 2.;
     let bottom = top + bounds.size.height;
 
+    // 泳道太多、右边画不下时，在这一行的右边点三个点，免得看着像历史断了
+    let mut clipped = lane >= MAX_LANES;
     for s in segments {
         if s.from >= MAX_LANES || s.to >= MAX_LANES {
+            clipped = true;
             continue;
         }
         let c = lane_color(s.color);
@@ -89,6 +92,24 @@ fn paint_row(
             px(1.5),
             gpui_kit::white(),
             BorderStyle::Solid,
+        ));
+    }
+    if clipped {
+        overflow_mark(window, bounds, mid);
+    }
+}
+
+fn overflow_mark(window: &mut Window, bounds: Bounds<Pixels>, mid: Pixels) {
+    let right = bounds.origin.x + bounds.size.width;
+    for i in 0..3 {
+        let r = px(1.5);
+        let x = right - px(3. + 5. * i as f32);
+        window.paint_quad(fill(
+            Bounds {
+                origin: point(x - r, mid - r),
+                size: size(r * 2., r * 2.),
+            },
+            gpui_kit::hsla(0., 0., 0.5, 1.),
         ));
     }
 }

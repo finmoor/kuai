@@ -3,6 +3,7 @@
 //! 请求来自后台线程（见 `fr_channel::init_prompts`），那边一直等到这里回答；
 //! 用户取消或者关掉弹窗就回答「取消」，对应的 git 或 ssh 会放弃这次认证。
 
+use fr_core::i18n::tr;
 use std::sync::mpsc::Sender;
 
 use futures::StreamExt as _;
@@ -85,9 +86,9 @@ fn open(request: Request, window: &mut Window, cx: &mut App) {
         let (on_enter, on_dismiss) = (submit.clone(), reply.clone());
         dialog
             .title(if secret {
-                "需要密码"
+                tr("需要密码")
             } else {
-                "需要输入"
+                tr("需要输入")
             })
             .w(px(520.))
             // 回车等于点确定（submit 里会关掉弹窗）
@@ -105,27 +106,22 @@ fn open(request: Request, window: &mut Window, cx: &mut App) {
                     .gap_3()
                     .child(div().text_sm().child(prompt.clone()))
                     .child(Input::new(&input))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child("这是 git 或 ssh 的原始提示。填的内容只交给它，不会保存。"),
-                    ),
+                    .child(div().text_xs().text_color(muted).child(tr(
+                        "这是 git 或 ssh 的原始提示。填的内容只交给它，不会保存。",
+                    ))),
             )
             .footer(
                 DialogFooter::new()
-                    .child(
-                        Button::new("cancel")
-                            .label("取消")
-                            .on_click(move |_, window, cx| {
-                                let _ = reply.send(None);
-                                window.close_dialog(cx);
-                            }),
-                    )
+                    .child(Button::new("cancel").label(tr("取消")).on_click(
+                        move |_, window, cx| {
+                            let _ = reply.send(None);
+                            window.close_dialog(cx);
+                        },
+                    ))
                     .child(
                         Button::new("ok")
                             .primary()
-                            .label("确定")
+                            .label(tr("确定"))
                             .on_click(move |_, window, cx| submit(window, cx)),
                     ),
             )

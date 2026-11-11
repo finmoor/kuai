@@ -20,6 +20,8 @@
 //! `id` 是 agent 自己编的号（和请求的编号无关），客户端弹窗让用户填，再用 `answer` 回答。
 //! - `list_dir`：参数 `{path}`，返回 [`DirListing`]。`path` 为空或 `~` 表示主目录。
 
+use crate::i18n::tr;
+use crate::tf;
 use std::io::{self, BufRead, Write};
 
 use anyhow::{Context as _, Result};
@@ -152,7 +154,7 @@ pub fn read_message<R: BufRead, T: DeserializeOwned + Frame>(
     let mut line = String::new();
     loop {
         line.clear();
-        if r.read_line(&mut line).context("读取消息失败")? == 0 {
+        if r.read_line(&mut line).context(tr("读取消息失败"))? == 0 {
             return Ok(None);
         }
         if !line.trim().is_empty() {
@@ -161,11 +163,11 @@ pub fn read_message<R: BufRead, T: DeserializeOwned + Frame>(
     }
     let header: T = serde_json::from_str(&line).with_context(|| {
         let shown: String = line.trim().chars().take(200).collect();
-        format!("无法解析消息：{shown}")
+        tf!("无法解析消息：{shown}", shown)
     })?;
     let mut payload = vec![0; header.payload_len() as usize];
     r.read_exact(&mut payload)
-        .context("读取消息附带的数据时连接中断")?;
+        .context(tr("读取消息附带的数据时连接中断"))?;
     Ok(Some((header, payload)))
 }
 

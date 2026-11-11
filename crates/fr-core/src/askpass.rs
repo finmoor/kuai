@@ -8,6 +8,7 @@
 //! 监听口：Linux 上是 agent 目录里的 unix 套接字（权限 600）；Windows 上是 127.0.0.1 的随机端口。
 //! 两种都要带随机口令才理会，口令只在 git 进程的环境变量里。
 
+use crate::i18n::tr;
 use std::hash::{BuildHasher as _, Hasher as _};
 use std::io::{BufRead as _, BufReader, Read, Write};
 use std::path::Path;
@@ -58,7 +59,7 @@ pub fn serve(
                 });
             }
         })
-        .context("无法启动密码请求线程")?;
+        .context(tr("无法启动密码请求线程"))?;
     let helper = helper.to_string_lossy().to_string();
     Ok(vec![
         ("GIT_ASKPASS".into(), helper.clone()),
@@ -80,7 +81,7 @@ fn answer_one(
     (&mut reader).take(MAX_PROMPT).read_line(&mut line)?;
     let ask: Ask = serde_json::from_str(&line)?;
     if ask.token != expected {
-        anyhow::bail!("口令不对");
+        anyhow::bail!(tr("口令不对"));
     }
     let answer = Answer {
         answer: on_prompt(&ask.prompt),
@@ -144,7 +145,7 @@ impl Listener {
         let path = dir.join(format!("askpass-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let listener = std::os::unix::net::UnixListener::bind(&path)
-            .with_context(|| format!("无法创建 {}", path.display()))?;
+            .with_context(|| crate::tf!("无法创建 {path}", path = path.display()))?;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         let addr = path.to_string_lossy().to_string();
         Ok((Listener::Unix(listener, path), addr))
@@ -153,7 +154,7 @@ impl Listener {
     #[cfg(not(unix))]
     fn bind(_helper: &Path) -> Result<(Listener, String)> {
         let listener =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).context("无法在本机开监听口")?;
+            std::net::TcpListener::bind(("127.0.0.1", 0)).context(tr("无法在本机开监听口"))?;
         let addr = listener.local_addr()?.to_string();
         Ok((Listener::Tcp(listener), addr))
     }

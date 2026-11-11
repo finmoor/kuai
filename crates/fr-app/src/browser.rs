@@ -1,6 +1,12 @@
 //! 浏览服务器上的目录，选一个仓库打开。放在「打开仓库」对话框里。
+//! 克隆到服务器时也用它选放仓库的目录（只选目录，不要求是仓库）。
+//!
+//! 输入框里显示的永远是列表正在显示的那个目录：前往一个进不去的路径时，
+//! 报错里写要去的路径，输入框回到原来的目录，免得显示的和实际要打开的不是一个地方。
 
 use fr_channel::DirListing;
+use fr_core::i18n::tr;
+use fr_core::tf;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, WindowExt as _, h_flex, v_flex};
@@ -12,11 +18,15 @@ use crate::settings::RepoEntry;
 
 pub enum BrowserEvent {
     Open(RepoEntry),
+    /// 选目录的用法：选中了这个目录
+    Dir(String),
 }
 
 pub struct RemoteBrowser {
     app: Entity<AppState>,
     server: String,
+    /// 只选目录，不打开仓库
+    pick_dir: bool,
     input: Entity<InputState>,
     listing: Option<DirListing>,
     /// 进行中的提示或错误
@@ -35,8 +45,31 @@ impl RemoteBrowser {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // 从主目录开始
+        Self::build(app, server, String::new(), false, window, cx)
+    }
+
+    /// 选一个目录（克隆到服务器时选放仓库的目录）。`start` 为空从主目录开始。
+    pub fn new_dir_picker(
+        app: Entity<AppState>,
+        server: String,
+        start: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(app, server, start, true, window, cx)
+    }
+
+    fn build(
+        app: Entity<AppState>,
+        server: String,
+        start: String,
+        pick_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("服务器上的路径，回车前往"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("服务器上的路径，回车前往")));
         let subscription = cx.subscribe_in(
             &input,
             window,
@@ -50,6 +83,7 @@ impl RemoteBrowser {
         let mut this = Self {
             app,
             server,
+            pick_dir,
             input,
             listing: None,
             status: None,
@@ -57,8 +91,7 @@ impl RemoteBrowser {
             task: None,
             _subscription: subscription,
         };
-        // 从主目录开始
-        this.navigate(String::new(), window, cx);
+        this.navigate(start, window, cx);
         this
     }
 
@@ -70,19 +103,27 @@ impl RemoteBrowser {
         self.busy = true;
         self.status = Some((
             if connected {
-                "正在读取…"
+                tr("正在读取…")
             } else {
-                "正在连接服务器…"
+                tr("正在连接服务器…")
             }
             .into(),
             false,
         ));
         self.task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = match channel.await {
-                Ok(channel) => channel
-                    .list_dir(&path)
-                    .await
-                    .map_err(|err| SharedString::from(format!("{err:#}"))),
+                Ok(channel) => channel.list_dir(&path).await.map_err(|err| {
+                    let shown = if path.is_empty() {
+                        tr("主目录")
+                    } else {
+                        &path
+                    };
+                    SharedString::from(tf!(
+                        "进不去 {shown}：{err}",
+                        shown,
+                        err = format!("{:#}", err)
+                    ))
+                }),
                 Err(err) => Err(err),
             };
             this.update_in(cx, |this, window, cx| {
@@ -95,7 +136,14 @@ impl RemoteBrowser {
                         this.listing = Some(listing);
                         this.status = None;
                     }
-                    Err(err) => this.status = Some((err, true)),
+                    Err(err) => {
+                        // 输入框回到列表正在显示的目录：下面的按钮操作的是它，不是没进去的那个
+                        if let Some(current) = this.listing.as_ref().map(|l| l.path.clone()) {
+                            this.input
+                                .update(cx, |input, cx| input.set_value(current, window, cx));
+                        }
+                        this.status = Some((err, true));
+                    }
                 }
                 cx.notify();
             })
@@ -115,14 +163,20 @@ impl RemoteBrowser {
             .app
             .update(cx, |app, cx| app.channel_for(Some(&server), cx));
         self.busy = true;
-        self.status = Some(("正在检查…".into(), false));
+        self.status = Some((tr("正在检查…").into(), false));
         self.task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = match channel.await {
                 Ok(channel) => channel
                     .git(&path, vec!["rev-parse".into(), "--show-toplevel".into()])
                     .await
                     .and_then(|out| out.ok())
-                    .map_err(|err| SharedString::from(format!("这里不是 git 仓库：{err:#}"))),
+                    .map_err(|err| {
+                        SharedString::from(tf!(
+                            "{path} 不在 git 仓库里：点进一个标着「仓库」的目录再打开。\n{err}",
+                            path,
+                            err = format!("{:#}", err)
+                        ))
+                    }),
                 Err(err) => Err(err),
             };
             this.update(cx, |this, cx| {
@@ -155,7 +209,9 @@ fn join(dir: &str, name: &str) -> String {
 }
 
 impl Render for RemoteBrowser {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 目录列表的高度跟着窗口走：窗口矮的时候对话框不能比窗口还高
+        let list_height = (window.viewport_size().height - px(290.)).clamp(px(140.), px(340.));
         let theme = cx.theme();
         let (border, muted, hover, danger) = (
             theme.border,
@@ -176,7 +232,7 @@ impl Render for RemoteBrowser {
                         .cursor_pointer()
                         .hover(|s| s.bg(hover))
                         .text_color(muted)
-                        .child("..（上一级）")
+                        .child(tr("..（上一级）"))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.navigate(parent.clone(), window, cx)
                         }))
@@ -195,7 +251,7 @@ impl Render for RemoteBrowser {
                         .hover(|s| s.bg(hover))
                         .child(div().flex_1().truncate().child(format!("{}/", entry.name)))
                         .when(entry.repo, |row| {
-                            row.child(div().text_xs().text_color(repo_color).child("仓库"))
+                            row.child(div().text_xs().text_color(repo_color).child(tr("仓库")))
                         })
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.navigate(target.clone(), window, cx)
@@ -209,17 +265,23 @@ impl Render for RemoteBrowser {
                         .px_3()
                         .py_2()
                         .text_color(muted)
-                        .child("没有子目录")
+                        .child(tr("没有子目录"))
                         .into_any_element(),
                 );
             }
         }
 
         let is_repo = self.listing.as_ref().is_some_and(|l| l.repo);
+        let has_listing = self.listing.is_some();
+        let pick_dir = self.pick_dir;
         let hint: SharedString = match (&self.status, is_repo) {
             (Some((text, _)), _) => text.clone(),
-            (None, true) => "这个目录是仓库，可以打开".into(),
-            (None, false) => "点目录进去；标着「仓库」的目录可以打开".into(),
+            (None, _) if pick_dir => tr("点目录进去；仓库会克隆到选中的目录下面").into(),
+            (None, true) => tr("这个目录是仓库，可以打开").into(),
+            (None, false) => {
+                tr("点目录进去；标着「仓库」的目录可以打开，仓库里面的子目录也可以（打开的是整个仓库）")
+                    .into()
+            }
         };
         let hint_color = match &self.status {
             Some((_, true)) => danger,
@@ -232,7 +294,7 @@ impl Render for RemoteBrowser {
                 h_flex()
                     .gap_2()
                     .child(div().flex_1().child(Input::new(&self.input)))
-                    .child(Button::new("go").label("前往").on_click(cx.listener(
+                    .child(Button::new("go").label(tr("前往")).on_click(cx.listener(
                         |this, _, window, cx| {
                             let path = this.input.read(cx).value().to_string();
                             this.navigate(path, window, cx);
@@ -242,7 +304,7 @@ impl Render for RemoteBrowser {
             .child(
                 div()
                     .id("dirs")
-                    .h(px(340.))
+                    .h(list_height)
                     .overflow_y_scroll()
                     .border_1()
                     .border_color(border)
@@ -250,23 +312,41 @@ impl Render for RemoteBrowser {
                     .text_sm()
                     .child(v_flex().py_1().children(rows)),
             )
-            .child(div().text_xs().text_color(hint_color).child(hint))
+            .child(
+                div()
+                    .text_xs()
+                    .whitespace_normal()
+                    .text_color(hint_color)
+                    .child(hint),
+            )
             .child(
                 h_flex()
                     .justify_end()
                     .gap_2()
                     .child(
                         Button::new("cancel")
-                            .label("取消")
+                            .label(tr("取消"))
                             .on_click(|_, window, cx| window.close_dialog(cx)),
                     )
-                    .child(
+                    .child(if pick_dir {
+                        Button::new("pick")
+                            .primary()
+                            .label(tr("克隆到这个目录下"))
+                            .disabled(!has_listing || self.busy)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(listing) = &this.listing {
+                                    cx.emit(BrowserEvent::Dir(listing.path.clone()));
+                                }
+                            }))
+                    } else {
+                        // 不是仓库的目录也能点：仓库里面的子目录同样能认出仓库根，
+                        // 确实不在仓库里就在下面说明
                         Button::new("open")
                             .primary()
-                            .label("打开这个仓库")
-                            .disabled(!is_repo || self.busy)
-                            .on_click(cx.listener(|this, _, window, cx| this.open(window, cx))),
-                    ),
+                            .label(tr("打开这个仓库"))
+                            .disabled(!has_listing || self.busy)
+                            .on_click(cx.listener(|this, _, window, cx| this.open(window, cx)))
+                    }),
             )
     }
 }
