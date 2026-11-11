@@ -9,13 +9,19 @@
 //! 仓库有变化时（在编辑器里存了文件、在终端里提交了），都重读工作区状态、引用和贮藏；
 //! 引用或 HEAD 变了才重读提交历史。
 
+mod activity;
+mod auto_fetch;
 mod blame;
 mod changes;
 mod dialogs;
 mod file_picker;
 mod history;
+mod inline_diff;
+mod layout;
 mod menus;
+mod merge;
 mod ops;
+mod rebase;
 mod sidebar;
 mod stage_diff;
 
@@ -50,12 +56,16 @@ enum Mode {
     History,
     /// 逐行追溯，盖在上面两个视图之上
     Blame,
+    /// 合并编辑器：解决一个文件里的冲突，也是盖在上面
+    Merge,
 }
 
 /// 仓库页发给工作区的事件。
 pub enum RepoEvent {
     /// 在新标签页里打开另一个仓库（子模块）
     Open(RepoEntry),
+    /// 给这个仓库改名（对话框由主窗口开）
+    Rename(RepoEntry),
 }
 
 impl EventEmitter<RepoEvent> for RepoView {}
@@ -80,6 +90,7 @@ pub struct RepoView {
     /// 子模块的路径（相对仓库根）
     submodules: Vec<String>,
     blame: Option<blame::BlameView>,
+    merge: Option<merge::MergeView>,
     /// 上次读历史时的引用快照（所有分支、标签加 HEAD），变了才重读历史
     history_key: Option<Vec<u8>>,
     refresh_task: Option<Task<()>>,
@@ -99,6 +110,11 @@ pub struct RepoView {
     op_progress: Option<SharedString>,
     /// 往这里发一下，正在做的联网操作就停下
     op_cancel: Option<futures::channel::oneshot::Sender<()>>,
+    /// 执行过的 git 命令和它们的结果
+    activity: activity::Log,
+    auto_fetch: auto_fetch::AutoFetch,
+    /// 窗口内容区的大小，每帧更新；各块的大小按它收
+    viewport: Size<Pixels>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -135,6 +151,7 @@ impl RepoView {
             remote_names: Vec::new(),
             submodules: Vec::new(),
             blame: None,
+            merge: None,
             history_key: None,
             refresh_task: None,
             refreshing: false,
@@ -147,6 +164,9 @@ impl RepoView {
             op_task: None,
             op_progress: None,
             op_cancel: None,
+            activity: activity::Log::default(),
+            auto_fetch: auto_fetch::AutoFetch::new(cx),
+            viewport: window.viewport_size(),
             _subscriptions: subscriptions,
         };
         // 测试开关：FR_TEST_VIEW=changes 打开仓库时直接显示本地修改
@@ -414,7 +434,7 @@ impl RepoView {
                             .truncate()
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
-                            .child(branch),
+                            .child(branch.clone()),
                     )
                     .when(ahead > 0, |d| {
                         d.child(
@@ -434,11 +454,14 @@ impl RepoView {
                                 .child(format!("↓{behind}")),
                         )
                     })
-                    .tooltip(|window, cx| {
-                        gpui_kit::component::tooltip::Tooltip::new(tr(
-                            "当前分支。↑ 是比上游多的提交（还没推送），↓ 是比上游少的（还没拉取）",
-                        ))
-                        .build(window, cx)
+                    // 分支名长了会被截掉：提示里有全名
+                    .tooltip(move |window, cx| {
+                        ui::two_line_tip(
+                            branch.clone(),
+                            tr("↑ 待推送，↓ 待拉取").into(),
+                            window,
+                            cx,
+                        )
                     }),
             )
             .child(div().flex_1().min_w(px(4.)))
@@ -451,14 +474,12 @@ impl RepoView {
                 };
                 // 不让它缩：窗口窄的时候缩的是左边的分支名，不然这里只剩「正在…」两个字
                 bar.child(
-                    div()
+                    ui::clipped("op-progress", text)
                         .mr_1()
                         .flex_none()
                         .max_w(px(240.))
-                        .truncate()
                         .text_xs()
-                        .text_color(muted)
-                        .child(text),
+                        .text_color(muted),
                 )
                 // 只有联网的操作能取消：中途杀掉改暂存区的 git 会留下锁文件
                 .when(self.op_progress.is_some(), |bar| {
@@ -473,14 +494,11 @@ impl RepoView {
             })
             .when_some(self.error.clone().filter(|_| ready), |bar, err| {
                 bar.child(
-                    div()
+                    ui::clipped("toolbar-error", err)
                         .mr_2()
-                        .min_w_0()
                         .max_w(px(320.))
-                        .truncate()
                         .text_xs()
-                        .text_color(danger)
-                        .child(err),
+                        .text_color(danger),
                 )
             })
             // 这三个按钮点右键有不常用的选项
@@ -494,7 +512,7 @@ impl RepoView {
                             IconName::ArrowDownToDot,
                             tr("获取"),
                             tr("git fetch --all；右键有更多选项"),
-                            running(tr("获取")),
+                            running(tr("获取")) || self.auto_fetching(),
                             idle,
                             0,
                             cx,
@@ -550,7 +568,7 @@ impl RepoView {
                     if has_changes {
                         tr("git stash push：把现在的改动收起来")
                     } else {
-                        tr("工作区是干净的，没有可以贮藏的改动")
+                        tr("没有可以贮藏的改动")
                     },
                     running(tr("贮藏")),
                     idle && has_changes,
@@ -564,7 +582,7 @@ impl RepoView {
                     "pop",
                     IconName::ArchiveRestore,
                     tr("弹出"),
-                    tr("git stash pop：恢复最近一次贮藏，并把它从贮藏列表里删除（会先问一下）"),
+                    tr("git stash pop：恢复最近一次贮藏并删掉它"),
                     running(tr("弹出贮藏")),
                     idle && has_stash,
                     0,
@@ -600,17 +618,30 @@ impl RepoView {
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.refresh_now(cx))),
             )
+            .child(
+                tool_button(
+                    "activity",
+                    IconName::Activity,
+                    tr("活动"),
+                    tr("执行过的 git 命令和输出"),
+                    false,
+                    true,
+                    self.activity_running(),
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.show_activity(window, cx))),
+            )
     }
 
     /// 「打开」按钮：把仓库交给终端、VS Code 或资源管理器。
     fn render_open_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let dir = self.entry.path.clone();
-        let destination = self
+        let server = self
             .entry
             .server
             .as_deref()
             .and_then(|id| self.app.read(cx).server(id))
-            .map(|server| server.destination.clone());
+            .cloned();
         // 不加悬停提示：提示也出现在按钮下面，会把弹出的菜单第一项盖住
         tool_button_bare(
             "open-in",
@@ -622,13 +653,13 @@ impl RepoView {
         )
         .dropdown_menu(move |menu, _, _| {
             let (a, b, c) = (dir.clone(), dir.clone(), dir.clone());
-            match destination.clone() {
+            match server.clone() {
                 // 服务器上的仓库：终端经 ssh 登录，VS Code 走 Remote-SSH
-                Some(dest) => {
-                    let dest2 = dest.clone();
+                Some(server) => {
+                    let dest2 = server.destination.clone();
                     menu.item(PopupMenuItem::new(tr("在终端里打开（ssh）")).on_click(
                         move |_, window, cx| {
-                            let result = crate::shell::open_terminal_ssh(&dest, &a);
+                            let result = crate::shell::open_terminal_ssh(&server, &a);
                             crate::shell::report(result, window, cx);
                         },
                     ))
@@ -686,18 +717,18 @@ impl RepoView {
         };
         let text = if conflicts > 0 {
             tf!(
-                "{name}停在一半：还有 {conflicts} 个文件有冲突。在「本地修改」里解决（右键可以整个文件取一边、交给编辑器），都解决后点「{go}」。",
+                "{name}停在一半：还有 {conflicts} 个文件有冲突。在「本地修改」里解决后点「{go}」。",
                 name = state.name(),
                 conflicts,
                 go
             )
         } else if empty {
             tf!(
-                "{name}停在一半：这个提交在当前分支上没有带来改动（内容已经有了）。点「跳过这个提交」接着做。",
+                "{name}停在一半：这个提交没有带来改动（内容已经有了）。点「跳过这个提交」继续。",
                 name = state.name()
             )
         } else if state == InProgress::Merge {
-            tr("合并停在一半：冲突都解决了，点「提交合并」。提交说明框里写了内容就用它，没写用默认的合并说明。").into()
+            tr("合并停在一半：冲突都解决了，点「提交合并」。说明没写就用默认的。").into()
         } else {
             tf!(
                 "{name}停在一半：冲突都解决了，点「继续」。",
@@ -844,7 +875,9 @@ fn tool_button_bare(
 impl Render for RepoView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.tick_bench(window, cx);
-        self.history.set_viewport(window.viewport_size());
+        self.viewport = window.viewport_size();
+        let sizes = self.sizes(cx);
+        self.history.set_layout(self.viewport, sizes);
         self.focus_blame_if_new(window, cx);
         let main = if self.channel.is_none() {
             match self.error.clone() {
@@ -863,19 +896,29 @@ impl Render for RepoView {
                 Mode::Changes => self.render_changes(cx),
                 Mode::History => self.render_history(cx),
                 Mode::Blame => self.render_blame(cx),
+                Mode::Merge => self.render_merge(cx),
             }
         };
         let banner = self
             .in_progress
             .map(|state| self.render_in_progress(state, cx).into_any_element());
-        h_flex().size_full().child(self.render_sidebar(cx)).child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .child(self.render_toolbar(cx))
-                .children(banner)
-                .child(div().flex_1().min_h_0().child(main)),
-        )
+        h_flex()
+            .size_full()
+            // 拖分隔条：不管鼠标拖到哪一块上面，都由这里按位置算大小
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<layout::DragSplit>, _, cx| {
+                    this.drag_split(event, cx)
+                }),
+            )
+            .child(self.render_sidebar(cx))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(self.render_toolbar(cx))
+                    .children(banner)
+                    .child(div().flex_1().min_h_0().child(main)),
+            )
     }
 }

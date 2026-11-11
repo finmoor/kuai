@@ -21,6 +21,8 @@ chrono = "0.4"
 log = "0.4"
 # 非 UTF-8 的文件（GBK 等）解码后显示
 encoding_rs = "0.8"
+# 行内差异：按词比较配对的两行（组件库也用它，不多带一个库）
+similar = "2"
 # 拿窗口句柄，让系统标题栏跟着深色主题（appearance.rs）
 raw-window-handle = "0.6"
 

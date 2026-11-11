@@ -172,7 +172,7 @@ impl RemoteBrowser {
                     .and_then(|out| out.ok())
                     .map_err(|err| {
                         SharedString::from(tf!(
-                            "{path} 不在 git 仓库里：点进一个标着「仓库」的目录再打开。\n{err}",
+                            "{path} 不是 git 仓库：选一个标着「仓库」的目录。\n{err}",
                             path,
                             err = format!("{:#}", err)
                         ))
@@ -249,7 +249,7 @@ impl Render for RemoteBrowser {
                         .gap_2()
                         .cursor_pointer()
                         .hover(|s| s.bg(hover))
-                        .child(div().flex_1().truncate().child(format!("{}/", entry.name)))
+                        .child(crate::ui::clipped("name", format!("{}/", entry.name)).flex_1())
                         .when(entry.repo, |row| {
                             row.child(div().text_xs().text_color(repo_color).child(tr("仓库")))
                         })
@@ -278,10 +278,7 @@ impl Render for RemoteBrowser {
             (Some((text, _)), _) => text.clone(),
             (None, _) if pick_dir => tr("点目录进去；仓库会克隆到选中的目录下面").into(),
             (None, true) => tr("这个目录是仓库，可以打开").into(),
-            (None, false) => {
-                tr("点目录进去；标着「仓库」的目录可以打开，仓库里面的子目录也可以（打开的是整个仓库）")
-                    .into()
-            }
+            (None, false) => tr("点目录进去；标着「仓库」的可以打开").into(),
         };
         let hint_color = match &self.status {
             Some((_, true)) => danger,

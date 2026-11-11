@@ -69,11 +69,29 @@ enum Started {
 }
 
 /// 连接选项。
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ConnectOptions {
     /// 转发本机的 ssh-agent（`ssh -A`）：服务器上的 git 推拉可以用本机的密钥。
     /// 服务器上有 root 权限的人在连接期间也能用它，只对信任的服务器打开
     pub forward_agent: bool,
+    /// 私钥文件（`ssh -i`）。空着用 ssh 默认的：`~/.ssh` 里的密钥、ssh-agent、`~/.ssh/config`
+    pub identity_file: Option<String>,
+    /// 用密码登录，不试密钥
+    pub password_auth: bool,
+    /// 存着的密码（`password_auth`）或私钥口令：ssh 问的时候自动回答一次。空着就弹窗问
+    pub secret: Option<String>,
+}
+
+impl std::fmt::Debug for ConnectOptions {
+    /// 密码不进日志：只写有没有
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectOptions")
+            .field("forward_agent", &self.forward_agent)
+            .field("identity_file", &self.identity_file)
+            .field("password_auth", &self.password_auth)
+            .field("secret", &self.secret.as_ref().map(|_| "…"))
+            .finish()
+    }
 }
 
 impl Connection {
@@ -85,7 +103,13 @@ impl Connection {
         let dir = agents.dir_name();
         let mut installed = false;
         loop {
-            let cmd = ssh(destination, &bootstrap_script(&dir), options.forward_agent);
+            // _saved 留到握手完：登录阶段 ssh 要密码时用得上
+            let (cmd, _saved) = ssh(
+                destination,
+                &bootstrap_script(&dir),
+                options,
+                options.forward_agent,
+            );
             match start(cmd, true, destination)? {
                 Started::Ready(inner, hello) => {
                     return Ok(Connection {
@@ -103,7 +127,7 @@ impl Connection {
                     if os != "Linux" {
                         bail!("{}", tf!("暂时只支持 Linux 服务器，这台是 {os}", os));
                     }
-                    install(destination, &dir, &agents.binary_for(&arch)?)?;
+                    install(destination, options, &dir, &agents.binary_for(&arch)?)?;
                     installed = true;
                 }
             }
@@ -547,7 +571,7 @@ fn connect_error(destination: &str, stderr_tail: &Mutex<String>, noise: &[String
     std::thread::sleep(Duration::from_millis(50));
     let stderr = stderr_tail.lock().unwrap().trim().to_string();
     let hint = if stderr.contains("Permission denied") {
-        tr("登录被拒绝：密钥不被接受，或者密码不对、取消了输入")
+        tr("登录被拒绝：密钥或密码不对，或者取消了输入")
     } else if stderr.contains("Could not resolve hostname") {
         tr("找不到这个主机名")
     } else if stderr.contains("timed out") {
@@ -557,7 +581,7 @@ fn connect_error(destination: &str, stderr_tail: &Mutex<String>, noise: &[String
     } else if stderr.contains("Host key verification failed")
         || stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
     {
-        tr("服务器的主机密钥和 known_hosts 里记录的不一致，先在终端里用 ssh 确认")
+        tr("主机密钥和 known_hosts 里的不一致，先在终端里用 ssh 确认")
     } else {
         tr("连接失败")
     };
@@ -572,17 +596,45 @@ fn connect_error(destination: &str, stderr_tail: &Mutex<String>, noise: &[String
 }
 
 /// 构造 ssh 命令。`--` 防止以 `-` 开头的目标被当成选项。
-fn ssh(destination: &str, remote_command: &str, forward_agent: bool) -> Command {
+/// 返回的第二项要留到登录完成：留着它，这个 ssh 要密码、口令时才会用存着的自动回答。
+fn ssh(
+    destination: &str,
+    remote_command: &str,
+    options: &ConnectOptions,
+    forward_agent: bool,
+) -> (Command, Option<crate::SavedSecret>) {
     let mut cmd = Command::new(ssh_program());
+    let mut saved = None;
     if forward_agent {
         cmd.arg("-A");
     }
+    if let Some(key) = &options.identity_file {
+        // 指定了私钥就只用它，不把 ssh-agent 里的密钥挨个试一遍（试多了服务器会直接断开）
+        cmd.arg("-i").arg(key);
+        cmd.args(["-o", "IdentitiesOnly=yes"]);
+    }
+    if options.password_auth {
+        cmd.args([
+            "-o",
+            "PreferredAuthentications=keyboard-interactive,password",
+        ]);
+    }
     match crate::ssh_env() {
-        // 要密码或密钥口令时 ssh 启动 askpass 程序来问我们，由界面弹窗
+        // 要密码或密钥口令时 ssh 启动 askpass 程序来问我们：存着的自动回答，没存的由界面弹窗
         // 密码只问一次：ssh 默认问三次，用户点了取消它还会接着再问两次。输错了点「重试」重连
         Some(env) => {
             cmd.envs(env.iter().map(|(k, v)| (k, v)));
             cmd.args(["-o", "NumberOfPasswordPrompts=1"]);
+            if let Some(secret) = &options.secret {
+                let kind = if options.password_auth {
+                    crate::PromptKind::Password
+                } else {
+                    crate::PromptKind::Passphrase
+                };
+                let entry = crate::SavedSecret::register(secret, kind);
+                cmd.env(fr_core::askpass::TAG_ENV, entry.tag());
+                saved = Some(entry);
+            }
         }
         // 没有界面可以弹窗（比如测试工具）：只用密钥，要密码就直接失败
         None => {
@@ -604,7 +656,7 @@ fn ssh(destination: &str, remote_command: &str, forward_agent: bool) -> Command 
         destination,
         remote_command,
     ]);
-    cmd
+    (cmd, saved)
 }
 
 fn ssh_program() -> PathBuf {
@@ -628,11 +680,11 @@ fn bootstrap_script(dir: &str) -> String {
 
 /// 经 ssh 的标准输入上传 agent：先写临时文件再改名，免得留下半个文件；
 /// 然后删掉 `~/.fork-remote/` 下其他版本的目录（名字以数字开头的）。
-fn install(destination: &str, dir: &str, binary: &[u8]) -> Result<()> {
+fn install(destination: &str, options: &ConnectOptions, dir: &str, binary: &[u8]) -> Result<()> {
     let script = format!(
         r#"sh -c 'set -e; R="$HOME/.fork-remote"; V="{dir}"; mkdir -p "$R/$V"; cat > "$R/$V/fr-agent.tmp"; chmod 755 "$R/$V/fr-agent.tmp"; mv -f "$R/$V/fr-agent.tmp" "$R/$V/fr-agent"; cd "$R"; for x in *; do case "$x" in "$V") ;; [0-9]*) rm -rf -- "$x" ;; esac; done'"#
     );
-    let mut cmd = ssh(destination, &script, false);
+    let (mut cmd, _saved) = ssh(destination, &script, options, false);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -667,4 +719,54 @@ fn no_window(cmd: &mut Command) {
     }
     #[cfg(not(windows))]
     let _ = cmd;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(options: &ConnectOptions) -> Vec<String> {
+        let (cmd, _saved) = ssh("ssh://u@h:2222", "true", options, options.forward_agent);
+        cmd.get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn 私钥文件和密码登录变成ssh的选项() {
+        let has = |args: &[String], what: &str| args.iter().any(|arg| arg == what);
+        let plain = args(&ConnectOptions::default());
+        assert!(!has(&plain, "-i") && !has(&plain, "-A"));
+        assert!(!plain.iter().any(|arg| arg.starts_with("Preferred")));
+        // 目标和命令在最后，前面有 --
+        assert_eq!(plain[plain.len() - 3..], ["--", "ssh://u@h:2222", "true"]);
+
+        let key = args(&ConnectOptions {
+            identity_file: Some("C:/keys/id".into()),
+            forward_agent: true,
+            ..Default::default()
+        });
+        let at = key.iter().position(|arg| arg == "-i").unwrap();
+        assert_eq!(key[at + 1], "C:/keys/id");
+        assert!(has(&key, "IdentitiesOnly=yes") && has(&key, "-A"));
+
+        let password = args(&ConnectOptions {
+            password_auth: true,
+            ..Default::default()
+        });
+        assert!(has(
+            &password,
+            "PreferredAuthentications=keyboard-interactive,password"
+        ));
+        assert!(!has(&password, "-i"));
+    }
+
+    #[test]
+    fn 密码不进调试输出() {
+        let options = ConnectOptions {
+            secret: Some("hunter2".into()),
+            ..Default::default()
+        };
+        assert!(!format!("{options:?}").contains("hunter2"));
+    }
 }

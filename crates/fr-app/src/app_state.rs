@@ -10,7 +10,9 @@ use futures::FutureExt as _;
 use futures::future::{LocalBoxFuture, Shared};
 use gpui_kit::*;
 
-use crate::settings::{self, RepoEntry, Server, Settings, TabGroup, WindowState};
+use crate::settings::{
+    self, Auth, Layout, RepoEntry, RepoMemo, Server, Settings, TabGroup, WindowState,
+};
 
 /// 正在进行或已经结束的连接；多处等同一个连接时共用。
 type Connecting = Shared<Task<Result<Arc<Connection>, SharedString>>>;
@@ -70,6 +72,9 @@ impl AppState {
                     server.ok_or_else(|| SharedString::from(tr("找不到这台服务器的设置")))?;
                 let options = ConnectOptions {
                     forward_agent: server.forward_agent,
+                    identity_file: server.key_file().map(str::to_string),
+                    password_auth: server.auth == Auth::Password,
+                    secret: crate::secrets::get(&server.id),
                 };
                 Connection::connect(&server.destination, &options)
                     .map(Arc::new)
@@ -117,47 +122,40 @@ impl AppState {
         }
     }
 
-    pub fn add_server(
-        &mut self,
-        name: String,
-        destination: String,
-        forward_agent: bool,
-        cx: &mut Context<Self>,
-    ) -> String {
+    /// 加一台服务器，返回给它起的 id（`server.id` 传什么都不看）。
+    pub fn add_server(&mut self, mut server: Server, cx: &mut Context<Self>) -> String {
         let millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis());
         let id = format!("s{millis}");
-        self.settings.servers.push(Server {
-            id: id.clone(),
-            name,
-            destination,
-            forward_agent,
-        });
+        server.id = id.clone();
+        self.settings.servers.push(server);
         self.save();
         cx.notify();
         id
     }
 
-    /// 改一台服务器的名字、地址、转发选项；id 和它名下登记的仓库都留着。
-    /// 返回连接参数变没变：变了就丢掉原来的连接，下次用的时候按新参数重连。
+    /// 改一台服务器（按 `server.id` 找）；它名下登记的仓库都留着。
+    /// 返回连接参数变没变（`secret_changed`：存着的密码、口令动过）：变了就丢掉原来的连接，
+    /// 下次用的时候按新参数重连。
     pub fn update_server(
         &mut self,
-        id: &str,
-        name: String,
-        destination: String,
-        forward_agent: bool,
+        server: Server,
+        secret_changed: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(server) = self.settings.servers.iter_mut().find(|s| s.id == id) else {
+        let Some(old) = self.settings.servers.iter_mut().find(|s| s.id == server.id) else {
             return false;
         };
-        let reconnect = server.destination != destination || server.forward_agent != forward_agent;
-        server.name = name;
-        server.destination = destination;
-        server.forward_agent = forward_agent;
+        let reconnect = secret_changed
+            || old.destination != server.destination
+            || old.forward_agent != server.forward_agent
+            || old.auth != server.auth
+            || old.identity_file != server.identity_file;
+        let id = server.id.clone();
+        *old = server;
         if reconnect {
-            self.conns.remove(id);
+            self.conns.remove(&id);
         }
         self.save();
         cx.notify();
@@ -171,6 +169,8 @@ impl AppState {
             .repos
             .retain(|r| r.server.as_deref() != Some(id));
         self.conns.remove(id);
+        // 存着的密码、口令跟着删掉
+        crate::secrets::delete(id);
         self.save();
         cx.notify();
     }
@@ -273,12 +273,29 @@ impl AppState {
         }
     }
 
-    /// 记下窗口的位置和大小，稍后存盘。
-    pub fn set_window_state(&mut self, state: WindowState, cx: &mut Context<Self>) {
-        if self.settings.window == Some(state) {
-            return;
+    /// 改各块的大小（拖分隔条时一直在变），稍后存盘。
+    pub fn edit_layout(&mut self, cx: &mut Context<Self>, edit: impl FnOnce(&mut Layout)) {
+        let before = self.settings.layout;
+        edit(&mut self.settings.layout);
+        if self.settings.layout != before {
+            self.save_soon(cx);
+            cx.notify();
         }
-        self.settings.window = Some(state);
+    }
+
+    /// 改一个仓库记的东西（隐藏的分支、最近的提交说明）并存盘。
+    pub fn edit_memo(
+        &mut self,
+        repo: &RepoEntry,
+        cx: &mut Context<Self>,
+        edit: impl FnOnce(&mut RepoMemo),
+    ) {
+        self.settings.edit_memo(repo, edit);
+        self.save();
+        cx.notify();
+    }
+
+    fn save_soon(&mut self, cx: &mut Context<Self>) {
         self.save_later = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(800))
@@ -287,13 +304,34 @@ impl AppState {
         }));
     }
 
-    /// 标签页上显示的名字：本机仓库是目录名，服务器上的再加服务器名。
+    /// 记下窗口的位置和大小，稍后存盘。
+    pub fn set_window_state(&mut self, state: WindowState, cx: &mut Context<Self>) {
+        if self.settings.window == Some(state) {
+            return;
+        }
+        self.settings.window = Some(state);
+        self.save_soon(cx);
+    }
+
+    /// 仓库显示的名字：起过名字就用它，没有就是目录名。
+    pub fn repo_name(&self, entry: &RepoEntry) -> SharedString {
+        self.settings.repo_name(entry).to_string().into()
+    }
+
+    /// 给仓库改名（只改显示的名字，目录不动）；空的就恢复成目录名。
+    pub fn rename_repo(&mut self, entry: &RepoEntry, name: &str, cx: &mut Context<Self>) {
+        self.settings.set_repo_name(entry, name);
+        self.save();
+        cx.notify();
+    }
+
+    /// 标签页上显示的名字：仓库的名字，服务器上的再加服务器名。
     pub fn repo_title(&self, entry: &RepoEntry) -> SharedString {
+        let name = self.settings.repo_name(entry);
         match &entry.server {
-            None => entry.name().to_string().into(),
+            None => name.to_string().into(),
             Some(id) => format!(
-                "{} · {}",
-                entry.name(),
+                "{name} · {}",
                 self.server(id).map_or("?", |s| s.name.as_str())
             )
             .into(),

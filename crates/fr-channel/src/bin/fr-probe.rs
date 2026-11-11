@@ -8,18 +8,43 @@
 //! 例如：
 //!     fr-probe --repo .testdata/big-repo local
 //!     fr-probe --repo /data/workspaces/big-repo root@my-server
+//!
+//! 连服务器时可以带登录方式（和客户端「添加服务器」里填的一样），用来不开界面检查登录这一段：
+//!     --key <私钥文件>           用这把私钥
+//!     --password                 用密码登录，不试密钥
+//!     --secret-env <环境变量名>   密码（带 --password 时）或私钥口令放在这个环境变量里，ssh 问的时候自动回答；
+//!                                没给、或者答过一次 ssh 还问，就打出它问的话并当作取消
+//!     --connect-only             连上就退出，不测速
 
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use fr_channel::{Channel, Connection, StreamItem};
+use fr_channel::{Channel, ConnectOptions, Connection, StreamItem};
 use futures::StreamExt as _;
 use futures::executor::block_on;
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // 被 ssh 当作 askpass 启动时：去问已经开着的那个 fr-probe，打出回答就退出
+    if let Some(code) = fr_core::askpass::run_helper() {
+        std::process::exit(code);
+    }
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let mut flag = |name: &str| {
+        let found = args.iter().any(|a| a == name);
+        args.retain(|a| a != name);
+        found
+    };
+    let (password_auth, connect_only) = (flag("--password"), flag("--connect-only"));
+    let value = |name: &str| args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone());
+    let options = ConnectOptions {
+        forward_agent: false,
+        identity_file: value("--key"),
+        password_auth,
+        secret: value("--secret-env").and_then(|name| std::env::var(name).ok()),
+    };
+    let ask = password_auth || options.secret.is_some();
     let usage = "用法：fr-probe --repo <仓库路径> (local | <ssh 目标> | --agent <fr-agent 程序>)";
     let repo = args
         .windows(2)
@@ -30,7 +55,7 @@ fn main() -> Result<()> {
         .windows(2)
         .find(|w| w[0] == "--watch")
         .and_then(|w| w[1].parse().ok());
-    let is_option = |a: &str| a == "--repo" || a == "--watch";
+    let is_option = |a: &str| matches!(a, "--repo" | "--watch" | "--key" | "--secret-env");
     let rest: Vec<&String> = args
         .iter()
         .enumerate()
@@ -52,7 +77,14 @@ fn main() -> Result<()> {
             Channel::Remote(Arc::new(conn))
         }
         [destination] => {
-            let conn = Connection::connect(destination, &Default::default())?;
+            if ask {
+                // 没有界面：存着的答不了的提问，打出来并当作取消
+                fr_channel::init_prompts(|prompt| {
+                    println!("ssh 问了没有存着答案的：{}", prompt.trim());
+                    None
+                })?;
+            }
+            let conn = Connection::connect(destination, &options)?;
             println!(
                 "连接 {destination}：{} ms（{}）· {} · {} {} · 主目录 {}",
                 conn.connect_time.as_millis(),
@@ -72,6 +104,7 @@ fn main() -> Result<()> {
     };
 
     match watch_secs {
+        _ if connect_only => Ok(()),
         Some(secs) => watch(&channel, &repo, Duration::from_secs(secs)),
         None => block_on(probe(&channel, &repo)),
     }

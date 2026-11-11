@@ -22,25 +22,38 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::diff::{Diff, DiffFile, DiffFileStatus, DiffState};
+use gpui_kit::component::diff::{Diff, DiffFile, DiffFileStatus, DiffMode, DiffState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::RepoView;
+use super::layout::Split;
 use crate::{graph_paint, ui};
 
 const ROW_HEIGHT: f32 = 26.;
 const AUTHOR_WIDTH: f32 = 140.;
 const DATE_WIDTH: f32 = 130.;
 const SHA_WIDTH: f32 = 76.;
-/// 提交详情左边一栏最宽这么宽；窗口窄的时候按比例缩，给右边的改动留地方
-const DETAILS_WIDTH: f32 = 380.;
 /// 第一次读历史时，读到这么多个提交就先显示
 const FIRST_PAGE: usize = 300;
+
+/// 提交列表里列哪些分支上的提交。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) enum Scope {
+    /// 所有分支、远程分支、标签（隐藏起来的除外）
+    #[default]
+    All,
+    /// 当前分支，加上它的上游
+    Current,
+    /// 只看一个引用：完整的引用名，和显示的名字
+    Only { full: String, name: String },
+}
 
 pub(super) struct Loaded {
     commits: Arc<Vec<Commit>>,
@@ -104,6 +117,8 @@ pub(super) struct History {
     details_width: Pixels,
     /// 窗口内容区的宽度：算一行里留给分支标签多宽、改动视图的文件标题多宽
     viewport_width: Pixels,
+    /// 侧栏现在多宽
+    side_width: f32,
     load: Load,
     load_task: Option<Task<()>>,
     /// 旧的历史还显示着，新的在后台读
@@ -112,6 +127,10 @@ pub(super) struct History {
     scroll: UniformListScrollHandle,
     /// 文件历史模式：只看改过这个文件的提交
     file: Option<String>,
+    /// 列哪些分支上的提交
+    scope: Scope,
+    /// 改动里显示整个文件，不只是改动附近的几行
+    whole_file: bool,
     search: Entity<InputState>,
     /// 搜索的内容（小写）；空表示没在搜索
     needle: String,
@@ -152,14 +171,17 @@ impl History {
             files: Vec::new(),
             collapsed: false,
             details_height: px(340.),
-            details_width: px(DETAILS_WIDTH),
+            details_width: px(380.),
             viewport_width: px(1400.),
+            side_width: super::layout::SIDEBAR_DEFAULT,
             load: Load::Idle,
             load_task: None,
             reloading: false,
             selected: None,
             scroll: UniformListScrollHandle::new(),
             file: None,
+            scope: Scope::All,
+            whole_file: false,
             search,
             needle: String::new(),
             matches: Vec::new(),
@@ -182,10 +204,11 @@ impl History {
         }
     }
 
-    /// 详情区占窗口高度的四成，夹在一个范围里，免得矮窗口里把提交列表挤没。
-    pub(super) fn set_viewport(&mut self, viewport: Size<Pixels>) {
-        self.details_height = (viewport.height * 0.4).clamp(px(150.), px(460.));
-        self.details_width = (viewport.width * 0.3).clamp(px(250.), px(DETAILS_WIDTH));
+    /// 每帧记下窗口的宽度和各块的大小（怎么算的见 `layout::sizes`）。
+    pub(super) fn set_layout(&mut self, viewport: Size<Pixels>, sizes: super::layout::Sizes) {
+        self.details_height = px(sizes.details_height);
+        self.details_width = px(sizes.details_width);
+        self.side_width = sizes.sidebar;
         self.viewport_width = viewport.width;
     }
 
@@ -232,11 +255,17 @@ impl RepoView {
             self.history.load = Load::Loading;
         }
         self.history.reloading = showing;
+        // 只看的那个引用已经不在了（分支删了）：回到所有分支
+        if let Scope::Only { full, .. } = &self.history.scope
+            && !self.ref_exists(full)
+        {
+            self.history.scope = Scope::All;
+        }
         // 文件历史：只要改过这个文件的提交，跟着改名往回找
         let file_mode = self.history.file.is_some();
         let log_args = match &self.history.file {
             Some(path) => gitlog::file_log_args(path),
-            None => gitlog::log_args(),
+            None => gitlog::scoped_log_args(&self.log_scope(), &self.hidden_refs(cx)),
         };
         let mut stream = channel.git_stream(&self.entry.path, log_args);
         let (tx, mut rx) = mpsc::unbounded();
@@ -523,6 +552,172 @@ impl RepoView {
         super::file_picker::open(picker, window, cx);
     }
 
+    /// 这个完整的引用名现在还有没有。
+    fn ref_exists(&self, full: &str) -> bool {
+        let has = |list: &[fr_core::refs::Branch], name: &str| list.iter().any(|b| b.name == name);
+        if let Some(name) = full.strip_prefix("refs/heads/") {
+            has(&self.refs.branches, name)
+        } else if let Some(name) = full.strip_prefix("refs/remotes/") {
+            has(&self.refs.remotes, name)
+        } else if let Some(name) = full.strip_prefix("refs/tags/") {
+            self.refs.tags.iter().any(|t| t.name == name)
+        } else {
+            false
+        }
+    }
+
+    /// 读历史时给 git 的范围。
+    fn log_scope(&self) -> gitlog::Scope {
+        match &self.history.scope {
+            Scope::All => gitlog::Scope::All,
+            Scope::Current => {
+                let mut refs = vec!["HEAD".to_string()];
+                // 带上上游：看得到还没拉下来的提交。上游已经被删掉的不带，不然 git 会报错
+                let upstream = self.status.as_ref().and_then(|s| s.upstream.as_deref());
+                if let Some(upstream) = upstream
+                    && self.refs.remotes.iter().any(|b| b.name == upstream)
+                {
+                    refs.push(format!("refs/remotes/{upstream}"));
+                }
+                gitlog::Scope::Refs(refs)
+            }
+            Scope::Only { full, .. } => gitlog::Scope::Refs(vec![full.clone()]),
+        }
+    }
+
+    /// 提交列表里隐藏了哪些引用（完整的名字）。
+    pub(super) fn hidden_refs(&self, cx: &App) -> Vec<String> {
+        self.app
+            .read(cx)
+            .settings
+            .memo(&self.entry)
+            .map(|memo| memo.hidden_refs.clone())
+            .unwrap_or_default()
+    }
+
+    /// 换一个范围看提交历史。
+    pub(super) fn set_scope(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_file_views(window, cx);
+        self.sidebar_select_history();
+        if self.history.scope != scope {
+            self.history.scope = scope;
+            self.restart_history(cx);
+        }
+        cx.notify();
+    }
+
+    /// 现在是不是只看这一个引用。
+    pub(super) fn is_only(&self, full: &str) -> bool {
+        matches!(&self.history.scope, Scope::Only { full: only, .. } if only == full)
+    }
+
+    /// 在提交列表里隐藏一个引用，或者取消隐藏。
+    pub(super) fn toggle_hidden(&mut self, full: String, cx: &mut Context<Self>) {
+        let entry = self.entry.clone();
+        self.app.update(cx, |app, cx| {
+            app.edit_memo(&entry, cx, |memo| {
+                if memo.hidden_refs.contains(&full) {
+                    memo.hidden_refs.retain(|hidden| *hidden != full);
+                } else {
+                    memo.hidden_refs.push(full);
+                }
+            })
+        });
+        // 隐藏只在列全部分支时起作用；这时才用得着重读
+        if self.history.scope == Scope::All && self.history.file.is_none() {
+            self.restart_history(cx);
+        }
+        cx.notify();
+    }
+
+    /// 一个都不隐藏了。
+    fn show_all_hidden(&mut self, cx: &mut Context<Self>) {
+        let entry = self.entry.clone();
+        self.app.update(cx, |app, cx| {
+            app.edit_memo(&entry, cx, |memo| memo.hidden_refs.clear())
+        });
+        if self.history.scope == Scope::All && self.history.file.is_none() {
+            self.restart_history(cx);
+        }
+        cx.notify();
+    }
+
+    /// 提交列表上面「看哪些分支」的按钮和它的菜单。
+    fn render_scope_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        let scope = self.history.scope.clone();
+        let hidden = self.hidden_refs(cx);
+        let current = self.status.as_ref().and_then(|s| s.branch.clone());
+        let mut label: String = match &scope {
+            Scope::All => tr("所有分支").into(),
+            Scope::Current => match &current {
+                Some(branch) => tf!("只看 {branch}", branch),
+                None => tr("只看当前的 HEAD").into(),
+            },
+            Scope::Only { name, .. } => tf!("只看 {name}", name),
+        };
+        if scope == Scope::All && !hidden.is_empty() {
+            label = tf!("{label}（隐藏了 {n} 个）", label, n = hidden.len());
+        }
+        let filtered = scope != Scope::All || !hidden.is_empty();
+        let accent = cx.theme().primary;
+        // 不加悬停提示：提示出现在按钮下面，会盖住弹出的菜单
+        Button::new("history-scope")
+            .small()
+            .ghost()
+            .icon(if filtered {
+                ui::icon(IconName::ListFilter).text_color(accent)
+            } else {
+                ui::icon(IconName::ListFilter)
+            })
+            .label(label)
+            .dropdown_menu(move |mut menu, _, _| {
+                let pick = |label: SharedString, to: Scope, on: bool| {
+                    let view = view.clone();
+                    PopupMenuItem::new(label)
+                        .checked(on)
+                        .on_click(move |_, window, cx| {
+                            view.update(cx, |this, cx| this.set_scope(to.clone(), window, cx))
+                                .ok();
+                        })
+                };
+                menu = menu
+                    .item(pick(tr("所有分支").into(), Scope::All, scope == Scope::All))
+                    .item(pick(
+                        tr("只看当前分支（和它的上游）").into(),
+                        Scope::Current,
+                        scope == Scope::Current,
+                    ));
+                if let Scope::Only { name, .. } = &scope {
+                    menu = menu.item(pick(tf!("只看 {name}", name).into(), scope.clone(), true));
+                }
+                if !hidden.is_empty() {
+                    menu = menu
+                        .separator()
+                        .item(PopupMenuItem::label(tr("隐藏起来的（点一下取消隐藏）")));
+                    for full in hidden.iter().take(12) {
+                        let (view, full) = (view.clone(), full.clone());
+                        menu =
+                            menu.item(PopupMenuItem::new(short_ref(&full).to_string()).on_click(
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.toggle_hidden(full.clone(), cx)
+                                    })
+                                    .ok();
+                                },
+                            ));
+                    }
+                    let view = view.clone();
+                    menu = menu.item(PopupMenuItem::new(tr("全部取消隐藏")).on_click(
+                        move |_, _, cx| {
+                            view.update(cx, |this, cx| this.show_all_hidden(cx)).ok();
+                        },
+                    ));
+                }
+                menu
+            })
+    }
+
     /// 换了要看的范围（全部提交或某个文件）：清掉选中，从头读。
     fn restart_history(&mut self, cx: &mut Context<Self>) {
         self.clear_commit_selection(cx);
@@ -618,6 +813,10 @@ impl RepoView {
             (Load::Ready { data, .. }, Some(ix)) => ix + 1 < data.commits.len(),
             _ => false,
         };
+        let whole_file = self.history.whole_file;
+        if whole_file {
+            fr_core::patch::set_context(&mut show_args, fr_core::patch::WHOLE_FILE);
+        }
         if let Some(path) = &self.history.file {
             show_args.extend(["--".into(), path.clone()]);
         }
@@ -642,16 +841,16 @@ impl RepoView {
             if in_file && let Ok(bytes) = &out {
                 let patch = show::parse(bytes).1;
                 if patch.iter().all(u8::is_ascii_whitespace) {
-                    whole = tr("这个提交里这个文件还叫别的名字，下面是这个提交的全部改动 · ");
+                    whole = tr("这个提交里文件还叫别的名字，下面是全部改动 · ");
                 } else if has_older && is_new_file_patch(patch) {
-                    whole =
-                        tr("这个文件是在这个提交里改成现在的名字的，下面是这个提交的全部改动 · ");
+                    whole = tr("文件在这个提交里改了名，下面是全部改动 · ");
                 }
                 if !whole.is_empty() {
-                    out = channel
-                        .git(&repo, show::args(&id))
-                        .await
-                        .and_then(|out| out.ok());
+                    let mut args = show::args(&id);
+                    if whole_file {
+                        fr_core::patch::set_context(&mut args, fr_core::patch::WHOLE_FILE);
+                    }
+                    out = channel.git(&repo, args).await.and_then(|out| out.ok());
                 }
             }
             let fetch_time = started.elapsed();
@@ -722,6 +921,26 @@ impl RepoView {
         cx.notify();
     }
 
+    /// 切换「显示整个文件」，重读正在看的那个提交的改动。
+    fn toggle_commit_whole_file(&mut self, cx: &mut Context<Self>) {
+        self.history.whole_file = !self.history.whole_file;
+        let whole = self.history.whole_file;
+        // 整个文件：补丁里带的上下文全都显示；否则只留改动附近三行
+        self.history.diff.update(cx, |state, cx| {
+            state.set_context_lines(if whole { None } else { Some(3) }, cx)
+        });
+        let showing = self
+            .history
+            .details
+            .as_ref()
+            .map(|details| details.id.clone())
+            .or_else(|| self.history.selected_commit().map(|c| c.id.to_string()));
+        if let Some(id) = showing {
+            self.load_details(id, cx);
+        }
+        cx.notify();
+    }
+
     /// 换了界面语言：搜索框的提示文字、还没选提交时的那句话要重新设一遍。
     pub(super) fn retranslate_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.history.search.update(cx, |state, cx| {
@@ -745,7 +964,7 @@ impl RepoView {
         let graph_width = graph_paint::column_width(data.graph.max_lanes);
         // 「说明」一栏的宽度：窗口宽度去掉侧栏、提交图、后面三栏、行的右边距和四个间隔
         let subject_width = f32::from(self.history.viewport_width)
-            - super::sidebar::WIDTH
+            - self.history.side_width
             - f32::from(graph_width)
             - AUTHOR_WIDTH
             - DATE_WIDTH
@@ -762,6 +981,13 @@ impl RepoView {
                 || name.split_once('/').is_some_and(|(remote, rest)| {
                     rest == "HEAD" && remote_names.iter().any(|n| n == remote)
                 })
+        };
+        // 隐藏起来的分支、标签：它指着的提交要是别的引用也够得着，提交还在，但它的名字不显示
+        // （只看某个分支时「隐藏」不起作用，名字也照常显示）
+        let hidden = if self.history.scope == Scope::All {
+            self.hidden_refs(cx)
+        } else {
+            Vec::new()
         };
         let rows: Vec<AnyElement> = range
             .clone()
@@ -812,15 +1038,15 @@ impl RepoView {
                             .children(ref_badges(
                                 &commit.refs,
                                 &is_remote,
+                                &hidden,
                                 badge_budget,
                                 ix,
                                 colors,
                             ))
-                            .child(
-                                div()
-                                    .truncate()
-                                    .child(SharedString::from(commit.subject.to_string())),
-                            ),
+                            .child(ui::clipped(
+                                ("subject", ix),
+                                SharedString::from(commit.subject.to_string()),
+                            )),
                     )
                     .child(
                         h_flex()
@@ -829,11 +1055,11 @@ impl RepoView {
                             .gap(px(6.))
                             .child(ui::avatar(&commit.author, 18., cx))
                             .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(colors.muted)
-                                    .child(SharedString::from(commit.author.to_string())),
+                                ui::clipped(
+                                    ("author", ix),
+                                    SharedString::from(commit.author.to_string()),
+                                )
+                                .text_color(colors.muted),
                             ),
                     )
                     .child(
@@ -911,13 +1137,25 @@ impl RepoView {
                             .text_color(color)
                             .child(file.letter),
                     )
-                    .child(div().flex_1().min_w_0().truncate().child(file.path.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis_start()
+                            .child(file.path.clone()),
+                    )
                     .child(
                         div()
                             .flex_none()
                             .text_color(colors.muted)
                             .child(format!("+{} −{}", file.additions, file.deletions)),
                     )
+                    .tooltip({
+                        let path = file.path.clone();
+                        move |window, cx| Tooltip::new(path.clone()).build(window, cx)
+                    })
                     .context_menu(menu)
                     .into_any_element()
             })
@@ -962,22 +1200,17 @@ impl RepoView {
                 v_flex()
                     .min_w_0()
                     .child(
-                        div()
+                        ui::clipped("detail-author", d.author.clone())
                             .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .truncate()
-                            .child(d.author.clone()),
+                            .font_weight(FontWeight::MEDIUM),
                     )
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(colors.muted)
-                            .truncate()
-                            .child(format!(
-                                "{} · {}",
-                                d.author_email,
-                                format_time(d.author_time)
-                            )),
+                        ui::clipped(
+                            "detail-email",
+                            format!("{} · {}", d.author_email, format_time(d.author_time)),
+                        )
+                        .text_xs()
+                        .text_color(colors.muted),
                     ),
             );
         let mut info = v_flex().gap_1();
@@ -1041,12 +1274,27 @@ impl RepoView {
             remote: theme.magenta,
         };
         let details = self.render_commit_details(colors, cx);
+        // 并排还是上下排跟着设置走：别的标签页里改了，这里重画时跟上
+        let split = self.app.read(cx).settings.diff_split;
+        let mode = if split {
+            DiffMode::Split
+        } else {
+            DiffMode::Unified
+        };
+        if self.history.diff.read(cx).mode() != mode {
+            self.history
+                .diff
+                .update(cx, |state, cx| state.set_mode(mode, cx));
+        }
+        let whole_file = self.history.whole_file;
+        let diff_state = self.history.diff.clone();
+        let (prev_state, next_state) = (diff_state.clone(), diff_state.clone());
         let collapsed = self.history.collapsed;
         let details_height = self.history.details_height;
         let details_width = self.history.details_width;
         // 改动视图看得见的宽度，去掉文件标题左边的折叠按钮、两边的内边距和滚动条的位置
         let header_width =
-            (self.history.viewport_width - px(super::sidebar::WIDTH) - details_width - px(64.))
+            (self.history.viewport_width - px(self.history.side_width) - details_width - px(64.))
                 .max(px(160.));
         let graph_width = match &self.history.load {
             Load::Ready { data, .. } => graph_paint::column_width(data.graph.max_lanes),
@@ -1054,60 +1302,58 @@ impl RepoView {
         };
         // 状态行上写的，和鼠标停在上面时显示的细节（读取、解析各花了多久）
         let mut status_detail: Option<SharedString> = None;
-        let (status, status_color, list): (SharedString, Hsla, AnyElement) = match &self
-            .history
-            .load
-        {
-            Load::Idle | Load::Loading => (
-                tr("正在读取提交历史…").into(),
-                muted,
-                div().into_any_element(),
-            ),
-            Load::Empty => (tr("还没有任何提交").into(), muted, div().into_any_element()),
-            Load::Failed(err) => (err.clone(), danger, div().into_any_element()),
-            Load::Ready { data, partial } => {
-                let (build, rows) = self.history.last_rows_build;
-                status_detail = Some(
-                    tf!(
-                        "{stats} · 构建 {rows} 行 {as_micros} µs",
-                        stats = data.stats,
-                        rows,
-                        as_micros = build.as_micros()
-                    )
-                    .into(),
-                );
-                let mut text = if *partial {
-                    tf!("先显示前 {n} 个提交，其余的还在读…", n = data.commits.len())
-                } else {
-                    tf!("{n} 个提交", n = data.commits.len())
-                };
-                if self.history.reloading && !partial {
-                    text.push_str(tr(" · 正在重读…"));
-                }
-                if data.graph.max_lanes > graph_paint::MAX_LANES {
-                    text = tf!(
-                        "提交图同时有 {lanes} 条线，只画得下前 {max} 条，右边带 ··· 的行还有没画出来的 · {text}",
-                        lanes = data.graph.max_lanes,
-                        max = graph_paint::MAX_LANES,
-                        text = text
-                    );
-                }
-                (
-                    text.into(),
+        let (status, status_color, list): (SharedString, Hsla, AnyElement) =
+            match &self.history.load {
+                Load::Idle | Load::Loading => (
+                    tr("正在读取提交历史…").into(),
                     muted,
-                    uniform_list(
-                        "commits",
-                        data.commits.len(),
-                        cx.processor(move |this, range: Range<usize>, _window, cx| {
-                            this.render_commit_rows(range, colors, cx)
-                        }),
+                    div().into_any_element(),
+                ),
+                Load::Empty => (tr("还没有任何提交").into(), muted, div().into_any_element()),
+                Load::Failed(err) => (err.clone(), danger, div().into_any_element()),
+                Load::Ready { data, partial } => {
+                    let (build, rows) = self.history.last_rows_build;
+                    status_detail = Some(
+                        tf!(
+                            "{stats} · 构建 {rows} 行 {as_micros} µs",
+                            stats = data.stats,
+                            rows,
+                            as_micros = build.as_micros()
+                        )
+                        .into(),
+                    );
+                    let mut text = if *partial {
+                        tf!("先显示前 {n} 个提交，其余的还在读…", n = data.commits.len())
+                    } else {
+                        tf!("{n} 个提交", n = data.commits.len())
+                    };
+                    if self.history.reloading && !partial {
+                        text.push_str(tr(" · 正在重读…"));
+                    }
+                    if data.graph.max_lanes > graph_paint::MAX_LANES {
+                        text = tf!(
+                            "提交图有 {lanes} 条线，只画前 {max} 条（带 ··· 的行没画全） · {text}",
+                            lanes = data.graph.max_lanes,
+                            max = graph_paint::MAX_LANES,
+                            text = text
+                        );
+                    }
+                    (
+                        text.into(),
+                        muted,
+                        uniform_list(
+                            "commits",
+                            data.commits.len(),
+                            cx.processor(move |this, range: Range<usize>, _window, cx| {
+                                this.render_commit_rows(range, colors, cx)
+                            }),
+                        )
+                        .track_scroll(&self.history.scroll)
+                        .size_full()
+                        .into_any_element(),
                     )
-                    .track_scroll(&self.history.scroll)
-                    .size_full()
-                    .into_any_element(),
-                )
-            }
-        };
+                }
+            };
 
         // 还没读完时不能说「没有匹配」：只是还没读到
         let still_reading = matches!(
@@ -1147,7 +1393,7 @@ impl RepoView {
                         .border_color(border)
                         .text_sm()
                         .child(div().text_color(muted).child(tr("文件历史")))
-                        .child(div().flex_1().min_w_0().truncate().child(path.clone()))
+                        .child(ui::clipped("file-history-path", path.clone()).flex_1())
                         .child(
                             Button::new("file-blame")
                                 .xsmall()
@@ -1181,13 +1427,10 @@ impl RepoView {
                         ),
                     )
                     .child(
-                        div()
+                        ui::clipped("match-info", match_info)
                             .flex_shrink(1.)
-                            .min_w_0()
-                            .truncate()
                             .text_xs()
-                            .text_color(muted)
-                            .child(match_info),
+                            .text_color(muted),
                     )
                     .when(has_matches, |bar| {
                         bar.child(
@@ -1208,6 +1451,9 @@ impl RepoView {
                         )
                     })
                     .child(div().flex_1())
+                    .when(self.history.file.is_none(), |bar| {
+                        bar.child(self.render_scope_button(cx))
+                    })
                     .child(
                         Button::new("pick-file")
                             .small()
@@ -1257,19 +1503,19 @@ impl RepoView {
                     .border_color(border)
                     .text_xs()
                     .text_color(status_color)
-                    .child(
-                        div()
+                    .child(match status_detail {
+                        // 有详细说明的（读了多久、多大）：停上去看说明
+                        Some(detail) => div()
                             .id("history-status")
                             .flex_1()
                             .min_w_0()
                             .truncate()
                             .child(status)
-                            .when_some(status_detail, |d, detail| {
-                                d.tooltip(move |window, cx| {
-                                    Tooltip::new(detail.clone()).build(window, cx)
-                                })
+                            .tooltip(move |window, cx| {
+                                ui::full_text_tip(detail.clone(), window, cx)
                             }),
-                    )
+                        None => ui::clipped("history-status", status).flex_1(),
+                    })
                     .child(
                         Button::new("toggle-details")
                             .xsmall()
@@ -1284,7 +1530,7 @@ impl RepoView {
                             } else {
                                 tr("收起详情")
                             })
-                            .tooltip(tr("收起或展开下面的提交详情和改动，给提交列表腾地方"))
+                            .tooltip(tr("收起或展开提交详情"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.history.collapsed = !this.history.collapsed;
                                 cx.notify();
@@ -1296,16 +1542,15 @@ impl RepoView {
                     h_flex()
                         .h(details_height)
                         .flex_none()
-                        .border_t_1()
-                        .border_color(border)
+                        .relative()
                         .child(
                             div()
                                 .w(details_width)
                                 .flex_none()
                                 .h_full()
-                                .border_r_1()
-                                .border_color(border)
-                                .child(details),
+                                .relative()
+                                .child(details)
+                                .child(self.split_handle(Split::DetailsWidth, cx)),
                         )
                         .child(
                             v_flex()
@@ -1313,17 +1558,69 @@ impl RepoView {
                                 .min_w_0()
                                 .h_full()
                                 .child(
-                                    div()
-                                        .h(px(26.))
+                                    h_flex()
+                                        .h(px(28.))
                                         .flex_none()
-                                        .px_3()
-                                        .flex()
-                                        .items_center()
+                                        .pl_3()
+                                        .pr_2()
+                                        .gap_1()
                                         .border_b_1()
                                         .border_color(border)
                                         .text_xs()
                                         .text_color(muted)
-                                        .child(self.history.diff_info.clone()),
+                                        .child(
+                                            ui::clipped(
+                                                "diff-info",
+                                                self.history.diff_info.clone(),
+                                            )
+                                            .flex_1(),
+                                        )
+                                        .child(
+                                            Button::new("diff-prev-change")
+                                                .xsmall()
+                                                .ghost()
+                                                .icon(ui::icon(IconName::ArrowUp))
+                                                .tooltip(tr("上一处改动"))
+                                                .on_click(move |_, _, cx| {
+                                                    prev_state.update(cx, |state, cx| {
+                                                        state.previous_change(cx)
+                                                    })
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("diff-next-change")
+                                                .xsmall()
+                                                .ghost()
+                                                .icon(ui::icon(IconName::ArrowDown))
+                                                .tooltip(tr("下一处改动"))
+                                                .on_click(move |_, _, cx| {
+                                                    next_state.update(cx, |state, cx| {
+                                                        state.next_change(cx)
+                                                    })
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("history-whole-file")
+                                                .xsmall()
+                                                .ghost()
+                                                .icon(ui::icon(IconName::UnfoldVertical))
+                                                .selected(whole_file)
+                                                .tooltip(tr("显示整个文件"))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.toggle_commit_whole_file(cx)
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("history-split")
+                                                .xsmall()
+                                                .ghost()
+                                                .icon(ui::icon(IconName::Columns2))
+                                                .selected(split)
+                                                .tooltip(tr("并排着看：左边是旧的，右边是新的"))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.toggle_split(cx)
+                                                })),
+                                        ),
                                 )
                                 .child(
                                     div().flex_1().min_h_0().child(
@@ -1336,7 +1633,9 @@ impl RepoView {
                                             .size_full(),
                                     ),
                                 ),
-                        ),
+                        )
+                        // 放在最后：画在详情和改动的上面，整条上边都拖得动
+                        .child(self.split_handle(Split::DetailsHeight, cx)),
                 )
             })
             .into_any_element()
@@ -1513,6 +1812,14 @@ fn not_found_text(id: &str) -> SharedString {
     .into()
 }
 
+/// 完整的引用名去掉 `refs/heads/` 这类前缀，给人看。
+pub(super) fn short_ref(full: &str) -> &str {
+    ["refs/heads/", "refs/remotes/", "refs/tags/"]
+        .iter()
+        .find_map(|prefix| full.strip_prefix(prefix))
+        .unwrap_or(full)
+}
+
 /// 补丁里有没有「新增文件」的那一行（`new file mode`）。
 fn is_new_file_patch(patch: &[u8]) -> bool {
     patch
@@ -1532,6 +1839,18 @@ const BADGE_MORE: f32 = 28.;
 struct RefLabel {
     name: String,
     kind: RefKind,
+}
+
+impl RefLabel {
+    /// 完整的引用名（`refs/heads/…`），和「隐藏」记的名字对得上。HEAD 没有，返回空的。
+    fn full_name(&self) -> String {
+        match self.kind {
+            RefKind::Current | RefKind::Local => format!("refs/heads/{}", self.name),
+            RefKind::Remote => format!("refs/remotes/{}", self.name),
+            RefKind::Tag => format!("refs/tags/{}", self.name),
+            RefKind::Head => String::new(),
+        }
+    }
 }
 
 /// 引用的种类，也是放不下时留谁的先后：当前分支的名字比「HEAD」两个字有用，排最前。
@@ -1615,11 +1934,15 @@ fn badges_that_fit(widths: &[f32], budget: f32) -> usize {
 fn ref_badges(
     refs: &str,
     is_remote: &dyn Fn(&str) -> bool,
+    hidden: &[String],
     budget: f32,
     row: usize,
     colors: RowColors,
 ) -> Vec<AnyElement> {
-    let labels = ref_labels(refs, is_remote);
+    let mut labels = ref_labels(refs, is_remote);
+    if !hidden.is_empty() {
+        labels.retain(|label| !hidden.contains(&label.full_name()));
+    }
     let widths: Vec<f32> = labels.iter().map(|l| badge_width(&l.name)).collect();
     let shown = badges_that_fit(&widths, budget);
     let mut visible: Vec<&RefLabel> = labels[..shown].iter().collect();
@@ -1629,7 +1952,8 @@ fn ref_badges(
     }
     let mut badges: Vec<AnyElement> = visible
         .into_iter()
-        .map(|label| {
+        .enumerate()
+        .map(|(at, label)| {
             let color: Hsla = match label.kind {
                 RefKind::Head => colors.head,
                 RefKind::Current | RefKind::Local => colors.local,
@@ -1637,7 +1961,7 @@ fn ref_badges(
                 RefKind::Remote => colors.remote,
             };
             // 当前分支加粗（和侧栏一样）：「HEAD」被收起来时也认得出
-            badge(&label.name, color, label.kind == RefKind::Current)
+            badge(at, &label.name, color, label.kind == RefKind::Current)
         })
         .collect();
     if shown < labels.len() {
@@ -1670,11 +1994,11 @@ fn ref_badges(
     badges
 }
 
-fn badge(label: &str, color: Hsla, bold: bool) -> AnyElement {
+/// 一个分支、标签的小牌子。名字太长会截掉，停上去看全名。`at` 是这一行里的第几个。
+fn badge(at: usize, label: &str, color: Hsla, bold: bool) -> AnyElement {
     div()
         .flex_none()
         .max_w(px(BADGE_TEXT_MAX + 10.))
-        .truncate()
         .when(bold, |d| d.font_weight(FontWeight::SEMIBOLD))
         .h(px(18.))
         .px(px(5.))
@@ -1685,7 +2009,10 @@ fn badge(label: &str, color: Hsla, bold: bool) -> AnyElement {
         .text_size(px(11.))
         .line_height(px(16.))
         .text_color(color)
-        .child(SharedString::from(label.to_string()))
+        .child(ui::clipped(
+            ("badge", at),
+            SharedString::from(label.to_string()),
+        ))
         .into_any_element()
 }
 
@@ -1710,12 +2037,11 @@ fn diff_file_header(file: &DiffFile, width: Pixels, muted: Hsla) -> AnyElement {
         .max_w(width)
         .gap_2()
         .child(
-            div()
+            ui::clipped(ElementId::Name(format!("diff-file:{name}").into()), name)
                 .flex_1()
-                .min_w_0()
-                .truncate()
-                .font_weight(FontWeight::MEDIUM)
-                .child(name),
+                // 放不下时省略前面的目录，文件名留着
+                .text_ellipsis_start()
+                .font_weight(FontWeight::MEDIUM),
         )
         .child(div().flex_none().text_xs().text_color(muted).child(format!(
             "+{} −{}",

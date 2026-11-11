@@ -3,8 +3,12 @@
 //! 界面的层级靠三样东西：文字的三级颜色（正文、次要、最弱）、主色只用在「现在选中的」和
 //! 「主要操作」上、同一类东西用同一个行高和圆角。这里把它们集中定下来，各个页面不各写各的。
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui_kit::assets::IconName;
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _};
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
@@ -19,6 +23,94 @@ pub fn icon(name: IconName) -> Icon {
 /// 小一号的图标：行尾的关闭、展开箭头。
 pub fn icon_small(name: IconName) -> Icon {
     Icon::new(name).xsmall()
+}
+
+/// 一行放不下就省略的文字，鼠标停上去显示全文。只在真的被截掉时才弹，放得下的不弹。
+///
+/// 返回的块上可以接着设字号、颜色、`flex_1()`；省略开头、中间的接 `text_ellipsis_start()`、
+/// `text_ellipsis_middle()`。不要在它上面加内边距：是拿这一块的宽度和文字的宽度比的。
+pub fn clipped(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Stateful<Div> {
+    let text: SharedString = text.into();
+    clipped_with_tip(id, text.clone(), text)
+}
+
+/// 同 [`clipped`]，提示里显示的是 `tip`（比如行里是文件名，提示给完整路径）。
+pub fn clipped_with_tip(
+    id: impl Into<ElementId>,
+    text: impl Into<SharedString>,
+    tip: impl Into<SharedString>,
+) -> Stateful<Div> {
+    let (text, tip): (SharedString, SharedString) = (text.into(), tip.into());
+    let cut = Rc::new(Cell::new(false));
+    // 量一下：这一块有多宽，文字不省略要多宽。画在这一块里面，拿得到它的字体和字号
+    let measure = {
+        let (text, cut) = (text.clone(), cut.clone());
+        canvas(
+            move |bounds, window, _| {
+                let style = window.text_style();
+                let size = style.font_size.to_pixels(window.rem_size());
+                let line: SharedString = if text.contains('\n') {
+                    text.replace('\n', " ").into()
+                } else {
+                    text
+                };
+                let run = style.to_run(line.len());
+                let width = window
+                    .text_system()
+                    .shape_line(line, size, &[run], None)
+                    .width;
+                cut.set(width > bounds.size.width + px(0.5));
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0()
+    };
+    div()
+        .id(id)
+        .relative()
+        .min_w_0()
+        .truncate()
+        .child(text)
+        .child(measure)
+        .tooltip(move |window, cx| {
+            if cut.get() {
+                full_text_tip(tip.clone(), window, cx)
+            } else {
+                // 没被截掉：给一个什么都不画的提示
+                cx.new(|_| Empty).into()
+            }
+        })
+}
+
+/// 显示全文的提示：太长就折行，不撑出窗口。
+pub fn full_text_tip(text: SharedString, window: &mut Window, cx: &mut App) -> AnyView {
+    Tooltip::element(move |_, _| {
+        // 文字里的换行各占一行
+        v_flex()
+            .max_w(px(560.))
+            .whitespace_normal()
+            .children(text.split('\n').map(|line| div().child(line.to_string())))
+    })
+    .build(window, cx)
+}
+
+/// 两行的提示：上面一行正文，下面一行小一号的次要文字（名字和路径）。
+pub fn two_line_tip(
+    title: SharedString,
+    sub: SharedString,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyView {
+    let muted = cx.theme().muted_foreground;
+    Tooltip::element(move |_, _| {
+        v_flex()
+            .max_w(px(560.))
+            .whitespace_normal()
+            .child(title.clone())
+            .child(div().text_xs().text_color(muted).child(sub.clone()))
+    })
+    .build(window, cx)
 }
 
 /// 计数的小块：侧栏「本地修改」后面的数字、分组里有几项。

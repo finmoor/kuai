@@ -13,10 +13,12 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::radio::Radio;
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+use super::ops::Step;
 use super::{Mode, RepoView};
 
 /// 对话框里「确定」要做的事，按钮和回车共用。
@@ -43,6 +45,20 @@ pub(super) struct Ask {
     pub validate: Option<Validate>,
 }
 
+/// 「几样里选一样」对话框的内容。
+#[derive(Default)]
+pub(super) struct Choose {
+    pub title: SharedString,
+    pub description: SharedString,
+    /// 单选项：文字，和它下面的一行小字（可以空着）
+    pub options: Vec<(SharedString, SharedString)>,
+    /// 默认选第几项
+    pub selected: usize,
+    /// 勾选项：文字和默认是否勾上
+    pub checks: Vec<(&'static str, bool)>,
+    pub ok: &'static str,
+}
+
 /// 用户在对话框里填的内容（去掉了首尾空白）和各勾选项的状态。
 pub(super) struct Answer {
     pub text: String,
@@ -63,7 +79,7 @@ pub(super) fn ref_name_error(name: &str) -> Option<String> {
         || name.contains("@{")
         || name == "@";
     (bad_char || bad_shape).then(|| {
-        tr("名字不合规则：不能有空格和 ~ ^ : ? * [ \\，不能有连着的两个点或两个斜杠，不能以 - / . 开头，也不能以 / 或 . 结尾。").to_string()
+        tr("名字不合规则：不能有空格、~ ^ : ? * [ \\、连着的两个点或斜杠，不能以 - / . 开头，不能以 / . 结尾。").to_string()
     })
 }
 
@@ -196,6 +212,116 @@ impl RepoView {
         });
     }
 
+    /// 弹出「几样里选一样」的对话框：上面一句说明，中间几个单选项（各带一行小字），下面可以有
+    /// 几个勾选项。点确定（或按回车）时关掉对话框，把选了第几项、各勾选项的状态交给 `on_ok`。
+    pub(super) fn choose(
+        &mut self,
+        choose: Choose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        on_ok: impl Fn(&mut Self, usize, Vec<bool>, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let Choose {
+            title,
+            description,
+            options,
+            selected,
+            checks,
+            ok,
+        } = choose;
+        let selected = Rc::new(Cell::new(selected.min(options.len().saturating_sub(1))));
+        let states: Rc<Vec<Cell<bool>>> =
+            Rc::new(checks.iter().map(|(_, on)| Cell::new(*on)).collect());
+        let view = cx.entity().downgrade();
+        let submit: Submit = {
+            let (selected, states) = (selected.clone(), states.clone());
+            Rc::new(move |window, cx| {
+                window.close_dialog(cx);
+                let checks: Vec<bool> = states.iter().map(Cell::get).collect();
+                view.update(cx, |this, cx| {
+                    on_ok(this, selected.get(), checks, window, cx)
+                })
+                .ok();
+            })
+        };
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let muted = cx.theme().muted_foreground;
+            // 没有说明时第一个单选项紧贴着标题，留一点空
+            let mut body = v_flex()
+                .gap_3()
+                .when(description.is_empty(), |body| body.pt_1());
+            if !description.is_empty() {
+                body = body.child(
+                    div()
+                        .text_sm()
+                        .whitespace_normal()
+                        .child(description.clone()),
+                );
+            }
+            for (ix, (label, detail)) in options.iter().enumerate() {
+                let pick = selected.clone();
+                body = body.child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            Radio::new(("choose-option", ix))
+                                .label(label.clone())
+                                .checked(selected.get() == ix)
+                                .on_click(move |_, window, _| {
+                                    pick.set(ix);
+                                    window.refresh();
+                                }),
+                        )
+                        .when(!detail.is_empty(), |row| {
+                            row.child(
+                                div()
+                                    .pl(px(24.))
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .whitespace_normal()
+                                    .child(detail.clone()),
+                            )
+                        }),
+                );
+            }
+            for (ix, (label, _)) in checks.iter().enumerate() {
+                let states = states.clone();
+                body = body.child(
+                    Checkbox::new(("choose-check", ix))
+                        .label(*label)
+                        .checked(states[ix].get())
+                        .on_click(move |checked, window, _| {
+                            states[ix].set(*checked);
+                            window.refresh();
+                        }),
+                );
+            }
+            let (submit, on_enter) = (submit.clone(), submit.clone());
+            dialog
+                .title(title.clone())
+                .w(px(540.))
+                .on_ok(move |_, window, cx| {
+                    on_enter(window, cx);
+                    false
+                })
+                .child(body)
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("cancel")
+                                .label(tr("取消"))
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("ok")
+                                .primary()
+                                .label(ok)
+                                .on_click(move |_, window, cx| submit(window, cx)),
+                        ),
+                )
+        });
+    }
+
     /// 新建分支：在提交历史里选了提交就从它创建，否则从当前 HEAD 创建。
     pub(super) fn new_branch_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let start = (self.mode == Mode::History)
@@ -233,21 +359,33 @@ impl RepoView {
             };
             args.push(branch.clone());
             args.extend(start.as_ref().map(|(id, _)| id.clone()));
-            this.run_op(
-                tr("新建分支"),
-                args,
-                None,
-                window,
-                cx,
-                move |_, _, window, cx| {
-                    let text = if switch {
-                        tf!("已创建分支 {branch}，并切换过去", branch)
-                    } else {
-                        tf!("已创建分支 {branch}", branch)
-                    };
-                    window.push_notification(Notification::success(text), cx);
-                },
-            );
+            let what = tf!("切换到 {branch}", branch = &branch);
+            let create =
+                move |this: &mut Self, stash: bool, window: &mut Window, cx: &mut Context<Self>| {
+                    let branch = branch.clone();
+                    this.run_stashed(
+                        tr("新建分支"),
+                        vec![Step::local(args.clone())],
+                        stash,
+                        window,
+                        cx,
+                        move |_, _, window, cx| {
+                            let text = if switch {
+                                tf!("已创建分支 {branch}，并切换过去", branch)
+                            } else {
+                                tf!("已创建分支 {branch}", branch)
+                            };
+                            window.push_notification(Notification::success(text), cx);
+                        },
+                    );
+                };
+            // 从别的提交新建并切换过去，工作区要换内容：有改动时先问怎么处理。
+            // 从当前 HEAD 新建不用问，改动原样留着
+            if switch && start.is_some() {
+                this.with_local_changes(what, tr("带着改动切过去"), window, cx, create);
+            } else {
+                create(this, false, window, cx);
+            }
         });
     }
 
@@ -256,8 +394,7 @@ impl RepoView {
         let ask = Ask {
             title: tr("贮藏改动").into(),
             placeholder: tr("说明，可以不填").into(),
-            hint: tr("工作区和暂存区的改动收起来，恢复成干净的状态；以后从侧栏的「贮藏」里恢复。")
-                .into(),
+            hint: tr("把改动收起来，工作区恢复干净；以后从侧栏的「贮藏」里恢复。").into(),
             ok: tr("贮藏"),
             checks: vec![(tr("包括未跟踪的文件"), false)],
             allow_empty: true,
@@ -265,13 +402,13 @@ impl RepoView {
                 let entries = this.status.as_ref().map(|s| s.entries.as_slice())?;
                 let untracked = answer.checks.first().copied().unwrap_or(false);
                 if entries.is_empty() {
-                    Some(tr("工作区是干净的，没有可以贮藏的改动").into())
+                    Some(tr("没有可以贮藏的改动").into())
                 } else if !untracked
                     && entries
                         .iter()
                         .all(|e| e.unstaged == Some(Kind::Untracked) && e.staged.is_none())
                 {
-                    Some(tr("现在只有未跟踪的文件：勾上「包括未跟踪的文件」才能贮藏它们").into())
+                    Some(tr("只有未跟踪的文件：勾上「包括未跟踪的文件」才能贮藏").into())
                 } else {
                     None
                 }
@@ -279,14 +416,8 @@ impl RepoView {
             ..Default::default()
         };
         self.ask(ask, window, cx, |this, answer, window, cx| {
-            let mut args: Vec<String> = vec!["stash".into(), "push".into()];
-            if answer.checks.first().copied().unwrap_or(false) {
-                args.push("--include-untracked".into());
-            }
-            if !answer.text.is_empty() {
-                args.push("-m".into());
-                args.push(answer.text);
-            }
+            let untracked = answer.checks.first().copied().unwrap_or(false);
+            let args = fr_core::stash::push_args(Some(&answer.text), untracked);
             this.run_op(
                 tr("贮藏"),
                 args,

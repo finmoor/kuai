@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory)] [int]$ProcessId,
-    # click | dblclick | rclick | mclick | drag | move | type | key | activate | hittest | syscommand
+    # click | dblclick | rclick | mclick | drag | move | wheel | type | key | activate | hittest | syscommand
     [Parameter(Mandatory)] [string]$Action,
     # 截图里的坐标（窗口矩形左上角为原点的物理像素，和 capture-printwindow.ps1 的图一致）
     [int]$X, [int]$Y, [int]$X2, [int]$Y2,
@@ -115,6 +115,16 @@ switch ($Action) {
             Post $WM_MOUSEMOVE $MK_LBUTTON (LParam $mx $my)
         }
         Post $WM_LBUTTONUP ([IntPtr]0) (LParam $X2 $Y2)
+    }
+    'wheel' {
+        # 滚轮：-Text 给格数，负数往下滚（不给就是 -3）。滚轮消息的坐标是屏幕坐标，和别的鼠标消息不一样；
+        # gpui 把滚动交给鼠标底下的那一块，所以先投一次移动
+        $notches = if ($Text) { [int]$Text } else { -3 }
+        Post $WM_MOUSEMOVE ([IntPtr]0) (LParam $X $Y)
+        $sx = $r.Left + $X; $sy = $r.Top + $Y
+        $at = [IntPtr]((($sy -band 0xFFFF) -shl 16) -bor ($sx -band 0xFFFF))
+        $delta = if ($notches -lt 0) { -120 } else { 120 }
+        for ($i = 0; $i -lt [Math]::Abs($notches); $i++) { Post 0x020A ([IntPtr]([int64]$delta -shl 16)) $at }
     }
     'activate' {
         # 模拟「切到别的程序再切回来」：先失活再激活（不真的改前台窗口）

@@ -10,16 +10,21 @@ use std::ops::Range;
 use fr_core::patch::{self, FileDiff, LineKind};
 use fr_core::status::Entry;
 use gpui_kit::component::Rope;
+use gpui_kit::component::diff::{DiffLineRange, DiffSide};
 use gpui_kit::component::highlighter::{HighlightTheme, SyntaxHighlighter};
 use gpui_kit::{HighlightStyle, SharedString, UniformListScrollHandle};
 
 use super::changes::Area;
+use super::inline_diff::{self, Marks};
 
 /// 一行最多显示这么多字符，超长的行（比如压缩过的 js）后面截掉；生成补丁时用的是原样字节，不受影响
 const MAX_CHARS: usize = 4000;
 
 /// 代码行加起来超过这么多字节就不做语法高亮（高亮在界面线程上算）
 const MAX_HIGHLIGHT_BYTES: usize = 400_000;
+
+/// 最多给这么多对行算行内差异（也在界面线程上算）
+const MAX_INLINE_PAIRS: usize = 2000;
 
 /// 一行里的语法高亮：字节范围和样式
 pub(super) type LineHighlights = Vec<(Range<usize>, HighlightStyle)>;
@@ -58,6 +63,8 @@ pub(super) struct StageDiff {
     pub(super) highlights: Vec<LineHighlights>,
     /// 高亮是按深色还是浅色主题算的；还没算过时为空
     pub(super) highlighted_dark: Option<bool>,
+    /// 每行里相对配对的那一行改了的部分（行内差异）；没有时是空的
+    pub(super) inline: Vec<Marks>,
     pub(super) selected: Vec<bool>,
     anchor: Option<usize>,
     /// 键盘上下键现在停在哪一行
@@ -112,7 +119,7 @@ impl StageDiff {
             }
         }
         let notice: Option<SharedString> = if file.is_combined() {
-            Some(tr("这个文件有冲突：在编辑器里解决后，点「标记为已解决」暂存它").into())
+            Some(tr("有冲突：点「解决冲突…」逐处选；在别处改好的，点「标记为已解决」").into())
         } else if file.is_binary() {
             Some(tr("二进制文件，只能整个文件操作").into())
         } else if file.hunks.is_empty() {
@@ -130,6 +137,11 @@ impl StageDiff {
             .max_by_key(|(_, t)| t.len())
             .map(|(i, _)| i);
         let selected = vec![false; rows.len()];
+        let inline = if file.is_combined() {
+            Vec::new()
+        } else {
+            inline_marks(&file, &rows, &texts)
+        };
         Self {
             area,
             entry,
@@ -138,6 +150,7 @@ impl StageDiff {
             texts,
             highlights: Vec::new(),
             highlighted_dark: None,
+            inline,
             selected,
             anchor: None,
             cursor: None,
@@ -148,6 +161,65 @@ impl StageDiff {
             notice,
             error: None,
             source: out.to_vec(),
+        }
+    }
+
+    /// git 给的原始 diff（并排着看时交给组件库再解析一遍）。
+    pub(super) fn source(&self) -> &[u8] {
+        &self.source
+    }
+
+    /// 并排着看时，组件库那边选中了一段行：把这段里的改动行标成选中，后面暂存、丢弃用的还是这份标记。
+    /// 同一边的范围只算那一边的行（左边是删除的行，右边是增加的行）；从一边拖到另一边的，
+    /// 按改动在补丁里的先后算中间的全部改动行。
+    pub(super) fn select_lines(&mut self, range: Option<&DiffLineRange>) {
+        self.clear();
+        self.anchor = None;
+        self.cursor = None;
+        let Some(range) = range else {
+            return;
+        };
+        let number = |row: &Row, side: DiffSide| match row {
+            Row::Line(h, l) => {
+                let line = &self.file.hunks[*h].lines[*l];
+                match side {
+                    DiffSide::Original => line.old_no,
+                    DiffSide::Modified => line.new_no,
+                }
+            }
+            _ => None,
+        };
+        if range.side() == range.end_side() {
+            let side = range.side();
+            let (lo, hi) = (
+                range.start().min(range.end()) as u32,
+                range.start().max(range.end()) as u32,
+            );
+            let wanted = match side {
+                DiffSide::Original => LineKind::Removed,
+                DiffSide::Modified => LineKind::Added,
+            };
+            for ix in 0..self.rows.len() {
+                let Row::Line(h, l) = self.rows[ix] else {
+                    continue;
+                };
+                let hit = number(&self.rows[ix], side).is_some_and(|n| (lo..=hi).contains(&n));
+                if hit && self.file.hunks[h].lines[l].kind == wanted {
+                    self.selected[ix] = true;
+                }
+            }
+            return;
+        }
+        let find = |side: DiffSide, line: usize| {
+            self.rows
+                .iter()
+                .position(|row| number(row, side) == Some(line as u32))
+        };
+        if let (Some(a), Some(b)) = (
+            find(range.side(), range.start()),
+            find(range.end_side(), range.end()),
+        ) {
+            self.select_range(a, b);
         }
     }
 
@@ -170,6 +242,7 @@ impl StageDiff {
             texts: Vec::new(),
             highlights: Vec::new(),
             highlighted_dark: None,
+            inline: Vec::new(),
             selected: Vec::new(),
             anchor: None,
             cursor: None,
@@ -383,7 +456,49 @@ impl StageDiff {
     }
 }
 
-/// 显示用的文字：不是 UTF-8 的字节显示成替换字符，Tab 换成 4 个空格，去掉行尾的 `\r`。
+/// 给每一行算行内差异。一块里连着的删除行后面紧跟着增加行，就按顺序一一配对来比。
+fn inline_marks(file: &FileDiff, rows: &[Row], texts: &[SharedString]) -> Vec<Marks> {
+    let mut marks = vec![Marks::new(); rows.len()];
+    // 块标题在第几行：块里第 l 行就在它后面第 l + 1 行
+    let mut starts = vec![0usize; file.hunks.len()];
+    for (ix, row) in rows.iter().enumerate() {
+        if let Row::Hunk(h) = row {
+            starts[*h] = ix;
+        }
+    }
+    let mut budget = MAX_INLINE_PAIRS;
+    for (h, hunk) in file.hunks.iter().enumerate() {
+        let lines = &hunk.lines;
+        let mut at = 0;
+        while at < lines.len() {
+            if lines[at].kind != LineKind::Removed {
+                at += 1;
+                continue;
+            }
+            let removed = lines[at..]
+                .iter()
+                .take_while(|line| line.kind == LineKind::Removed)
+                .count();
+            let added = lines[at + removed..]
+                .iter()
+                .take_while(|line| line.kind == LineKind::Added)
+                .count();
+            for k in 0..removed.min(added) {
+                if budget == 0 {
+                    return marks;
+                }
+                budget -= 1;
+                let (old_row, new_row) = (starts[h] + 1 + at + k, starts[h] + 1 + at + removed + k);
+                let (old, new) = inline_diff::pair(&texts[old_row], &texts[new_row]);
+                marks[old_row] = old;
+                marks[new_row] = new;
+            }
+            at += removed + added;
+        }
+    }
+    marks
+}
+
 /// 按文件扩展名（或文件名）认语言，返回高亮器认识的名字。
 fn language_for(path: &str) -> Option<&'static str> {
     let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
@@ -434,6 +549,7 @@ fn language_for(path: &str) -> Option<&'static str> {
     })
 }
 
+/// 显示用的文字：不是 UTF-8 的字节显示成替换字符，Tab 换成 4 个空格，去掉行尾的 `\r`。
 fn display(bytes: &[u8]) -> SharedString {
     let text = crate::text::decode(bytes);
     let text = text.strip_suffix('\r').unwrap_or(&text);
@@ -529,6 +645,75 @@ mod tests {
         assert_eq!(diff.selected_count(), 2);
         // 到头了不动
         assert_eq!(diff.step(false, false), None);
+    }
+
+    #[test]
+    fn 配对的行有行内差异() {
+        let v = view();
+        // 第 2 行是 -2，第 3 行是 +two：差得太多，不标
+        assert!(v.inline[2].is_empty() && v.inline[3].is_empty());
+        let diff = "diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -1,4 +1,4 @@
+ fn main() {
+-    let count = items.len();
+-    print(count);
++    let total = items.len();
++    print(total);
+ }
+";
+        let entry = Entry {
+            path: "a.rs".into(),
+            orig_path: None,
+            staged: None,
+            unstaged: Some(fr_core::status::Kind::Modified),
+            submodule: false,
+        };
+        let v = StageDiff::new(
+            Area::Unstaged,
+            entry,
+            diff.as_bytes(),
+            UniformListScrollHandle::new(),
+        );
+        // 行：块标题、上下文、两行删除、两行增加、上下文
+        let marked = |row: usize| -> Vec<&str> {
+            v.inline[row]
+                .iter()
+                .map(|range| &v.texts[row][range.clone()])
+                .collect()
+        };
+        assert_eq!(marked(2), ["count"]);
+        assert_eq!(marked(3), ["count"]);
+        assert_eq!(marked(4), ["total"]);
+        assert_eq!(marked(5), ["total"]);
+        assert!(v.inline[1].is_empty() && v.inline[6].is_empty());
+    }
+
+    #[test]
+    fn 并排时按行号选中改动行() {
+        let mut v = view();
+        // 左边（旧的）第 1 到 3 行：只有删除的那一行（-2）算
+        v.select_lines(Some(&DiffLineRange::new("a.txt", DiffSide::Original, 1, 3)));
+        assert_eq!(v.selected_count(), 1);
+        assert!(v.selected[2]);
+        // 右边（新的）第 11 到 2 行，倒着拖也行：+two 和 +x
+        v.select_lines(Some(&DiffLineRange::new(
+            "a.txt",
+            DiffSide::Modified,
+            11,
+            2,
+        )));
+        assert_eq!(v.selected_count(), 2);
+        assert!(v.selected[3] && v.selected[7]);
+        // 从左边第 2 行拖到右边第 2 行：-2 和 +two
+        let across =
+            DiffLineRange::new("a.txt", DiffSide::Original, 2, 2).with_end_side(DiffSide::Modified);
+        v.select_lines(Some(&across));
+        assert_eq!(v.selected_count(), 2);
+        assert!(v.selected[2] && v.selected[3]);
+        v.select_lines(None);
+        assert_eq!(v.selected_count(), 0);
     }
 
     #[test]

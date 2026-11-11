@@ -75,6 +75,7 @@ impl RepoView {
         });
         let back = match self.mode {
             Mode::Blame => self.blame.as_ref().map_or(Mode::History, |b| b.back),
+            Mode::Merge => Mode::Changes,
             other => other,
         };
         self.blame = Some(BlameView {
@@ -208,7 +209,7 @@ impl RepoView {
                     .border_color(border)
                     .text_sm()
                     .child(div().text_color(muted).child(tr("逐行追溯")))
-                    .child(div().flex_1().min_w_0().truncate().child(view.path.clone()))
+                    .child(crate::ui::clipped("blame-path", view.path.clone()).flex_1())
                     .child(
                         div()
                             .text_xs()
@@ -296,9 +297,8 @@ impl RepoView {
                                 .w(px(260.))
                                 .flex_none()
                                 .pr_2()
-                                .truncate()
                                 .text_color(muted)
-                                .child(what),
+                                .child(crate::ui::clipped("what", what)),
                         )
                         .child(
                             div()

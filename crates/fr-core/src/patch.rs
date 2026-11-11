@@ -44,6 +44,17 @@ fn diff_args(extra: &[&str], paths: &[&str]) -> Vec<String> {
     args
 }
 
+/// 「看整个文件」时要的上下文行数：比哪个文件都长就行。
+pub const WHOLE_FILE: u32 = 1_000_000;
+
+/// 把 diff、show 参数里的 `-U3` 换成别的上下文行数。按行暂存用的补丁不受影响：
+/// 上下文再多，生成补丁时也只是多带几行上下文。
+pub fn set_context(args: &mut [String], lines: u32) {
+    if let Some(arg) = args.iter_mut().find(|arg| arg.starts_with("-U")) {
+        *arg = format!("-U{lines}");
+    }
+}
+
 /// 把补丁应用到暂存区：暂存（`reverse=false`）或取消暂存（`reverse=true`）。补丁从标准输入给。
 pub fn apply_cached_args(reverse: bool) -> Vec<String> {
     let mut args = apply_args(reverse);

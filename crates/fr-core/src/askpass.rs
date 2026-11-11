@@ -19,6 +19,9 @@ use serde::{Deserialize, Serialize};
 
 const ENV_ADDR: &str = "FR_ASKPASS_ADDR";
 const ENV_TOKEN: &str = "FR_ASKPASS_TOKEN";
+/// 加在某一个 git、ssh 进程上的标记：askpass 把它原样带回来，主进程就知道是哪一次在问。
+/// 客户端连接服务器时用它认出「这台服务器存了密码」，自动回答。
+pub const TAG_ENV: &str = "FR_ASKPASS_TAG";
 /// 提示文字最长这么多，超过的不理会
 const MAX_PROMPT: u64 = 16 * 1024;
 
@@ -26,6 +29,8 @@ const MAX_PROMPT: u64 = 16 * 1024;
 struct Ask {
     token: String,
     prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tag: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -39,6 +44,14 @@ struct Answer {
 pub fn serve(
     helper: &Path,
     on_prompt: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
+) -> Result<Vec<(String, String)>> {
+    serve_tagged(helper, move |prompt, _| on_prompt(prompt))
+}
+
+/// 同 [`serve`]，`on_prompt` 多拿到一个参数：发问的进程环境变量 [`TAG_ENV`] 的值（没设就是 None）。
+pub fn serve_tagged(
+    helper: &Path,
+    on_prompt: impl Fn(&str, Option<&str>) -> Option<String> + Send + Sync + 'static,
 ) -> Result<Vec<(String, String)>> {
     let token = random_token();
     let (listener, addr) = Listener::bind(helper)?;
@@ -74,7 +87,7 @@ pub fn serve(
 fn answer_one(
     stream: Box<dyn Stream>,
     expected: &str,
-    on_prompt: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+    on_prompt: &(dyn Fn(&str, Option<&str>) -> Option<String> + Send + Sync),
 ) -> Result<()> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -84,7 +97,7 @@ fn answer_one(
         anyhow::bail!(tr("口令不对"));
     }
     let answer = Answer {
-        answer: on_prompt(&ask.prompt),
+        answer: on_prompt(&ask.prompt, ask.tag.as_deref()),
     };
     let mut stream = reader.into_inner();
     serde_json::to_writer(&mut stream, &answer)?;
@@ -108,7 +121,8 @@ pub fn run_helper() -> Option<i32> {
     }
     let ask = || -> Result<Option<String>> {
         let mut stream = connect(&addr)?;
-        serde_json::to_writer(&mut stream, &Ask { token, prompt })?;
+        let tag = std::env::var(TAG_ENV).ok();
+        serde_json::to_writer(&mut stream, &Ask { token, prompt, tag })?;
         stream.write_all(b"\n")?;
         stream.flush()?;
         let mut line = String::new();
@@ -209,13 +223,38 @@ fn connect(addr: &str) -> Result<Box<dyn Stream>> {
 }
 
 /// 128 位随机口令。标准库的 `RandomState` 每次新建都从系统取随机种子，借它生成，不用另加依赖。
-fn random_token() -> String {
+pub fn random_token() -> String {
     let part = || {
         let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
         hasher.write_u32(std::process::id());
         hasher.finish()
     };
     format!("{:016x}{:016x}", part(), part())
+}
+
+/// ssh、git 在要什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    /// 登录密码
+    Password,
+    /// 私钥文件的口令
+    Passphrase,
+    /// 别的：用户名、确认主机指纹、验证码……
+    Other,
+}
+
+/// 从提示文字看它在要什么。ssh、git 的提示不随系统语言变。
+pub fn prompt_kind(prompt: &str) -> PromptKind {
+    let lower = prompt.to_lowercase();
+    if lower.contains("(yes/no") {
+        PromptKind::Other
+    } else if lower.contains("passphrase") {
+        PromptKind::Passphrase
+    } else if lower.contains("password") {
+        PromptKind::Password
+    } else {
+        PromptKind::Other
+    }
 }
 
 /// 提示是不是在要密码（要遮住输入）。用户名、yes/no 确认这些不遮。
@@ -249,6 +288,47 @@ mod tests {
     }
 
     #[test]
+    fn 认得出在要密码还是密钥口令() {
+        assert_eq!(prompt_kind("user@host's password: "), PromptKind::Password);
+        assert_eq!(prompt_kind("(user@host) Password: "), PromptKind::Password);
+        assert_eq!(
+            prompt_kind("Enter passphrase for key 'C:\\Users\\u/.ssh/id_ed25519': "),
+            PromptKind::Passphrase
+        );
+        assert_eq!(prompt_kind("Verification code: "), PromptKind::Other);
+        assert_eq!(
+            prompt_kind("Are you sure you want to continue connecting (yes/no/[fingerprint])? "),
+            PromptKind::Other
+        );
+    }
+
+    #[test]
+    fn 标记原样带给主进程() {
+        let dir = std::env::temp_dir();
+        let env = serve_tagged(&dir.join("fr-askpass-test-helper"), |prompt, tag| {
+            Some(format!("{prompt}/{}", tag.unwrap_or("无")))
+        })
+        .unwrap();
+        let get = |key: &str| env.iter().find(|(k, _)| k == key).unwrap().1.clone();
+        let (addr, token) = (get(ENV_ADDR), get(ENV_TOKEN));
+        let ask = |tag: Option<&str>| -> Option<String> {
+            let mut stream = connect(&addr).unwrap();
+            let ask = Ask {
+                token: token.clone(),
+                prompt: "问".into(),
+                tag: tag.map(str::to_string),
+            };
+            serde_json::to_writer(&mut stream, &ask).unwrap();
+            stream.write_all(b"\n").unwrap();
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).ok()?;
+            serde_json::from_str::<Answer>(&line).ok()?.answer
+        };
+        assert_eq!(ask(Some("t1")).as_deref(), Some("问/t1"));
+        assert_eq!(ask(None).as_deref(), Some("问/无"));
+    }
+
+    #[test]
     fn 请求带着口令才回答() {
         let dir = std::env::temp_dir();
         let env = serve(&dir.join("fr-askpass-test-helper"), |prompt| {
@@ -263,6 +343,7 @@ mod tests {
             let ask = Ask {
                 token: token.into(),
                 prompt: prompt.into(),
+                tag: None,
             };
             serde_json::to_writer(&mut stream, &ask).unwrap();
             stream.write_all(b"\n").unwrap();

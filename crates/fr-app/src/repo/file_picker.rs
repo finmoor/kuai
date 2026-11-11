@@ -179,7 +179,7 @@ impl Render for FilePicker {
                             blame: false,
                         })
                     }))
-                    .child(div().flex_1().min_w_0().text_sm().truncate().child(path))
+                    .child(crate::ui::clipped("path", path).flex_1().text_sm())
                     .child(
                         Button::new(("blame", ix))
                             .xsmall()
@@ -202,7 +202,7 @@ impl Render for FilePicker {
             Files::Ready(_) if total == 0 => Some((tr("没有匹配的文件").into(), muted)),
             Files::Ready(_) if total > shown => Some((
                 tf!(
-                    "匹配 {total} 个文件，只列出前 {shown} 个；再输几个字缩小范围",
+                    "匹配 {total} 个，只列前 {shown} 个；多输几个字缩小范围",
                     total,
                     shown
                 )
@@ -226,7 +226,7 @@ impl Render for FilePicker {
                 note.map(|(text, color)| div().px_2().text_xs().text_color(color).child(text)),
             )
             .child(div().px_2().text_xs().text_color(muted).child(tr(
-                "回车或点一下看文件历史；点右边的「逐行追溯」看每一行最后是谁改的。",
+                "回车或点一下看文件历史；右边的「逐行追溯」看每行是谁改的。",
             )))
     }
 }

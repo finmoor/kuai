@@ -1714,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "fr-agent"
-version = "1.1.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "fr-core",
@@ -1724,7 +1724,7 @@ dependencies = [
 
 [[package]]
 name = "fr-app"
-version = "1.1.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1738,6 +1738,7 @@ dependencies = [
  "raw-window-handle",
  "serde",
  "serde_json",
+ "similar",
  "tray-icon",
  "winreg",
  "winresource",
@@ -1745,7 +1746,7 @@ dependencies = [
 
 [[package]]
 name = "fr-channel"
-version = "1.1.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "fr-core",
@@ -1755,7 +1756,7 @@ dependencies = [
 
 [[package]]
 name = "fr-core"
-version = "1.1.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "libc",

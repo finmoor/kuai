@@ -22,10 +22,10 @@ use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_fl
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+use super::layout::Split;
 use super::{Mode, RepoView};
 use crate::ui;
 
-pub(super) const WIDTH: f32 = 240.;
 const ROW_HEIGHT: f32 = 26.;
 /// 目录树每深一层往右缩进多少。
 const INDENT: f32 = 14.;
@@ -430,10 +430,13 @@ impl RepoView {
         let (muted, border, accent) = (theme.muted_foreground, theme.sidebar_border, theme.primary);
         let remote = self.entry.server.is_some();
         let place = self.place(cx);
+        let name = self.app.read(cx).repo_name(&self.entry);
+        let (view, entry) = (cx.entity().downgrade(), self.entry.clone());
         v_flex()
             .flex_none()
             .child(
                 h_flex()
+                    .id("side-header")
                     .h(px(super::TOOLBAR_HEIGHT))
                     .px(px(12.))
                     .gap(px(10.))
@@ -461,20 +464,41 @@ impl RepoView {
                         v_flex()
                             .min_w_0()
                             .child(
-                                div()
+                                ui::clipped("repo-name", name)
                                     .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .truncate()
-                                    .child(self.entry.name().to_string()),
+                                    .font_weight(FontWeight::SEMIBOLD),
                             )
                             .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(muted)
-                                    .truncate()
-                                    .child(format!("{place} · {}", self.entry.path)),
+                                // 提示里位置和路径各一行：路径很长，接在一行里会从盘符后面断开
+                                ui::clipped_with_tip(
+                                    "repo-place",
+                                    format!("{place} · {}", self.entry.path),
+                                    format!("{place}\n{}", self.entry.path),
+                                )
+                                .text_size(px(11.))
+                                .text_color(muted),
                             ),
-                    ),
+                    )
+                    .context_menu(move |menu, _, _| {
+                        let (view, entry) = (view.clone(), entry.clone());
+                        let path = entry.path.clone();
+                        menu.item(
+                            gpui_kit::component::menu::PopupMenuItem::new(tr("改名…")).on_click(
+                                move |_, _, cx| {
+                                    view.update(cx, |_, cx| {
+                                        cx.emit(super::RepoEvent::Rename(entry.clone()))
+                                    })
+                                    .ok();
+                                },
+                            ),
+                        )
+                        .item(
+                            gpui_kit::component::menu::PopupMenuItem::new(tr("复制仓库路径"))
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                                }),
+                        )
+                    }),
             )
             .child(
                 div().px(px(10.)).pt(px(8.)).pb(px(4.)).child(
@@ -488,16 +512,16 @@ impl RepoView {
 
     pub(super) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let (bg, border) = (theme.sidebar, theme.sidebar_border);
+        let bg = theme.sidebar;
         let count = self.sidebar_rows(cx).len();
         let actions = self.render_side_actions(cx);
+        let width = self.sizes(cx).sidebar;
         v_flex()
-            .w(px(WIDTH))
+            .w(px(width))
             .flex_none()
             .h_full()
+            .relative()
             .bg(bg)
-            .border_r_1()
-            .border_color(border)
             .child(self.render_side_header(cx))
             .child(
                 div()
@@ -519,6 +543,8 @@ impl RepoView {
                     ),
             )
             .children(actions)
+            // 右边那条线就是分隔条：拖它改侧栏的宽度，双击回到默认
+            .child(self.split_handle(Split::Sidebar, cx))
             .into_any_element()
     }
 
@@ -622,6 +648,7 @@ impl RepoView {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let rows = self.sidebar_rows(cx);
+        let hidden = self.hidden_refs(cx);
         let theme = cx.theme();
         let (fg, muted, active, hover, danger, accent) = (
             theme.sidebar_foreground,
@@ -660,7 +687,52 @@ impl RepoView {
                     .flex_none()
                     .text_color(muted)
                 };
-                let name = |text: String| div().flex_1().min_w_0().truncate().child(text);
+                // 在提交列表里藏起来的、单独看的：名字变淡或者行尾标一下
+                let full = match item {
+                    SideItem::Branch(i) => self
+                        .refs
+                        .branches
+                        .get(i)
+                        .map(|b| format!("refs/heads/{}", b.name)),
+                    SideItem::Remote(i) => self
+                        .refs
+                        .remotes
+                        .get(i)
+                        .map(|b| format!("refs/remotes/{}", b.name)),
+                    SideItem::Tag(i) => self
+                        .refs
+                        .tags
+                        .get(i)
+                        .map(|t| format!("refs/tags/{}", t.name)),
+                    _ => None,
+                };
+                let is_hidden = full.as_ref().is_some_and(|full| hidden.contains(full));
+                let is_only = full.as_ref().is_some_and(|full| self.is_only(full));
+                // 名字放不下时停上去看全名；分支、标签在文件夹里的，给带路径的全名
+                let full_name = full
+                    .as_ref()
+                    .map(|full| full.splitn(3, '/').nth(2).unwrap_or(full).to_string());
+                let name = |text: String| {
+                    let tip = full_name.clone().unwrap_or_else(|| text.clone());
+                    ui::clipped_with_tip(("side-name", ix), text, tip).flex_1()
+                };
+                let mark = |row: Div| {
+                    row.when(is_hidden, |r| {
+                        r.child(
+                            ui::icon_small(IconName::EyeOff)
+                                .flex_none()
+                                .text_color(muted),
+                        )
+                    })
+                    .when(is_only, |r| {
+                        r.child(
+                            ui::icon_small(IconName::ListFilter)
+                                .flex_none()
+                                .text_color(accent),
+                        )
+                    })
+                };
+                let inner = inner.when(is_hidden, |row| row.text_color(muted));
                 let count = |n: usize| {
                     div()
                         .flex_none()
@@ -753,13 +825,16 @@ impl RepoView {
                                         .child(detail),
                                 )
                             })
+                            .map(mark)
                     }
                     SideItem::Remote(_) => inner
                         .child(ui::icon(IconName::GitBranch).flex_none().text_color(muted))
-                        .child(name(row.label)),
+                        .child(name(row.label))
+                        .map(mark),
                     SideItem::Tag(_) => inner
                         .child(ui::icon(IconName::Tag).flex_none().text_color(muted))
-                        .child(name(row.label)),
+                        .child(name(row.label))
+                        .map(mark),
                     SideItem::Submodule(_) => inner
                         .child(ui::icon(IconName::Package).flex_none().text_color(muted))
                         .child(name(row.label)),
@@ -837,7 +912,7 @@ impl RepoView {
             other => Some(other),
         };
         self.sidebar.selected = found.unwrap_or(match self.mode {
-            Mode::Changes => SideItem::Changes,
+            Mode::Changes | Mode::Merge => SideItem::Changes,
             Mode::History | Mode::Blame => SideItem::History,
         });
     }

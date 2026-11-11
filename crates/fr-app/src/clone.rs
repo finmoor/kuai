@@ -281,7 +281,7 @@ impl CloneView {
         drop(_task);
         if self.server.is_some() {
             self.status = Some((
-                tf!("克隆已中止。服务器上的 {target} 里可能留着下了一半的内容：再克隆之前先把它删掉，或者换一个文件夹名。", target)
+                tf!("克隆已中止。服务器上的 {target} 可能留着下了一半的内容：先删掉它，或者换个文件夹名再克隆。", target)
                 .into(),
                 true,
             ));
@@ -312,7 +312,7 @@ impl CloneView {
                                 false,
                             ),
                             Err(err) => (
-                                tf!("克隆已中止，但下了一半的 {target} 没删掉（{err}）：再克隆之前先手动删掉它。", target, err)
+                                tf!("克隆已中止，但下了一半的 {target} 没删掉（{err}），请手动删除。", target, err)
                                 .into(),
                                 true,
                             ),
@@ -401,10 +401,7 @@ fn name_error(name: &str) -> Option<String> {
         || name == ".."
         || name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|'])
     {
-        Some(
-            tr("文件夹名里不能有 / \\ : * ? \" < > |：这里只填一个名字，放在哪个目录下在上面填。")
-                .into(),
-        )
+        Some(tr("文件夹名里不能有 / \\ : * ? \" < > |。放在哪个目录在上面填。").into())
     } else {
         None
     }
@@ -416,7 +413,7 @@ fn dir_not_empty(path: &Path) -> bool {
 
 fn exists_text(target: &str) -> String {
     tf!(
-        "{target} 已经存在，而且里面有东西。换一个文件夹名，或者先把它删掉。",
+        "{target} 已经存在且不是空的。换个文件夹名，或者先删掉它。",
         target
     )
 }
@@ -433,10 +430,7 @@ fn explain(err: &str, target: &str) -> String {
         Some(tr("找不到这个仓库。检查地址对不对，这个账号有没有权限。").to_string())
     } else if lower.contains("no such file or directory") || lower.contains("cannot find the path")
     {
-        Some(
-            tr("放仓库的目录不存在。服务器上的目录要先建好，或者点「浏览…」选一个已有的。")
-                .to_string(),
-        )
+        Some(tr("放仓库的目录不存在。先在服务器上建好，或点「浏览…」选一个。").to_string())
     } else {
         crate::repo::explain(err).map(str::to_string)
     };
@@ -480,7 +474,7 @@ impl Render for CloneView {
         let label = move |text: &'static str| div().text_xs().text_color(muted).child(text);
         let hint = match &self.server {
             None => tr("克隆到这台电脑上。目录不存在会新建。"),
-            Some(_) => tr("克隆到服务器上，由服务器去连远程仓库；放仓库的目录要已经存在。"),
+            Some(_) => tr("由服务器去连远程仓库；放仓库的目录要已经存在。"),
         };
         // 实际会克隆到哪里：克隆期间显示的是开始时定下来的
         let target = match &self.running {

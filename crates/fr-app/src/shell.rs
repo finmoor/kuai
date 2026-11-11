@@ -11,6 +11,8 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::{App, Window};
 
+use crate::settings::{Server, Target};
+
 /// CREATE_NO_WINDOW：不弹出控制台窗口
 const NO_WINDOW: u32 = 0x0800_0000;
 
@@ -85,8 +87,8 @@ pub fn open_terminal(dir: &str) -> Result<(), String> {
     spawn(cmd, tr("终端"))
 }
 
-/// 在终端里登录服务器并进到仓库目录。
-pub fn open_terminal_ssh(destination: &str, dir: &str) -> Result<(), String> {
+/// 在终端里登录服务器并进到仓库目录。指定了私钥文件的带上；密码在终端里自己输。
+pub fn open_terminal_ssh(server: &Server, dir: &str) -> Result<(), String> {
     if !in_path("ssh") {
         return Err(tr(
             "PATH 里没有 ssh。在「设置 › 系统 › 可选功能」里装上「OpenSSH 客户端」再试。",
@@ -96,20 +98,23 @@ pub fn open_terminal_ssh(destination: &str, dir: &str) -> Result<(), String> {
     // 目录用单引号包起来，里面的单引号换成 '\''
     let quoted = format!("'{}'", dir.replace('\'', r"'\''"));
     let remote = format!("cd {quoted} && exec \"$SHELL\" -l");
+    let mut ssh = vec!["ssh", "-t"];
+    if let Some(key) = server.key_file() {
+        ssh.extend(["-i", key]);
+    }
+    ssh.extend(["--", &server.destination, &remote]);
     let mut wt = Command::new("wt.exe");
-    wt.args(["ssh", "-t", "--", destination, &remote]);
+    wt.args(&ssh);
     if wt.spawn().is_ok() {
         return Ok(());
     }
     let mut cmd = Command::new("cmd.exe");
-    cmd.args(["/c", "start", "", "ssh", "-t", "--", destination, &remote]);
+    cmd.args(["/c", "start", ""]).args(&ssh);
     spawn(cmd, tr("终端"))
 }
 
 fn no_code() -> &'static str {
-    tr(
-        "没有找到 VS Code 的命令行（code）。装 VS Code 时勾上「添加到 PATH」，装好后重开这个程序再试。",
-    )
+    tr("找不到 VS Code 的命令行（code）。安装 VS Code 时勾上「添加到 PATH」，然后重开本程序。")
 }
 
 /// 用 VS Code 打开本机的目录或文件。`code` 是个 cmd 脚本，要经 cmd 启动。
@@ -130,12 +135,14 @@ pub fn open_vscode_remote(destination: &str, path: &str) -> Result<(), String> {
     if !in_path("code") {
         return Err(no_code().into());
     }
+    // Remote-SSH 不认 ssh:// 的写法，端口要写成 user@host:port
+    let host = Target::parse(destination).authority();
     let mut cmd = Command::new("cmd.exe");
     cmd.args([
         "/c",
         "code",
         "--remote",
-        &format!("ssh-remote+{destination}"),
+        &format!("ssh-remote+{host}"),
         path,
     ])
     .creation_flags(NO_WINDOW);

@@ -44,6 +44,46 @@ pub fn log_args() -> Vec<String> {
     LOG_ARGS.iter().map(|s| s.to_string()).collect()
 }
 
+/// 提交列表里列哪些分支上的提交。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Scope {
+    /// 所有本地分支、远程分支、标签和 HEAD
+    #[default]
+    All,
+    /// 只列从这几个引用（完整的引用名、`HEAD` 或哈希）够得着的提交
+    Refs(Vec<String>),
+}
+
+/// 按范围读提交历史的参数。`hidden` 是隐藏起来的引用（完整的名字，比如 `refs/heads/wip`、
+/// `refs/remotes/origin/old`、`refs/tags/v0.1`），只在列全部分支时起作用：这些引用不当起点，
+/// 只在它们上面的提交就不出现了。HEAD 总是列出来的，所以隐藏不了当前分支。
+pub fn scoped_log_args(scope: &Scope, hidden: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = vec!["log".into()];
+    match scope {
+        Scope::All if hidden.is_empty() => return log_args(),
+        Scope::All => {
+            // `--exclude` 只管它后面最近的一个 `--branches`、`--remotes` 或 `--tags`，
+            // 而且写的是去掉 `refs/heads/` 这类前缀以后的名字
+            for (prefix, flag) in [
+                ("refs/heads/", "--branches"),
+                ("refs/remotes/", "--remotes"),
+                ("refs/tags/", "--tags"),
+            ] {
+                for name in hidden.iter().filter_map(|full| full.strip_prefix(prefix)) {
+                    args.push(format!("--exclude={name}"));
+                }
+                args.push(flag.into());
+            }
+            args.push("HEAD".into());
+        }
+        Scope::Refs(refs) => args.extend(refs.iter().cloned()),
+    }
+    args.extend(["--date-order", "-z", FORMAT].map(String::from));
+    // 引用名和后面可能出现的路径分开：分支叫 `docs`、仓库里又有 `docs` 目录时不会有歧义
+    args.push("--".into());
+    args
+}
+
 /// 文件历史的参数：从 HEAD 往回，只要改过这个文件的提交，跟着改名往回找。
 pub fn file_log_args(path: &str) -> Vec<String> {
     ["log", "--follow", "-z", FORMAT, "HEAD", "--"]
@@ -153,6 +193,91 @@ mod tests {
         assert_eq!(&*commits[0].subject, "修复：空列表崩溃");
         assert!(commits[1].parents.is_empty());
         assert_eq!(commits[1].time, 1700000000);
+    }
+
+    #[test]
+    fn 按范围读历史的参数() {
+        let args = |scope: &Scope, hidden: &[&str]| {
+            let hidden: Vec<String> = hidden.iter().map(|s| s.to_string()).collect();
+            scoped_log_args(scope, &hidden).join(" ")
+        };
+        // 什么都不限：和原来的一样
+        assert_eq!(args(&Scope::All, &[]), LOG_ARGS.join(" "));
+        // 隐藏的引用按种类排在各自的开关前面
+        let hidden = args(
+            &Scope::All,
+            &[
+                "refs/heads/wip/a",
+                "refs/tags/v0.1",
+                "refs/remotes/origin/old",
+            ],
+        );
+        assert!(
+            hidden.starts_with(
+                "log --exclude=wip/a --branches --exclude=origin/old --remotes --exclude=v0.1 --tags HEAD --date-order"
+            ),
+            "{hidden}"
+        );
+        // 只看几个引用
+        let only = args(
+            &Scope::Refs(vec!["HEAD".into(), "refs/remotes/origin/main".into()]),
+            &["refs/heads/wip/a"],
+        );
+        assert!(
+            only.starts_with("log HEAD refs/remotes/origin/main --date-order"),
+            "{only}"
+        );
+        assert!(only.ends_with(" --"));
+    }
+
+    #[test]
+    fn 隐藏的分支上独有的提交不列出来() {
+        let dir = std::env::temp_dir().join(format!("fr-log-scope-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| crate::git::run(&dir, args).unwrap();
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&["checkout", "-q", "-b", "wip/a"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "only on wip"]);
+        git(&["tag", "v0.1"]);
+        git(&["checkout", "-q", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "on main"]);
+
+        let subjects = |scope: &Scope, hidden: &[&str]| -> Vec<String> {
+            let hidden: Vec<String> = hidden.iter().map(|s| s.to_string()).collect();
+            let args = scoped_log_args(scope, &hidden);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = crate::git::run(&dir, &args).unwrap();
+            let mut subjects: Vec<String> =
+                parse(&out).iter().map(|c| c.subject.to_string()).collect();
+            subjects.sort();
+            subjects
+        };
+        assert_eq!(
+            subjects(&Scope::All, &[]),
+            ["base", "on main", "only on wip"]
+        );
+        // 分支藏了，标签还指着那个提交：还看得到
+        assert_eq!(
+            subjects(&Scope::All, &["refs/heads/wip/a"]),
+            ["base", "on main", "only on wip"]
+        );
+        assert_eq!(
+            subjects(&Scope::All, &["refs/heads/wip/a", "refs/tags/v0.1"]),
+            ["base", "on main"]
+        );
+        assert_eq!(
+            subjects(&Scope::Refs(vec!["HEAD".into()]), &[]),
+            ["base", "on main"]
+        );
+        assert_eq!(
+            subjects(&Scope::Refs(vec!["refs/heads/wip/a".into()]), &[]),
+            ["base", "only on wip"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -11,6 +11,7 @@ mod manager;
 mod palette;
 mod prompt;
 mod repo;
+mod secrets;
 mod settings;
 mod settings_page;
 mod shell;

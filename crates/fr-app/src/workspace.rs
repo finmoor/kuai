@@ -1,7 +1,8 @@
 //! 主窗口：标题栏（工作区、标签页、设置）和下面的内容。
 //!
 //! 标题栏是自己画的，标签页直接放在里面，不另占一行。第一个标签页是仓库管理器，后面每个
-//! 打开的仓库一个；设置页打开时也是一个标签页。
+//! 打开的仓库一个；设置页打开时也是一个标签页。标签页开多了先一起变窄，窄到头了横向滚动，
+//! 右边多出一个列出全部标签页的按钮；设置和窗口的按钮一直留在原地。
 //!
 //! 工作区是一组标签页：切到另一个工作区，标签栏整个换成它的那一组。别的工作区里已经打开过
 //! 的标签页留在内存里（正在做的操作不会被打断），只是不显示。
@@ -40,6 +41,8 @@ use crate::win::{self, Hwnd};
 
 /// 标题栏的高度。标签页 28 高，上下各留 5。
 const TITLE_HEIGHT: f32 = 38.;
+/// 标签页最窄缩到这么宽（还看得见图标和名字的头几个字）；再放不下就横向滚动。
+const TAB_MIN_WIDTH: f32 = 96.;
 
 struct RepoTab {
     entry: RepoEntry,
@@ -70,6 +73,10 @@ pub struct Workspace {
     parked: Vec<Option<Parked>>,
     /// 设置页开着；它盖在当前标签页上面，关掉回到原来那一页
     showing_settings: bool,
+    /// 标签栏的横向滚动位置
+    tab_scroll: ScrollHandle,
+    /// 标签页多到放不下了（上一帧量出来的）：多显示一个「所有标签页」的按钮
+    tabs_overflow: bool,
     /// 关掉的标签页里没提交的说明，再打开同一个仓库时放回去（只在这次运行期间记着）
     drafts: Vec<(RepoEntry, String)>,
     tray: Option<Tray>,
@@ -94,6 +101,7 @@ impl Workspace {
         let subscriptions = vec![
             cx.subscribe_in(&manager, window, |this, _, event, window, cx| match event {
                 ManagerEvent::Open(entry) => this.open(entry.clone(), window, cx),
+                ManagerEvent::Rename(entry) => this.rename_repo(entry.clone(), window, cx),
             }),
             // 设置变了：服务器改名要刷新标签上的名字；服务器被移除了，它上面的仓库的标签页跟着关掉；
             // 主题、语言、托盘的选项变了就应用到窗口上
@@ -147,6 +155,8 @@ impl Workspace {
             active: 0,
             parked: (0..count).map(|_| None).collect(),
             showing_settings: false,
+            tab_scroll: ScrollHandle::new(),
+            tabs_overflow: false,
             drafts: Vec::new(),
             tray: None,
             hwnd: win::hwnd(window),
@@ -311,8 +321,46 @@ impl Workspace {
             }
         }
         self.showing_settings = false;
+        self.reveal_active_tab();
         self.persist(cx);
         cx.notify();
+    }
+
+    /// 标签页多到要滚动时，把选中的那一页滚到看得见的地方。
+    fn reveal_active_tab(&self) {
+        if let Some(ix) = self.active.checked_sub(1) {
+            self.tab_scroll.scroll_to_item(ix);
+        }
+    }
+
+    /// 在标签页上滚滚轮：标签页多到放不下时左右滚。
+    fn scroll_tabs(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let max = self.tab_scroll.max_offset().x;
+        if max <= px(0.) {
+            return;
+        }
+        let delta = event.delta.pixel_delta(window.line_height());
+        let step = if delta.x.is_zero() { delta.y } else { delta.x };
+        let mut offset = self.tab_scroll.offset();
+        offset.x = (offset.x + step).clamp(-max, px(0.));
+        self.tab_scroll.set_offset(offset);
+        cx.notify();
+    }
+
+    /// 给仓库改名：只改这里显示的名字，目录不动。留空恢复成目录名。
+    fn rename_repo(&mut self, entry: RepoEntry, window: &mut Window, cx: &mut Context<Self>) {
+        let app = self.app.clone();
+        let current = app.read(cx).repo_name(&entry).to_string();
+        ask_name(
+            tr("仓库改名"),
+            tr("显示的名字，留空用目录名"),
+            current,
+            tr("改名"),
+            true,
+            window,
+            cx,
+            move |name, _, cx| app.update(cx, |app, cx| app.rename_repo(&entry, &name, cx)),
+        );
     }
 
     fn build_tab(
@@ -330,6 +378,7 @@ impl Workspace {
                     .update(cx, |app, cx| app.add_repo(entry.clone(), cx));
                 this.open(entry.clone(), window, cx);
             }
+            RepoEvent::Rename(entry) => this.rename_repo(entry.clone(), window, cx),
         })
         .detach();
         // 上次关这个仓库的标签页时说明框里还有没提交的内容：放回去
@@ -462,6 +511,7 @@ impl Workspace {
     fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.active = ix.min(self.tabs.len());
         self.showing_settings = false;
+        self.reveal_active_tab();
         self.persist(cx);
         cx.notify();
     }
@@ -600,6 +650,7 @@ impl Workspace {
             }
         }
         self.showing_settings = false;
+        self.reveal_active_tab();
         self.persist(cx);
         cx.notify();
     }
@@ -611,6 +662,7 @@ impl Workspace {
             tr("工作区的名字，比如「公司」「个人」"),
             String::new(),
             tr("新建"),
+            false,
             window,
             cx,
             move |name, window, cx| {
@@ -633,6 +685,7 @@ impl Workspace {
             tr("新的名字"),
             old,
             tr("改名"),
+            false,
             window,
             cx,
             move |name, _, cx| app.update(cx, |app, cx| app.rename_workspace(ix, &name, cx)),
@@ -669,10 +722,7 @@ impl Workspace {
                 .description(if tabs == 0 {
                     tr("这个工作区里没有开着的标签页。").to_string()
                 } else {
-                    tf!(
-                        "里面开着的 {tabs} 个标签页会关掉。仓库还在仓库列表里，随时可以再打开。",
-                        tabs
-                    )
+                    tf!("里面的 {tabs} 个标签页会关掉，仓库还在列表里。", tabs)
                 })
                 .on_ok(|_, _, _| false)
                 .footer(
@@ -780,12 +830,19 @@ impl Workspace {
                 this.close(ix, window, cx);
             },
         ));
-        let (menu_this, menu_app, path) = (
-            cx.entity().downgrade(),
-            self.app.clone(),
-            tab.entry.path.clone(),
-        );
+        let (menu_this, menu_app, entry) =
+            (cx.entity().downgrade(), self.app.clone(), tab.entry.clone());
+        // 标签页窄了名字会被截掉：停上去显示完整的名字和路径
+        let (tip_title, tip_path) = (title.clone(), SharedString::from(tab.entry.path.clone()));
         tab_shell(("tab", ix), selected, cx)
+            .flex_shrink(1.)
+            .min_w(px(TAB_MIN_WIDTH))
+            .max_w(px(210.))
+            .tooltip(move |window, cx| {
+                ui::two_line_tip(tip_title.clone(), tip_path.clone(), window, cx)
+            })
+            // 标签页自己挡住了鼠标，滚轮到不了外面那层：在这里接住，滚标签栏
+            .on_scroll(cx.listener(Self::scroll_tabs))
             .on_click(cx.listener(move |this, _, _, cx| this.select(ix + 1, cx)))
             // 中键关标签页
             .on_mouse_down(
@@ -800,16 +857,70 @@ impl Workspace {
             })
             .child(close)
             .context_menu(move |menu, _, cx| {
-                tab_menu(menu, ix, path.clone(), &menu_app, &menu_this, cx)
+                tab_menu(menu, ix, entry.clone(), &menu_app, &menu_this, cx)
             })
             .into_any_element()
     }
 
-    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// 「所有标签页」的按钮：标签页多到要滚动时才有，点开列出全部，选一个就切过去。
+    fn render_tab_list_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let app = self.app.read(cx);
+        let titles: Vec<SharedString> = self
+            .tabs
+            .iter()
+            .map(|tab| app.repo_title(&tab.entry))
+            .collect();
+        let active = (!self.showing_settings)
+            .then(|| self.active.checked_sub(1))
+            .flatten();
+        let this = cx.entity().downgrade();
+        div()
+            .occlude()
+            .flex_none()
+            .child(
+                Button::new("tab-list")
+                    .ghost()
+                    .xsmall()
+                    .icon(ui::icon(IconName::ChevronDown))
+                    .tooltip(tr("所有标签页"))
+                    .dropdown_menu(move |mut menu, _, _| {
+                        for (ix, title) in titles.iter().enumerate() {
+                            let this = this.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(title.clone())
+                                    .checked(active == Some(ix))
+                                    .on_click(move |_, _, cx| {
+                                        this.update(cx, |this, cx| this.select(ix + 1, cx)).ok();
+                                    }),
+                            );
+                        }
+                        menu
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_title_bar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // 标签页放不放得下要等排完版才知道：下一帧看一眼滚动范围，变了再画一次
+        {
+            let handle = self.tab_scroll.clone();
+            cx.on_next_frame(window, move |this, _, cx| {
+                let overflow = handle.max_offset().x > px(0.5);
+                if overflow != this.tabs_overflow {
+                    this.tabs_overflow = overflow;
+                    cx.notify();
+                }
+            });
+        }
         let theme = cx.theme();
         let (border, muted) = (theme.border, theme.muted_foreground);
         let home_selected = self.active == 0 && !self.showing_settings;
         let home = tab_shell("tab-home", home_selected, cx)
+            .flex_none()
             .on_click(cx.listener(|this, _, _, cx| this.select(0, cx)))
             .child(ui::icon(IconName::LayoutGrid).flex_none())
             .child(trc("页面", "仓库"));
@@ -818,6 +929,7 @@ impl Workspace {
             .collect();
         let settings_tab = self.showing_settings.then(|| {
             tab_shell("tab-settings", true, cx)
+                .flex_none()
                 .child(ui::icon(IconName::Settings).flex_none())
                 .child(tr("设置"))
                 .child(
@@ -825,6 +937,37 @@ impl Workspace {
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_settings(cx))),
                 )
         });
+        let list_button = self.tabs_overflow.then(|| self.render_tab_list_button(cx));
+        // 标签页这一段：放不下时在自己的宽度里滚动
+        let strip = h_flex()
+            .absolute()
+            .inset_0()
+            .gap(px(4.))
+            .child(
+                h_flex()
+                    .id("tab-strip")
+                    .flex_shrink(1.)
+                    .min_w_0()
+                    .h_full()
+                    .gap(px(4.))
+                    .overflow_x_scroll()
+                    .track_scroll(&self.tab_scroll)
+                    .children(repo_tabs)
+                    .children(settings_tab),
+            )
+            .child(
+                div().occlude().flex_none().child(
+                    Button::new("tab-add")
+                        .ghost()
+                        .xsmall()
+                        .icon(ui::icon(IconName::Plus))
+                        .tooltip(tr("打开仓库（Ctrl+P）"))
+                        .on_click(cx.listener(|this, _, window, cx| this.quick_open(window, cx))),
+                ),
+            )
+            .children(list_button)
+            // 这一段是空的：按住可以拖窗口
+            .child(div().flex_1().min_w(px(24.)).h_full());
         TitleBar::new().h(px(TITLE_HEIGHT)).child(
             h_flex()
                 .h_full()
@@ -834,22 +977,10 @@ impl Workspace {
                 .child(self.render_workspace_button(cx))
                 .child(div().flex_none().w(px(1.)).h(px(16.)).mx(px(4.)).bg(border))
                 .child(home)
-                .children(repo_tabs)
-                .children(settings_tab)
-                .child(
-                    div().occlude().child(
-                        Button::new("tab-add")
-                            .ghost()
-                            .xsmall()
-                            .icon(ui::icon(IconName::Plus))
-                            .tooltip(tr("打开仓库（Ctrl+P）"))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.quick_open(window, cx)),
-                            ),
-                    ),
-                )
-                // 这一段是空的：按住可以拖窗口
-                .child(div().flex_1().min_w(px(24.)).h_full())
+                // 标签页那一段画在这个占位的块里面（绝对定位）。标题栏的宽度按里面内容的
+                // 最小宽度算，直接把标签页排在这一行里的话，开多了会把整行撑宽，
+                // 右边的设置和窗口按钮被挤出窗口
+                .child(div().relative().flex_1().min_w_0().h_full().child(strip))
                 .child(
                     div().occlude().mr(px(4.)).text_color(muted).child(
                         Button::new("open-settings")
@@ -877,11 +1008,11 @@ fn tab_shell(id: impl Into<ElementId>, selected: bool, cx: &App) -> Stateful<Div
     h_flex()
         .id(id)
         .group("tab")
-        // 标题栏整条是「拖动窗口」的区域，上面的控件要自己接住鼠标
+        // 标题栏整条是「拖动窗口」的区域，上面的控件要自己接住鼠标。
+        // 不能用「挡鼠标但放过滚轮」的那种：系统问这一点是不是标题栏时，gpui 把被它挡住的
+        // 拖动区也算上，真实鼠标点标签页就成了拖窗口
         .occlude()
-        .flex_shrink(1.)
-        .min_w(px(56.))
-        .max_w(px(210.))
+        .relative()
         .h(px(28.))
         .px(px(10.))
         .gap(px(6.))
@@ -899,10 +1030,11 @@ fn tab_shell(id: impl Into<ElementId>, selected: bool, cx: &App) -> Stateful<Div
         })
 }
 
-/// 标签页上的关闭按钮：选中的一直显示，没选中的鼠标移上去才显示。
+/// 标签页上的关闭按钮：选中的一直显示；没选中的鼠标移上去才显示，浮在标签页右边
+/// （不占名字的地方，标签页窄的时候名字能多露几个字）。
 fn tab_close(id: impl Into<ElementId>, selected: bool, cx: &App) -> Stateful<Div> {
     let theme = cx.theme();
-    let (muted, hover) = (theme.muted_foreground, theme.secondary);
+    let (muted, hover, tab_hover) = (theme.muted_foreground, theme.secondary, theme.accent);
     div()
         .id(id)
         .flex_none()
@@ -914,7 +1046,14 @@ fn tab_close(id: impl Into<ElementId>, selected: bool, cx: &App) -> Stateful<Div
         .text_color(muted)
         .hover(|s| s.bg(hover))
         .when(!selected, |close| {
-            close.invisible().group_hover("tab", |s| s.visible())
+            close
+                .absolute()
+                .right(px(6.))
+                .top(px(5.))
+                // 底色和悬停时的标签页一样，盖住下面的字
+                .bg(tab_hover)
+                .invisible()
+                .group_hover("tab", |s| s.visible())
         })
         .child(ui::icon_small(IconName::X))
 }
@@ -966,12 +1105,13 @@ fn workspace_menu(
 fn tab_menu(
     menu: PopupMenu,
     ix: usize,
-    path: String,
+    entry: RepoEntry,
     app: &Entity<AppState>,
     this: &WeakEntity<Workspace>,
     cx: &App,
 ) -> PopupMenu {
-    let (close, others, all) = (this.clone(), this.clone(), this.clone());
+    let (close, others, all, rename) = (this.clone(), this.clone(), this.clone(), this.clone());
+    let path = entry.path.clone();
     let mut menu = menu
         .item(
             PopupMenuItem::new(tr("关闭")).on_click(move |_, window, cx| {
@@ -1013,6 +1153,13 @@ fn tab_menu(
         menu = menu.separator();
     }
     menu.item(
+        PopupMenuItem::new(tr("改名…")).on_click(move |_, window, cx| {
+            rename
+                .update(cx, |this, cx| this.rename_repo(entry.clone(), window, cx))
+                .ok();
+        }),
+    )
+    .item(
         PopupMenuItem::new(tr("复制仓库路径")).on_click(move |_, _, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
         }),
@@ -1022,12 +1169,15 @@ fn tab_menu(
 /// 对话框里「确定」要做的事：回车和点按钮共用。
 type Submit = Rc<dyn Fn(&mut Window, &mut App)>;
 
-/// 问一个名字的小对话框：一个输入框，回车或点确定时名字不空就关掉并调用 `on_ok`。
+/// 问一个名字的小对话框：一个输入框，回车或点确定时关掉并调用 `on_ok`。
+/// `allow_empty` 为假时名字是空的就不关。
+#[allow(clippy::too_many_arguments)]
 fn ask_name<T: 'static>(
     title: &'static str,
     placeholder: &'static str,
     value: String,
     ok: &'static str,
+    allow_empty: bool,
     window: &mut Window,
     cx: &mut Context<T>,
     on_ok: impl Fn(String, &mut Window, &mut App) + 'static,
@@ -1040,7 +1190,7 @@ fn ask_name<T: 'static>(
         let input = input.clone();
         Rc::new(move |window, cx| {
             let name = input.read(cx).value().trim().to_string();
-            if name.is_empty() {
+            if name.is_empty() && !allow_empty {
                 return;
             }
             window.close_dialog(cx);
@@ -1079,7 +1229,8 @@ fn ask_name<T: 'static>(
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let title_bar = self.render_title_bar(window, cx).into_any_element();
         let theme = cx.theme();
         let (bg, fg) = (theme.background, theme.foreground);
         let content = if self.showing_settings {
@@ -1094,7 +1245,7 @@ impl Render for Workspace {
             .size_full()
             .bg(bg)
             .text_color(fg)
-            .child(self.render_title_bar(cx))
+            .child(title_bar)
             .child(div().flex_1().min_h_0().child(content))
     }
 }
@@ -1202,8 +1353,12 @@ impl Render for QuickOpen {
                     .child(
                         v_flex()
                             .min_w_0()
-                            .child(div().text_sm().child(title))
-                            .child(div().text_xs().text_color(muted).truncate().child(path)),
+                            .child(ui::clipped(("quick-title", ix), title).text_sm())
+                            .child(
+                                ui::clipped(("quick-path", ix), path)
+                                    .text_xs()
+                                    .text_color(muted),
+                            ),
                     )
                     .into_any_element()
             })

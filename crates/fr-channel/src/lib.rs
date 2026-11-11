@@ -11,8 +11,9 @@ mod remote;
 
 use fr_core::i18n::tr;
 use fr_core::tf;
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ use futures::Stream;
 use futures::channel::mpsc;
 use futures::future::BoxFuture;
 
+pub use fr_core::askpass::PromptKind;
 pub use fr_core::protocol::{DirEntry, DirListing, Hello};
 pub use remote::{ConnectOptions, Connection};
 
@@ -108,7 +110,10 @@ pub fn init_prompts(
         bail!(tr("init_prompts 只能调用一次"));
     }
     let exe = std::env::current_exe()?;
-    let env = fr_core::askpass::serve(&exe, move |prompt| handler(prompt))?;
+    // 这次连接存了密码、口令的先自动回答；没存的、答过一次还问的，才交给界面弹窗
+    let env = fr_core::askpass::serve_tagged(&exe, move |prompt, tag| {
+        saved_answer(tag, prompt).or_else(|| handler(prompt))
+    })?;
     fr_core::git::set_extra_env(env.clone());
     let _ = SSH_ENV.set(env);
     Ok(())
@@ -120,6 +125,57 @@ pub(crate) fn prompt_handler() -> Option<PromptHandler> {
 
 pub(crate) fn ssh_env() -> Option<&'static [(String, String)]> {
     SSH_ENV.get().map(Vec::as_slice)
+}
+
+/// 一个 ssh 进程可以自动回答的密码或口令。
+struct Saved {
+    secret: String,
+    kind: PromptKind,
+    /// 只答一次：答错了 ssh 会再问，那时交给弹窗，不拿同一个错的反复答
+    used: bool,
+}
+
+/// 标记（ssh 进程环境变量 `FR_ASKPASS_TAG` 的值）→ 它可以用的密码、口令
+static SAVED: LazyLock<Mutex<HashMap<String, Saved>>> = LazyLock::new(Mutex::default);
+
+/// 登记期间，带着这个标记的 ssh 要密码（或口令）时自动回答；丢弃就撤掉。
+pub(crate) struct SavedSecret {
+    tag: String,
+}
+
+impl SavedSecret {
+    pub(crate) fn register(secret: &str, kind: PromptKind) -> SavedSecret {
+        let tag = fr_core::askpass::random_token();
+        let saved = Saved {
+            secret: secret.to_string(),
+            kind,
+            used: false,
+        };
+        SAVED.lock().unwrap().insert(tag.clone(), saved);
+        SavedSecret { tag }
+    }
+
+    /// 要设到 ssh 进程环境变量 `FR_ASKPASS_TAG` 上的值。
+    pub(crate) fn tag(&self) -> &str {
+        &self.tag
+    }
+}
+
+impl Drop for SavedSecret {
+    fn drop(&mut self) {
+        SAVED.lock().unwrap().remove(&self.tag);
+    }
+}
+
+/// 这次提问能不能用存着的密码、口令回答：标记对得上、问的正是存的那一种、还没答过。
+fn saved_answer(tag: Option<&str>, prompt: &str) -> Option<String> {
+    let mut saved = SAVED.lock().unwrap();
+    let entry = saved.get_mut(tag?)?;
+    if entry.used || entry.kind != fr_core::askpass::prompt_kind(prompt) {
+        return None;
+    }
+    entry.used = true;
+    Some(entry.secret.clone())
 }
 
 /// 仓库所在的地方：本机，或者某台服务器的连接。
@@ -179,5 +235,43 @@ impl Channel {
             Channel::Local => local::list_dir(path),
             Channel::Remote(conn) => conn.list_dir(path),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 存着的密码只答一次_只答问对的那一种() {
+        let password = SavedSecret::register("pw", PromptKind::Password);
+        let tag = password.tag().to_string();
+        // 没带标记、标记不对：不答
+        assert_eq!(saved_answer(None, "u@h's password: "), None);
+        assert_eq!(saved_answer(Some("别的"), "u@h's password: "), None);
+        // 问的是私钥口令、主机指纹：不答，也不算用掉
+        let passphrase_prompt = "Enter passphrase for key 'k': ";
+        assert_eq!(saved_answer(Some(&tag), passphrase_prompt), None);
+        assert_eq!(saved_answer(Some(&tag), "… (yes/no/[fingerprint])? "), None);
+        assert_eq!(
+            saved_answer(Some(&tag), "u@h's password: ").as_deref(),
+            Some("pw")
+        );
+        // 答过了还问（密码不对）：不再答，交给弹窗
+        assert_eq!(saved_answer(Some(&tag), "u@h's password: "), None);
+
+        // 存的是私钥口令：只答口令
+        let passphrase = SavedSecret::register("pp", PromptKind::Passphrase);
+        let tag = passphrase.tag().to_string();
+        assert_eq!(saved_answer(Some(&tag), "u@h's password: "), None);
+        assert_eq!(
+            saved_answer(Some(&tag), passphrase_prompt).as_deref(),
+            Some("pp")
+        );
+        // 撤掉以后不答
+        let again = SavedSecret::register("pp", PromptKind::Passphrase);
+        let tag = again.tag().to_string();
+        drop(again);
+        assert_eq!(saved_answer(Some(&tag), passphrase_prompt), None);
     }
 }

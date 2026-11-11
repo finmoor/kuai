@@ -18,7 +18,7 @@ use gpui_kit::*;
 
 use crate::app_state::AppState;
 use crate::palette::PALETTES;
-use crate::settings::ThemeChoice;
+use crate::settings::{AUTO_FETCH_CHOICES, ThemeChoice};
 
 pub struct SettingsPage {
     app: Entity<AppState>,
@@ -57,7 +57,7 @@ impl SettingsPage {
                     },
                 ),
             )
-            .description(tr("换了以后马上生效；已经弹出来的通知不会跟着变。"))
+            .description(tr("马上生效；已弹出的通知不变。"))
         };
         let autostart = SettingItem::new(
             tr("开机时自动启动"),
@@ -71,9 +71,7 @@ impl SettingsPage {
                 },
             ),
         )
-        .description(tr(
-            "登录 Windows 后自己启动。开了下面的托盘选项时直接收进托盘，不弹窗口。",
-        ));
+        .description(tr("登录 Windows 后自动启动；开了托盘选项时直接进托盘。"));
         let minimize = {
             let (get, set) = (app.clone(), app.clone());
             SettingItem::new(
@@ -87,7 +85,7 @@ impl SettingsPage {
                     },
                 ),
             )
-            .description(tr("最小化以后任务栏上不留按钮，点托盘图标回来。"))
+            .description(tr("最小化后任务栏不留按钮，点托盘图标回来。"))
         };
         let close = {
             let (get, set) = (app.clone(), app.clone());
@@ -102,9 +100,44 @@ impl SettingsPage {
                     },
                 ),
             )
+            .description(tr("点关闭按钮只是藏起窗口；退出在托盘图标的右键菜单里。"))
+        };
+        let auto_fetch = {
+            let (get, set) = (app.clone(), app.clone());
+            SettingItem::new(
+                tr("自动获取"),
+                SettingField::dropdown(
+                    AUTO_FETCH_CHOICES
+                        .iter()
+                        .map(|minutes| (minutes.to_string().into(), auto_fetch_label(*minutes)))
+                        .collect(),
+                    move |cx| get.read(cx).settings.auto_fetch_minutes.to_string().into(),
+                    move |value: SharedString, cx| {
+                        let minutes = value.parse().unwrap_or(0);
+                        set.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| s.auto_fetch_minutes = minutes)
+                        });
+                    },
+                ),
+            )
             .description(tr(
-                "点右上角的关闭按钮只是把窗口藏起来；要退出，在托盘图标上点右键选「退出」。",
+                "在后台定时获取正在看的仓库（git fetch --all）。要密码时跳过，不弹窗。",
             ))
+        };
+        let stash = {
+            let (get, set) = (app.clone(), app.clone());
+            SettingItem::new(
+                tr("有改动时切换分支、拉取：默认先贮藏"),
+                SettingField::switch(
+                    move |cx| get.read(cx).settings.stash_before_switch,
+                    move |on, cx| {
+                        set.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| s.stash_before_switch = on)
+                        })
+                    },
+                ),
+            )
+            .description(tr("切换分支、检出、拉取前有没提交的改动时，默认怎么处理。"))
         };
         SettingPage::new(tr("常规"))
             .icon(Icon::new(IconName::Settings2))
@@ -116,6 +149,12 @@ impl SettingsPage {
                     .item(autostart)
                     .item(minimize)
                     .item(close),
+            )
+            .group(
+                SettingGroup::new()
+                    .title("Git")
+                    .item(auto_fetch)
+                    .item(stash),
             )
     }
 
@@ -259,6 +298,15 @@ impl SettingsPage {
     }
 }
 
+/// 自动获取的一档叫什么。
+fn auto_fetch_label(minutes: u32) -> SharedString {
+    match minutes {
+        0 => tr("不自动获取").into(),
+        60 => tr("每小时").into(),
+        minutes => fr_core::tf!("每 {minutes} 分钟", minutes).into(),
+    }
+}
+
 fn language_key(language: Language) -> &'static str {
     match language {
         Language::System => "system",
@@ -336,7 +384,7 @@ fn swatches(app: &Entity<AppState>, active: &'static str, cx: &App) -> AnyElemen
                         .py_1()
                         .gap_1()
                         .text_xs()
-                        .child(div().flex_1().min_w_0().truncate().child(p.label()))
+                        .child(crate::ui::clipped("palette-name", p.label()).flex_1())
                         .when(on, |row| {
                             row.child(crate::ui::icon_small(IconName::Check).text_color(accent))
                         }),

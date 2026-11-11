@@ -21,6 +21,7 @@ use gpui_kit::*;
 use super::RepoView;
 
 /// 写操作里的一步。
+#[derive(Clone)]
 pub(super) struct Step {
     pub args: Vec<String>,
     pub stdin: Option<Vec<u8>>,
@@ -154,6 +155,8 @@ impl RepoView {
         let Some(channel) = self.channel.clone() else {
             return;
         };
+        // 后台的自动获取让路：用户要做的事优先，两条 git 也不会抢同一个引用的锁
+        self.stop_auto_fetch();
         for step in &steps {
             log::info!("{}：git {}", self.entry.path, step.args.join(" "));
         }
@@ -187,10 +190,11 @@ impl RepoView {
                 let marked = this.update(cx, |this, cx| {
                     this.op_progress = net.then(SharedString::default);
                     cx.notify();
+                    this.activity.begin(label.clone(), &step.args)
                 });
-                if marked.is_err() {
+                let Ok(activity) = marked else {
                     return;
-                }
+                };
                 result = if step.net {
                     let mut stream = channel.git_progress(&repo, step.args);
                     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
@@ -232,7 +236,18 @@ impl RepoView {
                 } else {
                     channel.git_with_input(&repo, step.args, step.stdin).await
                 };
-                if !matches!(&result, Ok(out) if out.success()) {
+                let ok = matches!(&result, Ok(out) if out.success());
+                let logged = this.update(cx, |this, _| {
+                    this.activity.end(activity, &result, cancelled);
+                    // 刚联过网：自动获取从现在重新计时
+                    if net && ok {
+                        this.auto_fetch.last = std::time::Instant::now();
+                    }
+                });
+                if logged.is_err() {
+                    return;
+                }
+                if !ok {
                     failed_step = shown;
                     break;
                 }
@@ -268,22 +283,36 @@ impl RepoView {
                         this.show_changes(cx);
                         let title = tf!("{name}还没做完，又停下了", name = state.name());
                         let note = Notification::warning(
-                            tr("到「本地修改」里看看：有新的冲突就解决后再点「继续」；这个提交不要了点「跳过这个提交」。"),
+                            tr("有新冲突就在「本地修改」里解决后点「继续」；不要这个提交点「跳过这个提交」。"),
                         )
                         .title(title.clone())
                         .autohide(false);
-                        window.push_notification(with_detail(note, &title, &text), cx);
+                        let note = with_detail(note, &title, &text).id::<StoppedNote>();
+                        window.push_notification(note, cx);
                     }
                     (Some(state), Err(_)) => {
                         this.in_progress = Some(state);
                         this.show_changes(cx);
-                        let note = Notification::warning(
-                            tr("在「本地修改」里解决冲突，然后点上面的「继续」；不想做了点「中止」。"),
-                        )
-                        .title(tf!("{name}遇到冲突，停下了", name = state.name()));
+                        // 横幅上那个按钮，合并时叫「提交合并」，别的叫「继续」
+                        let go = if state == fr_core::state::InProgress::Merge {
+                            tr("提交合并")
+                        } else {
+                            tr("继续")
+                        };
+                        let note = Notification::warning(tf!(
+                            "在「本地修改」里解决冲突，然后点上面的「{go}」；不做了点「中止」。",
+                            go
+                        ))
+                        .title(tf!("{name}遇到冲突，停下了", name = state.name()))
+                        .id::<StoppedNote>();
                         window.push_notification(note, cx);
                     }
                     (_, result) => {
+                        // 停在一半时做的事（继续、跳过、中止、解决一个文件）有了结果：
+                        // 之前那条「停下了」的提示说的已经是过去的事，收掉
+                        if was_in_progress {
+                            window.remove_notification::<StoppedNote>(cx);
+                        }
                         // 多步操作：说清楚前面哪几步已经做完了，免得用户以为什么都没做
                         let result = result.map_err(|text| {
                             if total > 1 && !done.is_empty() {
@@ -427,7 +456,7 @@ impl RepoView {
         let candidate = format!("{}/{branch}", self.default_remote());
         if self.refs.remotes.iter().any(|b| b.name == candidate) {
             let description = tf!(
-                "{branch} 还没有上游分支。把它的上游设为 {candidate}，然后拉取。",
+                "{branch} 没有上游。设为 {candidate} 后拉取。",
                 branch,
                 candidate
             );
@@ -447,18 +476,39 @@ impl RepoView {
             );
         } else {
             let text = tf!(
-                "{branch} 还没有上游分支，远程上也没有同名的分支。先推送一次（会自动设好上游）；要跟踪别的远程分支，在侧栏的远程分支上点右键，选「设为当前分支的上游」。",
+                "{branch} 没有上游，远程上也没有同名分支。先推送一次；要跟踪别的分支，在侧栏的远程分支上右键「设为当前分支的上游」。",
                 branch
             );
             window.push_notification(Notification::warning(text).autohide(false), cx);
         }
     }
 
-    /// 拉取分两步：先获取（联网，可以取消），再合并或变基（改工作区，不能中途杀掉）。
+    /// 拉取。工作区有改动时先问要不要贮藏（git 自己的 `--autostash`：拉完自动放回来，
+    /// 合并遇到冲突停下时，等合并提交或中止以后再放回来）。
     fn run_pull(
+        &mut self,
+        steps: Vec<Step>,
+        rebase: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.with_local_changes(
+            tr("拉取"),
+            tr("不贮藏，直接拉取"),
+            window,
+            cx,
+            move |this, stash, window, cx| {
+                this.run_pull_now(steps.clone(), rebase, stash, window, cx)
+            },
+        );
+    }
+
+    /// 拉取分两步：先获取（联网，可以取消），再合并或变基（改工作区，不能中途杀掉）。
+    fn run_pull_now(
         &mut self,
         mut steps: Vec<Step>,
         rebase: bool,
+        autostash: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -467,6 +517,9 @@ impl RepoView {
         let mut merge = args(&["pull", "--no-edit"]);
         if rebase {
             merge.push("--rebase".into());
+        }
+        if autostash {
+            merge.push("--autostash".into());
         }
         steps.push(Step::local(merge));
         self.run_seq(
@@ -507,7 +560,7 @@ impl RepoView {
         if self.remote_names.is_empty() {
             window.push_notification(
                 Notification::warning(tr(
-                    "这个仓库还没有远程。在侧栏「远程」上点右键，选「添加远程…」，再推送。",
+                    "这个仓库还没有远程。先在侧栏「远程」上右键「添加远程…」。",
                 ))
                 .autohide(false),
                 cx,
@@ -542,17 +595,201 @@ impl RepoView {
             return;
         }
         let name = name.to_string();
-        let checkout = vec!["checkout".into(), "-q".into(), name.clone(), "--".into()];
-        self.run_op(
-            tr("切换分支"),
-            checkout,
-            None,
+        self.with_local_changes(
+            tf!("切换到 {name}", name = &name),
+            tr("带着改动切过去"),
             window,
             cx,
-            move |_, _, window, cx| {
-                window.push_notification(Notification::success(tf!("已切换到 {name}", name)), cx);
+            move |this, stash, window, cx| {
+                let name = name.clone();
+                let checkout = vec!["checkout".into(), "-q".into(), name.clone(), "--".into()];
+                this.run_stashed(
+                    tr("切换分支"),
+                    vec![Step::local(checkout)],
+                    stash,
+                    window,
+                    cx,
+                    move |_, _, window, cx| {
+                        window.push_notification(
+                            Notification::success(tf!("已切换到 {name}", name)),
+                            cx,
+                        );
+                    },
+                );
             },
         );
+    }
+
+    /// 工作区里有没有已跟踪文件的改动（切换分支、拉取时会碍事的那种；未跟踪的文件一般不碍事）。
+    pub(super) fn has_tracked_changes(&self) -> bool {
+        self.status.as_ref().is_some_and(|status| {
+            status.entries.iter().any(|entry| {
+                entry.staged.is_some()
+                    || entry
+                        .unstaged
+                        .is_some_and(|kind| kind != fr_core::status::Kind::Untracked)
+            })
+        })
+    }
+
+    /// 切换分支、检出、拉取之前：工作区有改动就先问怎么处理，再调用 `run(this, 要不要先贮藏, …)`；
+    /// 没有改动直接调用。`what` 是要做的事（「切换到 main」「拉取」），`keep` 是「不贮藏」那一项的叫法。
+    /// 选了哪样会记下来，下次默认选它。
+    pub(super) fn with_local_changes(
+        &mut self,
+        what: impl Into<SharedString>,
+        keep: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        run: impl Fn(&mut Self, bool, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        if !self.has_tracked_changes() {
+            run(self, false, window, cx);
+            return;
+        }
+        let what: SharedString = what.into();
+        let count = self.status.as_ref().map_or(0, |s| s.entries.len());
+        let choose = super::dialogs::Choose {
+            title: tr("工作区有改动还没提交").into(),
+            description: tf!(
+                "{count} 个文件有没提交的改动。「{what}」前怎么处理？",
+                count,
+                what
+            )
+            .into(),
+            options: vec![
+                (
+                    keep.into(),
+                    tr("git 的默认做法。改动和要拿到的内容冲突时 git 会拒绝，什么都不变。").into(),
+                ),
+                (
+                    tr("先贮藏，做完再放回来").into(),
+                    tr("改动（包括未跟踪的文件）先贮藏，做完自动放回。放回时有冲突，贮藏会留在侧栏里。").into(),
+                ),
+            ],
+            selected: usize::from(self.app.read(cx).settings.stash_before_switch),
+            checks: Vec::new(),
+            ok: tr("继续"),
+        };
+        self.choose(choose, window, cx, move |this, picked, _, window, cx| {
+            let stash = picked == 1;
+            this.app.update(cx, |app, cx| {
+                if app.settings.stash_before_switch != stash {
+                    app.update_settings(cx, |s| s.stash_before_switch = stash);
+                }
+            });
+            run(this, stash, window, cx);
+        });
+    }
+
+    /// 执行 `steps`（切换分支、检出这类不会停在一半的操作）。`stash` 为真时先把工作区的改动贮藏起来，
+    /// 做完以后放回去——没做成也放回去，工作区回到原来的样子。
+    pub(super) fn run_stashed(
+        &mut self,
+        label: &'static str,
+        steps: Vec<Step>,
+        stash: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        on_success: impl FnOnce(&mut Self, &GitOutput, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        if !stash {
+            self.run_seq(label, steps, window, cx, on_success);
+            return;
+        }
+        // 贮藏的说明里带一个记号：放回去时按它找，不会弹出用户自己的贮藏
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let marker = format!("fork-remote-{millis}");
+        let message = tf!(
+            "{label}之前自动贮藏的改动（{marker}）",
+            label,
+            marker = &marker
+        );
+        let push = fr_core::stash::push_args(Some(&message), true);
+        self.run_op_with(label, push, window, cx, move |this, result, window, cx| {
+            if let Err(text) = result {
+                failure(window, cx, label, text);
+                return;
+            }
+            this.run_steps(
+                label,
+                steps,
+                window,
+                cx,
+                Box::new(move |this, result, window, cx| {
+                    this.restore_stash(label, marker, result, on_success, window, cx)
+                }),
+            );
+        });
+    }
+
+    /// [`Self::run_stashed`] 的后一半：找到刚才自动贮藏的那一份，放回工作区，然后报告结果。
+    fn restore_stash(
+        &mut self,
+        label: &'static str,
+        marker: String,
+        result: Result<GitOutput, String>,
+        on_success: impl FnOnce(&mut Self, &GitOutput, &mut Window, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        let list = channel.git(&self.entry.path, fr_core::refs::stash_args());
+        cx.spawn_in(window, async move |this, cx| {
+            let selector = list
+                .await
+                .ok()
+                .and_then(|out| find_stash(&out.stdout, &marker));
+            this.update_in(cx, |this, window, cx| {
+                let Some(selector) = selector else {
+                    // 刚才没有贮藏下来东西（比如只有子模块里的改动）：就当没贮藏过
+                    match result {
+                        Ok(out) => on_success(this, &out, window, cx),
+                        Err(text) => failure(window, cx, label, text),
+                    }
+                    return;
+                };
+                let pop = vec!["stash".into(), "pop".into(), selector];
+                this.run_op_with(
+                    tr("放回改动"),
+                    pop,
+                    window,
+                    cx,
+                    move |this, popped, window, cx| match (result, popped) {
+                        (Ok(out), Ok(_)) => on_success(this, &out, window, cx),
+                        (Ok(_), Err(text)) => {
+                            this.show_changes(cx);
+                            let title = tf!("{label}做完了，但改动放回来时有冲突", label);
+                            let note = Notification::warning(tr(
+                                "在「本地修改」里解决冲突后暂存。自动贮藏还留在侧栏里，确认没丢东西再删。",
+                            ))
+                            .title(title.clone())
+                            .autohide(false);
+                            window.push_notification(with_detail(note, &title, &text), cx);
+                        }
+                        (Err(text), Ok(_)) => {
+                            let text =
+                                tf!("{text}\n\n改动已经放回工作区。", text);
+                            failure(window, cx, label, text);
+                        }
+                        (Err(text), Err(pop)) => {
+                            let text = tf!(
+                                "{text}\n\n改动放回时也出错了，还在侧栏的「贮藏」里：\n{pop}",
+                                text,
+                                pop
+                            );
+                            failure(window, cx, label, text);
+                        }
+                    },
+                );
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// 检出远程分支：有跟踪它的同名本地分支就切过去，没有就新建一个跟踪它的。
@@ -580,7 +817,7 @@ impl RepoView {
                     title: tf!("本地已经有分支 {local}", local).into(),
                     placeholder: tr("新的本地分支名").into(),
                     value: format!("{local}-{remote_name}"),
-                    hint: tf!("本地的 {local} {tracking}，不是 {remote}。填一个名字，新建跟踪 {remote} 的分支；想用原来的 {local}，取消后在侧栏双击它。", local, tracking, remote)
+                    hint: tf!("本地的 {local} {tracking}，不是 {remote}。换个名字新建；要用原来的，取消后在侧栏双击它。", local, tracking, remote)
                     .into(),
                     ok: tr("新建并切换"),
                     validate: Some(Box::new(|this, answer| {
@@ -604,28 +841,37 @@ impl RepoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let checkout = vec![
-            "checkout".into(),
-            "-q".into(),
-            "-b".into(),
-            local.clone(),
-            "--track".into(),
-            remote.clone(),
-        ];
-        self.run_op(
-            tr("切换分支"),
-            checkout,
-            None,
+        self.with_local_changes(
+            tf!("切换到 {local}", local = &local),
+            tr("带着改动切过去"),
             window,
             cx,
-            move |_, _, window, cx| {
-                window.push_notification(
-                    Notification::success(tf!(
-                        "已新建并切换到 {local}，跟踪 {remote}",
-                        local,
-                        remote
-                    )),
+            move |this, stash, window, cx| {
+                let (local, remote) = (local.clone(), remote.clone());
+                let checkout = vec![
+                    "checkout".into(),
+                    "-q".into(),
+                    "-b".into(),
+                    local.clone(),
+                    "--track".into(),
+                    remote.clone(),
+                ];
+                this.run_stashed(
+                    tr("切换分支"),
+                    vec![Step::local(checkout)],
+                    stash,
+                    window,
                     cx,
+                    move |_, _, window, cx| {
+                        window.push_notification(
+                            Notification::success(tf!(
+                                "已新建并切换到 {local}，跟踪 {remote}",
+                                local,
+                                remote
+                            )),
+                            cx,
+                        );
+                    },
                 );
             },
         );
@@ -671,7 +917,7 @@ impl RepoView {
                 // `-d` 不肯删，一般是分支还没合并。不去认 git 的报错文字（它跟着系统语言变），
                 // 原样给用户看，由用户决定要不要强制删
                 Err(text) if !force => {
-                    let description = tf!("git 没有删除 {name}：\n{text}\n\n强制删除后，只在这个分支上的提交很难再找回来。", name, text);
+                    let description = tf!("git 没有删除 {name}：\n{text}\n\n强制删除后，只在这个分支上的提交很难找回。", name, text);
                     this.confirm(
                         tr("强制删除分支？"),
                         description,
@@ -694,7 +940,7 @@ impl RepoView {
             return;
         };
         let description = tf!(
-            "恢复最近一次贮藏「{message}」（{selector}）里的改动，并把它从贮藏列表里删除。只想恢复、不删除，在侧栏的贮藏上点「应用」。",
+            "恢复贮藏「{message}」（{selector}）并把它从列表里删除。只恢复不删除，用侧栏贮藏上的「应用」。",
             message = stash.message,
             selector = stash.selector
         );
@@ -725,12 +971,8 @@ impl RepoView {
             cx,
             |this, _, window, cx| {
                 this.show_changes(cx);
-                window.push_notification(
-                    Notification::success(tr(
-                        "贮藏里的改动已经恢复到工作区，这条贮藏已从列表里删除",
-                    )),
-                    cx,
-                );
+                window
+                    .push_notification(Notification::success(tr("改动已恢复，这条贮藏已删除")), cx);
             },
         );
     }
@@ -750,10 +992,8 @@ impl RepoView {
             cx,
             |this, _, window, cx| {
                 this.show_changes(cx);
-                window.push_notification(
-                    Notification::success(tr("贮藏里的改动已经恢复到工作区，这条贮藏还留在列表里")),
-                    cx,
-                );
+                window
+                    .push_notification(Notification::success(tr("改动已恢复，这条贮藏还留着")), cx);
             },
         );
     }
@@ -815,6 +1055,9 @@ pub(super) fn failure(window: &mut Window, cx: &mut App, label: &str, detail: St
 
 /// 给通知加上 git 的原文：放在一个最高 `DETAIL_HEIGHT` 的小块里，下面是「复制全部」
 /// （复制的是标题加完整的原文）。原文不直接当通知的正文：一长就把半个窗口盖住了。
+/// 「停在一半」那条提示的标识：同一时间只留一条，状态往前走了就收掉。
+struct StoppedNote;
+
 fn with_detail(note: Notification, title: &str, detail: &str) -> Notification {
     let shown = SharedString::from(tail(detail, SHOWN_LINES));
     let full = format!("{title}\n{detail}");
@@ -855,10 +1098,12 @@ fn with_detail(note: Notification, title: &str, detail: &str) -> Notification {
 pub(crate) fn explain(detail: &str) -> Option<&'static str> {
     let text = detail.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| text.contains(w));
-    if has(&["non-fast-forward", "fetch first", "stale info"]) {
+    if has(&["not possible to fast-forward", "can't be fast-forwarded"]) {
         Some(tr(
-            "远程分支上有本地没有的提交，所以被拒绝了。先拉取（或获取后变基），再推送。",
+            "两边各有新提交，没法快进，什么都没做。要合并请换一种合并方式。",
         ))
+    } else if has(&["non-fast-forward", "fetch first", "stale info"]) {
+        Some(tr("被拒绝：远程分支上有本地没有的提交。先拉取再推送。"))
     } else if has(&[
         "authentication failed",
         "permission denied",
@@ -867,7 +1112,7 @@ pub(crate) fn explain(detail: &str) -> Option<&'static str> {
         "terminal prompts disabled",
     ]) {
         Some(tr(
-            "认证没通过。检查用户名、密码或密钥有没有这个仓库的权限，然后再试。",
+            "认证没通过。检查用户名、密码或密钥有没有这个仓库的权限。",
         ))
     } else if has(&[
         "could not resolve host",
@@ -877,28 +1122,24 @@ pub(crate) fn explain(detail: &str) -> Option<&'static str> {
         "unable to access",
         "connection reset",
     ]) {
-        Some(tr("连不上远程。检查网络、代理和远程的地址，然后再试。"))
+        Some(tr("连不上远程。检查网络、代理和远程地址。"))
     } else if has(&[
         "would be overwritten",
         "please commit your changes or stash them",
     ]) {
-        Some(tr(
-            "本地有改动会被覆盖，所以没有做。先提交或贮藏这些改动，然后再试。",
-        ))
+        Some(tr("本地改动会被覆盖，没有做。先提交或贮藏再试。"))
     } else if has(&["index.lock", "another git process"]) {
         Some(tr(
-            "有别的 git 进程正在用这个仓库，或者上次的操作没正常结束留下了锁文件。等一下再试；一直不行就删掉 .git 目录里的 index.lock。",
+            "仓库被锁住了：有别的 git 进程在用，或者上次操作没正常结束。稍后再试；一直不行就删掉 .git/index.lock。",
         ))
     } else if has(&["not fully merged"]) {
         Some(tr("这个分支还有没合并进来的提交。"))
     } else if has(&["no upstream", "has no upstream branch"]) {
-        Some(tr("这个分支还没有上游分支。推送一次会自动设好。"))
+        Some(tr("这个分支没有上游，推送一次会自动设好。"))
     } else if has(&["unmerged files", "unresolved conflict", "fix conflicts"]) {
         Some(tr("还有没解决的冲突。到「本地修改」里解决后再试。"))
     } else if has(&["not concluded your merge", "merge_head exists"]) {
-        Some(tr(
-            "上一次合并还没提交。先点上面横幅里的「提交合并」（或者「中止」），然后再试。",
-        ))
+        Some(tr("上一次合并还没提交。先点上面的「提交合并」或「中止」。"))
     } else if has(&["nothing to commit", "no changes added to commit"]) {
         Some(tr("没有可以提交的改动。"))
     } else if has(&["already exists"]) {
@@ -914,6 +1155,15 @@ pub(crate) fn explain(detail: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// 在 `git stash list` 的输出里找说明里带 `marker` 的那一份，返回 `stash@{n}`。
+fn find_stash(list: &[u8], marker: &str) -> Option<String> {
+    fr_core::refs::parse(&[], list)
+        .stashes
+        .into_iter()
+        .find(|stash| stash.message.contains(marker))
+        .map(|stash| stash.selector)
 }
 
 /// 最后 `n` 行；前面有省略时在开头注明省了多少行。
@@ -1001,7 +1251,19 @@ fn summary(out: &GitOutput) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_line, explain, last_progress_line, strip_progress, tail};
+    use super::{command_line, explain, find_stash, last_progress_line, strip_progress, tail};
+
+    #[test]
+    fn 按记号找自动贮藏的那一份() {
+        let list = "stash@{0}\x1faaa\x1f1700000002\x1fOn main: 手工贮藏的\0\
+                    stash@{1}\x1fbbb\x1f1700000001\x1fOn main: 切换分支之前自动贮藏的改动（fork-remote-123）\0";
+        assert_eq!(
+            find_stash(list.as_bytes(), "fork-remote-123").as_deref(),
+            Some("stash@{1}")
+        );
+        assert_eq!(find_stash(list.as_bytes(), "fork-remote-999"), None);
+        assert_eq!(find_stash(b"", "fork-remote-123"), None);
+    }
 
     #[test]
     fn 进度取最新的一行() {

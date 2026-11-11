@@ -14,8 +14,9 @@ use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::radio::Radio;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -23,11 +24,13 @@ use gpui_kit::*;
 use crate::app_state::{AppState, ConnStatus};
 use crate::browser::{BrowserEvent, RemoteBrowser};
 use crate::clone::{CloneEvent, CloneView};
-use crate::settings::{RepoEntry, Server};
+use crate::settings::{Auth, RepoEntry, Server, Target};
 use crate::ui;
 
 pub enum ManagerEvent {
     Open(RepoEntry),
+    /// 给这个仓库改名（对话框由主窗口开）
+    Rename(RepoEntry),
 }
 
 pub struct ManagerView {
@@ -93,79 +96,203 @@ impl ManagerView {
     }
 
     /// 添加服务器；`edit` 有值时是改一台已有的：id 和它名下登记的仓库都留着。
+    ///
+    /// 主机、端口、用户名分开填，存的时候拼成 ssh 的目标；登录方式选密钥或密码。
+    /// 填了的密码、私钥口令存进系统的凭据管理器（见 `secrets`），不进设置文件。
     fn server_dialog(&mut self, edit: Option<Server>, window: &mut Window, cx: &mut Context<Self>) {
-        let destination = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(tr(
-                "user@host、~/.ssh/config 里的主机别名，或 ssh://user@host:端口",
-            ))
-        });
-        let name =
-            cx.new(|cx| InputState::new(window, cx).placeholder(tr("可以不填，默认用主机名")));
-        if let Some(server) = &edit {
-            destination.update(cx, |state, cx| {
-                state.set_value(server.destination.clone(), window, cx)
+        let editing = edit.is_some();
+        let old = edit.unwrap_or_default();
+        let target = Target::parse(&old.destination);
+        // 这台服务器存着密码或口令（是哪一种，看它原来的登录方式）
+        let had_secret = editing && crate::secrets::get(&old.id).is_some();
+        let old_auth = old.auth;
+        let secret_hint = move |auth: Auth| {
+            if had_secret && auth == old_auth {
+                tr("已保存，不改就留空")
+            } else {
+                tr("不填则连接时问")
+            }
+        };
+        let mut input = |value: &str, placeholder: &'static str, masked: bool| {
+            let state = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(placeholder)
+                    .masked(masked)
             });
-            name.update(cx, |state, cx| {
-                state.set_value(server.name.clone(), window, cx)
-            });
-        }
+            if !value.is_empty() {
+                state.update(cx, |state, cx| {
+                    state.set_value(value.to_string(), window, cx)
+                });
+            }
+            state
+        };
+        let host = input(
+            &target.host,
+            tr("主机名、IP，或 ~/.ssh/config 里的别名"),
+            false,
+        );
+        let port = input(&target.port, "22", false);
+        let user = input(&target.user, tr("不填用 ssh 的默认"), false);
+        let key = input(
+            old.identity_file.as_deref().unwrap_or_default(),
+            tr("不填用默认密钥和 ssh-agent"),
+            false,
+        );
+        let passphrase = input("", secret_hint(Auth::Key), true);
+        let password = input("", secret_hint(Auth::Password), true);
+        let name = input(&old.name, tr("默认用主机名"), false);
+
         let app = self.app.clone();
+        let view = cx.entity().downgrade();
         let first_build = Cell::new(true);
-        let forward_agent = Rc::new(Cell::new(edit.as_ref().is_some_and(|s| s.forward_agent)));
-        let edit_id = edit.map(|server| server.id);
-        // 没填全时的提示，显示在对话框里
+        let auth = Rc::new(Cell::new(old.auth));
+        let forward_agent = Rc::new(Cell::new(old.forward_agent));
+        // 点了「清除」：存着的密码、口令不要了
+        let forget = Rc::new(Cell::new(false));
+        // 没填对时的提示，显示在对话框里
         let problem: Rc<RefCell<Option<SharedString>>> = Rc::default();
         window.open_dialog(cx, move |dialog, window, cx| {
             if first_build.replace(false) {
-                destination.focus_handle(cx).focus(window, cx);
+                host.focus_handle(cx).focus(window, cx);
             }
             let (muted, danger) = (cx.theme().muted_foreground, cx.theme().danger);
             let submit = {
-                let (destination, name, app) = (destination.clone(), name.clone(), app.clone());
-                let (forward_agent, edit_id) = (forward_agent.clone(), edit_id.clone());
-                let problem = problem.clone();
+                let (host, port, user, key) =
+                    (host.clone(), port.clone(), user.clone(), key.clone());
+                let (passphrase, password, name) =
+                    (passphrase.clone(), password.clone(), name.clone());
+                let (app, auth, forward_agent) =
+                    (app.clone(), auth.clone(), forward_agent.clone());
+                let (forget, problem, old) = (forget.clone(), problem.clone(), old.clone());
                 move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                    let target = destination.read(cx).value().trim().to_string();
-                    if target.is_empty() {
-                        *problem.borrow_mut() = Some(tr("还没有填 SSH 目标").into());
+                    let read = |input: &Entity<InputState>| input.read(cx).value().to_string();
+                    let (host, user, port) = (read(&host), read(&user), read(&port));
+                    let (key, name) = (read(&key), read(&name));
+                    let auth = auth.get();
+                    // 密码原样用，不去掉两头的空格
+                    let secret = match auth {
+                        Auth::Key => read(&passphrase),
+                        Auth::Password => read(&password),
+                    };
+                    let fail = |message: &'static str, window: &mut Window| {
+                        *problem.borrow_mut() = Some(message.into());
                         window.refresh();
-                        return;
+                    };
+                    // 主机那一格里贴进整个 user@host:端口 的也认；单独填了的用户名、端口优先
+                    let mut target = Target::parse(&host);
+                    if !user.trim().is_empty() {
+                        target.user = user.trim().to_string();
                     }
-                    let mut label = name.read(cx).value().trim().to_string();
+                    if !port.trim().is_empty() {
+                        target.port = port.trim().to_string();
+                    }
+                    if target.host.is_empty() {
+                        return fail(tr("还没有填主机"), window);
+                    }
+                    if !target.port.is_empty() && !target.port_ok() {
+                        return fail(tr("端口要填 1～65535 的数字"), window);
+                    }
+                    let key = key.trim();
+                    if auth == Auth::Key && !key.is_empty() {
+                        if key.to_lowercase().ends_with(".pub") {
+                            return fail(tr("这是公钥，要选不带 .pub 的私钥文件"), window);
+                        }
+                        // ~ 开头的由 ssh 自己展开，这里不查
+                        if !key.starts_with('~') && !std::path::Path::new(key).is_file() {
+                            return fail(tr("找不到这个私钥文件"), window);
+                        }
+                    }
+                    let mut label = name.trim().to_string();
                     if label.is_empty() {
-                        label = host_of(&target);
+                        label = target.host.clone();
                     }
+                    let server = Server {
+                        id: old.id.clone(),
+                        name: label,
+                        destination: target.compose(),
+                        forward_agent: forward_agent.get(),
+                        auth,
+                        // 换成密码登录时填过的私钥文件留着，换回来还在
+                        identity_file: (!key.is_empty()).then(|| key.to_string()),
+                    };
+                    // 存着的密码、口令：填了新的就换；没填、登录方式没变、也没点清除，就留着
+                    let keep = had_secret && auth == old.auth && !forget.get();
+                    let secret_changed = !secret.is_empty() || (had_secret && !keep);
+                    let account = server.destination.clone();
                     window.close_dialog(cx);
-                    match &edit_id {
-                        None => app.update(cx, |app, cx| {
-                            let id = app.add_server(label, target, forward_agent.get(), cx);
-                            // 添加后马上开始连接，结果显示在列表上
-                            drop(app.connect(&id, cx));
-                        }),
-                        Some(id) => {
-                            let reconnect = app.update(cx, |app, cx| {
-                                let reconnect =
-                                    app.update_server(id, label, target, forward_agent.get(), cx);
-                                if reconnect {
-                                    drop(app.connect(id, cx));
-                                }
-                                reconnect
-                            });
-                            if reconnect {
-                                window.push_notification(
-                                    Notification::info(
-                                        tr("连接参数改了，正在按新的重新连接。已经开着的这台服务器上的标签页还用着原来的连接，关掉重开后生效。"),
-                                    ),
-                                    cx,
-                                );
-                            }
+                    let (id, reconnect) = app.update(cx, |app, cx| {
+                        if editing {
+                            let id = server.id.clone();
+                            (id, app.update_server(server, secret_changed, cx))
+                        } else {
+                            (app.add_server(server, cx), true)
+                        }
+                    });
+                    if !secret.is_empty() {
+                        if let Err(err) = crate::secrets::set(&id, &account, &secret) {
+                            window.push_notification(
+                                Notification::error(tf!("密码没存上，连接时会问：{err}", err)),
+                                cx,
+                            );
+                        }
+                    } else if had_secret && !keep {
+                        crate::secrets::delete(&id);
+                    }
+                    if reconnect {
+                        // 马上开始连接，结果显示在列表上
+                        app.update(cx, |app, cx| drop(app.connect(&id, cx)));
+                        if editing {
+                            window.push_notification(
+                                Notification::info(tr(
+                                    "已按新参数重连；开着的标签页关掉重开后生效。",
+                                )),
+                                cx,
+                            );
                         }
                     }
                 }
             };
-            let editing = edit_id.is_some();
+            let auth_now = auth.get();
+            let pick_auth = |to: Auth| {
+                let auth = auth.clone();
+                move |_: &bool, window: &mut Window, _: &mut App| {
+                    auth.set(to);
+                    window.refresh();
+                }
+            };
+            let browse = {
+                let (view, key) = (view.clone(), key.clone());
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    view.update(cx, |this, cx| this.pick_key_file(key.clone(), window, cx))
+                        .ok();
+                }
+            };
+            // 密码、口令那一格；存着的可以点「清除」
+            let secret_field = |label: &'static str, input: &Entity<InputState>| {
+                let saved = had_secret && auth_now == old_auth && !forget.get();
+                let clear = saved.then(|| {
+                    let (forget, input) = (forget.clone(), input.clone());
+                    Button::new("forget-secret")
+                        .ghost()
+                        .xsmall()
+                        .label(tr("清除已保存的"))
+                        .on_click(move |_, window, cx| {
+                            forget.set(true);
+                            input.update(cx, |state, cx| {
+                                state.set_placeholder(tr("不填则连接时问"), window, cx)
+                            });
+                            window.refresh();
+                        })
+                        .into_any_element()
+                });
+                field_with(label, clear, Input::new(input).mask_toggle())
+            };
             dialog
-                .title(if editing { tr("编辑服务器") } else { tr("添加服务器") })
+                .title(if editing {
+                    tr("编辑服务器")
+                } else {
+                    tr("添加服务器")
+                })
                 // 回车等于点确定；关不关对话框由 submit 自己决定
                 .on_ok({
                     let submit = submit.clone();
@@ -178,11 +305,62 @@ impl ManagerView {
                 .child(
                     v_flex()
                         .gap_3()
-                        .child(field(tr("SSH 目标"), Input::new(&destination)))
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .items_start()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(field(tr("主机"), Input::new(&host))),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(96.))
+                                        .flex_none()
+                                        .child(field(tr("端口"), Input::new(&port))),
+                                ),
+                        )
+                        .child(field(tr("用户名"), Input::new(&user)))
+                        .child(
+                            h_flex()
+                                .gap_4()
+                                .child(div().text_sm().child(tr("登录方式")))
+                                .child(
+                                    Radio::new("auth-key")
+                                        .label(tr("密钥"))
+                                        .checked(auth_now == Auth::Key)
+                                        .on_click(pick_auth(Auth::Key)),
+                                )
+                                .child(
+                                    Radio::new("auth-password")
+                                        .label(tr("密码"))
+                                        .checked(auth_now == Auth::Password)
+                                        .on_click(pick_auth(Auth::Password)),
+                                ),
+                        )
+                        .map(|body| match auth_now {
+                            Auth::Key => body
+                                .child(field_with(
+                                    tr("私钥文件"),
+                                    None,
+                                    h_flex()
+                                        .gap_2()
+                                        .child(div().flex_1().min_w_0().child(Input::new(&key)))
+                                        .child(
+                                            Button::new("browse")
+                                                .label(tr("浏览…"))
+                                                .on_click(browse),
+                                        ),
+                                ))
+                                .child(secret_field(tr("私钥口令"), &passphrase)),
+                            Auth::Password => body.child(secret_field(tr("密码"), &password)),
+                        })
                         .child(field(tr("名称"), Input::new(&name)))
                         .child(
                             Checkbox::new("forward-agent")
-                                .label(tr("转发本机的 ssh-agent（服务器上的 git 推拉用本机密钥；只对信任的服务器打开）"))
+                                .label(tr("转发本机的 ssh-agent（只对信任的服务器开）"))
                                 .checked(forward_agent.get())
                                 .on_click({
                                     let forward_agent = forward_agent.clone();
@@ -195,10 +373,9 @@ impl ManagerView {
                         .when_some(problem.borrow().clone(), |body, found| {
                             body.child(div().text_sm().text_color(danger).child(found))
                         })
-                        .child(div().text_xs().text_color(muted).child(
-                            tr("用系统自带的 ssh 连接，沿用 ~/.ssh/config 和密钥；要密码或密钥口令时会弹窗问，不保存。\
-                             第一次连接时会在服务器的 ~/.fork-remote/ 下装一个 1 MB 左右的 agent，不要 root，不开端口。"),
-                        )),
+                        .child(div().text_xs().text_color(muted).child(tr(
+                            "密码、口令存在 Windows 凭据管理器。首次连接会往服务器的 ~/.fork-remote/ 装 agent。",
+                        ))),
                 )
                 .footer(
                     DialogFooter::new()
@@ -210,11 +387,44 @@ impl ManagerView {
                         .child(
                             Button::new("ok")
                                 .primary()
-                                .label(if editing { tr("保存") } else { tr("添加并连接") })
+                                .label(if editing {
+                                    tr("保存")
+                                } else {
+                                    tr("添加并连接")
+                                })
                                 .on_click(submit),
                         ),
                 )
         });
+    }
+
+    /// 选一个私钥文件，填进对话框的那一格。
+    fn pick_key_file(
+        &mut self,
+        input: Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(tr("选私钥文件").into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let path = path.to_string_lossy().into_owned();
+            this.update_in(cx, |_, window, cx| {
+                input.update(cx, |state, cx| state.set_value(path, window, cx));
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// 克隆仓库到本机（`server` 为空）或者某台服务器上，克隆完打开。
@@ -303,6 +513,10 @@ impl ManagerView {
         ));
         let open = entry.clone();
         let remove = entry.clone();
+        let (rename, menu_entry) = (entry.clone(), entry.clone());
+        let name = self.app.read(cx).repo_name(entry);
+        let remove_name = name.clone();
+        let view = cx.entity().downgrade();
         h_flex()
             .id(ElementId::Name(id))
             .h(px(46.))
@@ -322,36 +536,40 @@ impl ManagerView {
                     .flex_1()
                     .min_w_0()
                     .child(
-                        div()
+                        ui::clipped("name", name)
                             .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .truncate()
-                            .child(entry.name().to_string()),
+                            .font_weight(FontWeight::MEDIUM),
                     )
                     .child(
-                        div()
+                        ui::clipped("path", entry.path.clone())
                             .text_xs()
-                            .truncate()
-                            .text_color(colors.muted)
-                            .child(entry.path.clone()),
+                            .text_color(colors.muted),
                     ),
             )
-            // 「移除」一直在行尾，用次要的颜色，不抢眼
+            // 「改名」「移除」一直在行尾，用次要的颜色，不抢眼
+            .child(
+                Button::new("rename")
+                    .ghost()
+                    .xsmall()
+                    .icon(ui::icon(IconName::Pencil).text_color(colors.muted))
+                    .tooltip(tr("改名"))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(ManagerEvent::Rename(rename.clone()));
+                    })),
+            )
             .child(
                 Button::new("remove")
                     .ghost()
                     .xsmall()
                     .icon(ui::icon(IconName::X).text_color(colors.muted))
-                    .tooltip(tr("从列表里去掉，不动仓库本身（会先问一下）"))
+                    .tooltip(tr("从列表里移除"))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         let (app, entry) = (this.app.clone(), remove.clone());
                         confirm(
-                            tf!("从列表里移除 {name}？", name = remove.name()),
-                            tf!(
-                                "{path}\n只是不在这里列出来了，仓库本身不动；以后可以再加回来。",
-                                path = remove.path
-                            ),
+                            tf!("从列表里移除 {name}？", name = &remove_name),
+                            tf!("{path}\n只从列表里移除，仓库本身不动。", path = remove.path),
                             tr("移除"),
                             false,
                             window,
@@ -360,6 +578,19 @@ impl ManagerView {
                         );
                     })),
             )
+            .context_menu(move |menu, _, _| {
+                let (view, entry) = (view.clone(), menu_entry.clone());
+                let path = entry.path.clone();
+                menu.item(PopupMenuItem::new(tr("改名…")).on_click(move |_, _, cx| {
+                    view.update(cx, |_, cx| cx.emit(ManagerEvent::Rename(entry.clone())))
+                        .ok();
+                }))
+                .item(
+                    PopupMenuItem::new(tr("复制仓库路径")).on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                    }),
+                )
+            })
             .into_any_element()
     }
 }
@@ -425,21 +656,25 @@ fn confirm(
 }
 
 fn field(label: &'static str, input: Input) -> impl IntoElement {
-    v_flex()
-        .gap_1()
-        .child(div().text_sm().child(label))
-        .child(input)
+    field_with(label, None, input)
 }
 
-/// 从 SSH 目标里取主机名，当默认的显示名。
-fn host_of(destination: &str) -> String {
-    let rest = destination.strip_prefix("ssh://").unwrap_or(destination);
-    let rest = rest.rsplit('@').next().unwrap_or(rest);
-    let host = match rest.rsplit_once(':') {
-        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
-        _ => rest,
-    };
-    host.trim_end_matches('/').to_string()
+/// 一格：上面是名字（右边可以带个小按钮），下面是填的地方。
+fn field_with(
+    label: &'static str,
+    aside: Option<AnyElement>,
+    body: impl IntoElement,
+) -> impl IntoElement {
+    v_flex()
+        .gap_1()
+        .child(
+            h_flex()
+                .h(px(20.))
+                .justify_between()
+                .child(div().text_sm().child(label))
+                .children(aside),
+        )
+        .child(body)
 }
 
 impl Render for ManagerView {
@@ -465,10 +700,16 @@ impl Render for ManagerView {
             .collect();
         let mut sections = vec![card(
             card_header(
+                "local",
                 IconName::Monitor,
                 tr("本机").into(),
                 None,
-                status_line(None, tf!("{n} 个仓库", n = local.len()).into(), colors),
+                status_line(
+                    "local",
+                    None,
+                    tf!("{n} 个仓库", n = local.len()).into(),
+                    colors,
+                ),
                 vec![
                     Button::new("clone-local")
                         .small()
@@ -489,7 +730,7 @@ impl Render for ManagerView {
             ),
             None,
             local,
-            tr("还没有本机仓库。「添加本机仓库…」选一个文件夹，或者「克隆…」一个下来。"),
+            tr("还没有本机仓库。点「添加本机仓库…」或「克隆…」。"),
             colors,
         )];
 
@@ -576,14 +817,14 @@ impl Render for ManagerView {
                     .dropdown_menu(move |menu, _, _| {
                         let (view, edit) = (menu_view.clone(), menu_server.clone());
                         let (app, remove) = (menu_app.clone(), menu_server.clone());
-                        menu.item(PopupMenuItem::new(tr("编辑…")).on_click(
-                            move |_, window, cx| {
+                        menu.item(
+                            PopupMenuItem::new(tr("编辑…")).on_click(move |_, window, cx| {
                                 view.update(cx, |this, cx| {
                                     this.server_dialog(Some(edit.clone()), window, cx)
                                 })
                                 .ok();
-                            },
-                        ))
+                            }),
+                        )
                         .separator()
                         .item(
                             PopupMenuItem::new(tr("移除…")).on_click(move |_, window, cx| {
@@ -592,14 +833,14 @@ impl Render for ManagerView {
                                     String::new()
                                 } else {
                                     tf!(
-                                        "它名下登记的 {n} 个仓库也会从列表里去掉，开着的标签页会关掉。",
+                                        "它的 {n} 个仓库也从列表里移除，开着的标签页会关掉。",
                                         n = repo_count
                                     )
                                 };
                                 confirm(
                                     tf!("移除服务器 {name}？", name = remove.name),
                                     tf!(
-                                        "{destination}\n{repos}服务器上的东西不动；以后要用得重新添加，仓库也要重新打开一遍。",
+                                        "{destination}\n{repos}服务器上的东西不动。",
                                         destination = remove.destination,
                                         repos = repos
                                     ),
@@ -616,16 +857,17 @@ impl Render for ManagerView {
             );
             sections.push(card(
                 card_header(
+                    &server.id,
                     IconName::Server,
                     server.name.clone().into(),
                     Some(server.destination.clone().into()),
-                    status_line(dot, status_text, colors),
+                    status_line(&server.id, dot, status_text, colors),
                     actions,
                     colors,
                 ),
                 failure,
                 repos,
-                tr("还没有打开过这台服务器上的仓库。「打开仓库…」在服务器上挑一个。"),
+                tr("还没有这台服务器上的仓库。点「打开仓库…」挑一个。"),
                 colors,
             ));
         }
@@ -658,9 +900,12 @@ impl Render for ManagerView {
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .child(trc("页面", "仓库")),
                                     )
-                                    .child(div().text_sm().text_color(colors.muted).child(tr(
-                                        "本机和服务器上的仓库都在这里，点一下在新标签页里打开。",
-                                    ))),
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(colors.muted)
+                                            .child(tr("点仓库在新标签页里打开。")),
+                                    ),
                             )
                             .child(
                                 Button::new("add-server")
@@ -678,7 +923,8 @@ impl Render for ManagerView {
 }
 
 /// 状态的那一行：一个小圆点（没有就不画）加一句话。
-fn status_line(dot: Option<Hsla>, text: SharedString, colors: Colors) -> AnyElement {
+/// `key` 区分是哪张卡片的（本机是 "local"，服务器是它的 id）。
+fn status_line(key: &str, dot: Option<Hsla>, text: SharedString, colors: Colors) -> AnyElement {
     h_flex()
         .gap(px(6.))
         .min_w_0()
@@ -686,18 +932,16 @@ fn status_line(dot: Option<Hsla>, text: SharedString, colors: Colors) -> AnyElem
             row.child(div().flex_none().size(px(7.)).rounded_full().bg(color))
         })
         .child(
-            div()
-                .min_w_0()
-                .truncate()
+            ui::clipped(ElementId::Name(format!("status:{key}").into()), text)
                 .text_xs()
-                .text_color(colors.muted)
-                .child(text),
+                .text_color(colors.muted),
         )
         .into_any_element()
 }
 
 /// 卡片顶上的一条：图标、名字（后面跟一句小字），下面一行是状态；右边是按钮。
 fn card_header(
+    key: &str,
     icon: IconName,
     name: SharedString,
     aside: Option<SharedString>,
@@ -733,22 +977,20 @@ fn card_header(
                     h_flex()
                         .gap_2()
                         .child(
-                            div()
+                            ui::clipped(ElementId::Name(format!("card-name:{key}").into()), name)
                                 .flex_none()
                                 .max_w(px(280.))
-                                .truncate()
                                 .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(name),
+                                .font_weight(FontWeight::SEMIBOLD),
                         )
                         .when_some(aside, |row, aside| {
                             row.child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(colors.muted)
-                                    .child(aside),
+                                ui::clipped(
+                                    ElementId::Name(format!("card-aside:{key}").into()),
+                                    aside,
+                                )
+                                .text_xs()
+                                .text_color(colors.muted),
                             )
                         }),
                 )
@@ -800,16 +1042,4 @@ fn card(
                 .children(rows),
         )
         .into_any_element()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::host_of;
-
-    #[test]
-    fn 从ssh目标取主机名() {
-        assert_eq!(host_of("root@10.0.0.5"), "10.0.0.5");
-        assert_eq!(host_of("ssh://me@example.com:2222"), "example.com");
-        assert_eq!(host_of("devbox"), "devbox");
-    }
 }
