@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -14,12 +14,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 use fr_core::exec::{self, Killer, OnStderr};
 use fr_core::protocol::{
-    self, DaemonInfo, GitResult, Hello, PROTOCOL_VERSION, Request, Response, TermOpen,
+    self, DaemonInfo, FilePut, GitResult, Hello, PROTOCOL_VERSION, Request, Response, TermOpen,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::VERSION;
+use crate::files::{self, Uploads};
 use crate::out::Outbox;
 use crate::term::{Registry, Size};
 
@@ -44,18 +45,31 @@ pub struct Shared {
     control: Option<Box<dyn Control>>,
     /// 装在哪个目录里（`<版本>-<哈希>`）
     pub build: String,
+    /// 客户端传上来的文件放在哪
+    pub drop_dir: PathBuf,
     /// 最近一次有客户端连着的时间：闲了多久从它算
     last_busy: Mutex<Instant>,
 }
 
 impl Shared {
     pub fn new(terms: Registry, control: Option<Box<dyn Control>>, build: String) -> Arc<Shared> {
+        Self::with_drop_dir(terms, control, build, files::default_dir())
+    }
+
+    /// 同 [`Self::new`]，传上来的文件放到 `drop_dir`（测试用）。
+    pub fn with_drop_dir(
+        terms: Registry,
+        control: Option<Box<dyn Control>>,
+        build: String,
+        drop_dir: PathBuf,
+    ) -> Arc<Shared> {
         Arc::new(Shared {
             terms,
             conns: Mutex::default(),
             next_conn: AtomicU64::new(1),
             control,
             build,
+            drop_dir,
             last_busy: Mutex::new(Instant::now()),
         })
     }
@@ -127,6 +141,8 @@ pub struct Conn {
     next_ask: AtomicU64,
     /// 这条 ssh 连接转发过来的 ssh-agent 套接字
     auth_sock: Mutex<Option<String>>,
+    /// 正在传上来的文件；连接断开时没传完的跟着删掉
+    uploads: Mutex<Uploads>,
 }
 
 impl Conn {
@@ -216,6 +232,7 @@ pub fn serve(shared: &Arc<Shared>, reader: impl Read, writer: impl Write + Send 
         asks: Mutex::default(),
         next_ask: AtomicU64::new(1),
         auth_sock: Mutex::default(),
+        uploads: Mutex::new(Uploads::new(shared.drop_dir.clone())),
     });
     shared.conns.lock().unwrap().insert(conn.id, conn.clone());
     let mut watchers: HashMap<u64, fr_core::watch::Watcher> = HashMap::new();
@@ -325,6 +342,13 @@ fn handle(
             {
                 session.resize(Size::new(params.cols, params.rows));
             }
+        }
+        "file_put" => {
+            let reply = serde_json::from_value::<FilePut>(request.params)
+                .context("file_put 参数不对")
+                .and_then(|params| conn.uploads.lock().unwrap().put(params, &payload))
+                .and_then(|reply| Ok(serde_json::to_value(reply)?));
+            conn.reply(id, reply);
         }
         "upgrade" => {
             let exe = param("exe").and_then(Value::as_str).unwrap_or_default();
@@ -629,6 +653,41 @@ mod tests {
         let exit: TermExit = serde_json::from_value(response.result.unwrap()).unwrap();
         assert_eq!(exit.exit, Some(0));
         assert_eq!(shared.terms.count(), 0);
+    }
+
+    #[test]
+    fn 传文件_分块传上来_断开时没传完的删掉() {
+        let dir = files::tests::TempDir::new();
+        let (terms, _) = fake_registry();
+        let shared = Shared::with_drop_dir(terms, None, String::new(), dir.0.clone());
+        let mut client = connect(&shared);
+        // 第一块给名字，拿到编号
+        let id = client.send("file_put", json!({ "name": "说明 1.txt" }), "你好，".as_bytes());
+        let (response, _) = client.next();
+        assert_eq!(response.id, id);
+        let first = response.result.unwrap();
+        assert_eq!(first["received"], 9);
+        assert!(first.get("path").is_none());
+        let upload = first["upload"].as_str().unwrap().to_string();
+        let done = json!({ "upload": upload, "done": true });
+        let id = client.send("file_put", done, "世界".as_bytes());
+        let (response, _) = client.next();
+        assert_eq!(response.id, id);
+        let last = response.result.unwrap();
+        assert_eq!(last["received"], 15);
+        let path = PathBuf::from(last["path"].as_str().unwrap());
+        assert_eq!(path, dir.0.join("说明_1.txt"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "你好，世界");
+        // 编号不对：回错误，连接照常
+        client.send("file_put", json!({ "upload": "u99" }), b"x");
+        assert!(client.next().0.error.is_some());
+        // 传到一半客户端断开：没传完的不留
+        client.send("file_put", json!({ "name": "half.bin" }), b"123");
+        assert!(client.next().0.result.is_some());
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 2);
+        drop(client);
+        wait_until("没传完的删掉", || std::fs::read_dir(&dir.0).unwrap().count() == 1);
+        assert!(path.exists());
     }
 
     #[test]

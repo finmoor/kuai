@@ -120,7 +120,7 @@ impl RepoView {
         sizes(
             &self.app.read(cx).settings.layout,
             self.viewport,
-            self.terminal_open,
+            self.terminals.open,
         )
     }
 
@@ -157,7 +157,7 @@ impl RepoView {
         // 存之前先按现在的窗口收一下：拖到头以后再往回拖，马上就跟手
         let mut layout = self.app.read(cx).settings.layout;
         set(&mut layout, split, Some(value.max(0.)));
-        let fitted = sizes(&layout, self.viewport, self.terminal_open);
+        let fitted = sizes(&layout, self.viewport, self.terminals.open);
         let value = match split {
             Split::Sidebar => fitted.sidebar,
             Split::ChangesList => fitted.changes_list,

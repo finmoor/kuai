@@ -316,8 +316,8 @@ impl Workspace {
                     .flatten()
                     .flat_map(|(tabs, _)| tabs.iter()),
             )
-            .filter(|tab| tab.view.read(cx).terminal_alive(cx))
-            .count()
+            .map(|tab| tab.view.read(cx).terminals_alive(cx))
+            .sum()
     }
 
     /// 服务器被移除了：它上面的仓库的标签页跟着关掉（各个工作区里的都关）。
@@ -720,6 +720,14 @@ impl Workspace {
                 let text = tr("这个工作区里没有刚关掉的标签页。");
                 window.push_notification(Notification::info(text), cx);
             }
+        }
+    }
+
+    /// Ctrl+Shift+`：当前仓库再开一个终端。
+    pub fn new_terminal_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_repo() {
+            tab.view
+                .update(cx, |view, cx| view.new_terminal(window, cx));
         }
     }
 

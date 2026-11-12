@@ -18,6 +18,7 @@ mod bridge;
 mod conn;
 #[cfg(unix)]
 mod daemon;
+mod files;
 mod out;
 mod term;
 
@@ -69,6 +70,8 @@ fn stdio() {
     #[cfg(not(unix))]
     let terms = term::Registry::unsupported();
     let shared = conn::Shared::new(terms, None, build());
+    // 以前传上来、已经过期的文件
+    files::sweep(&shared.drop_dir);
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {

@@ -1748,7 +1748,7 @@ dependencies = [
 
 [[package]]
 name = "fr-app"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -1759,6 +1759,7 @@ dependencies = [
  "futures",
  "gpui-kit",
  "gpui-pre",
+ "image",
  "log",
  "raw-window-handle",
  "serde",
@@ -1771,7 +1772,7 @@ dependencies = [
 
 [[package]]
 name = "fr-channel"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "fr-core",
@@ -1781,7 +1782,7 @@ dependencies = [
 
 [[package]]
 name = "fr-core"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -3488,7 +3489,7 @@ dependencies = [
 
 [[package]]
 name = "kuaid"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

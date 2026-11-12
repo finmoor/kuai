@@ -27,6 +27,8 @@ similar = "2"
 raw-window-handle = "0.6"
 # 内置终端：伪终端（Windows 上是 ConPTY）和终端仿真，画由 terminal/ 自己来
 alacritty_terminal = "0.26"
+# 往终端里发剪贴板里的图片：位图转成 PNG（GPUI 也用它，不多带一个库）
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "tiff", "ico", "pnm"] }
 
 [target.'cfg(windows)'.dependencies]
 # 托盘图标和它的右键菜单（最小化到托盘、关闭到托盘）

@@ -34,6 +34,13 @@
 //! - `term_close`：参数 `{term}`，结束会话里的程序并忘掉这个会话。
 //! - `term_list`：返回 `{terms: [TermInfo]}`。
 //!
+//! 传文件（协议 5 起）。往终端里发图片、文件用：终端那条路只能过文字，文件先传上来，
+//! 客户端再把它在服务器上的路径贴进终端：
+//! - `file_put`：参数 [`FilePut`]，请求带的字节是文件的下一块。第一块给文件名，kuaid 回一个
+//!   `upload` 编号，之后的块带着它接着写；每块回一条 [`FilePutReply`]（已经收到多少）。
+//!   `done` 的那一块写完后文件才放到位（`~/.kuai/drop/` 下，重名的换个名字），响应里带它的完整路径。
+//!   `abort` 是不传了。客户端断开时没传完的自动删掉；传好的文件过几天由 kuaid 清掉。
+//!
 //! 给 ssh 转接程序（`kuaid --connect`）和运维用的：
 //! - `info`：返回 [`DaemonInfo`]。
 //! - `bridge`：参数 `{auth_sock}`，转接程序报告这条 ssh 连接转发过来的 ssh-agent 套接字。不回响应。
@@ -50,7 +57,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// 协议版本，握手时交换。服务器上的 kuaid 不能比客户端旧（连接时会原地升级），可以比客户端新。
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// 一条消息后面跟多少字节的原始数据。
 pub trait Frame {
@@ -192,6 +199,35 @@ pub struct TermInfo {
     /// 开了多久（秒）
     #[serde(default)]
     pub age: u64,
+}
+
+/// `file_put` 的参数。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FilePut {
+    /// 第一块：文件名（只看最后一段，不能指定目录）
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// 之后的块：第一块的响应里给的编号
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub upload: String,
+    /// 这是最后一块
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub done: bool,
+    /// 不传了，删掉已经收到的
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub abort: bool,
+}
+
+/// `file_put` 每一块的响应。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FilePutReply {
+    pub upload: String,
+    /// 已经收到多少字节
+    #[serde(default)]
+    pub received: u64,
+    /// 传完了：文件在服务器上的完整路径
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// `git` 方法的结果。

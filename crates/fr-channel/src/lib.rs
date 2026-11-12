@@ -6,6 +6,7 @@
 //! 调用都返回 future，不阻塞调用方；future 或流被丢弃时取消请求，对应的 git 进程会被杀掉。
 //!
 //! 服务器上的终端也开在 kuaid 里（[`Connection::term_open`]）：流被丢弃只是断开，里面的程序接着跑。
+//! 往终端里发图片、文件：先传到服务器上（[`Connection::upload`]），再把路径贴进终端。
 
 mod binaries;
 mod local;
@@ -14,6 +15,7 @@ mod remote;
 use fr_core::i18n::tr;
 use fr_core::tf;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::task::{Context, Poll};
@@ -110,6 +112,35 @@ pub struct TermStream {
 
 impl Stream for TermStream {
     type Item = Result<TermItem>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.rx).poll_next(cx)
+    }
+}
+
+/// 要传到服务器上的东西从哪来。
+pub enum UploadSource {
+    /// 本机的一个文件，边读边传
+    File(PathBuf),
+    /// 已经在内存里的（比如剪贴板里的图片）
+    Bytes(Vec<u8>),
+}
+
+/// 上传流里的一项。
+pub enum UploadItem {
+    /// 服务器已经收到多少、一共多少（字节）
+    Progress { sent: u64, total: u64 },
+    /// 传完了：文件在服务器上的完整路径
+    Done(String),
+}
+
+/// 一次上传。丢弃就是不传了，服务器上已经收到的那部分会删掉。出错时流以一个错误结束。
+pub struct UploadStream {
+    rx: mpsc::UnboundedReceiver<Result<UploadItem>>,
+}
+
+impl Stream for UploadStream {
+    type Item = Result<UploadItem>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.rx).poll_next(cx)

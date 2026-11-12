@@ -44,7 +44,8 @@ gpui_kit::actions!(
         ShowHistory,
         OpenSettings,
         ReopenTab,
-        OpenTerminal
+        OpenTerminal,
+        NewTerminal
     ]
 );
 
@@ -173,6 +174,8 @@ fn main() {
                 KeyBinding::new("ctrl-,", OpenSettings, None),
                 KeyBinding::new("ctrl-shift-t", ReopenTab, None),
                 KeyBinding::new("ctrl-`", OpenTerminal, None),
+                KeyBinding::new("ctrl-shift-`", NewTerminal, None),
+                KeyBinding::new("ctrl-~", NewTerminal, None),
             ]);
             // 焦点在终端里时，这几个键是 shell 和里面的程序要用的（删一个词、往前搜、上一条命令……），
             // 不当成上面的快捷键。切标签页、设置、Ctrl+` 这些终端用不到的照常
@@ -196,6 +199,9 @@ fn main() {
             workspace_action::<ReopenTab>(cx, |ws, window, cx| ws.reopen_closed(window, cx));
             workspace_action::<OpenTerminal>(cx, |ws, window, cx| {
                 ws.terminal_in_active(window, cx)
+            });
+            workspace_action::<NewTerminal>(cx, |ws, window, cx| {
+                ws.new_terminal_in_active(window, cx)
             });
             cx.on_action(|_: &ToggleFrameOverlay, cx: &mut App| {
                 for handle in cx.windows() {

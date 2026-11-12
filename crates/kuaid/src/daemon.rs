@@ -24,6 +24,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::conn::{self, Control, Shared};
+use crate::files;
 use crate::term::pty::{self, Pty};
 use crate::term::{Backend, Ended, Frozen, Registry, Size};
 
@@ -31,6 +32,8 @@ use crate::term::{Backend, Ended, Frozen, Registry, Size};
 const IDLE: Duration = Duration::from_secs(600);
 /// 隔这么久看一次要不要退出
 const IDLE_CHECK: Duration = Duration::from_secs(5);
+/// 隔这么久清一次客户端传上来的过期文件
+const SWEEP_EVERY: Duration = Duration::from_secs(3600);
 /// 交接文件的格式版本
 const HANDOFF_FORMAT: u32 = 1;
 
@@ -273,7 +276,13 @@ pub fn run(resume: Option<&str>) -> Result<()> {
     std::thread::Builder::new()
         .name("kuaid-idle".into())
         .spawn(move || {
+            // 一启动先清一次：上次退出以后过期的
+            let mut swept: Option<Instant> = None;
             loop {
+                if swept.is_none_or(|at| at.elapsed() >= SWEEP_EVERY) {
+                    files::sweep(&for_idle.drop_dir);
+                    swept = Some(Instant::now());
+                }
                 std::thread::sleep(IDLE_CHECK);
                 for_idle.terms.sweep();
                 if for_idle.idle_for() >= IDLE {

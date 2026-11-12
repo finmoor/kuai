@@ -27,6 +27,7 @@ mod ops;
 mod rebase;
 mod sidebar;
 mod stage_diff;
+mod terminals;
 
 pub(crate) use ops::explain;
 
@@ -49,7 +50,6 @@ use gpui_kit::*;
 
 use crate::app_state::AppState;
 use crate::settings::RepoEntry;
-use crate::terminal::TerminalView;
 use crate::ui;
 
 /// 工具栏的高度；侧栏顶上写仓库名字的那一块和它一样高，底边对得齐。
@@ -121,12 +121,8 @@ pub struct RepoView {
     auto_fetch: auto_fetch::AutoFetch,
     /// 窗口内容区的大小，每帧更新；各块的大小按它收
     viewport: Size<Pixels>,
-    /// 底下的终端；第一次打开面板时才建，之后收起面板也留着（里面的程序接着跑）
-    terminal: Option<Entity<TerminalView>>,
-    /// 终端的面板开没开
-    terminal_open: bool,
-    /// 服务器上留着这个仓库的终端（上次开的还在跑），这次还没打开面板去接
-    server_terminal: bool,
+    /// 底下的终端们
+    terminals: terminals::Terminals,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -179,9 +175,7 @@ impl RepoView {
             activity: activity::Log::default(),
             auto_fetch: auto_fetch::AutoFetch::new(cx),
             viewport: window.viewport_size(),
-            terminal: None,
-            terminal_open: false,
-            server_terminal: false,
+            terminals: terminals::Terminals::default(),
             _subscriptions: subscriptions,
         };
         // 测试开关：FR_TEST_VIEW=changes 打开仓库时直接显示本地修改
@@ -206,7 +200,7 @@ impl RepoView {
                 match result {
                     Ok(channel) => {
                         this.start_watch(&channel, cx);
-                        this.check_server_terminal(&channel, cx);
+                        this.check_server_terminals(&channel, cx);
                         this.channel = Some(channel);
                         this.refresh(cx);
                     }
@@ -632,13 +626,16 @@ impl RepoView {
                     },
                     false,
                     true,
-                    // 面板收着、里面有东西在跑：按钮上标个 1
-                    (!self.terminal_open && self.terminal_running(cx)) as usize,
+                    // 面板收着：按钮上标出有几个终端里有东西在跑
+                    match self.terminals.open {
+                        true => 0,
+                        false => self.terminals_running(cx),
+                    },
                     cx,
                 )
-                .selected(self.terminal_open)
+                .selected(self.terminals.open)
                 .on_click(cx.listener(|this, _, window, cx| {
-                    this.show_terminal(!this.terminal_open, window, cx)
+                    this.show_terminal(!this.terminals.open, window, cx)
                 })),
             )
             .child(self.render_open_button(cx))
@@ -668,165 +665,6 @@ impl RepoView {
                 )
                 .on_click(cx.listener(|this, _, window, cx| this.show_activity(window, cx))),
             )
-    }
-
-    /// 关掉这个标签页会不会结束终端里还在跑的程序（会的话关之前要问一下）。只有本机的终端会：
-    /// 服务器上的终端开在 kuaid 里，标签页关了它接着跑，再打开这个仓库时接上。
-    pub fn terminal_alive(&self, cx: &App) -> bool {
-        self.terminal
-            .as_ref()
-            .is_some_and(|terminal| terminal.read(cx).dies_with_view())
-    }
-
-    /// 这个仓库的终端里有东西在跑：这次打开的，或者服务器上留着的（上次没结束）。
-    fn terminal_running(&self, cx: &App) -> bool {
-        match &self.terminal {
-            Some(terminal) => terminal.read(cx).is_running(),
-            None => self.server_terminal,
-        }
-    }
-
-    /// 连上服务器以后问一下：kuaid 里有没有这个仓库的终端还在跑（工具栏的按钮上标出来）。
-    fn check_server_terminal(&mut self, channel: &Channel, cx: &mut Context<Self>) {
-        let Channel::Remote(conn) = channel else {
-            return;
-        };
-        let listing = conn.term_list();
-        let key = self.entry.path.clone();
-        cx.spawn(async move |this, cx| {
-            let Ok(terms) = listing.await else {
-                return;
-            };
-            let running = terms.iter().any(|term| term.key == key && term.alive);
-            this.update(cx, |this, cx| {
-                this.server_terminal = running;
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// 打开或收起终端的面板。打开时焦点放进终端；收起不结束里面的程序。
-    pub fn show_terminal(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if open {
-            let terminal = match &self.terminal {
-                Some(terminal) => terminal.clone(),
-                None => {
-                    let (entry, app) = (self.entry.clone(), self.app.clone());
-                    let terminal = cx.new(|cx| {
-                        TerminalView::new(
-                            move |cx| crate::shell::terminal_launch(&entry, &app, cx),
-                            window,
-                            cx,
-                        )
-                    });
-                    // 里面的程序结束、断开时，工具栏按钮上的标记要跟着变
-                    self._subscriptions
-                        .push(cx.observe(&terminal, |_, _, cx| cx.notify()));
-                    self.terminal = Some(terminal.clone());
-                    self.server_terminal = false;
-                    terminal
-                }
-            };
-            terminal.focus_handle(cx).focus(window, cx);
-        } else if self.terminal_focused(window, cx) {
-            // 焦点还留在看不见的终端上的话，键盘就没反应了
-            window.blur(cx);
-        }
-        self.terminal_open = open;
-        cx.notify();
-    }
-
-    fn terminal_focused(&self, window: &Window, cx: &App) -> bool {
-        self.terminal
-            .as_ref()
-            .is_some_and(|terminal| terminal.focus_handle(cx).is_focused(window))
-    }
-
-    /// Ctrl+`：没开就打开；开着但焦点不在里面就把焦点放进去；焦点在里面就收起。
-    pub fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let open = !(self.terminal_open && self.terminal_focused(window, cx));
-        self.show_terminal(open, window, cx);
-    }
-
-    /// 结束终端里的程序并收起面板。
-    fn end_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_terminal(false, window, cx);
-        // 服务器上的终端不说一声的话会接着跑
-        if let Some(terminal) = self.terminal.take() {
-            terminal.update(cx, |terminal, cx| terminal.kill(cx));
-        }
-    }
-
-    /// 终端的面板：上面一条标题（重新启动、结束、收起），下面是终端。
-    fn render_terminal(&self, height: f32, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let terminal = self.terminal.clone()?;
-        let theme = cx.theme();
-        let (border, muted, fg) = (theme.border, theme.muted_foreground, theme.foreground);
-        // 程序自己设了标题（多半是「用户@主机: 目录」）就显示它
-        let title = terminal.read(cx).title();
-        let restart = terminal.clone();
-        let panel = v_flex()
-            .relative()
-            .flex_none()
-            .h(px(height))
-            .border_t_1()
-            .border_color(border)
-            .child(self.split_handle(layout::Split::TerminalHeight, cx))
-            .child(
-                h_flex()
-                    .flex_none()
-                    .h(px(30.))
-                    .pl(px(10.))
-                    .pr(px(6.))
-                    .gap(px(6.))
-                    .text_color(muted)
-                    .child(ui::icon(IconName::SquareTerminal).flex_none())
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_sm()
-                            .text_color(fg)
-                            .child(tr("终端")),
-                    )
-                    .when_some(title, |bar, title| {
-                        bar.child(ui::clipped("terminal-title", title).text_xs())
-                    })
-                    .child(div().flex_1().min_w(px(4.)))
-                    .child(
-                        Button::new("terminal-restart")
-                            .ghost()
-                            .xsmall()
-                            .icon(ui::icon(IconName::RotateCw))
-                            .tooltip(tr("结束里面的程序，重新开一个"))
-                            .on_click(move |_, _, cx| {
-                                restart.update(cx, |terminal, cx| terminal.restart(cx));
-                            }),
-                    )
-                    .child(
-                        Button::new("terminal-end")
-                            .ghost()
-                            .xsmall()
-                            .icon(ui::icon(IconName::Trash))
-                            .tooltip(tr("结束终端"))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.end_terminal(window, cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("terminal-hide")
-                            .ghost()
-                            .xsmall()
-                            .icon(ui::icon(IconName::ChevronDown))
-                            .tooltip(tr("收起，里面的程序接着跑（Ctrl+`）"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.show_terminal(false, window, cx)
-                            })),
-                    ),
-            )
-            .child(div().flex_1().min_h_0().child(terminal));
-        Some(panel.into_any_element())
     }
 
     /// 「打开」按钮：把仓库交给外面的终端、VS Code 或资源管理器。
@@ -1077,6 +915,7 @@ impl Render for RepoView {
         let sizes = self.sizes(cx);
         self.history.set_layout(self.viewport, sizes);
         self.focus_blame_if_new(window, cx);
+        self.sync_terminals(window, cx);
         let main = if self.channel.is_none() {
             match self.error.clone() {
                 Some(err) => self.render_placeholder(err, true, cx),
@@ -1101,7 +940,8 @@ impl Render for RepoView {
             .in_progress
             .map(|state| self.render_in_progress(state, cx).into_any_element());
         let terminal = self
-            .terminal_open
+            .terminals
+            .open
             .then(|| self.render_terminal(sizes.terminal_height, cx))
             .flatten();
         h_flex()

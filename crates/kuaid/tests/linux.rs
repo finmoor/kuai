@@ -22,7 +22,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use fr_core::protocol::{
-    self, DaemonInfo, Hello, PROTOCOL_VERSION, Request, Response, TermExit, TermInfo, TermOpened,
+    self, DaemonInfo, FilePutReply, Hello, PROTOCOL_VERSION, Request, Response, TermExit, TermInfo,
+    TermOpened,
 };
 use serde_json::{Value, json};
 
@@ -585,4 +586,75 @@ fn 叫停以后终端里的程序也结束_套接字删掉() {
     let mut again = home.connect(&exe);
     assert!(again.hello().daemon);
     assert!(again.terms().is_empty());
+}
+
+/// 传一块文件上去，返回 kuaid 的回答。
+fn put(client: &mut Client, params: Value, bytes: &[u8]) -> FilePutReply {
+    let id = client.send("file_put", params, bytes);
+    let (response, _) = client.reply(id, "file_put 的回答");
+    assert_eq!(response.error, None, "file_put 失败");
+    serde_json::from_value(response.result.unwrap()).unwrap()
+}
+
+fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn 传上来的文件_终端里的程序读得到_没传完的客户端走了就删() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = Home::new();
+    let exe = home.install("1.0.0-aaaaaaaaaaaa");
+    let mut client = home.connect(&exe);
+    client.hello();
+    // 分三块传：开头、中间、最后一块带上「传完了」
+    let content: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let chunks: Vec<&[u8]> = content.chunks(120_000).collect();
+    let first = put(&mut client, json!({ "name": "截 图 1.png" }), chunks[0]);
+    assert_eq!((first.received, &first.path), (120_000, &None));
+    let second = put(&mut client, json!({ "upload": first.upload }), chunks[1]);
+    assert_eq!((second.received, &second.path), (240_000, &None));
+    let last = put(
+        &mut client,
+        json!({ "upload": first.upload, "done": true }),
+        chunks[2],
+    );
+    assert_eq!(last.received, 300_000);
+    // 放在主目录的 .kuai/drop 下，名字里的空格换掉了：贴进终端不用加引号
+    let drop_dir = home.dir.join(".kuai/drop");
+    let path = PathBuf::from(last.path.unwrap());
+    assert_eq!(path, drop_dir.join("截_图_1.png"));
+    assert_eq!(std::fs::read(&path).unwrap(), content);
+    // 只有本人能读
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(mode(&drop_dir), 0o700);
+    // 传完的那次上传不在了，不能接着往里写
+    let id = client.send("file_put", json!({ "upload": first.upload }), b"more");
+    let (response, _) = client.reply(id, "传完以后再传的回答");
+    assert!(response.error.is_some());
+
+    // 终端里的程序拿这个路径读得到
+    let (stream, opened) = client.open("repo", &home.dir);
+    let command = format!("wc -c < {}; echo read-$?\n", path.display());
+    client.input(&opened.term, &command);
+    let out = client.output_until(stream, "read-0");
+    assert!(out.contains("300000"), "{out}");
+
+    // 另一个客户端传到一半走了：没传完的不留
+    let mut other = home.connect(&exe);
+    other.hello();
+    let begun = put(&mut other, json!({ "name": "big.bin" }), &content[..1000]);
+    assert_eq!(begun.path, None);
+    let partial = || names(&drop_dir).iter().any(|name| name.ends_with(".part"));
+    assert!(partial(), "{:?}", names(&drop_dir));
+    other.leave();
+    wait_until("没传完的被删掉", || !partial());
+    assert_eq!(names(&drop_dir), ["截_图_1.png"]);
 }

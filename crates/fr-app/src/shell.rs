@@ -93,9 +93,13 @@ pub fn local_shells() -> Vec<LocalShell> {
 
 /// 内置终端要跑什么：本机仓库是设置里选的 shell（没选、选的找不到了就用第一个找得到的）；
 /// 服务器上的仓库是开在 kuaid 里的终端，经这台服务器的连接接上（没连着就先连）。
+///
+/// `number`：这个仓库的第几个终端（从 1 起）。服务器上的终端靠它起名字，下次打开这个仓库时
+/// 接上的还是原来那个。
 pub fn terminal_launch(
     entry: &RepoEntry,
     app: &Entity<AppState>,
+    number: u32,
     cx: &mut App,
 ) -> Result<Launch, String> {
     let Some(server) = &entry.server else {
@@ -123,8 +127,7 @@ pub fn terminal_launch(
     let connecting = app.update(cx, |app, cx| app.connect(server, cx));
     Ok(Launch::Remote(RemoteLaunch {
         connect: connecting.boxed_local(),
-        // 一个仓库一个终端：用仓库路径当名字，下次打开这个仓库接上的还是它
-        key: entry.path.clone(),
+        key: crate::terminal::session_key(&entry.path, number),
         cwd: entry.path.clone(),
     }))
 }

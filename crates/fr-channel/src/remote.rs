@@ -11,7 +11,8 @@
 use fr_core::i18n::tr;
 use fr_core::tf;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use fr_core::protocol::{
-    self, DirListing, GitResult, Hello, PROTOCOL_VERSION, Request, Response, TermExit, TermInfo,
-    TermOpen, TermOpened,
+    self, DirListing, FilePut, FilePutReply, GitResult, Hello, PROTOCOL_VERSION, Request,
+    Response, TermExit, TermInfo, TermOpen, TermOpened,
 };
 use futures::FutureExt as _;
 use futures::channel::{mpsc, oneshot};
@@ -29,7 +30,10 @@ use futures::future::{self, BoxFuture};
 use serde_json::{Value, json};
 
 use crate::binaries::Binaries;
-use crate::{ChangeStream, GitOutput, GitStream, StreamItem, TermItem, TermStream};
+use crate::{
+    ChangeStream, GitOutput, GitStream, StreamItem, TermItem, TermStream, UploadItem,
+    UploadSource, UploadStream,
+};
 
 /// 启动脚本找到 kuaid 时先打这一行；前面的输出（比如 `.bashrc` 打印的东西）都跳过
 const START_MARKER: &str = "KUAID-START";
@@ -37,6 +41,8 @@ const START_MARKER: &str = "KUAID-START";
 const MISSING_MARKER: &str = "KUAID-MISSING";
 /// ssh 的标准错误留最后这么多，连接失败时拿来提示
 const STDERR_TAIL: usize = 4096;
+/// 上传文件时一块这么大：每块等 kuaid 回一声再发下一块，进度和中止都按块算
+const UPLOAD_CHUNK: usize = 512 * 1024;
 
 /// 和一台服务器的连接。丢弃时断开。
 pub struct Connection {
@@ -340,6 +346,28 @@ impl Connection {
         .boxed()
     }
 
+    /// 把一个文件传到服务器上：kuaid 放在 `~/.kuai/drop/` 下（重名的换个名字，过几天自己清掉），
+    /// 传完给出它在服务器上的完整路径。往终端里发图片、文件用：终端只能过文字，文件走这里，
+    /// 再把路径贴进终端。`name` 是文件名，kuaid 会把贴进 shell 要加引号的字符换掉。
+    pub fn upload(&self, name: &str, source: UploadSource) -> UploadStream {
+        let (tx, rx) = mpsc::unbounded();
+        let inner = Arc::downgrade(&self.inner);
+        let name = name.to_string();
+        let for_error = tx.clone();
+        // 读文件、等每一块的回音都会卡住，放在自己的线程里
+        let spawned = std::thread::Builder::new()
+            .name("kuai-upload".into())
+            .spawn(move || {
+                if let Err(err) = upload_blocking(&inner, &name, source, &tx) {
+                    let _ = tx.unbounded_send(Err(err));
+                }
+            });
+        if let Err(err) = spawned {
+            let _ = for_error.unbounded_send(Err(anyhow!(err)));
+        }
+        UploadStream { rx }
+    }
+
     /// 发一个请求，等它的响应。返回的 future 被丢弃时向 kuaid 发取消。
     fn call(
         &self,
@@ -347,33 +375,85 @@ impl Connection {
         params: Value,
         payload: Vec<u8>,
     ) -> BoxFuture<'static, Result<(Value, Vec<u8>)>> {
-        let id = self.inner.next_id();
-        let (tx, rx) = oneshot::channel();
-        self.inner
-            .pending
-            .lock()
-            .unwrap()
-            .insert(id, Pending::Call(tx));
-        let request = Request {
-            id,
-            method: method.into(),
-            params,
-            bytes: payload.len() as u64,
-        };
-        if let Err(err) = self.inner.send(request, payload) {
-            self.inner.pending.lock().unwrap().remove(&id);
-            return future::ready(Err(err)).boxed();
+        self.inner.call(method, params, payload)
+    }
+}
+
+/// 上传的那个线程：一块块读、一块块发，每块等 kuaid 回一声。
+fn upload_blocking(
+    inner: &Weak<Inner>,
+    name: &str,
+    source: UploadSource,
+    tx: &mpsc::UnboundedSender<Result<UploadItem>>,
+) -> Result<()> {
+    let (mut reader, total): (Box<dyn Read>, u64) = match source {
+        UploadSource::File(path) => {
+            let file =
+                File::open(&path).with_context(|| tf!("打不开 {path}", path = path.display()))?;
+            let total = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+            (Box::new(file), total)
         }
-        let guard = CancelOnDrop {
-            inner: Arc::downgrade(&self.inner),
-            id,
-        };
-        async move {
-            let result = rx.await;
-            drop(guard);
-            result.unwrap_or_else(|_| Err(anyhow!(tr("与服务器的连接已断开"))))
+        UploadSource::Bytes(bytes) => {
+            let total = bytes.len() as u64;
+            (Box::new(Cursor::new(bytes)), total)
         }
-        .boxed()
+    };
+    let mut read_chunk = move || -> Result<Vec<u8>> {
+        let mut chunk = Vec::with_capacity(UPLOAD_CHUNK);
+        reader
+            .by_ref()
+            .take(UPLOAD_CHUNK as u64)
+            .read_to_end(&mut chunk)
+            .context(tr("读文件时出错"))?;
+        Ok(chunk)
+    };
+    let mut upload = String::new();
+    // 多读一块：下一块是空的，这一块就是最后一块
+    let mut current = read_chunk()?;
+    loop {
+        let next = read_chunk()?;
+        let done = next.is_empty();
+        let params = FilePut {
+            name: if upload.is_empty() { name.to_string() } else { String::new() },
+            upload: upload.clone(),
+            done,
+            abort: false,
+        };
+        let connection = inner.upgrade().context(tr("连接已关闭"))?;
+        let call = connection.call("file_put", json!(params), current);
+        drop(connection);
+        let (result, _) = futures::executor::block_on(call)?;
+        let reply: FilePutReply =
+            serde_json::from_value(result).context(tr("kuaid 返回的结果格式不对"))?;
+        upload = reply.upload;
+        let progress = UploadItem::Progress {
+            sent: reply.received,
+            total: total.max(reply.received),
+        };
+        if tx.unbounded_send(Ok(progress)).is_err() {
+            // 没人等了（用户取消了）：不传了，让 kuaid 把收到的删掉
+            if !done && let Some(connection) = inner.upgrade() {
+                let abort = FilePut {
+                    upload,
+                    abort: true,
+                    ..Default::default()
+                };
+                let request = Request {
+                    id: 0,
+                    method: "file_put".into(),
+                    params: json!(abort),
+                    bytes: 0,
+                };
+                let _ = connection.send(request, Vec::new());
+            }
+            return Ok(());
+        }
+        if done {
+            let path = reply.path.context(tr("kuaid 返回的结果格式不对"))?;
+            let _ = tx.unbounded_send(Ok(UploadItem::Done(path)));
+            return Ok(());
+        }
+        current = next;
     }
 }
 
@@ -391,6 +471,38 @@ impl Drop for Connection {
 impl Inner {
     fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// 发一个请求，等它的响应。返回的 future 被丢弃时向 kuaid 发取消。
+    fn call(
+        self: &Arc<Self>,
+        method: &str,
+        params: Value,
+        payload: Vec<u8>,
+    ) -> BoxFuture<'static, Result<(Value, Vec<u8>)>> {
+        let id = self.next_id();
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(id, Pending::Call(tx));
+        let request = Request {
+            id,
+            method: method.into(),
+            params,
+            bytes: payload.len() as u64,
+        };
+        if let Err(err) = self.send(request, payload) {
+            self.pending.lock().unwrap().remove(&id);
+            return future::ready(Err(err)).boxed();
+        }
+        let guard = CancelOnDrop {
+            inner: Arc::downgrade(self),
+            id,
+        };
+        async move {
+            let result = rx.await;
+            drop(guard);
+            result.unwrap_or_else(|_| Err(anyhow!(tr("与服务器的连接已断开"))))
+        }
+        .boxed()
     }
 
     fn send(&self, request: Request, payload: Vec<u8>) -> Result<()> {

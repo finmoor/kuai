@@ -16,9 +16,17 @@
 //!   [`EntityInputHandler`] 送进来。
 //! - 生命周期：面板第一次画出来、知道能放几行几列时才启动进程；进程结束后画面留着，
 //!   按回车重新启动；这个视图丢弃时，本机的进程跟着结束，服务器上的只是断开。
+//!
+//! 一个仓库可以开几个终端（仓库页的面板上一个标签一个），各是各的视图。服务器上的每个终端
+//! 在 kuaid 里有自己的会话，名字见 [`session_key`]。
+//!
+//! 往终端里发图片、文件（粘贴、拖进来、点按钮选）见 [`attach`]：发过去的是文件的路径。
 
+mod attach;
 mod colors;
 mod keys;
+
+pub use attach::Attachment;
 
 use std::any::Any;
 use std::borrow::Cow;
@@ -42,7 +50,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::tty::{self, Options, Shell};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor};
-use fr_channel::{Connection, TermItem, TermStream};
+use fr_channel::{Connection, TermItem, TermStream, UploadItem, UploadSource};
 use fr_core::i18n::tr;
 use fr_core::tf;
 use futures::channel::mpsc;
@@ -60,6 +68,28 @@ const FONT_SIZE: f32 = 13.;
 const LINE_HEIGHT: f32 = 16.;
 /// 字和面板边缘之间留的空
 const PADDING: f32 = 8.;
+
+/// 服务器上终端会话的名字里，仓库路径和序号之间的分隔符（路径里不会有的一个控制字符）
+const KEY_SEPARATOR: char = '\u{1f}';
+
+/// 仓库的第 `number` 个终端在 kuaid 里的会话名字。第 1 个就是仓库路径（1.5 只有一个终端时
+/// 用的就是它，升上来以后接得上），之后的在后面加分隔符和序号。
+pub fn session_key(repo: &str, number: u32) -> String {
+    match number {
+        0 | 1 => repo.to_string(),
+        n => format!("{repo}{KEY_SEPARATOR}{n}"),
+    }
+}
+
+/// 反过来：这个会话是不是这个仓库的终端，是第几个。
+pub fn session_number(repo: &str, key: &str) -> Option<u32> {
+    let rest = key.strip_prefix(repo)?;
+    if rest.is_empty() {
+        return Some(1);
+    }
+    let number: u32 = rest.strip_prefix(KEY_SEPARATOR)?.parse().ok()?;
+    (number >= 2).then_some(number)
+}
 
 /// 终端里要跑什么。
 pub enum Launch {
@@ -83,7 +113,7 @@ pub struct LocalLaunch {
 pub struct RemoteLaunch {
     /// 等这台服务器的连接
     pub connect: LocalBoxFuture<'static, Result<Arc<Connection>, SharedString>>,
-    /// 终端会话的名字：kuaid 里有同名的就接上，不另开。用仓库路径
+    /// 终端会话的名字：kuaid 里有同名的就接上，不另开。见 [`session_key`]
     pub key: String,
     /// 在哪个目录里开 shell
     pub cwd: String,
@@ -367,6 +397,20 @@ fn quoted(program: &str) -> String {
 /// 启动终端时调用，算出要跑什么；失败时返回给用户看的原因。每次（重新）启动都算一遍。
 type Launcher = Box<dyn Fn(&mut App) -> Result<Launch, String>>;
 
+/// 正在把文件发给终端里的程序（服务器上的终端要先把文件传上去）。
+struct Sending {
+    /// 正在传的那个文件
+    name: SharedString,
+    /// 第几个、一共几个
+    index: usize,
+    count: usize,
+    /// 服务器已经收到多少、一共多少（字节）
+    sent: u64,
+    total: u64,
+    /// 丢弃就是不传了
+    _task: Task<()>,
+}
+
 pub struct TerminalView {
     launcher: Launcher,
     session: Option<Session>,
@@ -380,6 +424,12 @@ pub struct TerminalView {
     exited: Option<Option<i32>>,
     /// 和服务器的连接断了，画面留着；终端里的程序还在服务器上跑
     lost: bool,
+    /// 这是服务器上留着的终端（上次没结束），还没接上：也算有东西在跑
+    restored: bool,
+    /// 正在往里发文件
+    sending: Option<Sending>,
+    /// 要提示一下的话（发不了的原因之类）；再敲键盘就消失
+    flash: Option<SharedString>,
     focus: FocusHandle,
     geometry: Rc<Cell<Geometry>>,
     /// 输入法正在组的字，还没上屏
@@ -418,6 +468,9 @@ impl TerminalView {
             error: None,
             exited: None,
             lost: false,
+            restored: false,
+            sending: None,
+            flash: None,
             focus,
             geometry: Rc::default(),
             marked: None,
@@ -439,9 +492,18 @@ impl TerminalView {
         self.is_alive() && self.session.as_ref().is_some_and(|session| !session.is_remote())
     }
 
-    /// 有东西在跑：本机的进程，或者服务器上的终端（连接断了它也在跑）。
+    /// 有东西在跑：本机的进程，或者服务器上的终端（连接断了它也在跑；上次留下、
+    /// 这次还没接上的也算）。
     pub fn is_running(&self) -> bool {
-        self.session.is_some() && self.exited.is_none()
+        match &self.session {
+            Some(_) => self.exited.is_none(),
+            None => self.restored && self.error.is_none() && self.exited.is_none(),
+        }
+    }
+
+    /// 这是服务器上留着的终端，里面的程序还在跑：没接上之前 [`Self::is_running`] 也为真。
+    pub fn mark_restored(&mut self) {
+        self.restored = true;
     }
 
     /// 程序自己设的标题。Windows 上 shell 刚启动时标题是它自己的完整路径，只留文件名。
@@ -477,6 +539,8 @@ impl TerminalView {
                 .detach();
         }
         self.session = None;
+        self.restored = false;
+        self.sending = None;
     }
 
     /// 丢掉现在的会话，下一帧重新开：本机是新的进程；服务器上有同名的会话就接上它
@@ -489,6 +553,8 @@ impl TerminalView {
         self.lost = false;
         self.title = None;
         self.marked = None;
+        self.sending = None;
+        self.flash = None;
         cx.notify();
     }
 
@@ -668,15 +734,199 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// 粘贴。剪贴板里有文字就贴文字；没有文字、是文件（资源管理器里复制的）或者图片（截图）
+    /// 就发过去，见 [`Self::send`]。
     fn paste(&mut self, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        let Some(item) = cx.read_from_clipboard() else {
             return;
         };
-        if text.is_empty() {
+        // 不用 `item.text()`：剪贴板里只有文件时它会把几个路径连在一起当文字
+        let mut text = String::new();
+        let mut files = Vec::new();
+        let mut image = None;
+        for entry in item.entries() {
+            match entry {
+                ClipboardEntry::String(string) => text.push_str(string.text()),
+                ClipboardEntry::ExternalPaths(paths) => {
+                    files.extend(paths.paths().iter().cloned().map(Attachment::File));
+                }
+                ClipboardEntry::Image(found) => image = image.or(Some(found)),
+            }
+        }
+        if !text.is_empty() {
+            let bracketed = self.mode().contains(TermMode::BRACKETED_PASTE);
+            self.input(keys::paste(&text, bracketed), cx);
+            return;
+        }
+        if files.is_empty()
+            && let Some(image) = image
+        {
+            match attach::image_attachment(image, chrono::Local::now()) {
+                Ok(image) => files.push(image),
+                Err(err) => {
+                    self.flash = Some(err.into());
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        self.send(files, cx);
+    }
+
+    /// 让用户选文件，发给终端里的程序。
+    pub fn pick_files(&mut self, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: None,
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.send(paths.into_iter().map(Attachment::File).collect(), cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 把图片、文件发给终端里的程序：发过去的是它们的路径（每个作为一次粘贴）。本机的终端直接给
+    /// 本机的路径；服务器上的终端先把文件传到服务器，给服务器上的路径。
+    pub fn send(&mut self, items: Vec<Attachment>, cx: &mut Context<Self>) {
+        if items.is_empty() {
+            return;
+        }
+        self.flash = None;
+        let refuse = if !self.is_alive() {
+            Some(tr("终端没在跑，发不了。"))
+        } else if self.sending.is_some() {
+            Some(tr("上一批还没发完。"))
+        } else {
+            None
+        };
+        if let Some(why) = refuse {
+            self.flash = Some(why.into());
+            cx.notify();
+            return;
+        }
+        let Some(session) = &self.session else {
+            return;
+        };
+        let (name, count) = (SharedString::from(items[0].name()), items.len());
+        let task = match &session.link {
+            Link::Local { .. } => cx.spawn(async move |this, cx| {
+                // 存图片要写文件，放到后台
+                let prepared = cx
+                    .background_spawn(async move { attach::local_paths(items) })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.sending = None;
+                    match prepared {
+                        Ok(paths) => this.paste_paths(&paths, cx),
+                        Err(err) => this.flash = Some(err.into()),
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }),
+            Link::Remote { conn, .. } => {
+                let conn = conn.clone();
+                cx.spawn(async move |this, cx| {
+                    let mut paths = Vec::new();
+                    let mut failed: Option<SharedString> = None;
+                    for (index, item) in items.into_iter().enumerate() {
+                        let name = item.name();
+                        let source = match item {
+                            Attachment::File(path) if path.is_dir() => {
+                                failed = Some(tf!("文件夹发不了，先打成压缩包：{name}", name).into());
+                                break;
+                            }
+                            Attachment::File(path) => UploadSource::File(path),
+                            Attachment::Image { bytes, .. } => UploadSource::Bytes(bytes),
+                        };
+                        let shown = SharedString::from(name.clone());
+                        let begun = this.update(cx, |this, cx| {
+                            if let Some(sending) = &mut this.sending {
+                                (sending.name, sending.index) = (shown, index);
+                                (sending.sent, sending.total) = (0, 0);
+                            }
+                            cx.notify();
+                        });
+                        if begun.is_err() {
+                            return;
+                        }
+                        let mut stream = conn.upload(&name, source);
+                        let mut path = None;
+                        while let Some(item) = stream.next().await {
+                            match item {
+                                Ok(UploadItem::Progress { sent, total }) => {
+                                    let shown = this.update(cx, |this, cx| {
+                                        if let Some(sending) = &mut this.sending {
+                                            (sending.sent, sending.total) = (sent, total);
+                                        }
+                                        cx.notify();
+                                    });
+                                    if shown.is_err() {
+                                        return;
+                                    }
+                                }
+                                Ok(UploadItem::Done(remote)) => path = Some(remote),
+                                Err(err) => {
+                                    let err = format!("{err:#}");
+                                    failed = Some(tf!("{name} 没传上去：{err}", name, err).into());
+                                }
+                            }
+                        }
+                        match path {
+                            Some(path) => paths.push(path),
+                            None => {
+                                failed.get_or_insert_with(|| {
+                                    tf!("{name} 没传上去：和服务器的连接断了", name).into()
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    this.update(cx, |this, cx| {
+                        this.sending = None;
+                        // 传上去了的照样给程序，没传上去的说一声
+                        this.paste_paths(&paths, cx);
+                        this.flash = failed;
+                        cx.notify();
+                    })
+                    .ok();
+                })
+            }
+        };
+        self.sending = Some(Sending {
+            name,
+            index: 0,
+            count,
+            sent: 0,
+            total: 0,
+            _task: task,
+        });
+        cx.notify();
+    }
+
+    /// 把几个路径贴给程序。
+    fn paste_paths(&mut self, paths: &[String], cx: &mut Context<Self>) {
+        if paths.is_empty() {
             return;
         }
         let bracketed = self.mode().contains(TermMode::BRACKETED_PASTE);
-        self.input(keys::paste(&text, bracketed), cx);
+        let windows = self.session.as_ref().is_some_and(|s| !s.is_remote());
+        self.input(attach::paste_paths(paths, bracketed, windows), cx);
+    }
+
+    /// 从外面拖文件进来。
+    fn on_drop(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus.focus(window, cx);
+        let files = paths.paths().iter().cloned().map(Attachment::File).collect();
+        self.send(files, cx);
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -685,6 +935,16 @@ impl TerminalView {
         let key = keystroke.key.as_str();
         // Alt+F4 留给系统关窗口
         if mods.alt && key == "f4" {
+            return;
+        }
+        if self.flash.take().is_some() {
+            cx.notify();
+        }
+        // 正在传文件时 Esc 是不传了（不交给程序）
+        if key == "escape" && self.sending.take().is_some() {
+            self.flash = Some(tr("不传了。").into());
+            cx.stop_propagation();
+            cx.notify();
             return;
         }
         if !self.is_alive() {
@@ -847,9 +1107,40 @@ impl TerminalView {
         if self.lost && self.exited.is_none() {
             return Some(tr("和服务器断开了，里面的程序还在跑。按回车重新接上。").into());
         }
-        match self.exited? {
-            Some(0) | None => Some(tr("进程已结束。按回车重新启动。").into()),
-            Some(code) => Some(tf!("进程已结束（退出码 {code}）。按回车重新启动。", code).into()),
+        match self.exited {
+            Some(Some(0) | None) => return Some(tr("进程已结束。按回车重新启动。").into()),
+            Some(Some(code)) => {
+                return Some(tf!("进程已结束（退出码 {code}）。按回车重新启动。", code).into());
+            }
+            None => {}
+        }
+        // 本机的终端不用传，一闪就过，不说
+        if let Some(sending) = &self.sending
+            && self.session.as_ref().is_some_and(Session::is_remote)
+        {
+            return Some(sending.notice());
+        }
+        self.flash.clone()
+    }
+}
+
+impl Sending {
+    /// 传到哪了。
+    fn notice(&self) -> SharedString {
+        let name = &self.name;
+        let progress = match self.total {
+            0 => String::new(),
+            total => format!(
+                "：{} / {}",
+                attach::human_size(self.sent),
+                attach::human_size(total)
+            ),
+        };
+        if self.count > 1 {
+            let (index, count) = (self.index + 1, self.count);
+            tf!("正在传第 {index}/{count} 个 {name}{progress}。按 Esc 不传了。", index, count, name, progress).into()
+        } else {
+            tf!("正在传 {name}{progress}。按 Esc 不传了。", name, progress).into()
         }
     }
 }
@@ -957,6 +1248,11 @@ impl Render for TerminalView {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll(cx.listener(Self::on_scroll))
+            // 从资源管理器拖文件进来：拖到上面时底色变一下（不能加边框，会挤得行列数变）
+            .drag_over::<ExternalPaths>(|style, _, _, cx| {
+                style.bg(cx.theme().primary.opacity(0.12))
+            })
+            .on_drop(cx.listener(Self::on_drop))
             .child(
                 canvas(
                     move |bounds, window, cx| prepaint(&for_prepaint, bounds, window, cx),
@@ -1357,4 +1653,38 @@ fn paint(
             let _ = line.paint(origin, frame.cell.height, TextAlign::Left, None, window, cx);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    // 不能 `use super::*`：那样 `#[test]` 会变成界面库里同名的那个宏
+    use super::{session_key, session_number};
+
+    #[test]
+    fn 服务器上终端的名字_第一个就是仓库路径() {
+        let repo = "/data/workspaces/kuai";
+        // 第一个和 1.5 用的名字一样，升上来以后接得上原来的
+        assert_eq!(session_key(repo, 1), repo);
+        assert_eq!(session_key(repo, 3), "/data/workspaces/kuai\u{1f}3");
+        for number in [1, 2, 3, 10, 120] {
+            assert_eq!(session_number(repo, &session_key(repo, number)), Some(number));
+        }
+    }
+
+    #[test]
+    fn 别的仓库的终端不认() {
+        let repo = "/data/workspaces/kuai";
+        // 路径只是开头一样的另一个仓库
+        assert_eq!(session_number(repo, "/data/workspaces/kuai2"), None);
+        assert_eq!(session_number(repo, "/data/workspaces/kuai/sub"), None);
+        assert_eq!(session_number(repo, "/data/workspaces/kuai2\u{1f}2"), None);
+        assert_eq!(session_number(repo, "/data/workspaces"), None);
+        // 不是序号、或者不该出现的序号
+        assert_eq!(session_number(repo, "/data/workspaces/kuai\u{1f}"), None);
+        assert_eq!(session_number(repo, "/data/workspaces/kuai\u{1f}x"), None);
+        assert_eq!(session_number(repo, "/data/workspaces/kuai\u{1f}1"), None);
+        assert_eq!(session_number(repo, "/data/workspaces/kuai\u{1f}0"), None);
+        // 不是仓库页开的（名字是空的）
+        assert_eq!(session_number(repo, ""), None);
+    }
 }

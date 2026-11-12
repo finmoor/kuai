@@ -41,6 +41,7 @@ Windows 上界面和操作习惯接近 Fork 的 Git 客户端，最终目标是�
 | Ctrl+Tab、Ctrl+Shift+Tab | 下一个、上一个标签页 |
 | Ctrl+Shift+T | 重新打开刚关掉的标签页 |
 | Ctrl+` | 打开终端；焦点已经在终端里就收起 |
+| Ctrl+Shift+` | 当前仓库再开一个终端 |
 
 列表里的按键（先点一下列表或者用 Ctrl+1、Ctrl+2 把焦点放过去）：
 
@@ -52,7 +53,7 @@ Windows 上界面和操作习惯接近 Fork 的 Git 客户端，最终目标是�
 | 侧栏 | 上下键换选中的项，回车等于双击（切换分支）；选中文件夹时左键头收起、右键头展开 |
 | 逐行追溯 | 上下键、PageUp、PageDown、Home、End 选行，回车跳到改这一行的提交，Esc 关闭 |
 
-焦点在终端里时，F5、Ctrl+W、Ctrl+F、Ctrl+P 交给终端里的程序（shell 里它们是删一个词、往前搜、上一条命令），其余的照常。终端里：Ctrl+C 中断（选着字时是复制），Ctrl+Shift+C 复制，Ctrl+V、Shift+Insert 粘贴，右键是「选着字就复制、没选就粘贴」，Shift+PageUp、PageDown 和滚轮翻前面的输出。
+焦点在终端里时，F5、Ctrl+W、Ctrl+F、Ctrl+P 交给终端里的程序（shell 里它们是删一个词、往前搜、上一条命令），其余的照常。终端里：Ctrl+C 中断（选着字时是复制），Ctrl+Shift+C 复制，Ctrl+V、Shift+Insert 粘贴（剪贴板里是图片、文件时贴进去的是它们的路径），右键是「选着字就复制、没选就粘贴」，Shift+PageUp、PageDown 和滚轮翻前面的输出。
 
 ## 构建与运行
 

@@ -22,13 +22,18 @@
 //!     --secs <秒数>              `--term` 看多久，默认 3
 //!     --term-list                列出 kuaid 里的终端会话
 //!     --term-close               结束这个仓库的终端
+//!
+//! 连服务器时测传文件（往终端里发图片、文件走的那条路）：
+//!     --put <本机文件>           传到服务器的 ~/.kuai/drop/ 下，打出它在服务器上的路径和速度
 
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use fr_channel::{Channel, ConnectOptions, Connection, StreamItem, TermItem};
+use fr_channel::{
+    Channel, ConnectOptions, Connection, StreamItem, TermItem, UploadItem, UploadSource,
+};
 use futures::StreamExt as _;
 use futures::executor::block_on;
 
@@ -64,11 +69,12 @@ fn main() -> Result<()> {
         .find(|w| w[0] == "--watch")
         .and_then(|w| w[1].parse().ok());
     let term_command = value("--term");
+    let put = value("--put");
     let term_secs: u64 = value("--secs").and_then(|secs| secs.parse().ok()).unwrap_or(3);
     let is_option = |a: &str| {
         matches!(
             a,
-            "--repo" | "--watch" | "--key" | "--secret-env" | "--term" | "--secs"
+            "--repo" | "--watch" | "--key" | "--secret-env" | "--term" | "--secs" | "--put"
         )
     };
     let rest: Vec<&String> = args
@@ -117,6 +123,13 @@ fn main() -> Result<()> {
         }
         _ => anyhow::bail!(usage),
     };
+
+    if let Some(file) = &put {
+        let Channel::Remote(conn) = &channel else {
+            anyhow::bail!("传文件只有连服务器时能测");
+        };
+        return upload(conn, file);
+    }
 
     if term_list || term_close || term_command.is_some() {
         let Channel::Remote(conn) = &channel else {
@@ -212,6 +225,35 @@ fn terminal(conn: &Connection, repo: &str, command: &str, duration: Duration) ->
     }
     println!("\n（收到 {bytes} 字节，断开；终端里的程序接着跑）");
     Ok(())
+}
+
+/// 把本机的一个文件传到服务器上，打出它在那边的路径和速度。
+fn upload(conn: &Connection, file: &str) -> Result<()> {
+    let name = file.rsplit(['/', '\\']).next().unwrap_or(file);
+    let started = Instant::now();
+    let mut stream = conn.upload(name, UploadSource::File(file.into()));
+    let (mut chunks, mut size) = (0, 0);
+    block_on(async {
+        while let Some(item) = stream.next().await {
+            match item? {
+                UploadItem::Progress { sent, .. } => {
+                    chunks += 1;
+                    size = sent;
+                }
+                UploadItem::Done(path) => {
+                    let secs = started.elapsed().as_secs_f64();
+                    println!(
+                        "传完了：{path}，{:.1} MB，{chunks} 块，{:.0} ms，{:.1} MB/s",
+                        size as f64 / 1e6,
+                        secs * 1e3,
+                        size as f64 / 1e6 / secs.max(1e-6),
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        anyhow::bail!("上传中断")
+    })
 }
 
 /// 监听仓库一段时间，每收到一次变化通知打一行。
