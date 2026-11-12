@@ -520,8 +520,9 @@ impl RepoView {
         }
     }
 
-    /// 把键盘焦点放到提交列表上（Ctrl+2）。
+    /// 切到 Git 页的提交历史，把键盘焦点放到提交列表上（Ctrl+2）。
     pub fn show_history_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_page(super::Page::Git, window, cx);
         self.leave_file_views(window, cx);
         self.sidebar_select_history();
         self.history.focus.focus(window, cx);

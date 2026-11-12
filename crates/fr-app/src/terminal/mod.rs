@@ -506,13 +506,15 @@ impl TerminalView {
         self.restored = true;
     }
 
-    /// 程序自己设的标题。Windows 上 shell 刚启动时标题是它自己的完整路径，只留文件名。
+    /// 程序自己设的标题。Windows 上 shell 刚启动时标题是它自己的完整路径，只留程序名
+    /// （`pwsh`，不带 `.exe`）。
     pub fn title(&self) -> Option<SharedString> {
         let title = self.title.as_ref()?;
         let is_program_path =
             title.to_lowercase().ends_with(".exe") && title.contains(['\\', '/']);
         match title.rsplit(['\\', '/']).next() {
-            Some(name) if is_program_path => Some(name.to_string().into()),
+            // 结尾的 .exe 是 ASCII，按字节截不会截到半个字
+            Some(name) if is_program_path => Some(name[..name.len() - 4].to_string().into()),
             _ => Some(title.clone()),
         }
     }

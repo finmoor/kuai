@@ -723,7 +723,7 @@ impl Workspace {
         }
     }
 
-    /// Ctrl+Shift+`：当前仓库再开一个终端。
+    /// Ctrl+Shift+`：当前仓库再开一个终端，切到终端页显示它。
     pub fn new_terminal_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_repo() {
             tab.view
@@ -731,7 +731,7 @@ impl Workspace {
         }
     }
 
-    /// Ctrl+`：打开、收起当前仓库底下的终端。
+    /// Ctrl+`：当前仓库在 Git、终端两页之间来回切。
     pub fn terminal_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_repo() {
             tab.view

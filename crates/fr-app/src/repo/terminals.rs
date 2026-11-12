@@ -1,4 +1,9 @@
-//! 仓库页底下的终端面板：一个仓库可以开几个终端，面板上一个标签一个。
+//! 仓库的终端页：一个仓库可以开几个终端。
+//!
+//! 每个仓库分 Git、终端两页（侧栏里仓库名下面的切换，或者 Ctrl+`），各记各的。终端页的侧栏里
+//! 一个终端一行：新开、切换、结束都在这里，右键还有发文件、重开。右边上面一条工具栏，写着选中的
+//! 终端叫什么、开在哪，右边是发文件、重开；下面是选中的终端，占满。只画选中的那个，没选中的
+//! 照样收输出，只是不画、不跟着改大小。
 //!
 //! 本机仓库的终端跟着仓库的标签页走，关了就结束。服务器上的终端开在 kuaid 里，各有各的会话
 //! （名字见 [`crate::terminal::session_key`]）：关标签页、退出 Kuai 以后接着跑；再打开这个仓库时
@@ -6,35 +11,37 @@
 
 use fr_channel::Channel;
 use fr_core::i18n::tr;
+use fr_core::tf;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{Sizable as _, h_flex, v_flex};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use super::{RepoView, layout};
+use super::{Page, RepoView, TOOLBAR_HEIGHT, tool_button};
 use crate::terminal::{self, TerminalView};
 use crate::ui;
 
-/// 面板上的一个终端。
+/// 侧栏里一个终端一行的高度。
+const ROW_HEIGHT: f32 = 28.;
+
+/// 一个终端。
 struct TermTab {
-    /// 标签上的数字：这个仓库的第几个终端。关掉的不补位，新开的用最小的空号
+    /// 侧栏那一行前面的数字：这个仓库的第几个终端。关掉的不补位，新开的用最小的空号
     number: u32,
     view: Entity<TerminalView>,
-    /// 里面的程序结束、断开时，工具栏按钮上的数字要跟着变
+    /// 里面的程序结束、断开时，切换上的数字要跟着变
     _observe: Subscription,
 }
 
 /// 一个仓库的终端们。
 #[derive(Default)]
 pub(super) struct Terminals {
-    /// 第一次打开面板时才建；之后收起面板也留着（里面的程序接着跑）
+    /// 第一次到终端页时才建；切回 Git 页也留着（里面的程序接着跑）
     tabs: Vec<TermTab>,
-    /// 面板上显示的是哪一个
+    /// 终端页上显示的是哪一个
     active: usize,
-    /// 面板开没开
-    pub(super) open: bool,
     /// 服务器上留着、这次还没接上的终端：序号，里面的程序还在不在跑
     waiting: Vec<(u32, bool)>,
 }
@@ -64,8 +71,8 @@ impl RepoView {
         opened + waiting.count()
     }
 
-    /// 连上服务器以后问一下：kuaid 里留着这个仓库的哪几个终端（工具栏的按钮上标出个数，
-    /// 打开面板时都接回来）。
+    /// 连上服务器以后问一下：kuaid 里留着这个仓库的哪几个终端（侧栏的切换上标出个数，
+    /// 到终端页时都接回来）。
     pub(super) fn check_server_terminals(&mut self, channel: &Channel, cx: &mut Context<Self>) {
         let Channel::Remote(conn) = channel else {
             return;
@@ -94,7 +101,7 @@ impl RepoView {
         .detach();
     }
 
-    /// 加一个终端的标签，返回它在第几个。`restored`：它是服务器上留着的、里面的程序还在跑。
+    /// 加一个终端，返回它在第几个。`restored`：它是服务器上留着的、里面的程序还在跑。
     fn add_terminal(
         &mut self,
         number: u32,
@@ -131,7 +138,7 @@ impl RepoView {
         at
     }
 
-    /// 服务器上留着、还没接上的终端都加成标签（选中哪个才去接哪个）。面板上显示的还是原来那个。
+    /// 服务器上留着、还没接上的终端都加进来（选中哪个才去接哪个）。显示的还是原来那个。
     fn adopt_waiting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.terminals.waiting.is_empty() {
             return;
@@ -146,47 +153,59 @@ impl RepoView {
             self.add_terminal(number, alive, window, cx);
         }
         // 新加的可能排在前面，显示的那个的位置跟着变
-        let at = |shown| self.terminals.tabs.iter().position(|tab| tab.number == shown);
+        let at = |shown| {
+            self.terminals
+                .tabs
+                .iter()
+                .position(|tab| tab.number == shown)
+        };
         self.terminals.active = shown.and_then(at).unwrap_or(0);
     }
 
-    /// 画之前调用。面板已经开着、这时才知道服务器上还留着别的终端（连得慢，或者断了重连）：
-    /// 补成标签。
+    /// 画之前调用。正在终端页上、这时才知道服务器上还留着别的终端（连得慢，或者断了重连）：
+    /// 补进来。
     pub(super) fn sync_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.terminals.open {
+        if self.page == Page::Terminal {
             self.adopt_waiting(window, cx);
         }
     }
 
-    /// 打开或收起终端的面板。打开时焦点放进终端；收起不结束里面的程序。
-    pub fn show_terminal(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if open {
-            // 服务器上留着的都接回来；一个都没有就开第一个
-            self.adopt_waiting(window, cx);
-            if self.terminals.tabs.is_empty() {
-                self.terminals.active = self.add_terminal(1, false, window, cx);
+    /// 切到 Git 页或终端页。到终端页时服务器上留着的都接回来，一个都没有就开第一个，焦点放进
+    /// 终端；回 Git 页不结束里面的程序。
+    pub(super) fn show_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        match page {
+            Page::Terminal => {
+                self.adopt_waiting(window, cx);
+                if self.terminals.tabs.is_empty() {
+                    self.terminals.active = self.add_terminal(1, false, window, cx);
+                }
+                self.focus_terminal(window, cx);
             }
-            self.focus_terminal(window, cx);
-        } else if self.terminal_focused(window, cx) {
             // 焦点还留在看不见的终端上的话，键盘就没反应了
-            window.blur(cx);
+            Page::Git if self.terminal_focused(window, cx) => window.blur(cx),
+            Page::Git => {}
         }
-        self.terminals.open = open;
+        self.page = page;
         cx.notify();
     }
 
-    /// 再开一个终端（Ctrl+Shift+`）。
+    /// Ctrl+`：在 Git、终端两页之间来回切。
+    pub fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let page = match self.page {
+            Page::Git => Page::Terminal,
+            Page::Terminal => Page::Git,
+        };
+        self.show_page(page, window, cx);
+    }
+
+    /// 再开一个终端（侧栏的「新终端」、Ctrl+Shift+`），切到终端页显示它。
     pub fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // 服务器上留着的先接回来，新的排在它们后面
         self.adopt_waiting(window, cx);
-        if self.terminals.tabs.is_empty() {
-            // 还没开过：打开面板开的第一个就是新的
-            return self.show_terminal(true, window, cx);
-        }
         let used: Vec<u32> = self.terminals.tabs.iter().map(|tab| tab.number).collect();
         let number = (1..).find(|n| !used.contains(n)).unwrap_or(1);
         self.terminals.active = self.add_terminal(number, false, window, cx);
-        self.terminals.open = true;
+        self.page = Page::Terminal;
         self.focus_terminal(window, cx);
         cx.notify();
     }
@@ -217,24 +236,20 @@ impl RepoView {
             .is_some_and(|view| view.focus_handle(cx).is_focused(window))
     }
 
-    /// Ctrl+`：没开就打开；开着但焦点不在里面就把焦点放进去；焦点在里面就收起。
-    pub fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let open = !(self.terminals.open && self.terminal_focused(window, cx));
-        self.show_terminal(open, window, cx);
-    }
-
-    /// 结束面板上显示的这个终端。还有别的就换过去，没有了就收起面板。
-    fn end_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.terminals.active >= self.terminals.tabs.len() {
+    /// 结束第 `index` 个终端。显示的是它就换到旁边那个；一个都不剩时留在终端页，显示空的样子。
+    fn end_terminal(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.terminals.tabs.len() {
             return;
         }
-        let tab = self.terminals.tabs.remove(self.terminals.active);
+        let tab = self.terminals.tabs.remove(index);
         // 服务器上的终端不说一声的话会接着跑
         tab.view.update(cx, |view, cx| view.kill(cx));
+        if index < self.terminals.active {
+            self.terminals.active -= 1;
+        }
         if self.terminals.tabs.is_empty() {
             self.terminals.active = 0;
-            self.show_terminal(false, window, cx);
-            // 面板收起时焦点可能还在刚丢掉的终端上
+            // 焦点可能还在刚丢掉的终端上
             window.blur(cx);
         } else {
             self.terminals.active = self.terminals.active.min(self.terminals.tabs.len() - 1);
@@ -243,122 +258,349 @@ impl RepoView {
         cx.notify();
     }
 
-    /// 终端的面板：上面一条是各个终端的标签和几个按钮，下面是选中的那个终端。
-    pub(super) fn render_terminal(&self, height: f32, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let active = self.active_terminal()?.clone();
-        let theme = cx.theme();
-        let (border, muted, fg) = (theme.border, theme.muted_foreground, theme.foreground);
-        let (selected_bg, hover_bg) = (theme.secondary, theme.accent);
-        let tab = |(index, tab): (usize, &TermTab)| {
-            let selected = index == self.terminals.active;
-            // 程序自己设了标题（多半是「用户@主机: 目录」，或者正在跑的程序的名字）就显示它
-            let title = tab.view.read(cx).title();
-            let title = title.unwrap_or_else(|| tr("终端").into());
-            h_flex()
-                .id(("terminal-tab", index))
-                .flex_shrink(1.)
-                .min_w(px(40.))
-                .max_w(px(200.))
-                .h(px(22.))
-                .px(px(8.))
-                .gap(px(6.))
-                .rounded(px(ui::RADIUS))
-                .text_xs()
-                .cursor_pointer()
-                .when(selected, |tab| tab.bg(selected_bg).text_color(fg))
-                .when(!selected, |tab| {
-                    tab.hover(|style| style.bg(hover_bg).text_color(fg))
-                })
-                .child(div().flex_none().child(tab.number.to_string()))
-                .child(
-                    ui::clipped(("terminal-title", index), title)
-                        .flex_1()
-                        .min_w_0(),
-                )
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.select_terminal(index, window, cx);
-                }))
+    /// 结束第 `index` 个终端里的程序，重新开一个，并显示它。
+    fn restart_terminal(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.terminals.tabs.get(index).map(|tab| tab.view.clone()) else {
+            return;
         };
-        let tabs: Vec<_> = self.terminals.tabs.iter().enumerate().map(tab).collect();
-        let (for_attach, for_restart) = (active.clone(), active.clone());
-        let panel = v_flex()
-            .relative()
-            .flex_none()
-            .h(px(height))
-            .border_t_1()
+        self.select_terminal(index, window, cx);
+        view.update(cx, |view, cx| view.restart(cx));
+    }
+
+    /// 给第 `index` 个终端选图片、文件发进去，并显示它。
+    fn attach_to_terminal(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.terminals.tabs.get(index).map(|tab| tab.view.clone()) else {
+            return;
+        };
+        self.select_terminal(index, window, cx);
+        view.update(cx, |view, cx| view.pick_files(cx));
+    }
+
+    /// 终端页的侧栏，接在仓库名和两页的切换下面：Git 页过滤框的位置是「新终端」，
+    /// 下面一个终端一行。
+    pub(super) fn render_terminal_side(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (fg, muted, bg, border, hover) = (
+            theme.sidebar_foreground,
+            theme.muted_foreground,
+            theme.background,
+            theme.input,
+            theme.list_hover,
+        );
+        // 和 Git 页的过滤框一样大、一样的边框，切页时下面的东西不跳
+        let new_button = h_flex()
+            .id("terminal-new")
+            .h(px(24.))
+            .px(px(8.))
+            .gap(px(6.))
+            .rounded(px(ui::RADIUS))
+            .border_1()
             .border_color(border)
-            .child(self.split_handle(layout::Split::TerminalHeight, cx))
+            .bg(bg)
+            .text_size(px(13.))
+            .text_color(fg)
+            .cursor_pointer()
+            .hover(|s| s.bg(hover))
+            .child(ui::icon(IconName::Plus).flex_none().text_color(muted))
+            .child(div().flex_1().min_w_0().truncate().child(tr("新终端")))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(11.))
+                    .text_color(muted)
+                    .child("Ctrl+Shift+`"),
+            )
+            .on_click(cx.listener(|this, _, window, cx| this.new_terminal(window, cx)));
+        let rows: Vec<AnyElement> = (0..self.terminals.tabs.len())
+            .map(|index| self.render_terminal_row(index, cx))
+            .collect();
+        let empty = rows.is_empty();
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(div().px(px(10.)).pt(px(8.)).pb(px(4.)).child(new_button))
+            .child(
+                v_flex()
+                    .id("terminal-rows")
+                    .flex_1()
+                    .min_h_0()
+                    .py(px(4.))
+                    .overflow_y_scroll()
+                    .children(rows)
+                    .when(empty, |list| {
+                        list.child(
+                            div()
+                                .px(px(16.))
+                                .py(px(4.))
+                                .text_xs()
+                                .text_color(muted)
+                                .child(tr("没有开着的终端")),
+                        )
+                    }),
+            )
+    }
+
+    /// 侧栏里一个终端的一行：序号、名字（程序自己设的标题），选中的和鼠标停着的行尾有结束的 ×。
+    /// 点一下切过去，右键有发文件、重开、结束。
+    fn render_terminal_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (fg, muted, selected_bg, hover, border, close_hover) = (
+            theme.sidebar_foreground,
+            theme.muted_foreground,
+            theme.sidebar_accent,
+            theme.list_hover,
+            theme.input,
+            theme.secondary,
+        );
+        let tab = &self.terminals.tabs[index];
+        let selected = index == self.terminals.active;
+        let terminal = tab.view.read(cx);
+        // 程序自己设了标题（多半是「用户@主机: 目录」，或者正在跑的程序的名字）就显示它
+        let title: SharedString = terminal.title().unwrap_or_else(|| tr("终端").into());
+        // 里面的程序已经结束了：名字变淡
+        let running = terminal.is_running();
+        let close = div()
+            .id(("terminal-end", index))
+            .flex_none()
+            .size(px(18.))
+            .rounded(px(4.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(muted)
+            .hover(|s| s.bg(close_hover).text_color(fg))
+            .when(!selected, |close| {
+                close
+                    .invisible()
+                    .group_hover("terminal-row", |s| s.visible())
+            })
+            .child(ui::icon_small(IconName::X))
+            .tooltip(|window, cx| ui::tip(tr("结束这个终端"), window, cx))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.end_terminal(index, window, cx);
+            }));
+        let view = cx.entity().downgrade();
+        h_flex()
+            .id(("terminal-row", index))
+            .group("terminal-row")
+            .h(px(ROW_HEIGHT))
+            .w_full()
+            .cursor_pointer()
+            .on_click(
+                cx.listener(move |this, _, window, cx| this.select_terminal(index, window, cx)),
+            )
             .child(
                 h_flex()
-                    .flex_none()
-                    .h(px(30.))
-                    .pl(px(10.))
-                    .pr(px(6.))
-                    .gap(px(4.))
-                    .text_color(muted)
-                    .child(ui::icon(IconName::SquareTerminal).flex_none())
+                    .h(px(ROW_HEIGHT - 2.))
+                    .flex_1()
+                    .min_w_0()
+                    .mx(px(6.))
+                    .pl(px(6.))
+                    .pr(px(5.))
+                    .gap(px(8.))
+                    .rounded(px(ui::RADIUS))
+                    .text_size(px(13.))
+                    .text_color(if running { fg } else { muted })
+                    .when(selected, |row| row.bg(selected_bg))
+                    .when(!selected, |row| row.hover(|s| s.bg(hover)))
                     .child(
-                        h_flex()
-                            .flex_shrink(1.)
-                            .min_w_0()
-                            .gap(px(2.))
-                            .pl(px(4.))
-                            .overflow_hidden()
-                            .children(tabs),
+                        div()
+                            .flex_none()
+                            .size(px(18.))
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(border)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(11.))
+                            .text_color(muted)
+                            .child(tab.number.to_string()),
                     )
-                    .child(
-                        Button::new("terminal-new")
-                            .ghost()
-                            .xsmall()
-                            .icon(ui::icon(IconName::Plus))
-                            .tooltip(tr("再开一个终端（Ctrl+Shift+`）"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.new_terminal(window, cx);
-                            })),
-                    )
-                    .child(div().flex_1().min_w(px(4.)))
-                    .child(
-                        Button::new("terminal-attach")
-                            .ghost()
-                            .xsmall()
-                            .icon(ui::icon(IconName::Paperclip))
-                            .tooltip(tr("发图片、文件（也可以拖进来，或者复制后按 Ctrl+V）"))
-                            .on_click(move |_, _, cx| {
-                                for_attach.update(cx, |terminal, cx| terminal.pick_files(cx));
-                            }),
-                    )
-                    .child(
-                        Button::new("terminal-restart")
-                            .ghost()
-                            .xsmall()
-                            .icon(ui::icon(IconName::RotateCw))
-                            .tooltip(tr("结束里面的程序，重新开一个"))
-                            .on_click(move |_, _, cx| {
-                                for_restart.update(cx, |terminal, cx| terminal.restart(cx));
-                            }),
-                    )
-                    .child(
-                        Button::new("terminal-end")
-                            .ghost()
-                            .xsmall()
-                            .icon(ui::icon(IconName::Trash))
-                            .tooltip(tr("结束这个终端"))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.end_terminal(window, cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("terminal-hide")
-                            .ghost()
-                            .xsmall()
-                            .icon(ui::icon(IconName::ChevronDown))
-                            .tooltip(tr("收起，里面的程序接着跑（Ctrl+`）"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.show_terminal(false, window, cx)
-                            })),
-                    ),
+                    .child(ui::clipped(("terminal-title", index), title).flex_1())
+                    .child(close),
             )
-            .child(div().flex_1().min_h_0().child(active));
-        Some(panel.into_any_element())
+            .context_menu(move |menu, _, _| {
+                let (attach, restart, end) = (view.clone(), view.clone(), view.clone());
+                menu.item(
+                    PopupMenuItem::new(tr("发图片、文件…")).on_click(move |_, window, cx| {
+                        attach
+                            .update(cx, |this, cx| this.attach_to_terminal(index, window, cx))
+                            .ok();
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new(tr("重开")).on_click(move |_, window, cx| {
+                        restart
+                            .update(cx, |this, cx| this.restart_terminal(index, window, cx))
+                            .ok();
+                    }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new(tr("结束")).on_click(move |_, window, cx| {
+                        end.update(cx, |this, cx| this.end_terminal(index, window, cx))
+                            .ok();
+                    }),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// 终端页的右边：上面一条工具栏，下面是选中的终端，占满；一个都没有时是空的样子。
+    pub(super) fn render_terminal_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let body = match self.active_terminal() {
+            Some(view) => div()
+                .flex_1()
+                .min_h_0()
+                .child(view.clone())
+                .into_any_element(),
+            None => self.render_no_terminal(cx),
+        };
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(self.render_terminal_toolbar(cx))
+            .child(body)
+            .into_any_element()
+    }
+
+    /// 终端页的工具栏，和 Git 页的一样高：左边是选中的终端叫什么、开在哪，右边是发文件、重开。
+    /// 结束在侧栏那一行上，这里不重复。
+    fn render_terminal_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (border, muted, bg, chip) = (
+            theme.border,
+            theme.muted_foreground,
+            theme.background,
+            theme.secondary,
+        );
+        let place: SharedString = match &self.entry.server {
+            Some(_) => tf!(
+                "开在 {place} 上，关了 Kuai 也接着跑",
+                place = self.place(cx)
+            )
+            .into(),
+            None => tr("开在本机，在仓库目录里").into(),
+        };
+        let index = self.terminals.active;
+        let title = self.active_terminal().map(|view| {
+            let title: SharedString = view.read(cx).title().unwrap_or_else(|| tr("终端").into());
+            title
+        });
+        let shown = title.is_some();
+        h_flex()
+            .h(px(TOOLBAR_HEIGHT))
+            .px(px(10.))
+            .gap(px(2.))
+            .flex_none()
+            .bg(bg)
+            .border_b_1()
+            .border_color(border)
+            .when_some(title, |bar, title| {
+                bar.child(
+                    h_flex()
+                        .h(px(30.))
+                        .min_w(px(30.))
+                        .max_w(px(320.))
+                        .flex_shrink(1.)
+                        .mr(px(8.))
+                        .px(px(10.))
+                        .gap(px(6.))
+                        .rounded(px(ui::RADIUS))
+                        .bg(chip)
+                        .overflow_hidden()
+                        .child(
+                            ui::icon(IconName::SquareTerminal)
+                                .flex_none()
+                                .text_color(muted),
+                        )
+                        .child(
+                            ui::clipped("terminal-name", title)
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM),
+                        ),
+                )
+            })
+            .child(
+                ui::clipped("terminal-place", place)
+                    .flex_shrink(1.)
+                    .text_xs()
+                    .text_color(muted),
+            )
+            .child(div().flex_1().min_w(px(4.)))
+            .when(shown, |bar| {
+                bar.child(
+                    tool_button(
+                        "terminal-attach",
+                        IconName::Paperclip,
+                        tr("发文件"),
+                        tr("发图片、文件（也可以拖进来，或者复制后按 Ctrl+V）"),
+                        false,
+                        true,
+                        0,
+                        cx,
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.attach_to_terminal(index, window, cx)
+                    })),
+                )
+                .child(
+                    tool_button(
+                        "terminal-restart",
+                        IconName::RotateCw,
+                        tr("重开"),
+                        tr("结束里面的程序，重新开一个"),
+                        false,
+                        true,
+                        0,
+                        cx,
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.restart_terminal(index, window, cx)
+                    })),
+                )
+            })
+    }
+
+    /// 终端页上一个终端都没有了（最后一个结束了）：不自己跳回 Git 页，留在这里等再开。
+    fn render_no_terminal(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (muted, bg) = (theme.muted_foreground, theme.background);
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .bg(bg)
+            .child(
+                Icon::new(IconName::SquareTerminal)
+                    .size(px(28.))
+                    .text_color(muted),
+            )
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(tr("这个仓库没有开着的终端")),
+            )
+            .child(
+                Button::new("terminal-first")
+                    .primary()
+                    .small()
+                    .icon(ui::icon(IconName::Plus))
+                    .label(tr("开一个终端"))
+                    .on_click(cx.listener(|this, _, window, cx| this.new_terminal(window, cx))),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(tr("或者按 Ctrl+Shift+`")),
+            )
+            .into_any_element()
     }
 }

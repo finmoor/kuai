@@ -1,12 +1,14 @@
 //! 仓库标签页。
 //!
-//! 左边是侧栏（仓库的名字、本地修改、所有提交、分支、远程分支、标签、贮藏），从上到下占满；
-//! 右边上面是工具栏（当前分支、获取、拉取、推送、贮藏……），下面按侧栏选中的项显示
-//! 本地修改（按文件、按块、按行暂存，提交）或提交历史（提交图、详情、改动）。
+//! 分 Git、终端两页，侧栏里仓库名下面的切换（或者 Ctrl+`）来回切，每个标签页各记各的：
+//! - Git 页：左边是侧栏（仓库的名字、本地修改、所有提交、分支、远程分支、标签、贮藏），
+//!   从上到下占满；右边上面是工具栏（当前分支、获取、拉取、推送、贮藏……），下面按侧栏选中的项
+//!   显示本地修改（按文件、按块、按行暂存，提交）或提交历史（提交图、详情、改动）。
+//! - 终端页：侧栏里列着这个仓库的几个终端，右边是选中的那个，见 [`terminals`]。在仓库目录里的
+//!   shell，切回 Git 页不结束里面的程序。本机仓库的关标签页才结束；服务器上的仓库的终端开在
+//!   kuaid 里，关了标签页、退出、断线它都接着跑，再到这个仓库的终端页时接上。
+//!
 //! 本机仓库和服务器上的仓库共用这一套，经 [`Channel`] 执行 git。
-//! 右边最底下可以开一个终端（工具栏的「终端」或 Ctrl+`）：在仓库目录里的 shell，
-//! 收起面板不结束里面的程序。本机仓库的关标签页才结束；服务器上的仓库的终端开在 kuaid 里，
-//! 关了标签页、退出、断线它都接着跑，再打开这个仓库的终端时接上。
 //!
 //! 什么时候刷新：连上以后、切到这个标签页、切回这个窗口、每次写操作之后，还有文件监听报告
 //! 仓库有变化时（在编辑器里存了文件、在终端里提交了），都重读工作区状态、引用和贮藏；
@@ -42,9 +44,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
@@ -64,6 +64,15 @@ enum Mode {
     Blame,
     /// 合并编辑器：解决一个文件里的冲突，也是盖在上面
     Merge,
+}
+
+/// 显示哪一页（侧栏里的切换，Ctrl+` 来回切）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Page {
+    /// 侧栏、提交历史、本地修改
+    Git,
+    /// 这个仓库的终端们
+    Terminal,
 }
 
 /// 仓库页发给工作区的事件。
@@ -121,7 +130,9 @@ pub struct RepoView {
     auto_fetch: auto_fetch::AutoFetch,
     /// 窗口内容区的大小，每帧更新；各块的大小按它收
     viewport: Size<Pixels>,
-    /// 底下的终端们
+    /// 显示的是 Git 页还是终端页
+    page: Page,
+    /// 终端页上的终端们
     terminals: terminals::Terminals,
     _subscriptions: Vec<Subscription>,
 }
@@ -175,6 +186,7 @@ impl RepoView {
             activity: activity::Log::default(),
             auto_fetch: auto_fetch::AutoFetch::new(cx),
             viewport: window.viewport_size(),
+            page: Page::Git,
             terminals: terminals::Terminals::default(),
             _subscriptions: subscriptions,
         };
@@ -360,8 +372,9 @@ impl RepoView {
         self.status.as_ref().map_or(0, |s| s.entries.len())
     }
 
-    /// 切到提交历史，把键盘焦点放到搜索框（Ctrl+F）。
+    /// 切到 Git 页的提交历史，把键盘焦点放到搜索框（Ctrl+F）。
     pub fn find_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_page(Page::Git, window, cx);
         self.focus_search(window, cx);
     }
 
@@ -614,30 +627,6 @@ impl RepoView {
                 .on_click(cx.listener(|this, _, window, cx| this.new_branch_dialog(window, cx))),
             )
             .child(separator())
-            .child(
-                tool_button(
-                    "terminal",
-                    IconName::SquareTerminal,
-                    tr("终端"),
-                    if self.entry.server.is_some() {
-                        tr("终端：开在服务器上，关了 Kuai 也接着跑（Ctrl+`）")
-                    } else {
-                        tr("终端：在仓库目录里开一个 shell（Ctrl+`）")
-                    },
-                    false,
-                    true,
-                    // 面板收着：按钮上标出有几个终端里有东西在跑
-                    match self.terminals.open {
-                        true => 0,
-                        false => self.terminals_running(cx),
-                    },
-                    cx,
-                )
-                .selected(self.terminals.open)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.show_terminal(!this.terminals.open, window, cx)
-                })),
-            )
             .child(self.render_open_button(cx))
             .child(
                 tool_button(
@@ -853,6 +842,41 @@ impl RepoView {
             })
             .into_any_element()
     }
+
+    /// Git 页的右边：工具栏，停在一半的操作的横幅，下面是本地修改或提交历史。
+    fn render_git_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let main = if self.channel.is_none() {
+            match self.error.clone() {
+                Some(err) => self.render_placeholder(err, true, cx),
+                None => {
+                    let text = tf!("正在连接 {cx}…", cx = self.place(cx));
+                    self.render_placeholder(text.into(), false, cx)
+                }
+            }
+        } else if let (Some(err), None) = (self.error.clone(), &self.status) {
+            self.render_placeholder(err, true, cx)
+        } else if self.status.is_none() {
+            self.render_placeholder(tr("正在读取仓库状态…").into(), false, cx)
+        } else {
+            match self.mode {
+                Mode::Changes => self.render_changes(cx),
+                Mode::History => self.render_history(cx),
+                Mode::Blame => self.render_blame(cx),
+                Mode::Merge => self.render_merge(cx),
+            }
+        };
+        let banner = self
+            .in_progress
+            .map(|state| self.render_in_progress(state, cx).into_any_element());
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(self.render_toolbar(cx))
+            .children(banner)
+            .child(div().flex_1().min_h_0().child(main))
+            .into_any_element()
+    }
 }
 
 /// 工具栏按钮：图标在上、字在下。`badge` 不是 0 时在图标旁边标一个数（拉取、推送有几个提交）。
@@ -916,34 +940,10 @@ impl Render for RepoView {
         self.history.set_layout(self.viewport, sizes);
         self.focus_blame_if_new(window, cx);
         self.sync_terminals(window, cx);
-        let main = if self.channel.is_none() {
-            match self.error.clone() {
-                Some(err) => self.render_placeholder(err, true, cx),
-                None => {
-                    let text = tf!("正在连接 {cx}…", cx = self.place(cx));
-                    self.render_placeholder(text.into(), false, cx)
-                }
-            }
-        } else if let (Some(err), None) = (self.error.clone(), &self.status) {
-            self.render_placeholder(err, true, cx)
-        } else if self.status.is_none() {
-            self.render_placeholder(tr("正在读取仓库状态…").into(), false, cx)
-        } else {
-            match self.mode {
-                Mode::Changes => self.render_changes(cx),
-                Mode::History => self.render_history(cx),
-                Mode::Blame => self.render_blame(cx),
-                Mode::Merge => self.render_merge(cx),
-            }
+        let right = match self.page {
+            Page::Git => self.render_git_page(cx),
+            Page::Terminal => self.render_terminal_page(cx),
         };
-        let banner = self
-            .in_progress
-            .map(|state| self.render_in_progress(state, cx).into_any_element());
-        let terminal = self
-            .terminals
-            .open
-            .then(|| self.render_terminal(sizes.terminal_height, cx))
-            .flatten();
         h_flex()
             .size_full()
             // 拖分隔条：不管鼠标拖到哪一块上面，都由这里按位置算大小
@@ -953,15 +953,6 @@ impl Render for RepoView {
                 }),
             )
             .child(self.render_sidebar(cx))
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .child(self.render_toolbar(cx))
-                    .children(banner)
-                    .child(div().flex_1().min_h_0().child(main))
-                    .children(terminal),
-            )
+            .child(right)
     }
 }

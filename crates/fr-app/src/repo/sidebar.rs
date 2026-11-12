@@ -1,4 +1,5 @@
-//! 侧栏：仓库的名字和位置、过滤框，下面是本地修改、所有提交、分支、远程、标签、贮藏、子模块。
+//! 侧栏：仓库的名字和位置，Git、终端两页的切换；Git 页下面是过滤框和本地修改、所有提交、分支、
+//! 远程、标签、贮藏、子模块，终端页下面是这个仓库的几个终端（见 [`super::terminals`]）。
 //!
 //! 分支、远程分支、标签按名字里的 `/` 排成目录树；远程分支先按远程分，每个远程一个文件夹
 //! （刚添加、还没获取到分支的远程也有，是空的）。文件夹和分组都可以收起。
@@ -23,7 +24,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::layout::Split;
-use super::{Mode, RepoView};
+use super::{Mode, Page, RepoView};
 use crate::ui;
 
 const ROW_HEIGHT: f32 = 26.;
@@ -424,7 +425,7 @@ impl RepoView {
         rows
     }
 
-    /// 侧栏顶上：仓库的名字、在哪（和右边的工具栏一样高），下面是过滤框。
+    /// 侧栏顶上：仓库的名字、在哪，和右边的工具栏一样高。
     fn render_side_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (muted, border, accent) = (theme.muted_foreground, theme.sidebar_border, theme.primary);
@@ -432,119 +433,195 @@ impl RepoView {
         let place = self.place(cx);
         let name = self.app.read(cx).repo_name(&self.entry);
         let (view, entry) = (cx.entity().downgrade(), self.entry.clone());
-        v_flex()
+        v_flex().flex_none().child(
+            h_flex()
+                .id("side-header")
+                .h(px(super::TOOLBAR_HEIGHT))
+                .px(px(12.))
+                .gap(px(10.))
+                .border_b_1()
+                .border_color(border)
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(28.))
+                        .rounded(px(7.))
+                        .bg(accent.opacity(0.14))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            ui::icon(if remote {
+                                IconName::Server
+                            } else {
+                                IconName::FolderGit2
+                            })
+                            .text_color(accent),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .child(
+                            ui::clipped("repo-name", name)
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD),
+                        )
+                        .child(
+                            // 提示里位置和路径各一行：路径很长，接在一行里会从盘符后面断开
+                            ui::clipped_with_tip(
+                                "repo-place",
+                                format!("{place} · {}", self.entry.path),
+                                format!("{place}\n{}", self.entry.path),
+                            )
+                            .text_size(px(11.))
+                            .text_color(muted),
+                        ),
+                )
+                .context_menu(move |menu, _, _| {
+                    let (view, entry) = (view.clone(), entry.clone());
+                    let path = entry.path.clone();
+                    menu.item(
+                        gpui_kit::component::menu::PopupMenuItem::new(tr("改名…")).on_click(
+                            move |_, _, cx| {
+                                view.update(cx, |_, cx| {
+                                    cx.emit(super::RepoEvent::Rename(entry.clone()))
+                                })
+                                .ok();
+                            },
+                        ),
+                    )
+                    .item(
+                        gpui_kit::component::menu::PopupMenuItem::new(tr("复制仓库路径")).on_click(
+                            move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                            },
+                        ),
+                    )
+                }),
+        )
+    }
+
+    /// Git、终端两页的切换：仓库名下面、过滤框上面，两页里都在这个位置。终端那一半标出
+    /// 有几个终端在跑（服务器上留着、还没接上的也算）。
+    fn render_page_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (track, fg, muted) = (theme.secondary, theme.foreground, theme.muted_foreground);
+        let dark = theme.is_dark();
+        // 选中的那一半：浅色主题是白底加一点影子，深色主题比底下亮一档
+        let on_bg = if dark {
+            track.blend(fg.opacity(0.12))
+        } else {
+            theme.background
+        };
+        let running = self.terminals_running(cx);
+        let half = |id: &'static str, page: Page, icon: IconName, label: &'static str| {
+            let on = self.page == page;
+            h_flex()
+                .id(id)
+                .flex_1()
+                .min_w_0()
+                .h(px(26.))
+                .gap(px(6.))
+                .justify_center()
+                .rounded(px(5.))
+                .text_size(px(13.))
+                .text_color(if on { fg } else { muted })
+                .when(on, |half| {
+                    half.bg(on_bg)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .when(!dark, |half| half.shadow_xs())
+                })
+                .when(!on, |half| {
+                    half.cursor_pointer().hover(|s| s.text_color(fg))
+                })
+                .child(ui::icon(icon).flex_none())
+                .child(label)
+                .tooltip(|window, cx| ui::tip(tr("Git、终端两页来回切（Ctrl+`）"), window, cx))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if this.page != page {
+                        this.show_page(page, window, cx);
+                    }
+                }))
+        };
+        h_flex()
             .flex_none()
+            .mx(px(10.))
+            .mt(px(8.))
+            .p(px(2.))
+            .gap(px(2.))
+            .rounded(px(7.))
+            .bg(track)
+            .child(half("page-git", Page::Git, IconName::GitBranch, "Git"))
             .child(
-                h_flex()
-                    .id("side-header")
-                    .h(px(super::TOOLBAR_HEIGHT))
-                    .px(px(12.))
-                    .gap(px(10.))
-                    .border_b_1()
-                    .border_color(border)
-                    .child(
+                half(
+                    "page-terminal",
+                    Page::Terminal,
+                    IconName::SquareTerminal,
+                    tr("终端"),
+                )
+                .when(running > 0, |half| {
+                    half.child(
                         div()
                             .flex_none()
-                            .size(px(28.))
-                            .rounded(px(7.))
-                            .bg(accent.opacity(0.14))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                ui::icon(if remote {
-                                    IconName::Server
-                                } else {
-                                    IconName::FolderGit2
-                                })
-                                .text_color(accent),
-                            ),
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(muted)
+                            .child(running.to_string()),
                     )
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .child(
-                                ui::clipped("repo-name", name)
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD),
-                            )
-                            .child(
-                                // 提示里位置和路径各一行：路径很长，接在一行里会从盘符后面断开
-                                ui::clipped_with_tip(
-                                    "repo-place",
-                                    format!("{place} · {}", self.entry.path),
-                                    format!("{place}\n{}", self.entry.path),
-                                )
-                                .text_size(px(11.))
-                                .text_color(muted),
-                            ),
-                    )
-                    .context_menu(move |menu, _, _| {
-                        let (view, entry) = (view.clone(), entry.clone());
-                        let path = entry.path.clone();
-                        menu.item(
-                            gpui_kit::component::menu::PopupMenuItem::new(tr("改名…")).on_click(
-                                move |_, _, cx| {
-                                    view.update(cx, |_, cx| {
-                                        cx.emit(super::RepoEvent::Rename(entry.clone()))
-                                    })
-                                    .ok();
-                                },
-                            ),
-                        )
-                        .item(
-                            gpui_kit::component::menu::PopupMenuItem::new(tr("复制仓库路径"))
-                                .on_click(move |_, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
-                                }),
-                        )
-                    }),
-            )
-            .child(
-                div().px(px(10.)).pt(px(8.)).pb(px(4.)).child(
-                    Input::new(&self.sidebar.filter)
-                        .small()
-                        .cleanable(true)
-                        .prefix(ui::icon(IconName::Search).text_color(muted)),
-                ),
+                }),
             )
     }
 
     pub(super) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let bg = theme.sidebar;
-        let count = self.sidebar_rows(cx).len();
-        let actions = self.render_side_actions(cx);
+        let (bg, muted) = (theme.sidebar, theme.muted_foreground);
         let width = self.sizes(cx).sidebar;
-        v_flex()
+        let side = v_flex()
             .w(px(width))
             .flex_none()
             .h_full()
             .relative()
             .bg(bg)
             .child(self.render_side_header(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .py(px(4.))
-                    .track_focus(&self.sidebar.focus)
-                    .on_key_down(cx.listener(Self::sidebar_key))
-                    .child(
-                        uniform_list(
-                            "sidebar",
-                            count,
-                            cx.processor(|this, range: Range<usize>, _window, cx| {
-                                this.render_sidebar_rows(range, cx)
-                            }),
-                        )
-                        .track_scroll(&self.sidebar.scroll)
-                        .size_full(),
+            .child(self.render_page_switch(cx));
+        let side = match self.page {
+            Page::Terminal => side.child(self.render_terminal_side(cx)),
+            Page::Git => {
+                let count = self.sidebar_rows(cx).len();
+                let actions = self.render_side_actions(cx);
+                side.child(
+                    div().px(px(10.)).pt(px(8.)).pb(px(4.)).child(
+                        Input::new(&self.sidebar.filter)
+                            .small()
+                            .cleanable(true)
+                            .prefix(ui::icon(IconName::Search).text_color(muted)),
                     ),
-            )
-            .children(actions)
-            // 右边那条线就是分隔条：拖它改侧栏的宽度，双击回到默认
-            .child(self.split_handle(Split::Sidebar, cx))
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .py(px(4.))
+                        .track_focus(&self.sidebar.focus)
+                        .on_key_down(cx.listener(Self::sidebar_key))
+                        .child(
+                            uniform_list(
+                                "sidebar",
+                                count,
+                                cx.processor(|this, range: Range<usize>, _window, cx| {
+                                    this.render_sidebar_rows(range, cx)
+                                }),
+                            )
+                            .track_scroll(&self.sidebar.scroll)
+                            .size_full(),
+                        ),
+                )
+                .children(actions)
+            }
+        };
+        // 右边那条线就是分隔条：拖它改侧栏的宽度，双击回到默认
+        side.child(self.split_handle(Split::Sidebar, cx))
             .into_any_element()
     }
 
@@ -993,8 +1070,9 @@ impl RepoView {
         }
     }
 
-    /// 切到本地修改，并把键盘焦点放到文件列表上（Ctrl+1）。
+    /// 切到 Git 页的本地修改，并把键盘焦点放到文件列表上（Ctrl+1）。
     pub fn show_changes_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_page(Page::Git, window, cx);
         self.blame = None;
         self.show_changes(cx);
         self.focus_file_list(window, cx);

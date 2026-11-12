@@ -45,9 +45,8 @@ pub struct Layout {
     /// 详情区左边一栏（说明、改动的文件）的宽度
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details_width: Option<f32>,
-    /// 仓库页底下终端的高度
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal_height: Option<f32>,
+    // 1.3～1.6 还有 terminal_height（仓库页底下终端的高度）。1.7 起终端单独一页、占满，
+    // 不再要它；旧设置文件里的这一项读的时候忽略，下次保存就没了
     /// 仓库页上「全部仓库」展开着（工作区里还没有仓库时不看这一项，一直展开）
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub all_repos: bool,
