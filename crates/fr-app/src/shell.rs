@@ -7,12 +7,14 @@ use fr_core::tf;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use futures::FutureExt as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::{App, Window};
+use gpui_kit::{App, Entity, Window};
 
+use crate::app_state::AppState;
 use crate::settings::{RepoEntry, Server, Target};
-use crate::terminal::Launch;
+use crate::terminal::{Launch, LocalLaunch, RemoteLaunch};
 
 /// CREATE_NO_WINDOW：不弹出控制台窗口
 const NO_WINDOW: u32 = 0x0800_0000;
@@ -89,14 +91,15 @@ pub fn local_shells() -> Vec<LocalShell> {
     shells
 }
 
-/// 内置终端要跑什么：本机仓库是设置里选的 shell（没选、选的找不到了就用第一个找得到的），
-/// 服务器上的仓库是 ssh 登录过去并进到仓库目录。
+/// 内置终端要跑什么：本机仓库是设置里选的 shell（没选、选的找不到了就用第一个找得到的）；
+/// 服务器上的仓库是开在 kuaid 里的终端，经这台服务器的连接接上（没连着就先连）。
 pub fn terminal_launch(
     entry: &RepoEntry,
-    server: Option<&Server>,
-    preferred: &str,
+    app: &Entity<AppState>,
+    cx: &mut App,
 ) -> Result<Launch, String> {
-    if entry.server.is_none() {
+    let Some(server) = &entry.server else {
+        let preferred = app.read(cx).settings.terminal_shell.clone();
         let mut shells = local_shells();
         let at = shells
             .iter()
@@ -106,34 +109,24 @@ pub fn terminal_launch(
             return Err(tr("找不到可以用的 shell（PowerShell、cmd）。").into());
         }
         let shell = shells.swap_remove(at);
-        return Ok(Launch {
+        return Ok(Launch::Local(LocalLaunch {
             program: shell.program.to_string_lossy().into_owned(),
             args: shell.args,
             cwd: Some(PathBuf::from(windows_path(&entry.path))),
             env: Vec::new(),
             keep: None,
-        });
+        }));
+    };
+    if app.read(cx).server(server).is_none() {
+        return Err(tr("找不到这台服务器的设置").into());
     }
-    let server = server.ok_or_else(|| tr("找不到这台服务器的设置").to_string())?;
-    if !in_path("ssh") {
-        return Err(tr(
-            "PATH 里没有 ssh。在「设置 › 系统 › 可选功能」里装上「OpenSSH 客户端」再试。",
-        )
-        .into());
-    }
-    let command = fr_channel::terminal_command(
-        &server.destination,
-        &entry.path,
-        &crate::app_state::connect_options(server),
-    );
-    Ok(Launch {
-        program: command.program.to_string_lossy().into_owned(),
-        args: command.args.clone(),
-        cwd: None,
-        env: command.env.clone(),
-        // 留着它，ssh 要密码、口令时才会用存着的自动回答
-        keep: Some(Box::new(command)),
-    })
+    let connecting = app.update(cx, |app, cx| app.connect(server, cx));
+    Ok(Launch::Remote(RemoteLaunch {
+        connect: connecting.boxed_local(),
+        // 一个仓库一个终端：用仓库路径当名字，下次打开这个仓库接上的还是它
+        key: entry.path.clone(),
+        cwd: entry.path.clone(),
+    }))
 }
 
 /// 在资源管理器里打开所在目录并选中这个文件。

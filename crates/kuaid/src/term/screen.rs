@@ -1,0 +1,831 @@
+//! 记住一个终端会话的屏幕，客户端重新接上时把它还原出来。
+//!
+//! 程序的输出除了转给接着的客户端，也喂给这里的终端仿真器（和客户端画终端用的是同一个库），
+//! 所以随时知道屏幕上是什么、光标在哪、开着哪些模式。客户端接上来时，[`Screen::dump`] 把这些
+//! 写成一串普通的终端输出：往回翻的内容、屏幕、光标、模式。客户端从空白的终端开始照着处理一遍，
+//! 就和一直连着没断过一样，之后接着收实时的输出。
+//!
+//! 还原不了的（仿真库不给读）：滚动区域、自定义的制表位、正在用的画线字符集。全屏程序换窗口
+//! 大小时会自己重画，一般碰不上。
+
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
+use alacritty_terminal::grid::{Dimensions, Grid};
+use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, CursorStyle, NamedColor, Processor, Rgb};
+
+/// 往回翻的内容留多少行。客户端接上时全部还原，所以不能太多
+const HISTORY: usize = 2000;
+/// 没写完的转义序列最多记这么长（剪贴板序列可以很长），再长就不管了
+const TAIL_LIMIT: usize = 256 * 1024;
+/// 画样式要看的那几位（其余的是换行、宽字符占位这些排版标记）
+const STYLE: Flags = Flags::INVERSE
+    .union(Flags::BOLD)
+    .union(Flags::ITALIC)
+    .union(Flags::ALL_UNDERLINES)
+    .union(Flags::DIM)
+    .union(Flags::HIDDEN)
+    .union(Flags::STRIKEOUT);
+
+/// 几行几列。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Size {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl Size {
+    /// 至少两列一行：仿真器不接受更小的。
+    pub fn new(cols: u16, rows: u16) -> Size {
+        Size {
+            cols: cols.clamp(2, 1000),
+            rows: rows.clamp(1, 500),
+        }
+    }
+}
+
+impl Dimensions for Size {
+    fn total_lines(&self) -> usize {
+        self.rows as usize
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.rows as usize
+    }
+
+    fn columns(&self) -> usize {
+        self.cols as usize
+    }
+}
+
+/// 仿真器要告诉外面的事先攒在这里，处理完一批输出再看。
+#[derive(Clone, Default)]
+struct Events(Arc<Mutex<Vec<Event>>>);
+
+impl EventListener for Events {
+    fn send_event(&self, event: Event) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+pub struct Screen {
+    term: Term<Events>,
+    parser: Processor,
+    events: Events,
+    tail: Tail,
+    size: Size,
+    /// 程序自己设的标题（OSC 0、2）
+    title: Option<String>,
+}
+
+impl Screen {
+    pub fn new(size: Size) -> Screen {
+        let events = Events::default();
+        let config = Config {
+            scrolling_history: HISTORY,
+            ..Config::default()
+        };
+        Screen {
+            term: Term::new(config, &size, events.clone()),
+            parser: Processor::new(),
+            events,
+            tail: Tail::default(),
+            size,
+            title: None,
+        }
+    }
+
+    pub fn size(&self) -> Size {
+        self.size
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    /// 处理程序的一块输出。返回终端该回给程序的话（程序问光标位置、终端型号之类）：
+    /// 有客户端接着时由客户端的终端回答，这里的丢掉；没人接着时才写回给程序。
+    pub fn advance(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.flush_sync();
+        self.parser.advance(&mut self.term, bytes);
+        self.tail.feed(bytes);
+        self.take_events()
+    }
+
+    /// 程序开了「同步刷新」又迟迟不结束时，到时间就把攒着的画出来。隔一会儿调用一次。
+    pub fn flush_sync(&mut self) {
+        let due = self
+            .parser
+            .sync_timeout()
+            .sync_timeout()
+            .is_some_and(|deadline| deadline <= Instant::now());
+        if due {
+            self.parser.stop_sync(&mut self.term);
+        }
+    }
+
+    fn take_events(&mut self) -> Vec<u8> {
+        let events = std::mem::take(&mut *self.events.0.lock().unwrap());
+        let mut reply = Vec::new();
+        for event in events {
+            match event {
+                Event::PtyWrite(text) => reply.extend_from_slice(text.as_bytes()),
+                Event::TextAreaSizeRequest(format) => {
+                    let size = WindowSize {
+                        num_lines: self.size.rows,
+                        num_cols: self.size.cols,
+                        cell_width: 8,
+                        cell_height: 16,
+                    };
+                    reply.extend_from_slice(format(size).as_bytes());
+                }
+                Event::Title(title) => self.title = Some(title),
+                Event::ResetTitle => self.title = None,
+                // 颜色只有客户端知道；剪贴板不在服务器上
+                _ => {}
+            }
+        }
+        reply
+    }
+
+    /// 屏幕上某一行的字（测试用）。
+    #[cfg(test)]
+    pub(crate) fn line_text(&self, line: usize) -> String {
+        let grid = self.term.grid();
+        let text: String = (0..grid.columns())
+            .map(|col| grid[Line(line as i32)][Column(col)].c)
+            .collect();
+        text.trim_end().to_string()
+    }
+
+    pub fn resize(&mut self, size: Size) {
+        if size != self.size {
+            self.size = size;
+            self.term.resize(size);
+        }
+    }
+
+    /// 把现在的屏幕写成一串终端输出，给刚接上来的客户端（它的终端是空白的）。
+    pub fn dump(&mut self) -> Vec<u8> {
+        // 同步刷新攒着没画的先画上，不然拍下来的是旧画面
+        self.parser.stop_sync(&mut self.term);
+        self.take_events();
+        let mut out = Vec::with_capacity(64 * 1024);
+        let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
+        // 全屏程序用的备用屏先拍下来：下面换到主屏再换回来，仿真器会把它清掉
+        let alt_part = alt.then(|| {
+            let mut part = b"\x1b[?1049h\x1b[m\x1b[2J\x1b[H".to_vec();
+            write_grid(&mut part, self.term.grid(), false);
+            write_cursor(&mut part, self.term.grid());
+            part
+        });
+        if alt {
+            self.term.swap_alt();
+        }
+        write_grid(&mut out, self.term.grid(), true);
+        write_cursor(&mut out, self.term.grid());
+        if let Some(part) = alt_part {
+            out.extend_from_slice(&part);
+            // 自己也照这一段把备用屏重画一遍，和客户端那边一模一样。另起一个解析器：
+            // 原来那个可能正停在一条没写完的转义序列中间
+            let mut parser: Processor = Processor::new();
+            parser.advance(&mut self.term, &part);
+            self.take_events();
+        }
+        if let Some(title) = &self.title {
+            let clean: String = title.chars().filter(|c| !c.is_control()).collect();
+            out.extend_from_slice(format!("\x1b]2;{clean}\x1b\\").as_bytes());
+        }
+        write_colors(&mut out, &self.term);
+        write_modes(&mut out, &self.term);
+        // 最后是没写完的转义序列的前半截：客户端的解析器要停在同一个地方，后半截来了才接得上
+        out.extend_from_slice(self.tail.pending());
+        out
+    }
+}
+
+/// 一格的样式。
+#[derive(Clone, PartialEq)]
+struct Style {
+    fg: Color,
+    bg: Color,
+    flags: Flags,
+    underline: Option<Color>,
+    /// 超链接的编号和地址
+    link: Option<(String, String)>,
+}
+
+impl Default for Style {
+    fn default() -> Self {
+        Style {
+            fg: Color::Named(NamedColor::Foreground),
+            bg: Color::Named(NamedColor::Background),
+            flags: Flags::empty(),
+            underline: None,
+            link: None,
+        }
+    }
+}
+
+impl Style {
+    fn of(cell: &Cell) -> Style {
+        Style {
+            fg: cell.fg,
+            bg: cell.bg,
+            flags: cell.flags & STYLE,
+            underline: cell.underline_color(),
+            link: cell
+                .hyperlink()
+                .map(|link| (link.id().to_string(), link.uri().to_string())),
+        }
+    }
+}
+
+/// 现在写出去的字会是什么样式；只在变了的时候才发转义序列。
+#[derive(Default)]
+struct Pen(Style);
+
+impl Pen {
+    fn set(&mut self, out: &mut Vec<u8>, style: Style) {
+        if style == self.0 {
+            return;
+        }
+        let same_look = style.fg == self.0.fg
+            && style.bg == self.0.bg
+            && style.flags == self.0.flags
+            && style.underline == self.0.underline;
+        if !same_look {
+            write_sgr(out, &style);
+        }
+        if style.link != self.0.link {
+            match &style.link {
+                Some((id, uri)) => {
+                    out.extend_from_slice(format!("\x1b]8;id={id};{uri}\x1b\\").as_bytes());
+                }
+                None => out.extend_from_slice(b"\x1b]8;;\x1b\\"),
+            }
+        }
+        self.0 = style;
+    }
+
+    fn reset(&mut self, out: &mut Vec<u8>) {
+        self.set(out, Style::default());
+    }
+}
+
+/// 整个重设一遍样式：先清掉，再把有的都加上。
+fn write_sgr(out: &mut Vec<u8>, style: &Style) {
+    let mut codes = String::from("\x1b[0");
+    let flags = style.flags;
+    for (flag, code) in [
+        (Flags::BOLD, ";1"),
+        (Flags::DIM, ";2"),
+        (Flags::ITALIC, ";3"),
+        (Flags::UNDERLINE, ";4"),
+        (Flags::DOUBLE_UNDERLINE, ";21"),
+        (Flags::UNDERCURL, ";4:3"),
+        (Flags::DOTTED_UNDERLINE, ";4:4"),
+        (Flags::DASHED_UNDERLINE, ";4:5"),
+        (Flags::INVERSE, ";7"),
+        (Flags::HIDDEN, ";8"),
+        (Flags::STRIKEOUT, ";9"),
+    ] {
+        if flags.contains(flag) {
+            codes.push_str(code);
+        }
+    }
+    push_color(&mut codes, style.fg, 30, 90, 38, NamedColor::Foreground);
+    push_color(&mut codes, style.bg, 40, 100, 48, NamedColor::Background);
+    match style.underline {
+        Some(Color::Spec(Rgb { r, g, b })) => codes.push_str(&format!(";58;2;{r};{g};{b}")),
+        Some(Color::Indexed(index)) => codes.push_str(&format!(";58;5;{index}")),
+        _ => {}
+    }
+    codes.push('m');
+    out.extend_from_slice(codes.as_bytes());
+}
+
+/// 前景或背景色的 SGR 参数。默认色不用写（开头的 0 已经清成默认了）。
+fn push_color(
+    codes: &mut String,
+    color: Color,
+    normal: u8,
+    bright: u8,
+    extended: u8,
+    default: NamedColor,
+) {
+    match color {
+        Color::Named(name) if name == default => {}
+        Color::Named(name) => match name as usize {
+            index @ 0..=7 => codes.push_str(&format!(";{}", normal as usize + index)),
+            index @ 8..=15 => codes.push_str(&format!(";{}", bright as usize + index - 8)),
+            // 别的名字只在画的时候算出来，格子里不会存
+            _ => {}
+        },
+        Color::Indexed(index) => codes.push_str(&format!(";{extended};5;{index}")),
+        Color::Spec(Rgb { r, g, b }) => codes.push_str(&format!(";{extended};2;{r};{g};{b}")),
+    }
+}
+
+/// 这一格是不是什么都没有（没写过字、没有底色）。行尾这样的格子不用写。
+fn is_blank(cell: &Cell) -> bool {
+    cell.c == ' '
+        && cell.flags.is_empty()
+        && cell.extra.is_none()
+        && cell.fg == Color::Named(NamedColor::Foreground)
+        && cell.bg == Color::Named(NamedColor::Background)
+}
+
+fn write_cell(out: &mut Vec<u8>, pen: &mut Pen, cell: &Cell) {
+    pen.set(out, Style::of(cell));
+    // 制表符在格子里是原样存着的（复制时用），照写的话光标会多跳一次
+    let c = if cell.c == '\t' { ' ' } else { cell.c };
+    let mut buf = [0u8; 4];
+    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    for extra in cell.zerowidth().unwrap_or_default() {
+        out.extend_from_slice(extra.encode_utf8(&mut buf).as_bytes());
+    }
+}
+
+/// 把一个网格从上到下写出来：`history` 为真时从往回翻的最上面一行开始，否则只写屏幕。
+/// 写的时候就当对方的光标在屏幕左上角、屏幕是空的；一行行写下去，多出屏幕的自然滚进历史。
+fn write_grid(out: &mut Vec<u8>, grid: &Grid<Cell>, history: bool) {
+    let cols = grid.columns();
+    let bottom = grid.screen_lines() as i32 - 1;
+    let top = if history {
+        -(grid.history_size() as i32)
+    } else {
+        0
+    };
+    out.extend_from_slice(b"\x1b[m");
+    let mut pen = Pen::default();
+    let mut after_wrap = false;
+    for line in top..=bottom {
+        let row = &grid[Line(line)];
+        // 这一行是写满以后自动折到下一行的：照样写满，让对方也自动折行，不发换行
+        let wrapped = line != bottom && row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+        let end = if wrapped {
+            cols
+        } else {
+            (0..cols)
+                .rev()
+                .find(|&col| !is_blank(&row[Column(col)]))
+                .map_or(0, |col| col + 1)
+        };
+        for col in 0..end {
+            let cell = &row[Column(col)];
+            // 宽字符后面（或者行尾放不下它时留的）占位格不写，写宽字符本身时对方会自己留
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            write_cell(out, &mut pen, cell);
+        }
+        if !wrapped {
+            // 先回到默认样式：换行滚屏时新的一行会带上当时的底色
+            pen.reset(out);
+            // 接在折行后面的这一行是带着上一行的样式滚出来的，没写到的格子清一下
+            if after_wrap && end < cols {
+                out.extend_from_slice(b"\x1b[K");
+            }
+            if line != bottom {
+                out.extend_from_slice(b"\r\n");
+            }
+        }
+        after_wrap = wrapped;
+    }
+    pen.reset(out);
+}
+
+/// 把光标放到这个网格里它该在的地方，并换成它现在的样式（之后程序写的字用这个样式）。
+fn write_cursor(out: &mut Vec<u8>, grid: &Grid<Cell>) {
+    let cols = grid.columns();
+    let point = grid.cursor.point;
+    let line = point.line.0.clamp(0, grid.screen_lines() as i32 - 1);
+    let mut col = point.column.0.min(cols - 1);
+    let mut pen = Pen::default();
+    if grid.cursor.input_needs_wrap {
+        // 光标停在最后一列、下一个字要折行：把最后那个字重写一遍，对方的光标才会进到同一个状态
+        let row = &grid[Line(line)];
+        if row[Column(col)].flags.contains(Flags::WIDE_CHAR_SPACER) && col > 0 {
+            col -= 1;
+        }
+        out.extend_from_slice(format!("\x1b[{};{}H", line + 1, col + 1).as_bytes());
+        write_cell(out, &mut pen, &row[Column(col)]);
+    } else {
+        out.extend_from_slice(format!("\x1b[{};{}H", line + 1, col + 1).as_bytes());
+    }
+    pen.set(out, Style::of(&grid.cursor.template));
+}
+
+/// 程序改过的颜色（OSC 4、10、11、12）。
+fn write_colors<T>(out: &mut Vec<u8>, term: &Term<T>) {
+    let colors = term.colors();
+    let spec = |rgb: Rgb| format!("rgb:{:02x}/{:02x}/{:02x}", rgb.r, rgb.g, rgb.b);
+    for index in 0..256 {
+        if let Some(rgb) = colors[index] {
+            out.extend_from_slice(format!("\x1b]4;{index};{}\x1b\\", spec(rgb)).as_bytes());
+        }
+    }
+    for (name, code) in [
+        (NamedColor::Foreground, 10),
+        (NamedColor::Background, 11),
+        (NamedColor::Cursor, 12),
+    ] {
+        if let Some(rgb) = colors[name] {
+            out.extend_from_slice(format!("\x1b]{code};{}\x1b\\", spec(rgb)).as_bytes());
+        }
+    }
+}
+
+/// 开着的模式和光标的样子。放在内容后面：有的模式（不自动折行、插入）会影响前面内容的写法。
+fn write_modes<T>(out: &mut Vec<u8>, term: &Term<T>) {
+    let mode = *term.mode();
+    let style = term.cursor_style();
+    if style != CursorStyle::default() {
+        let code = match style.shape {
+            CursorShape::Block => Some(1),
+            CursorShape::Underline => Some(3),
+            CursorShape::Beam => Some(5),
+            CursorShape::HollowBlock | CursorShape::Hidden => None,
+        };
+        if let Some(code) = code {
+            let code = if style.blinking { code } else { code + 1 };
+            out.extend_from_slice(format!("\x1b[{code} q").as_bytes());
+        }
+    }
+    // 新开的终端里默认开着的：关了才要说
+    for (flag, off) in [
+        (TermMode::SHOW_CURSOR, "\x1b[?25l"),
+        (TermMode::LINE_WRAP, "\x1b[?7l"),
+        (TermMode::ALTERNATE_SCROLL, "\x1b[?1007l"),
+        (TermMode::URGENCY_HINTS, "\x1b[?1042l"),
+    ] {
+        if !mode.contains(flag) {
+            out.extend_from_slice(off.as_bytes());
+        }
+    }
+    // 默认关着的：开了才要说
+    for (flag, on) in [
+        (TermMode::APP_CURSOR, "\x1b[?1h"),
+        (TermMode::APP_KEYPAD, "\x1b="),
+        (TermMode::MOUSE_REPORT_CLICK, "\x1b[?1000h"),
+        (TermMode::MOUSE_DRAG, "\x1b[?1002h"),
+        (TermMode::MOUSE_MOTION, "\x1b[?1003h"),
+        (TermMode::FOCUS_IN_OUT, "\x1b[?1004h"),
+        (TermMode::UTF8_MOUSE, "\x1b[?1005h"),
+        (TermMode::SGR_MOUSE, "\x1b[?1006h"),
+        (TermMode::BRACKETED_PASTE, "\x1b[?2004h"),
+        (TermMode::INSERT, "\x1b[4h"),
+        (TermMode::LINE_FEED_NEW_LINE, "\x1b[20h"),
+    ] {
+        if mode.contains(flag) {
+            out.extend_from_slice(on.as_bytes());
+        }
+    }
+    let kitty = (mode & TermMode::KITTY_KEYBOARD_PROTOCOL).bits() >> 18;
+    if kitty != 0 {
+        out.extend_from_slice(format!("\x1b[={kitty};1u").as_bytes());
+    }
+}
+
+/// 跟着输出走的一个很小的状态机，只管一件事：现在是不是停在一条没写完的转义序列（或者
+/// 没写完的 UTF-8 字符）中间，是的话已经来了哪些字节。
+#[derive(Default)]
+struct Tail {
+    state: TailState,
+    bytes: Vec<u8>,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+enum TailState {
+    #[default]
+    Ground,
+    /// UTF-8 字符还差几个字节
+    Utf8(u8),
+    /// 刚收到 ESC
+    Escape,
+    /// ESC 后面跟着中间字节
+    EscapeMore,
+    /// `ESC [` 开头的控制序列
+    Csi,
+    /// `ESC ]` 开头的：响铃或者 `ESC \` 结束
+    Osc,
+    /// `ESC P`、`ESC X`、`ESC ^`、`ESC _` 开头的：`ESC \` 结束
+    Text,
+}
+
+impl Tail {
+    fn feed(&mut self, data: &[u8]) {
+        use TailState::*;
+        for &byte in data {
+            // 字符没写完就来了别的：前面的作废，这个字节当新的看
+            if matches!(self.state, Utf8(_)) && !(0x80..=0xbf).contains(&byte) {
+                self.state = Ground;
+                self.bytes.clear();
+            }
+            let next = match (self.state, byte) {
+                // 取消
+                (Escape | EscapeMore | Csi | Osc | Text, 0x18 | 0x1a) => Ground,
+                // 来一个 ESC 就是新的开始；在字符串里的话可能是结束符 `ESC \` 的前一半，前面的留着
+                (_, 0x1b) => Escape,
+                (Ground, 0xc2..=0xdf) => Utf8(1),
+                (Ground, 0xe0..=0xef) => Utf8(2),
+                (Ground, 0xf0..=0xf4) => Utf8(3),
+                (Ground, _) => Ground,
+                (Utf8(1), _) => Ground,
+                (Utf8(left), _) => Utf8(left - 1),
+                (Escape, b'[') => Csi,
+                (Escape, b']') => Osc,
+                (Escape, b'P' | b'X' | b'^' | b'_') => Text,
+                (Escape | EscapeMore, 0x20..=0x2f) => EscapeMore,
+                (Escape | EscapeMore, 0x30..=0x7e) => Ground,
+                (Escape | EscapeMore, _) => self.state,
+                (Csi, 0x40..=0x7e) => Ground,
+                (Csi, _) => Csi,
+                (Osc, 0x07) => Ground,
+                (Osc, _) => Osc,
+                (Text, _) => Text,
+            };
+            if next == Ground || self.bytes.len() >= TAIL_LIMIT {
+                self.bytes.clear();
+                // 太长的不记了，当它不存在
+                self.state = Ground;
+            } else {
+                self.bytes.push(byte);
+                self.state = next;
+            }
+        }
+    }
+
+    /// 没写完的那一截；不在序列中间时是空的。
+    fn pending(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alacritty_terminal::index::Point;
+
+    /// 两个仿真器里的东西是不是一样：每一行每一格、光标、模式。
+    fn assert_same(a: &Screen, b: &Screen, what: &str) {
+        let (ga, gb) = (a.term.grid(), b.term.grid());
+        assert_eq!(ga.history_size(), gb.history_size(), "{what}：往回翻的行数");
+        assert_eq!(ga.columns(), gb.columns());
+        for line in -(ga.history_size() as i32)..ga.screen_lines() as i32 {
+            for col in 0..ga.columns() {
+                let (x, y) = (&ga[Line(line)][Column(col)], &gb[Line(line)][Column(col)]);
+                let text = |cell: &Cell| if cell.c == '\t' { ' ' } else { cell.c };
+                let same = text(x) == text(y)
+                    && x.flags == y.flags
+                    && x.zerowidth().unwrap_or_default() == y.zerowidth().unwrap_or_default()
+                    && Style::of(x).link.map(|l| l.1) == Style::of(y).link.map(|l| l.1)
+                    && x.underline_color() == y.underline_color()
+                    // 空格的前景色看不出来，不比
+                    && (x.fg == y.fg || (text(x) == ' ' && (x.flags & STYLE).is_empty()))
+                    && x.bg == y.bg;
+                assert!(
+                    same,
+                    "{what}：第 {line} 行第 {col} 列不一样\n原来 {x:?}\n还原 {y:?}"
+                );
+            }
+        }
+        assert_eq!(ga.cursor.point, gb.cursor.point, "{what}：光标位置");
+        assert_eq!(
+            ga.cursor.input_needs_wrap, gb.cursor.input_needs_wrap,
+            "{what}：光标是不是等着折行"
+        );
+        let (ta, tb) = (&ga.cursor.template, &gb.cursor.template);
+        assert!(
+            Style::of(ta) == Style::of(tb),
+            "{what}：之后写字用的样式\n原来 {ta:?}\n还原 {tb:?}"
+        );
+        assert_eq!(a.term.mode(), b.term.mode(), "{what}：模式");
+        assert_eq!(a.title, b.title, "{what}：标题");
+    }
+
+    /// 喂一段输出，拍下来，在另一个空白的终端里还原，两边应当一样；之后两边再收同样的输出，还是一样。
+    fn roundtrip(cols: u16, rows: u16, input: &[u8], more: &[u8]) -> Screen {
+        let size = Size::new(cols, rows);
+        let mut original = Screen::new(size);
+        original.advance(input);
+        let dump = original.dump();
+        let mut restored = Screen::new(size);
+        restored.advance(&dump);
+        assert_same(&original, &restored, "还原后");
+        // 拍一下不应该改变自己：再拍一次得到的一样
+        assert_eq!(original.dump(), dump, "拍两次不一样");
+        assert_same(&original, &restored, "拍第二次后");
+        original.advance(more);
+        restored.advance(more);
+        assert_same(&original, &restored, "接着输出后");
+        original
+    }
+
+    #[test]
+    fn 普通的几行字() {
+        roundtrip(40, 6, b"$ ls\r\nCargo.toml  README.md\r\n$ ", b"git status\r\n");
+    }
+
+    #[test]
+    fn 超出屏幕的滚进历史() {
+        let mut input = Vec::new();
+        for n in 0..50 {
+            input.extend_from_slice(format!("line {n}\r\n").as_bytes());
+        }
+        let screen = roundtrip(20, 5, &input, b"tail\r\n");
+        assert_eq!(screen.term.grid().history_size(), 47);
+    }
+
+    #[test]
+    fn 颜色和样式() {
+        let input = b"\x1b[31mred\x1b[0m \x1b[1;4;38;5;200mbold-underline\x1b[0m \
+            \x1b[48;2;1;2;3mtrue-bg\x1b[0m \x1b[7minv\x1b[27m \x1b[2mdim\x1b[22m \
+            \x1b[3mit\x1b[23m \x1b[9mstrike\x1b[29m \x1b[4:3mcurl\x1b[4:0m \
+            \x1b[21mdbl\x1b[24m \x1b[4;58;2;9;8;7mulc\x1b[0m \x1b[92;104mbright\x1b[0m\r\n";
+        roundtrip(120, 5, input, b"\x1b[33mmore\x1b[m");
+    }
+
+    #[test]
+    fn 写字的样式留着() {
+        // 样式开着没关就断开了：还原后接着写的字还是这个样式
+        roundtrip(30, 4, b"plain \x1b[1;35;44m", b"styled\x1b[m plain");
+    }
+
+    #[test]
+    fn 带底色的空格和清行() {
+        roundtrip(30, 4, b"\x1b[44m\x1b[K head\x1b[m\r\n\x1b[41m   \x1b[m|", b"x");
+    }
+
+    #[test]
+    fn 中文是两格宽() {
+        roundtrip(20, 4, "中文测试 abc 混排\r\n第二行".as_bytes(), "接着写".as_bytes());
+    }
+
+    #[test]
+    fn 长行自动折行() {
+        let line = "0123456789".repeat(7);
+        roundtrip(16, 6, line.as_bytes(), b"\r\nnext");
+        // 折行的行滚进了历史
+        let many = format!("{line}\r\n{line}\r\n{line}\r\nend");
+        roundtrip(16, 4, many.as_bytes(), b"!");
+    }
+
+    #[test]
+    fn 行尾放不下的宽字符整个折到下一行() {
+        // 9 列：四个汉字占 8 列，第五个放不下
+        roundtrip(9, 4, "一二三四五六".as_bytes(), "七".as_bytes());
+    }
+
+    #[test]
+    fn 折行时带着底色() {
+        let input = format!("\x1b[42m{}\x1b[m tail", "x".repeat(25));
+        roundtrip(10, 3, input.as_bytes(), b"\r\nok");
+    }
+
+    #[test]
+    fn 正好写满一行() {
+        // 写满后换行：不算折行
+        roundtrip(10, 4, b"0123456789\r\nnext", b"!");
+        // 写满后不换行：光标停在最后一列等着折行，下一个字才折
+        let screen = roundtrip(10, 4, b"0123456789", b"A");
+        assert_eq!(screen.term.grid().cursor.point, Point::new(Line(1), Column(1)));
+        // 最后一格是宽字符
+        roundtrip(10, 4, "01234567中".as_bytes(), b"A");
+    }
+
+    #[test]
+    fn 光标不在末尾() {
+        roundtrip(20, 6, b"one\r\ntwo\r\nthree\x1b[2;2H", b"X");
+        // 屏幕下半截是空的
+        roundtrip(20, 6, b"only\x1b[4;7H", b"Y");
+    }
+
+    #[test]
+    fn 制表符() {
+        roundtrip(40, 3, b"a\tb\tc", b"\td");
+    }
+
+    #[test]
+    fn 全屏程序的备用屏() {
+        let mut input = b"$ vim\r\n".to_vec();
+        input.extend_from_slice(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[7m status \x1b[m\r\n~\r\n~");
+        input.extend_from_slice(b"\x1b[?1h\x1b=\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[2;3H");
+        let mut screen = roundtrip(30, 5, &input, b"typed");
+        assert!(screen.term.mode().contains(TermMode::ALT_SCREEN));
+        // 退出全屏程序后，主屏上原来的东西还在
+        screen.advance(b"\x1b[?1049l");
+        let dump = screen.dump();
+        let mut restored = Screen::new(Size::new(30, 5));
+        restored.advance(&dump);
+        assert_same(&screen, &restored, "退出备用屏后");
+        let first: String = (0..5)
+            .map(|col| restored.term.grid()[Line(0)][Column(col)].c)
+            .collect();
+        assert_eq!(first, "$ vim");
+    }
+
+    #[test]
+    fn 光标藏起来和别的模式() {
+        let screen = roundtrip(20, 3, b"\x1b[?25l\x1b[?1004h\x1b[?7l\x1b[5 qhidden", b"");
+        assert!(!screen.term.mode().contains(TermMode::SHOW_CURSOR));
+    }
+
+    #[test]
+    fn 标题和超链接() {
+        let input = b"\x1b]2;user@host: ~/repo\x07see \x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ end";
+        let screen = roundtrip(40, 3, input, b"");
+        assert_eq!(screen.title(), Some("user@host: ~/repo"));
+    }
+
+    #[test]
+    fn 组合字符() {
+        roundtrip(20, 3, "e\u{301}a\u{308}o".as_bytes(), b"k");
+    }
+
+    #[test]
+    fn 停在转义序列中间() {
+        // 颜色序列只来了前一半就断开重连：后一半来了以后两边还得一样
+        roundtrip(20, 3, b"abc\x1b[3", b"1mred\x1b[m");
+        // 一个汉字的三个字节只来了两个
+        roundtrip(20, 3, &"好".as_bytes()[..2], &"好".as_bytes()[2..]);
+        // 标题只来了一半
+        roundtrip(20, 3, b"x\x1b]2;half", b" title\x07y");
+    }
+
+    #[test]
+    fn 同步刷新攒着的也拍得到() {
+        // 程序开了同步刷新还没结束：这时拍，画面里要有它已经写的东西
+        let size = Size::new(20, 3);
+        let mut original = Screen::new(size);
+        original.advance(b"before\r\n\x1b[?2026hduring");
+        let dump = original.dump();
+        let mut restored = Screen::new(size);
+        restored.advance(&dump);
+        let text: String = (0..6)
+            .map(|col| restored.term.grid()[Line(1)][Column(col)].c)
+            .collect();
+        assert_eq!(text, "during");
+    }
+
+    #[test]
+    fn 改了大小以后拍() {
+        let size = Size::new(30, 6);
+        let mut original = Screen::new(size);
+        original.advance("一行比较长的字，改窄了以后要折行 abcdefghijklmnop\r\n$ ".as_bytes());
+        let narrow = Size::new(12, 4);
+        original.resize(narrow);
+        let dump = original.dump();
+        let mut restored = Screen::new(narrow);
+        restored.advance(&dump);
+        assert_same(&original, &restored, "改窄后");
+    }
+
+    #[test]
+    fn 回答程序的提问() {
+        let mut screen = Screen::new(Size::new(20, 3));
+        // 问光标位置
+        let reply = screen.advance(b"ab\x1b[6n");
+        assert_eq!(reply, b"\x1b[1;3R");
+        // 问终端型号
+        assert!(!screen.advance(b"\x1b[c").is_empty());
+    }
+
+    #[test]
+    fn 认得出没写完的序列() {
+        let pending = |data: &[u8]| {
+            let mut tail = Tail::default();
+            tail.feed(data);
+            tail.pending().to_vec()
+        };
+        assert_eq!(pending(b"plain text\r\n"), b"");
+        assert_eq!(pending(b"x\x1b"), b"\x1b");
+        assert_eq!(pending(b"x\x1b[38;5"), b"\x1b[38;5");
+        assert_eq!(pending(b"x\x1b[38;5;1m"), b"");
+        assert_eq!(pending(b"\x1b]0;tit"), b"\x1b]0;tit");
+        assert_eq!(pending(b"\x1b]0;title\x07"), b"");
+        assert_eq!(pending(b"\x1b]0;title\x1b"), b"\x1b]0;title\x1b");
+        assert_eq!(pending(b"\x1b]0;title\x1b\\"), b"");
+        assert_eq!(pending(b"\x1bP1$r"), b"\x1bP1$r");
+        assert_eq!(pending(b"\x1bP1$r\x1b\\ok"), b"");
+        assert_eq!(pending(b"\x1b(B"), b"");
+        assert_eq!(pending(b"\x1b("), b"\x1b(");
+        assert_eq!(pending(b"\x1b[12\x18"), b"");
+        assert_eq!(pending(&"中".as_bytes()[..1]), &"中".as_bytes()[..1]);
+        assert_eq!(pending("中".as_bytes()), b"");
+        // 一个字节一个字节地喂，结果一样
+        let mut tail = Tail::default();
+        for byte in b"ok\x1b[1;3" {
+            tail.feed(&[*byte]);
+        }
+        assert_eq!(tail.pending(), b"\x1b[1;3");
+    }
+}

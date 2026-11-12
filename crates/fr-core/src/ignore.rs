@@ -2,7 +2,7 @@
 //!
 //! 通道只会「在仓库里执行 git」，没有写文件的操作。这里借 git 的 shell 别名来写：
 //! `git -c alias.x='!…' x <规则>`，别名在仓库根目录里由 sh 执行（Git for Windows 自带 sh），
-//! 本机和服务器上都能用，agent 不用为此加功能。
+//! 本机和服务器上都能用，kuaid 不用为此加功能。
 
 /// 追加一行的 shell 函数：`.gitignore` 末尾没有换行时先补一个。规则作为参数传进去，不拼进脚本。
 const ALIAS: &str = r#"alias.fr-ignore=!f(){ if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then echo >> .gitignore; fi; printf '%s\n' "$1" >> .gitignore; }; f"#;

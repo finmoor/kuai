@@ -1,0 +1,588 @@
+//! 在 Linux 上拿真的 kuaid 程序测常驻这一套：拉起、终端断开后还在、原地升级、结束。
+//!
+//! 每个测试用一个自己的临时主目录（`HOME`），所以各有各的常驻进程，互不相干，也不碰真的 `~/.kuai`。
+//! 测的是经转接程序（`kuaid --connect`）说协议，和客户端经 ssh 用它的方式一样。
+//!
+//! kuaid 程序：环境变量 `KUAID_BIN` 给的，没给就用 cargo 编出来的。开发机是 Windows，
+//! 这个文件是交叉编译成 Linux 的测试程序，拿到 Linux 机器上跑：
+//!
+//! ```text
+//! cargo test --no-run --release -p kuaid --target x86_64-unknown-linux-musl
+//! # 把 target/x86_64-unknown-linux-musl/release/ 下的 kuaid 和 deps/linux-<哈希> 拷到 Linux 机器上
+//! KUAID_BIN=./kuaid ./linux-<哈希>
+//! ```
+#![cfg(unix)]
+
+use std::io::{BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
+
+use fr_core::protocol::{
+    self, DaemonInfo, Hello, PROTOCOL_VERSION, Request, Response, TermExit, TermInfo, TermOpened,
+};
+use serde_json::{Value, json};
+
+const TIMEOUT: Duration = Duration::from_secs(15);
+
+fn kuaid_bin() -> PathBuf {
+    std::env::var_os("KUAID_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_kuaid")))
+}
+
+/// 一个临时的主目录，里面按客户端上传的样子装着 kuaid。丢弃时让常驻进程退出、删掉目录。
+struct Home {
+    dir: PathBuf,
+}
+
+impl Home {
+    fn new() -> Home {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kuaid-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Home { dir }
+    }
+
+    /// 装一个版本：`~/.kuai/<build>/kuaid`。
+    fn install(&self, build: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = self.dir.join(".kuai").join(build);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("kuaid");
+        // 硬链接，不拷贝：拷贝要开着文件写，这时别的测试线程正好在启动子进程的话，子进程会带着
+        // 这个开着写的文件，接下来启动这个程序就报「Text file busy」。不在一个盘上才拷贝
+        if std::fs::hard_link(kuaid_bin(), &exe).is_err() {
+            std::fs::copy(kuaid_bin(), &exe).unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        exe
+    }
+
+    fn command(&self, exe: &Path) -> Command {
+        let mut cmd = Command::new(exe);
+        cmd.env("HOME", &self.dir)
+            .env("SHELL", "/bin/sh")
+            .env_remove("SSH_AUTH_SOCK")
+            .current_dir(&self.dir);
+        cmd
+    }
+
+    /// 像客户端那样连上来：启动转接程序。
+    fn connect(&self, exe: &Path) -> Client {
+        self.connect_with(exe, None)
+    }
+
+    /// `agent`：这条 ssh 连接转发过来的 ssh-agent 的套接字。
+    fn connect_with(&self, exe: &Path, agent: Option<&str>) -> Client {
+        let mut cmd = self.command(exe);
+        if let Some(agent) = agent {
+            cmd.env("SSH_AUTH_SOCK", agent);
+        }
+        let mut child = cmd
+            .arg("--connect")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            while let Ok(Some(message)) = protocol::read_message::<_, Response>(&mut reader) {
+                if tx.send(message).is_err() {
+                    break;
+                }
+            }
+        });
+        Client {
+            child,
+            stdin: Some(stdin),
+            rx,
+            kept: VecDeque::new(),
+            next: 1,
+        }
+    }
+
+    fn run(&self, exe: &Path, arg: &str) -> (bool, String) {
+        let out = self.command(exe).arg(arg).output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.success(), text)
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.dir.join(".kuai/run/kuaid.log")).unwrap_or_default()
+    }
+}
+
+impl Drop for Home {
+    fn drop(&mut self) {
+        // 用哪个版本的程序去叫停都行
+        if let Ok(entries) = std::fs::read_dir(self.dir.join(".kuai")) {
+            for entry in entries.flatten() {
+                let exe = entry.path().join("kuaid");
+                if exe.is_file() {
+                    let _ = self.command(&exe).arg("--stop").output();
+                    break;
+                }
+            }
+        }
+        if std::thread::panicking() {
+            eprintln!("---- 常驻进程的日志 ----\n{}", self.log());
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+struct Client {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    rx: Receiver<(Response, Vec<u8>)>,
+    /// 收到了、还没人要的消息：等某一条时别的先留在这里。几条流上的消息谁先到不一定
+    /// （比如结束终端的回答和终端的退出消息），不能因为先等了一个就把另一个丢了
+    kept: VecDeque<(Response, Vec<u8>)>,
+    next: u64,
+}
+
+impl Client {
+    fn send(&mut self, method: &str, params: Value, payload: &[u8]) -> u64 {
+        let id = self.next;
+        self.next += 1;
+        let request = Request {
+            id,
+            method: method.into(),
+            params,
+            bytes: payload.len() as u64,
+        };
+        let stdin = self.stdin.as_mut().unwrap();
+        protocol::write_message(stdin, &request, payload).unwrap();
+        stdin.flush().unwrap();
+        id
+    }
+
+    /// 等第一条符合 `want` 的消息；`what` 是在等什么，等不到时报出来。
+    fn take(&mut self, what: &str, want: impl Fn(&Response) -> bool) -> (Response, Vec<u8>) {
+        if let Some(at) = self.kept.iter().position(|(response, _)| want(response)) {
+            return self.kept.remove(at).unwrap();
+        }
+        loop {
+            let Ok(message) = self.rx.recv_timeout(TIMEOUT) else {
+                panic!("等不到：{what}");
+            };
+            if want(&message.0) {
+                return message;
+            }
+            self.kept.push_back(message);
+        }
+    }
+
+    /// 请求 `id` 最后的那条响应（不是中间的一块，也不是要密码的询问：询问的编号是另一套）。
+    fn reply(&mut self, id: u64, what: &str) -> (Response, Vec<u8>) {
+        self.take(what, |r| r.id == id && !r.chunk && r.ask.is_none())
+    }
+
+    fn call(&mut self, method: &str, params: Value) -> Value {
+        let id = self.send(method, params, &[]);
+        let (response, _) = self.reply(id, &format!("{method} 的回答"));
+        assert_eq!(response.error, None, "{method} 失败");
+        response.result.unwrap_or(Value::Null)
+    }
+
+    fn hello(&mut self) -> Hello {
+        serde_json::from_value(self.call("hello", json!({ "protocol": PROTOCOL_VERSION }))).unwrap()
+    }
+
+    fn info(&mut self) -> DaemonInfo {
+        serde_json::from_value(self.call("info", json!({}))).unwrap()
+    }
+
+    fn terms(&mut self) -> Vec<TermInfo> {
+        serde_json::from_value(self.call("term_list", json!({}))["terms"].clone()).unwrap()
+    }
+
+    /// 开（或者接上）名字是 `key` 的终端。返回流的编号和开头那条消息。
+    fn open(&mut self, key: &str, cwd: &Path) -> (u64, TermOpened) {
+        let id = self.send(
+            "term_open",
+            json!({ "key": key, "cwd": cwd, "cols": 80, "rows": 24 }),
+            &[],
+        );
+        // 这个流上的第一条：开好了，或者开不了的报错
+        let (response, _) = self.take("term_open 的回答", |r| r.id == id && r.ask.is_none());
+        assert_eq!(response.error, None, "开不了终端");
+        (id, serde_json::from_value(response.result.unwrap()).unwrap())
+    }
+
+    fn input(&mut self, term: &str, text: &str) {
+        self.send("term_input", json!({ "term": term }), text.as_bytes());
+    }
+
+    /// 收这个流上的输出，直到里面出现 `needle`。返回收到的全部。
+    fn output_until(&mut self, stream: u64, needle: &str) -> String {
+        let mut seen = String::new();
+        let deadline = Instant::now() + TIMEOUT;
+        while !seen.contains(needle) {
+            let what = format!("终端里的 {needle:?}，收到的是：{seen:?}");
+            assert!(Instant::now() < deadline, "等不到：{what}");
+            let (response, payload) = self.take(&what, |r| r.id == stream && r.ask.is_none());
+            assert!(response.chunk, "终端提前结束了：{response:?}，收到的是：{seen:?}");
+            seen.push_str(&String::from_utf8_lossy(&payload));
+        }
+        seen
+    }
+
+    /// 收到这个流结束：程序的退出码。
+    fn exit_of(&mut self, stream: u64) -> Option<i32> {
+        let (response, _) = self.reply(stream, "终端结束的消息");
+        assert_eq!(response.error, None);
+        let exit: TermExit = serde_json::from_value(response.result.unwrap()).unwrap();
+        exit.exit
+    }
+
+    /// 等常驻进程来要密码：询问的编号和它问的话。
+    fn next_ask(&mut self) -> (u64, String) {
+        let (response, _) = self.take("要密码的询问", |r| r.ask.is_some());
+        (response.id, response.ask.unwrap())
+    }
+
+    /// 像 ssh 断开那样走掉：关掉标准输入，转接程序应当自己退出。
+    fn leave(mut self) {
+        drop(self.stdin.take());
+        let deadline = Instant::now() + TIMEOUT;
+        while self.child.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "转接程序没有退出");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// 等转接程序自己退出（常驻进程把连接断了）。
+    fn wait_closed(mut self) {
+        let deadline = Instant::now() + TIMEOUT;
+        while self.child.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "连接没有被断开");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
+    let deadline = Instant::now() + TIMEOUT;
+    while !check() {
+        assert!(Instant::now() < deadline, "等不到：{what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn process_exists(pid: &str) -> bool {
+    Path::new("/proc").join(pid).exists()
+}
+
+/// 终端里问一句、答一句：敲 `echo <前缀>$((6*7))` 这类命令，回显里没有算出来的结果，
+/// 等到结果出现才算程序真的执行了。
+fn pid_of_shell(client: &mut Client, stream: u64, term: &str) -> String {
+    client.input(term, "echo pid=$$ ok-$((1+1))\n");
+    let seen = client.output_until(stream, "ok-2");
+    let at = seen.rfind("pid=").unwrap();
+    seen[at + 4..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect()
+}
+
+#[test]
+fn 拉起常驻进程_终端在客户端走了以后还在() {
+    let home = Home::new();
+    let exe = home.install("1.0.0-aaaaaaaaaaaa");
+    // 拉起常驻进程的这条连接带着 ssh-agent 转发
+    let mut first = home.connect_with(&exe, Some("/nonexistent/first-connection"));
+    let hello = first.hello();
+    assert!(hello.daemon);
+    assert_eq!(hello.build, "1.0.0-aaaaaaaaaaaa");
+    assert_eq!(hello.protocol, PROTOCOL_VERSION);
+    let daemon_pid = first.info().pid;
+
+    let (stream, opened) = first.open("repo", &home.dir);
+    assert!(opened.created);
+    first.input(&opened.term, "echo KUAID-$((6*7))\n");
+    first.output_until(stream, "KUAID-42");
+    // 在仓库目录里、环境变量对
+    first.input(
+        &opened.term,
+        "echo cwd=$PWD term=$TERM in=$KUAI_TERM auth=[$SSH_AUTH_SOCK] done-$((1+1))\n",
+    );
+    let seen = first.output_until(stream, "done-2");
+    assert!(seen.contains(&format!("cwd={}", home.dir.display())), "{seen}");
+    assert!(seen.contains("term=xterm-256color"), "{seen}");
+    assert!(seen.contains(&format!("in={}", opened.term)), "{seen}");
+    // 终端拿到的是固定的地址，指向这条连接的 ssh-agent：以后换了连接，改指过去就行
+    let link = home.dir.join(".kuai/run/auth.sock");
+    assert!(seen.contains(&format!("auth=[{}]", link.display())), "{seen}");
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        Path::new("/nonexistent/first-connection")
+    );
+    let shell_pid = pid_of_shell(&mut first, stream, &opened.term);
+    // 起一个一直跑着的程序
+    first.input(&opened.term, "sleep 600 &\n");
+
+    // 改大小
+    first.send(
+        "term_resize",
+        json!({ "term": opened.term, "cols": 100, "rows": 30 }),
+        &[],
+    );
+    first.input(&opened.term, "stty size\n");
+    first.output_until(stream, "30 100");
+
+    // 客户端走了
+    first.leave();
+    let mut second = home.connect(&exe);
+    assert_eq!(second.info().pid, daemon_pid, "常驻进程不该换");
+    let terms = second.terms();
+    assert_eq!(terms.len(), 1);
+    assert!(terms[0].alive);
+    assert_eq!(terms[0].attached, 0);
+    assert_eq!(terms[0].key, "repo");
+    assert!(process_exists(&shell_pid), "shell 被带走了");
+
+    // 同一个名字再开：接上原来的，屏幕还原出来
+    let (stream, again) = second.open("repo", &home.dir);
+    assert_eq!((again.term.as_str(), again.created), (opened.term.as_str(), false));
+    second.output_until(stream, "KUAID-42");
+    assert_eq!(pid_of_shell(&mut second, stream, &again.term), shell_pid);
+
+    // 状态命令看得到它
+    let (ok, status) = home.run(&exe, "--status");
+    assert!(ok, "{status}");
+    assert!(status.contains(&again.term) && status.contains("在跑"), "{status}");
+
+    // 这条连接没带 ssh-agent 转发：它新开的终端里没有，常驻进程没记着拉起它的那条连接的
+    let (plain_stream, plain) = second.open("plain", &home.dir);
+    second.input(&plain.term, "echo auth=[$SSH_AUTH_SOCK] done-$((1+1))\n");
+    let seen = second.output_until(plain_stream, "done-2");
+    assert!(seen.contains("auth=[]"), "{seen}");
+    assert_eq!(second.call("term_close", json!({ "term": plain.term }))["closed"], true);
+    second.exit_of(plain_stream);
+
+    // shell 退出：收到退出码，会话没了
+    second.input(&again.term, "exit 7\n");
+    assert_eq!(second.exit_of(stream), Some(7));
+    wait_until("会话被忘掉", || second.terms().is_empty());
+}
+
+#[test]
+fn 结束终端会把里面的程序都带走() {
+    let home = Home::new();
+    let exe = home.install("1.0.0-aaaaaaaaaaaa");
+    let mut client = home.connect(&exe);
+    client.hello();
+    let (stream, opened) = client.open("repo", &home.dir);
+    let shell_pid = pid_of_shell(&mut client, stream, &opened.term);
+    // 前台跑着一个不会自己结束的程序
+    client.input(&opened.term, "sleep 600\n");
+    std::thread::sleep(Duration::from_millis(300));
+    let closed = client.call("term_close", json!({ "term": opened.term }));
+    assert_eq!(closed["closed"], true);
+    client.exit_of(stream);
+    wait_until("shell 退出", || !process_exists(&shell_pid));
+    assert!(client.terms().is_empty());
+    // 开在不存在的目录里：回错误，连接照常
+    let id = client.send(
+        "term_open",
+        json!({ "key": "x", "cwd": "/nonexistent/dir", "cols": 80, "rows": 24 }),
+        &[],
+    );
+    let (response, _) = client.reply(id, "开不了终端的报错");
+    assert!(response.error.is_some());
+    client.call("ping", json!({}));
+}
+
+#[test]
+fn 没人看着时结束的终端_下次来看还看得到() {
+    let home = Home::new();
+    let exe = home.install("1.0.0-aaaaaaaaaaaa");
+    let mut first = home.connect(&exe);
+    first.hello();
+    let (stream, opened) = first.open("repo", &home.dir);
+    // 两秒后自己退出
+    first.input(&opened.term, "(sleep 2; echo LAST-$((40+2))) ; exit 3\n");
+    first.output_until(stream, "sleep 2");
+    first.leave();
+
+    let mut second = home.connect(&exe);
+    second.hello();
+    wait_until("程序结束", || second.terms().iter().all(|term| !term.alive));
+    assert_eq!(second.terms().len(), 1, "还没人看过，应该留着");
+    let (stream, again) = second.open("repo", &home.dir);
+    assert!(!again.created);
+    second.output_until(stream, "LAST-42");
+    assert_eq!(second.exit_of(stream), Some(3));
+    assert!(second.terms().is_empty());
+}
+
+#[test]
+fn 新版本连上来_常驻进程原地换掉_终端留着() {
+    let home = Home::new();
+    let old = home.install("1.0.0-aaaaaaaaaaaa");
+    let new = home.install("1.0.1-bbbbbbbbbbbb");
+    let mut first = home.connect(&old);
+    assert_eq!(first.hello().build, "1.0.0-aaaaaaaaaaaa");
+    let daemon_pid = first.info().pid;
+    let (stream, opened) = first.open("repo", &home.dir);
+    first.input(&opened.term, "MARK=kept; echo READY-$((6*7))\n");
+    first.output_until(stream, "READY-42");
+    let shell_pid = pid_of_shell(&mut first, stream, &opened.term);
+    // 一个开着但没人看的终端，和一个已经结束、没人看过的
+    let (_, idle) = first.open("idle", &home.dir);
+    let (ended_stream, ended) = first.open("ended", &home.dir);
+    first.send("cancel", json!({ "id": ended_stream }), &[]);
+    wait_until("从终端上断开", || {
+        first.terms().iter().any(|t| t.term == ended.term && t.attached == 0)
+    });
+    first.input(&ended.term, "echo GONE-$((1+1)); exit 5\n");
+    wait_until("那个终端结束", || {
+        first.terms().iter().any(|t| t.term == ended.term && !t.alive)
+    });
+    // 升级的那一刻程序正在不停地输出
+    first.input(&opened.term, "while :; do echo tick; sleep 0.05; done &\n");
+    first.output_until(stream, "tick");
+
+    // 新版本的客户端连上来
+    let mut second = home.connect(&new);
+    let hello = second.hello();
+    assert_eq!(hello.build, "1.0.1-bbbbbbbbbbbb", "日志：\n{}", home.log());
+    assert_eq!(second.info().pid, daemon_pid, "换程序不换进程号");
+    // 原来连着的客户端被断开
+    first.wait_closed();
+
+    let terms = second.terms();
+    assert_eq!(terms.len(), 3, "{terms:?}");
+    assert!(terms.iter().any(|t| t.term == idle.term && t.alive));
+    assert!(terms.iter().any(|t| t.term == ended.term && !t.alive));
+    assert!(process_exists(&shell_pid));
+
+    // 接上原来的终端：屏幕还在，shell 还是那个，变量还在，后台的输出还在来
+    let (stream, again) = second.open("repo", &home.dir);
+    assert_eq!((again.term.as_str(), again.created), (opened.term.as_str(), false));
+    second.output_until(stream, "tick");
+    second.input(&again.term, "kill %1; echo mark=$MARK=\n");
+    second.output_until(stream, "mark=kept=");
+    assert_eq!(pid_of_shell(&mut second, stream, &again.term), shell_pid);
+    // 结束了的那个：最后的画面和退出码带过来了
+    let (stream, seen_ended) = second.open("ended", &home.dir);
+    assert!(!seen_ended.created);
+    second.output_until(stream, "GONE-2");
+    assert_eq!(second.exit_of(stream), Some(5));
+    // 新开的终端编号不和带过来的重
+    let (_, fresh) = second.open("fresh", &home.dir);
+    assert!(fresh.created);
+    assert!(![&opened.term, &idle.term, &ended.term].contains(&&fresh.term));
+
+    // 旧版本的客户端再连：不把常驻进程换回去，照样能用
+    let mut third = home.connect(&old);
+    assert_eq!(third.hello().build, "1.0.1-bbbbbbbbbbbb");
+    assert_eq!(third.info().pid, daemon_pid);
+    third.call("ping", json!({}));
+    // 新版本那个客户端没被断开
+    second.call("ping", json!({}));
+    // 上传新版本时不能删的那个目录
+    let current = std::fs::read_to_string(home.dir.join(".kuai/run/current")).unwrap();
+    assert_eq!(current, "1.0.1-bbbbbbbbbbbb");
+}
+
+#[test]
+fn 两个客户端同时连_只拉起一个常驻进程() {
+    let home = Home::new();
+    let exe = home.install("1.0.0-aaaaaaaaaaaa");
+    let mut clients: Vec<Client> = (0..4).map(|_| home.connect(&exe)).collect();
+    let pids: Vec<u32> = clients.iter_mut().map(|client| client.info().pid).collect();
+    assert!(pids.iter().all(|pid| *pid == pids[0]), "{pids:?}");
+    assert_eq!(clients[0].info().clients, 4);
+    // 各自执行 git，互不相干
+    for client in &mut clients {
+        let id = client.send("git", json!({ "repo": ".", "args": ["--version"] }), &[]);
+        let (_, payload) = client.reply(id, "git 的结果");
+        assert!(String::from_utf8_lossy(&payload).starts_with("git version"));
+    }
+}
+
+#[test]
+fn 两个客户端的_git_要密码_各问各的() {
+    let home = Home::new();
+    let exe = home.install("1.0.0-aaaaaaaaaaaa");
+    let mut alice = home.connect(&exe);
+    let mut bob = home.connect(&exe);
+    alice.hello();
+    bob.hello();
+    // 不联网就能让 git 来要用户名和密码：没有凭据助手时 `git credential fill` 会经 askpass 问
+    let args = json!({ "repo": ".", "args": ["-c", "credential.helper=", "credential", "fill"] });
+    let a = alice.send("git", args.clone(), b"protocol=https\nhost=a.example\n\n");
+    let b = bob.send("git", args, b"protocol=https\nhost=b.example\n\n");
+    // 两个 git 同时在等；各自的客户端被问到的是自己那个地址的
+    for (client, host, name) in [(&mut bob, "b.example", "bob"), (&mut alice, "a.example", "alice")] {
+        let (ask, prompt) = client.next_ask();
+        assert!(prompt.contains("Username") && prompt.contains(host), "{prompt}");
+        client.send("answer", json!({ "id": ask, "answer": name }), &[]);
+        let (ask, prompt) = client.next_ask();
+        assert!(prompt.contains("Password") && prompt.contains(host), "{prompt}");
+        client.send("answer", json!({ "id": ask, "answer": format!("pw-{name}") }), &[]);
+    }
+    for (client, id, name) in [(&mut alice, a, "alice"), (&mut bob, b, "bob")] {
+        let (_, payload) = client.reply(id, "git 的结果");
+        let out = String::from_utf8_lossy(&payload);
+        assert!(out.contains(&format!("username={name}\n")), "{out}");
+        assert!(out.contains(&format!("password=pw-{name}\n")), "{out}");
+    }
+}
+
+#[test]
+fn 叫停以后终端里的程序也结束_套接字删掉() {
+    let home = Home::new();
+    let exe = home.install("1.0.0-aaaaaaaaaaaa");
+    // 没在跑的时候：状态命令报错，不会顺手拉起来
+    let (ok, _) = home.run(&exe, "--status");
+    assert!(!ok);
+    assert!(!home.dir.join(".kuai/run/kuaid.sock").exists());
+
+    let mut client = home.connect(&exe);
+    client.hello();
+    let (stream, opened) = client.open("repo", &home.dir);
+    let shell_pid = pid_of_shell(&mut client, stream, &opened.term);
+    let (ok, text) = home.run(&exe, "--stop");
+    assert!(ok, "{text}");
+    client.wait_closed();
+    wait_until("shell 退出", || !process_exists(&shell_pid));
+    // 套接字文件（常驻进程听的、密码转发用的）都删了，只留下锁文件和日志
+    let mut left: Vec<String> = std::fs::read_dir(home.dir.join(".kuai/run"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["kuaid.lock", "kuaid.log"]);
+    // 再连：拉起一个新的
+    let mut again = home.connect(&exe);
+    assert!(again.hello().daemon);
+    assert!(again.terms().is_empty());
+}

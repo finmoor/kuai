@@ -1,0 +1,20 @@
+[package]
+name = "kuaid"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# 服务器上的常驻程序：在服务器上执行 git、托管终端会话，经 ssh 的 stdin/stdout 和客户端通信。
+# 只能依赖纯 Rust 的库，才能从 Windows 直接交叉编译出 Linux 静态程序。
+[dependencies]
+fr-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# 终端仿真：记住每个终端会话的屏幕，客户端重新接上时还原。和客户端画终端用的是同一个库、
+# 同一个版本，两边对同一串输出的理解才一样
+alacritty_terminal = "0.26"
+
+[target.'cfg(unix)'.dependencies]
+# 伪终端、套接字的锁、给进程发信号
+libc = "0.2"

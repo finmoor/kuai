@@ -5,7 +5,8 @@
 //! 本地修改（按文件、按块、按行暂存，提交）或提交历史（提交图、详情、改动）。
 //! 本机仓库和服务器上的仓库共用这一套，经 [`Channel`] 执行 git。
 //! 右边最底下可以开一个终端（工具栏的「终端」或 Ctrl+`）：在仓库目录里的 shell，
-//! 服务器上的仓库是 ssh 登录过去。收起面板不结束里面的程序，关标签页才结束。
+//! 收起面板不结束里面的程序。本机仓库的关标签页才结束；服务器上的仓库的终端开在 kuaid 里，
+//! 关了标签页、退出、断线它都接着跑，再打开这个仓库的终端时接上。
 //!
 //! 什么时候刷新：连上以后、切到这个标签页、切回这个窗口、每次写操作之后，还有文件监听报告
 //! 仓库有变化时（在编辑器里存了文件、在终端里提交了），都重读工作区状态、引用和贮藏；
@@ -124,6 +125,8 @@ pub struct RepoView {
     terminal: Option<Entity<TerminalView>>,
     /// 终端的面板开没开
     terminal_open: bool,
+    /// 服务器上留着这个仓库的终端（上次开的还在跑），这次还没打开面板去接
+    server_terminal: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -178,6 +181,7 @@ impl RepoView {
             viewport: window.viewport_size(),
             terminal: None,
             terminal_open: false,
+            server_terminal: false,
             _subscriptions: subscriptions,
         };
         // 测试开关：FR_TEST_VIEW=changes 打开仓库时直接显示本地修改
@@ -202,6 +206,7 @@ impl RepoView {
                 match result {
                     Ok(channel) => {
                         this.start_watch(&channel, cx);
+                        this.check_server_terminal(&channel, cx);
                         this.channel = Some(channel);
                         this.refresh(cx);
                     }
@@ -621,13 +626,14 @@ impl RepoView {
                     IconName::SquareTerminal,
                     tr("终端"),
                     if self.entry.server.is_some() {
-                        tr("终端：登录服务器，进到仓库目录（Ctrl+`）")
+                        tr("终端：开在服务器上，关了 Kuai 也接着跑（Ctrl+`）")
                     } else {
                         tr("终端：在仓库目录里开一个 shell（Ctrl+`）")
                     },
                     false,
                     true,
-                    0,
+                    // 面板收着、里面有东西在跑：按钮上标个 1
+                    (!self.terminal_open && self.terminal_running(cx)) as usize,
                     cx,
                 )
                 .selected(self.terminal_open)
@@ -664,11 +670,41 @@ impl RepoView {
             )
     }
 
-    /// 底下终端里的程序是不是还在跑（关标签页前要问一下）。
+    /// 关掉这个标签页会不会结束终端里还在跑的程序（会的话关之前要问一下）。只有本机的终端会：
+    /// 服务器上的终端开在 kuaid 里，标签页关了它接着跑，再打开这个仓库时接上。
     pub fn terminal_alive(&self, cx: &App) -> bool {
         self.terminal
             .as_ref()
-            .is_some_and(|terminal| terminal.read(cx).is_alive())
+            .is_some_and(|terminal| terminal.read(cx).dies_with_view())
+    }
+
+    /// 这个仓库的终端里有东西在跑：这次打开的，或者服务器上留着的（上次没结束）。
+    fn terminal_running(&self, cx: &App) -> bool {
+        match &self.terminal {
+            Some(terminal) => terminal.read(cx).is_running(),
+            None => self.server_terminal,
+        }
+    }
+
+    /// 连上服务器以后问一下：kuaid 里有没有这个仓库的终端还在跑（工具栏的按钮上标出来）。
+    fn check_server_terminal(&mut self, channel: &Channel, cx: &mut Context<Self>) {
+        let Channel::Remote(conn) = channel else {
+            return;
+        };
+        let listing = conn.term_list();
+        let key = self.entry.path.clone();
+        cx.spawn(async move |this, cx| {
+            let Ok(terms) = listing.await else {
+                return;
+            };
+            let running = terms.iter().any(|term| term.key == key && term.alive);
+            this.update(cx, |this, cx| {
+                this.server_terminal = running;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// 打开或收起终端的面板。打开时焦点放进终端；收起不结束里面的程序。
@@ -680,17 +716,16 @@ impl RepoView {
                     let (entry, app) = (self.entry.clone(), self.app.clone());
                     let terminal = cx.new(|cx| {
                         TerminalView::new(
-                            move |cx| {
-                                let app = app.read(cx);
-                                let server = entry.server.as_deref().and_then(|id| app.server(id));
-                                let shell = &app.settings.terminal_shell;
-                                crate::shell::terminal_launch(&entry, server, shell)
-                            },
+                            move |cx| crate::shell::terminal_launch(&entry, &app, cx),
                             window,
                             cx,
                         )
                     });
+                    // 里面的程序结束、断开时，工具栏按钮上的标记要跟着变
+                    self._subscriptions
+                        .push(cx.observe(&terminal, |_, _, cx| cx.notify()));
                     self.terminal = Some(terminal.clone());
+                    self.server_terminal = false;
                     terminal
                 }
             };
@@ -718,7 +753,10 @@ impl RepoView {
     /// 结束终端里的程序并收起面板。
     fn end_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_terminal(false, window, cx);
-        self.terminal = None;
+        // 服务器上的终端不说一声的话会接着跑
+        if let Some(terminal) = self.terminal.take() {
+            terminal.update(cx, |terminal, cx| terminal.kill(cx));
+        }
     }
 
     /// 终端的面板：上面一条标题（重新启动、结束、收起），下面是终端。

@@ -1,11 +1,11 @@
-//! 让 git 和 ssh 要密码时来问我们，而不是在不存在的终端里等。客户端和 agent 共用。
+//! 让 git 和 ssh 要密码时来问我们，而不是在不存在的终端里等。客户端和 kuaid 共用。
 //!
-//! 主进程（客户端或 agent）开一个只有本机能连的监听口，再把自己的程序路径设成
+//! 主进程（客户端或 kuaid）开一个只有本机能连的监听口，再把自己的程序路径设成
 //! `GIT_ASKPASS` 和 `SSH_ASKPASS`。git、ssh 要密码时会启动这个程序，参数是提示文字；
 //! 程序发现环境变量里有监听地址，就进入「助手模式」：连上主进程，把提示交过去，
 //! 等回答，打到标准输出后退出。Fork 自带的 `Fork.AskPass.exe` 是同样的思路。
 //!
-//! 监听口：Linux 上是 agent 目录里的 unix 套接字（权限 600）；Windows 上是 127.0.0.1 的随机端口。
+//! 监听口：Linux 上是 kuaid 目录里的 unix 套接字（权限 600）；Windows 上是 127.0.0.1 的随机端口。
 //! 两种都要带随机口令才理会，口令只在 git 进程的环境变量里。
 
 use crate::i18n::tr;
@@ -53,8 +53,19 @@ pub fn serve_tagged(
     helper: &Path,
     on_prompt: impl Fn(&str, Option<&str>) -> Option<String> + Send + Sync + 'static,
 ) -> Result<Vec<(String, String)>> {
+    let dir = helper.parent().unwrap_or(Path::new("/tmp"));
+    serve_tagged_in(dir, helper, on_prompt)
+}
+
+/// 同 [`serve_tagged`]，套接字文件放在 `dir` 里（Windows 上用不到）。常驻的 kuaid 把它放在
+/// 自己的运行目录里：程序所在的目录会随升级换掉，套接字不能跟着没。
+pub fn serve_tagged_in(
+    dir: &Path,
+    helper: &Path,
+    on_prompt: impl Fn(&str, Option<&str>) -> Option<String> + Send + Sync + 'static,
+) -> Result<Vec<(String, String)>> {
     let token = random_token();
-    let (listener, addr) = Listener::bind(helper)?;
+    let (listener, addr) = Listener::bind(dir)?;
     let on_prompt = Arc::new(on_prompt);
     let expected = token.clone();
     std::thread::Builder::new()
@@ -152,11 +163,10 @@ enum Listener {
 
 impl Listener {
     #[cfg(unix)]
-    fn bind(helper: &Path) -> Result<(Listener, String)> {
+    fn bind(dir: &Path) -> Result<(Listener, String)> {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = helper.parent().unwrap_or(Path::new("/tmp"));
         clean_stale_sockets(dir);
-        let path = dir.join(format!("askpass-{}.sock", std::process::id()));
+        let path = socket_path(dir);
         let _ = std::fs::remove_file(&path);
         let listener = std::os::unix::net::UnixListener::bind(&path)
             .with_context(|| crate::tf!("无法创建 {path}", path = path.display()))?;
@@ -166,7 +176,7 @@ impl Listener {
     }
 
     #[cfg(not(unix))]
-    fn bind(_helper: &Path) -> Result<(Listener, String)> {
+    fn bind(_dir: &Path) -> Result<(Listener, String)> {
         let listener =
             std::net::TcpListener::bind(("127.0.0.1", 0)).context(tr("无法在本机开监听口"))?;
         let addr = listener.local_addr()?.to_string();
@@ -191,6 +201,12 @@ impl Drop for Listener {
             let _ = std::fs::remove_file(path);
         }
     }
+}
+
+/// 这个进程在 `dir` 里听的套接字文件。用 `exit` 直接退出的程序（kuaid 的常驻进程）走之前自己删。
+#[cfg(unix)]
+pub fn socket_path(dir: &Path) -> std::path::PathBuf {
+    dir.join(format!("askpass-{}.sock", std::process::id()))
 }
 
 /// 删掉已经退出的进程留下的套接字文件（进程被杀掉时来不及删）。

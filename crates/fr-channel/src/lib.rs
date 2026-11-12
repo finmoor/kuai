@@ -1,11 +1,13 @@
 //! 仓库通道：界面只认 [`Channel`]，不区分本机仓库和服务器上的仓库。
 //!
 //! - 本机仓库：在进程内直接启动 git。
-//! - 服务器上的仓库：经一条 ssh 连接交给服务器上的 fr-agent，见 [`Connection`]。
+//! - 服务器上的仓库：经一条 ssh 连接交给服务器上的 kuaid，见 [`Connection`]。
 //!
 //! 调用都返回 future，不阻塞调用方；future 或流被丢弃时取消请求，对应的 git 进程会被杀掉。
+//!
+//! 服务器上的终端也开在 kuaid 里（[`Connection::term_open`]）：流被丢弃只是断开，里面的程序接着跑。
 
-mod agents;
+mod binaries;
 mod local;
 mod remote;
 
@@ -23,8 +25,8 @@ use futures::channel::mpsc;
 use futures::future::BoxFuture;
 
 pub use fr_core::askpass::PromptKind;
-pub use fr_core::protocol::{DirEntry, DirListing, Hello};
-pub use remote::{ConnectOptions, Connection, TerminalCommand, terminal_command};
+pub use fr_core::protocol::{DirEntry, DirListing, Hello, TermInfo};
+pub use remote::{ConnectOptions, Connection};
 
 /// 一次 git 调用的结果。
 #[derive(Debug, Clone, Default)]
@@ -86,6 +88,30 @@ impl Stream for ChangeStream {
     type Item = ();
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<()>> {
+        Pin::new(&mut self.rx).poll_next(cx)
+    }
+}
+
+/// 终端流里的一项。
+pub enum TermItem {
+    /// 流的第一项：会话的编号；`created` 为假说明接上的是已有的会话
+    Opened { term: String, created: bool },
+    /// 程序的一块输出（接上已有会话时，开头几块是还原屏幕用的）
+    Output(Vec<u8>),
+    /// 程序结束了：退出码
+    Exited(Option<i32>),
+}
+
+/// 一个终端的输出。丢弃时从终端上断开，里面的程序接着跑。连接断了，流以一个错误结束。
+pub struct TermStream {
+    rx: mpsc::UnboundedReceiver<Result<TermItem>>,
+    _cancel: Box<dyn Send>,
+}
+
+impl Stream for TermStream {
+    type Item = Result<TermItem>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.rx).poll_next(cx)
     }
 }

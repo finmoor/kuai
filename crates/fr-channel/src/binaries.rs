@@ -1,4 +1,4 @@
-//! 找要上传到服务器的 Linux 版 agent 程序，算出它在服务器上的目录名。
+//! 找要上传到服务器的 Linux 版 kuaid 程序，算出它在服务器上的目录名。
 //!
 //! 目录名是 `<版本>-<程序内容的哈希>`：开发时版本号不变、程序在变，
 //! 靠哈希区分，服务器上的旧程序会被换掉。
@@ -15,13 +15,13 @@ const TARGETS: &[(&str, &str)] = &[
     ("aarch64", "aarch64-unknown-linux-musl"),
 ];
 
-pub(crate) struct Agents {
+pub(crate) struct Binaries {
     found: Vec<(&'static str, PathBuf)>,
     build: u64,
 }
 
-impl Agents {
-    pub fn find() -> Result<Agents> {
+impl Binaries {
+    pub fn find() -> Result<Binaries> {
         let mut found = Vec::new();
         let mut build = FNV_OFFSET;
         for (arch, triple) in TARGETS {
@@ -34,10 +34,10 @@ impl Agents {
         }
         if found.is_empty() {
             bail!(tr(
-                "找不到 Linux 版 agent 程序。开发时先运行 `cargo build-agent`；也可以用环境变量 FR_AGENT_DIR 指定目录"
+                "找不到 Linux 版 kuaid 程序。开发时先运行 `cargo build-kuaid`；也可以用环境变量 FR_KUAID_DIR 指定目录"
             ));
         }
-        Ok(Agents { found, build })
+        Ok(Binaries { found, build })
     }
 
     /// 服务器上 `~/.kuai/` 下的目录名。
@@ -55,7 +55,7 @@ impl Agents {
             bail!(
                 "{}",
                 tf!(
-                    "服务器的 CPU 架构是 {arch}，没有这个架构的 agent 程序",
+                    "服务器的 CPU 架构是 {arch}，没有这个架构的 kuaid 程序",
                     arch
                 )
             );
@@ -64,19 +64,19 @@ impl Agents {
     }
 }
 
-/// 依次在这些地方找：环境变量 FR_AGENT_DIR；程序旁边的 agents 目录（打包后）；
-/// 开发时 cargo 的 target 目录（`target/release/fr-app.exe` 对应 `target/<目标>/release/fr-agent`）。
+/// 依次在这些地方找：环境变量 FR_KUAID_DIR；程序旁边的 kuaid 目录（打包后）；
+/// 开发时 cargo 的 target 目录（`target/release/fr-app.exe` 对应 `target/<目标>/release/kuaid`）。
 fn candidates(triple: &str) -> Vec<PathBuf> {
     let mut list = Vec::new();
-    if let Some(dir) = std::env::var_os("FR_AGENT_DIR") {
-        list.push(PathBuf::from(dir).join(triple).join("fr-agent"));
+    if let Some(dir) = std::env::var_os("FR_KUAID_DIR") {
+        list.push(PathBuf::from(dir).join(triple).join("kuaid"));
     }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        list.push(dir.join("agents").join(triple).join("fr-agent"));
+        list.push(dir.join("kuaid").join(triple).join("kuaid"));
         if let Some(target) = dir.parent() {
-            list.push(target.join(triple).join("release").join("fr-agent"));
+            list.push(target.join(triple).join("release").join("kuaid"));
         }
     }
     list

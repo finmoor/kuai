@@ -1,4 +1,4 @@
-//! 启动 git 进程、读它的输出，并且能从别的线程取消。agent 和客户端的本机通道共用这一套。
+//! 启动 git 进程、读它的输出，并且能从别的线程取消。kuaid 和客户端的本机通道共用这一套。
 
 use crate::i18n::tr;
 use crate::tf;
@@ -90,9 +90,22 @@ pub fn spawn_with(
     repo: &Path,
     args: &[String],
     stdin: Option<Vec<u8>>,
+    on_stderr: Option<OnStderr>,
+) -> Result<(Running, Killer)> {
+    spawn_env(repo, args, stdin, on_stderr, &[])
+}
+
+/// 同 [`spawn_with`]，这一个 git 进程再多带几个环境变量。kuaid 同时服务几个客户端时用它
+/// 标出是哪个客户端的 git（要密码时知道去问谁），带上那条连接转发过来的 ssh-agent。
+pub fn spawn_env(
+    repo: &Path,
+    args: &[String],
+    stdin: Option<Vec<u8>>,
     mut on_stderr: Option<OnStderr>,
+    env: &[(String, String)],
 ) -> Result<(Running, Killer)> {
     let mut cmd = crate::git::command(repo, args);
+    cmd.envs(env.iter().map(|(key, value)| (key, value)));
     cmd.stdin(if stdin.is_some() {
         Stdio::piped()
     } else {

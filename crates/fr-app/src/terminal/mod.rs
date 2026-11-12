@@ -1,26 +1,34 @@
-//! 内置终端：仓库页底下的一块，在仓库目录里开一个 shell（服务器上的仓库是 ssh 登录过去）。
+//! 内置终端：仓库页底下的一块，在仓库目录里开一个 shell。
 //!
-//! 进程和终端仿真交给 `alacritty_terminal`：它在 Windows 上用 ConPTY 开伪终端，后台线程读
-//! 程序的输出、解析转义序列、维护字符格子。这里做三件事：
+//! 终端仿真交给 `alacritty_terminal`：解析转义序列、维护字符格子。程序在哪跑有两种：
+//!
+//! - 本机仓库：这个库在 Windows 上用 ConPTY 开伪终端，它的后台线程读程序的输出。关掉标签页，
+//!   里面的程序就结束。
+//! - 服务器上的仓库：终端开在服务器上常驻的 kuaid 里，输出经仓库通道那条 ssh 连接送过来
+//!   （[`Session::attach`]），我们只管喂给仿真器。关掉标签页、退出、断线都只是断开，里面的程序
+//!   接着跑；再打开时接上原来的，kuaid 把屏幕还原出来。
+//!
+//! 这里做三件事：
 //!
 //! - 画：每帧把格子拍下来（[`snapshot`]），背景一块块填，字按样式连成一段段画。等宽靠
 //!   「每个字形固定前进一格」（中文等宽字符是两格），不靠字体自己的宽度，回退字体也对得齐。
 //! - 输入：功能键和 Ctrl、Alt 组合在 `keys` 里编码；普通的字和输入法上屏的字由系统经
 //!   [`EntityInputHandler`] 送进来。
 //! - 生命周期：面板第一次画出来、知道能放几行几列时才启动进程；进程结束后画面留着，
-//!   按回车重新启动；这个视图丢弃时进程跟着结束。
+//!   按回车重新启动；这个视图丢弃时，本机的进程跟着结束，服务器上的只是断开。
 
 mod colors;
 mod keys;
 
 use std::any::Any;
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
@@ -33,11 +41,13 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::tty::{self, Options, Shell};
-use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor};
+use fr_channel::{Connection, TermItem, TermStream};
 use fr_core::i18n::tr;
 use fr_core::tf;
-use futures::StreamExt as _;
 use futures::channel::mpsc;
+use futures::future::LocalBoxFuture;
+use futures::{FutureExt as _, StreamExt as _};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -51,25 +61,53 @@ const LINE_HEIGHT: f32 = 16.;
 /// 字和面板边缘之间留的空
 const PADDING: f32 = 8.;
 
-/// 终端里要跑的程序。
-pub struct Launch {
+/// 终端里要跑什么。
+pub enum Launch {
+    /// 本机的程序
+    Local(LocalLaunch),
+    /// 服务器上的终端，开在 kuaid 里
+    Remote(RemoteLaunch),
+}
+
+pub struct LocalLaunch {
     pub program: String,
     pub args: Vec<String>,
     /// 启动时所在的目录；空着用本程序的
     pub cwd: Option<PathBuf>,
     /// 额外的环境变量
     pub env: Vec<(String, String)>,
-    /// 进程活着的时候要一直留着的东西（登录服务器时自动回答密码的登记）
+    /// 进程活着的时候要一直留着的东西
     pub keep: Option<Box<dyn Any>>,
+}
+
+pub struct RemoteLaunch {
+    /// 等这台服务器的连接
+    pub connect: LocalBoxFuture<'static, Result<Arc<Connection>, SharedString>>,
+    /// 终端会话的名字：kuaid 里有同名的就接上，不另开。用仓库路径
+    pub key: String,
+    /// 在哪个目录里开 shell
+    pub cwd: String,
+}
+
+/// 送回界面线程的事。
+enum Feed {
+    /// 仿真器的事件（有新内容、标题变了、程序问颜色……）
+    Term(TermEvent),
+    /// 服务器上的终端接上了：会话的编号
+    Opened(String),
+    /// 服务器上的终端里的程序结束了：退出码
+    Exited(Option<i32>),
+    /// 和服务器的连接断了（终端里的程序还在跑）
+    Lost(String),
 }
 
 /// 把仿真器的事件送回界面线程。
 #[derive(Clone)]
-struct Proxy(mpsc::UnboundedSender<TermEvent>);
+struct Proxy(mpsc::UnboundedSender<Feed>);
 
 impl EventListener for Proxy {
     fn send_event(&self, event: TermEvent) {
-        let _ = self.0.unbounded_send(event);
+        let _ = self.0.unbounded_send(Feed::Term(event));
     }
 }
 
@@ -113,24 +151,38 @@ struct Geometry {
     cursor: Option<Bounds<Pixels>>,
 }
 
-/// 一个跑着的终端进程。丢弃时进程结束。
+/// 一个开着的终端。丢弃时本机的进程结束，服务器上的只是断开。
 struct Session {
     term: Arc<FairMutex<Term<Proxy>>>,
-    sender: EventLoopSender,
     grid: Grid,
     cell: Size<Pixels>,
-    _keep: Option<Box<dyn Any>>,
+    link: Link,
     _events: Task<()>,
+}
+
+/// 程序在哪跑、怎么把输入和大小交给它。
+enum Link {
+    Local {
+        sender: EventLoopSender,
+        _keep: Option<Box<dyn Any>>,
+    },
+    Remote {
+        conn: Arc<Connection>,
+        /// kuaid 给这个会话的编号；刚发出请求、还没回来时是空的
+        term: RefCell<Option<String>>,
+        /// 收输出、喂给仿真器的任务；丢弃就从会话上断开
+        _pump: Task<()>,
+    },
 }
 
 impl Session {
     fn spawn(
-        launch: Launch,
+        launch: LocalLaunch,
         grid: Grid,
         cell: Size<Pixels>,
         cx: &mut Context<TerminalView>,
     ) -> std::io::Result<Self> {
-        let (tx, mut rx) = mpsc::unbounded();
+        let (tx, rx) = mpsc::unbounded();
         let proxy = Proxy(tx);
         let term = Term::new(Config::default(), &grid, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
@@ -152,31 +204,155 @@ impl Session {
         let event_loop = EventLoop::new(term.clone(), proxy, pty, true, false)?;
         let sender = event_loop.channel();
         event_loop.spawn();
-        let events = cx.spawn(async move |this, cx| {
-            while let Some(event) = rx.next().await {
-                if this
-                    .update(cx, |this, cx| this.on_event(event, cx))
-                    .is_err()
-                {
+        Ok(Self {
+            term,
+            grid,
+            cell,
+            link: Link::Local {
+                sender,
+                _keep: launch.keep,
+            },
+            _events: Self::deliver(rx, cx),
+        })
+    }
+
+    /// 接上服务器上的终端：请 kuaid 接上（或者新开）名字是 `key` 的会话，它的输出喂给这里的仿真器。
+    fn attach(
+        conn: Arc<Connection>,
+        key: &str,
+        cwd: &str,
+        grid: Grid,
+        cell: Size<Pixels>,
+        cx: &mut Context<TerminalView>,
+    ) -> Self {
+        let (tx, rx) = mpsc::unbounded();
+        let term = Term::new(Config::default(), &grid, Proxy(tx.clone()));
+        let term = Arc::new(FairMutex::new(term));
+        let stream = conn.term_open(key, cwd, grid.cols as u16, grid.rows as u16);
+        let executor = cx.background_executor().clone();
+        // 解析输出放在后台：大段输出不卡界面
+        let pump = cx
+            .background_executor()
+            .spawn(pump(stream, term.clone(), tx, executor));
+        Self {
+            term,
+            grid,
+            cell,
+            link: Link::Remote {
+                conn,
+                term: RefCell::new(None),
+                _pump: pump,
+            },
+            _events: Self::deliver(rx, cx),
+        }
+    }
+
+    /// 把后台送来的事交给界面线程上的视图。
+    fn deliver(mut rx: mpsc::UnboundedReceiver<Feed>, cx: &mut Context<TerminalView>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            while let Some(feed) = rx.next().await {
+                if this.update(cx, |this, cx| this.on_feed(feed, cx)).is_err() {
                     break;
                 }
             }
-        });
-        Ok(Self {
-            term,
-            sender,
-            grid,
-            cell,
-            _keep: launch.keep,
-            _events: events,
         })
+    }
+
+    /// 写给程序。
+    fn write(&self, bytes: Cow<'static, [u8]>) {
+        match &self.link {
+            Link::Local { sender, .. } => {
+                let _ = sender.send(Msg::Input(bytes));
+            }
+            // 会话的编号还没回来的那一瞬间敲的字不要了
+            Link::Remote { conn, term, .. } => {
+                if let Some(term) = term.borrow().as_deref() {
+                    conn.term_input(term, bytes.into_owned());
+                }
+            }
+        }
+    }
+
+    fn resize(&mut self, grid: Grid, cell: Size<Pixels>) {
+        self.grid = grid;
+        self.cell = cell;
+        self.term.lock().resize(grid);
+        match &self.link {
+            Link::Local { sender, .. } => {
+                let _ = sender.send(Msg::Resize(window_size(grid, cell)));
+            }
+            Link::Remote { conn, term, .. } => {
+                if let Some(term) = term.borrow().as_deref() {
+                    conn.term_resize(term, grid.cols as u16, grid.rows as u16);
+                }
+            }
+        }
+    }
+
+    fn is_remote(&self) -> bool {
+        matches!(self.link, Link::Remote { .. })
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // 读输出的线程收到后退出，伪终端跟着关掉，里面的进程结束
-        let _ = self.sender.send(Msg::Shutdown);
+        // 本机：读输出的线程收到后退出，伪终端跟着关掉，里面的进程结束。
+        // 服务器上的：收输出的任务跟着丢弃，kuaid 那边只是少了一个接着的客户端
+        if let Link::Local { sender, .. } = &self.link {
+            let _ = sender.send(Msg::Shutdown);
+        }
+    }
+}
+
+/// 收服务器上终端的输出，喂给仿真器。连接断了、程序结束了就停。
+async fn pump(
+    mut stream: TermStream,
+    term: Arc<FairMutex<Term<Proxy>>>,
+    tx: mpsc::UnboundedSender<Feed>,
+    executor: BackgroundExecutor,
+) {
+    let mut parser: Processor = Processor::new();
+    let send = |feed: Feed| tx.unbounded_send(feed).is_ok();
+    loop {
+        // 程序开了「同步刷新」（攒着一起画）又迟迟不结束：到时间就画出来
+        let item = match parser.sync_timeout().sync_timeout() {
+            Some(deadline) => {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                futures::select_biased! {
+                    item = stream.next().fuse() => item,
+                    _ = executor.timer(wait).fuse() => {
+                        parser.stop_sync(&mut *term.lock());
+                        if !send(Feed::Term(TermEvent::Wakeup)) {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+            }
+            None => stream.next().await,
+        };
+        let alive = match item {
+            Some(Ok(TermItem::Opened { term, .. })) => send(Feed::Opened(term)),
+            Some(Ok(TermItem::Output(bytes))) => {
+                parser.advance(&mut *term.lock(), &bytes);
+                send(Feed::Term(TermEvent::Wakeup))
+            }
+            Some(Ok(TermItem::Exited(code))) => {
+                send(Feed::Exited(code));
+                false
+            }
+            Some(Err(err)) => {
+                send(Feed::Lost(format!("{err:#}")));
+                false
+            }
+            None => {
+                send(Feed::Lost(String::new()));
+                false
+            }
+        };
+        if !alive {
+            return;
+        }
     }
 }
 
@@ -189,15 +365,21 @@ fn quoted(program: &str) -> String {
 }
 
 /// 启动终端时调用，算出要跑什么；失败时返回给用户看的原因。每次（重新）启动都算一遍。
-type Launcher = Box<dyn Fn(&App) -> Result<Launch, String>>;
+type Launcher = Box<dyn Fn(&mut App) -> Result<Launch, String>>;
 
 pub struct TerminalView {
     launcher: Launcher,
     session: Option<Session>,
+    /// 正在等服务器的连接
+    connecting: Option<Task<()>>,
+    /// 最近一次画的时候面板能放几行几列（连接好的那一刻按它开）
+    fitted: Option<(Grid, Size<Pixels>)>,
     /// 启动不了的原因
     error: Option<SharedString>,
     /// 进程结束了（里面是退出码），画面留着
     exited: Option<Option<i32>>,
+    /// 和服务器的连接断了，画面留着；终端里的程序还在服务器上跑
+    lost: bool,
     focus: FocusHandle,
     geometry: Rc<Cell<Geometry>>,
     /// 输入法正在组的字，还没上屏
@@ -219,7 +401,7 @@ impl Focusable for TerminalView {
 
 impl TerminalView {
     pub fn new(
-        launcher: impl Fn(&App) -> Result<Launch, String> + 'static,
+        launcher: impl Fn(&mut App) -> Result<Launch, String> + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -231,8 +413,11 @@ impl TerminalView {
         Self {
             launcher: Box::new(launcher),
             session: None,
+            connecting: None,
+            fitted: None,
             error: None,
             exited: None,
+            lost: false,
             focus,
             geometry: Rc::default(),
             marked: None,
@@ -243,8 +428,19 @@ impl TerminalView {
         }
     }
 
-    /// 里面的进程还在跑。
+    /// 里面的进程还在跑，而且连着（敲的字它收得到）。
     pub fn is_alive(&self) -> bool {
+        self.session.is_some() && self.exited.is_none() && !self.lost
+    }
+
+    /// 丢弃这个视图（关标签页、退出）会结束里面还在跑的程序：只有本机的终端会，
+    /// 服务器上的开在 kuaid 里，接着跑。
+    pub fn dies_with_view(&self) -> bool {
+        self.is_alive() && self.session.as_ref().is_some_and(|session| !session.is_remote())
+    }
+
+    /// 有东西在跑：本机的进程，或者服务器上的终端（连接断了它也在跑）。
+    pub fn is_running(&self) -> bool {
         self.session.is_some() && self.exited.is_none()
     }
 
@@ -261,9 +457,36 @@ impl TerminalView {
 
     /// 结束里面的进程，重新开一个（下一帧知道大小了再启动）。
     pub fn restart(&mut self, cx: &mut Context<Self>) {
+        self.kill(cx);
+        self.reopen(cx);
+    }
+
+    /// 结束里面的进程。本机的丢掉会话就结束了；服务器上的要告诉 kuaid，不然它接着跑。
+    pub fn kill(&mut self, cx: &mut Context<Self>) {
+        if let Some(Session {
+            link: Link::Remote { conn, term, .. },
+            ..
+        }) = &self.session
+            && let Some(term) = term.borrow().clone()
+        {
+            let closing = conn.term_close(&term);
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = closing.await;
+                })
+                .detach();
+        }
         self.session = None;
+    }
+
+    /// 丢掉现在的会话，下一帧重新开：本机是新的进程；服务器上有同名的会话就接上它
+    /// （连接断了以后重新接上用的就是这个）。
+    fn reopen(&mut self, cx: &mut Context<Self>) {
+        self.session = None;
+        self.connecting = None;
         self.error = None;
         self.exited = None;
+        self.lost = false;
         self.title = None;
         self.marked = None;
         cx.notify();
@@ -277,29 +500,81 @@ impl TerminalView {
 
     /// 面板画出来时调用：还没启动就按这个大小启动，大小变了就告诉程序。
     fn fit(&mut self, grid: Grid, cell: Size<Pixels>, cx: &mut Context<Self>) {
+        self.fitted = Some((grid, cell));
         match &mut self.session {
-            None if self.error.is_none() => self.start(grid, cell, cx),
-            Some(session) if session.grid != grid => {
-                session.grid = grid;
-                session.cell = cell;
-                session.term.lock().resize(grid);
-                let _ = session
-                    .sender
-                    .send(Msg::Resize(window_size(grid, cell)));
+            None if self.error.is_none() && self.connecting.is_none() => {
+                self.start(grid, cell, cx);
             }
+            Some(session) if session.grid != grid => session.resize(grid, cell),
             _ => {}
         }
     }
 
     fn start(&mut self, grid: Grid, cell: Size<Pixels>, cx: &mut Context<Self>) {
         self.exited = None;
-        let spawned = (self.launcher)(cx).and_then(|launch| {
-            Session::spawn(launch, grid, cell, cx).map_err(|err| err.to_string())
-        });
-        match spawned {
-            Ok(session) => self.session = Some(session),
-            Err(err) => self.error = Some(tf!("终端启动不了：{err}", err).into()),
+        self.lost = false;
+        let launch = match (self.launcher)(cx) {
+            Ok(launch) => launch,
+            Err(err) => {
+                self.error = Some(tf!("终端启动不了：{err}", err).into());
+                return;
+            }
+        };
+        match launch {
+            Launch::Local(launch) => match Session::spawn(launch, grid, cell, cx) {
+                Ok(session) => self.session = Some(session),
+                Err(err) => self.error = Some(tf!("终端启动不了：{err}", err).into()),
+            },
+            // 服务器上的：先等连接（多半已经连着，马上就好）
+            Launch::Remote(launch) => {
+                let RemoteLaunch { connect, key, cwd } = launch;
+                self.connecting = Some(cx.spawn(async move |this, cx| {
+                    let connected = connect.await;
+                    this.update(cx, |this, cx| {
+                        this.connecting = None;
+                        // 等的这一会儿面板的大小可能变了，用现在的
+                        let (grid, cell) = this.fitted.unwrap_or((grid, cell));
+                        match connected {
+                            Ok(conn) => {
+                                let session = Session::attach(conn, &key, &cwd, grid, cell, cx);
+                                this.session = Some(session);
+                            }
+                            Err(err) => {
+                                this.error = Some(tf!("连不上服务器：{err}", err).into());
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                }));
+            }
         }
+    }
+
+    fn on_feed(&mut self, feed: Feed, cx: &mut Context<Self>) {
+        match feed {
+            Feed::Term(event) => return self.on_event(event, cx),
+            Feed::Opened(id) => {
+                if let Some(Session {
+                    link: Link::Remote { conn, term, .. },
+                    grid,
+                    ..
+                }) = &self.session
+                {
+                    // 请求发出去以后面板的大小可能又变了，那时还不知道编号，没法说
+                    conn.term_resize(&id, grid.cols as u16, grid.rows as u16);
+                    *term.borrow_mut() = Some(id);
+                }
+            }
+            Feed::Exited(code) => self.exited = Some(code),
+            Feed::Lost(reason) => {
+                if !reason.is_empty() {
+                    log::warn!("终端和服务器断开了：{reason}");
+                }
+                self.lost = true;
+            }
+        }
+        cx.notify();
     }
 
     fn on_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {
@@ -351,8 +626,8 @@ impl TerminalView {
 
     /// 往程序的输入里写。
     fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        if let (Some(session), None) = (&self.session, self.exited) {
-            let _ = session.sender.send(Msg::Input(bytes.into()));
+        if let (Some(session), true) = (&self.session, self.is_alive()) {
+            session.write(bytes.into());
         }
     }
 
@@ -413,8 +688,9 @@ impl TerminalView {
             return;
         }
         if !self.is_alive() {
-            if key == "enter" {
-                self.restart(cx);
+            // 正在连的时候按回车不管；连接断了是重新接上，别的是重新开
+            if key == "enter" && self.connecting.is_none() {
+                self.reopen(cx);
                 cx.stop_propagation();
             }
             return;
@@ -560,10 +836,16 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// 进程没在跑时，盖在画面底下的一句话。
+    /// 进程没在跑（或者够不着）时，盖在画面底下的一句话。
     fn notice(&self) -> Option<SharedString> {
         if let Some(error) = &self.error {
             return Some(tf!("{error} 按回车重试。", error).into());
+        }
+        if self.connecting.is_some() {
+            return Some(tr("正在连接服务器…").into());
+        }
+        if self.lost && self.exited.is_none() {
+            return Some(tr("和服务器断开了，里面的程序还在跑。按回车重新接上。").into());
         }
         match self.exited? {
             Some(0) | None => Some(tr("进程已结束。按回车重新启动。").into()),
@@ -783,8 +1065,8 @@ fn prepaint(
         cell,
         rects,
         runs,
-        // 进程结束了就不画光标
-        cursor: cursor.filter(|_| this.exited.is_none()),
+        // 进程结束了、够不着了就不画光标
+        cursor: cursor.filter(|_| this.is_alive()),
         foreground: palette.foreground,
         background: palette.background,
         focused,

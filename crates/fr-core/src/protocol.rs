@@ -1,11 +1,13 @@
-//! 客户端和 agent 之间的通信协议。
+//! 客户端和服务器上的 kuaid 之间的通信协议。
 //!
-//! 每条消息是一行 JSON；带大块数据时（git 的输出、写给 git 的标准输入），
+//! 每条消息是一行 JSON；带大块数据时（git 的输出、写给 git 的标准输入、终端的输出），
 //! 在 JSON 的 `bytes` 字段写明长度，紧跟在这一行后面发原始字节。
 //! 控制消息保持能直接用眼睛看，大块数据也不用为 JSON 转义多付体积。
 //!
+//! 协议只加不改：kuaid 常驻在服务器上，可能比连上来的客户端新，新的 kuaid 要认得旧客户端。
+//!
 //! 方法：
-//! - `hello`：握手，返回 [`Hello`]。
+//! - `hello`：握手，参数 `{protocol}`（客户端的协议版本），返回 [`Hello`]。
 //! - `ping`：测往返延迟。
 //! - `git`：参数 `{repo, args, stream, progress}`，请求带的字节作为 git 的标准输入。
 //!   不流式时一条响应：`result` 是 [`GitResult`]，后面跟全部标准输出；
@@ -13,12 +15,30 @@
 //!   `progress` 为真时标准错误也一块块发回来（`chunk: true, err: true`），拿来显示推拉的进度。
 //! - `watch`：参数 `{repo}`，监听仓库的变化。每次有变化回一条 `chunk: true` 的空消息，
 //!   直到被 `cancel`；装不上监听时回一条带 `error` 的响应。
-//! - `cancel`：参数 `{id}`，杀掉那个请求的 git 进程，或者停掉那个监听。不回响应。
-//! - `answer`：参数 `{id, answer}`，回答 agent 发来的密码请求，`answer` 为空表示取消。不回响应。
-//!
-//! agent 也会主动问客户端：服务器上的 git 要密码时，发一条 `ask` 是提示文字的消息，
-//! `id` 是 agent 自己编的号（和请求的编号无关），客户端弹窗让用户填，再用 `answer` 回答。
+//! - `cancel`：参数 `{id}`，杀掉那个请求的 git 进程、停掉那个监听，或者从那个终端上断开
+//!   （终端里的程序接着跑）。不回响应。
+//! - `answer`：参数 `{id, answer}`，回答 kuaid 发来的密码请求，`answer` 为空表示取消。不回响应。
 //! - `list_dir`：参数 `{path}`，返回 [`DirListing`]。`path` 为空或 `~` 表示主目录。
+//!
+//! kuaid 也会主动问客户端：服务器上的 git 要密码时，发一条 `ask` 是提示文字的消息，
+//! `id` 是 kuaid 自己编的号（和请求的编号无关），客户端弹窗让用户填，再用 `answer` 回答。
+//!
+//! 终端（协议 4 起）。终端会话开在 kuaid 里，客户端断开、退出以后里面的程序接着跑：
+//! - `term_open`：参数 [`TermOpen`]。有同一个 `key` 的会话就接上它，没有就在 `cwd` 里开一个登录 shell。
+//!   响应是一个流：第一条 `chunk: true`、`result` 是 [`TermOpened`]；接着是还原屏幕用的输出
+//!   （接上已有会话时）和之后的输出，每条 `chunk: true` 带一块原始字节；程序结束时最后一条
+//!   `result` 是 [`TermExit`]。`cancel` 这个请求只是断开。
+//! - `term_attach`：参数 `{term, cols, rows}`，接上指定的会话，响应同上。
+//! - `term_input`：参数 `{term}`，请求带的字节写给程序。不回响应。
+//! - `term_resize`：参数 `{term, cols, rows}`。不回响应。
+//! - `term_close`：参数 `{term}`，结束会话里的程序并忘掉这个会话。
+//! - `term_list`：返回 `{terms: [TermInfo]}`。
+//!
+//! 给 ssh 转接程序（`kuaid --connect`）和运维用的：
+//! - `info`：返回 [`DaemonInfo`]。
+//! - `bridge`：参数 `{auth_sock}`，转接程序报告这条 ssh 连接转发过来的 ssh-agent 套接字。不回响应。
+//! - `upgrade`：参数 `{exe}`，常驻进程原地换成这个程序，终端会话带过去。成功时不回响应，连接直接断开。
+//! - `shutdown`：结束所有终端会话并退出。
 
 use crate::i18n::tr;
 use crate::tf;
@@ -29,8 +49,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// 协议版本，握手时交换。agent 装在按版本区分的目录里，正常不会不一致。
-pub const PROTOCOL_VERSION: u32 = 3;
+/// 协议版本，握手时交换。服务器上的 kuaid 不能比客户端旧（连接时会原地升级），可以比客户端新。
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// 一条消息后面跟多少字节的原始数据。
 pub trait Frame {
@@ -57,7 +77,7 @@ pub struct Response {
     /// 这一块是标准错误（进度），不是标准输出
     #[serde(default, skip_serializing_if = "is_false")]
     pub err: bool,
-    /// agent 问客户端要密码：提示文字。此时 `id` 是这次询问的编号
+    /// kuaid 问客户端要密码：提示文字。此时 `id` 是这次询问的编号
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -93,6 +113,85 @@ pub struct Hello {
     /// 主目录，浏览目录时从这里开始
     #[serde(default)]
     pub home: String,
+    /// kuaid 装在哪个目录里（`<版本>-<程序内容的哈希>`）；不是装出来的（测试时直接启动）为空
+    #[serde(default)]
+    pub build: String,
+    /// 是常驻进程：终端会话在客户端断开后还留着
+    #[serde(default)]
+    pub daemon: bool,
+}
+
+/// `info` 的结果：常驻进程现在的情况。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DaemonInfo {
+    pub protocol: u32,
+    pub version: String,
+    /// 同 [`Hello::build`]
+    #[serde(default)]
+    pub build: String,
+    #[serde(default)]
+    pub pid: u32,
+    /// 现在有几个终端会话（含程序已经结束、还没人看过的）
+    #[serde(default)]
+    pub terms: usize,
+    /// 现在连着几个客户端（含发这个请求的）
+    #[serde(default)]
+    pub clients: usize,
+}
+
+/// `term_open` 的参数。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TermOpen {
+    /// 客户端起的名字（现在用仓库路径）：有同名的会话就接上，不另开
+    #[serde(default)]
+    pub key: String,
+    /// 在哪个目录里开 shell
+    pub cwd: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// 终端流的第一条消息。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TermOpened {
+    /// 会话的编号，之后的 `term_input`、`term_resize`、`term_close` 用它
+    pub term: String,
+    /// 这次新开的；为假说明接上的是已有的会话
+    #[serde(default)]
+    pub created: bool,
+}
+
+/// 终端流的最后一条消息：程序结束了。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TermExit {
+    /// 退出码；被信号杀掉或者查不到时为空
+    pub exit: Option<i32>,
+}
+
+/// `term_list` 里的一项。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TermInfo {
+    pub term: String,
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub cwd: String,
+    /// 程序自己设的标题
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub cols: u16,
+    #[serde(default)]
+    pub rows: u16,
+    /// 里面的程序还在跑
+    #[serde(default)]
+    pub alive: bool,
+    /// 现在接着几个客户端
+    #[serde(default)]
+    pub attached: usize,
+    /// 开了多久（秒）
+    #[serde(default)]
+    pub age: u64,
 }
 
 /// `git` 方法的结果。

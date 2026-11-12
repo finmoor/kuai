@@ -1,7 +1,10 @@
-//! 服务器上的仓库：经一条 ssh 连接和 fr-agent 通信，所有请求按编号在这条连接上复用。
+//! 服务器上的仓库：经一条 ssh 连接和 kuaid 通信，所有请求按编号在这条连接上复用。
 //!
 //! 用系统自带的 ssh（Windows 上是 `System32\OpenSSH\ssh.exe`），沿用用户的 `~/.ssh/config` 和密钥。
 //! Windows 版 OpenSSH 不支持 ControlMaster，所以每台服务器只开一条连接，复用自己做。
+//!
+//! kuaid 在服务器上常驻：ssh 过去跑的是它的转接程序（`kuaid --connect`），由它接到常驻进程上，
+//! 没在跑就拉起来，比客户端旧就让它原地换成新的。所以这条连接断了，开在 kuaid 里的终端还在。
 //!
 //! 线程：一个写线程把请求依次写进 ssh 的标准输入；一个读线程读响应，按编号交给等待的 future。
 
@@ -16,19 +19,22 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use fr_core::protocol::{self, DirListing, GitResult, Hello, PROTOCOL_VERSION, Request, Response};
+use fr_core::protocol::{
+    self, DirListing, GitResult, Hello, PROTOCOL_VERSION, Request, Response, TermExit, TermInfo,
+    TermOpen, TermOpened,
+};
 use futures::FutureExt as _;
 use futures::channel::{mpsc, oneshot};
 use futures::future::{self, BoxFuture};
 use serde_json::{Value, json};
 
-use crate::agents::Agents;
-use crate::{ChangeStream, GitOutput, GitStream, StreamItem};
+use crate::binaries::Binaries;
+use crate::{ChangeStream, GitOutput, GitStream, StreamItem, TermItem, TermStream};
 
-/// 启动脚本找到 agent 时先打这一行；前面的输出（比如 `.bashrc` 打印的东西）都跳过
-const START_MARKER: &str = "FR-AGENT-START";
-/// 没装 agent 时打这一行，后面跟 `uname -s` 和 `uname -m`
-const MISSING_MARKER: &str = "FR-AGENT-MISSING";
+/// 启动脚本找到 kuaid 时先打这一行；前面的输出（比如 `.bashrc` 打印的东西）都跳过
+const START_MARKER: &str = "KUAID-START";
+/// 没装 kuaid 时打这一行，后面跟 `uname -s` 和 `uname -m`
+const MISSING_MARKER: &str = "KUAID-MISSING";
 /// ssh 的标准错误留最后这么多，连接失败时拿来提示
 const STDERR_TAIL: usize = 4096;
 
@@ -37,9 +43,9 @@ pub struct Connection {
     /// ssh 的目标：主机别名、`user@host` 或 `ssh://user@host:port`
     pub destination: String,
     pub hello: Hello,
-    /// 从启动 ssh 到握手完成用的时间（含上传 agent）
+    /// 从启动 ssh 到握手完成用的时间（含上传 kuaid）
     pub connect_time: Duration,
-    /// 这次连接时上传了 agent
+    /// 这次连接时上传了 kuaid
     pub installed: bool,
     inner: Arc<Inner>,
 }
@@ -61,6 +67,7 @@ enum Pending {
     Call(oneshot::Sender<Result<(Value, Vec<u8>)>>),
     Stream(mpsc::UnboundedSender<Result<StreamItem>>),
     Watch(mpsc::UnboundedSender<()>),
+    Term(mpsc::UnboundedSender<Result<TermItem>>),
 }
 
 enum Started {
@@ -95,12 +102,12 @@ impl std::fmt::Debug for ConnectOptions {
 }
 
 impl Connection {
-    /// 连接服务器：经 ssh 启动 agent；没装或版本不对就先上传再连。
+    /// 连接服务器：经 ssh 启动 kuaid；没装或版本不对就先上传再连。
     /// 会阻塞（建立连接要几百毫秒，第一次还要上传），放在后台线程里调用。
     pub fn connect(destination: &str, options: &ConnectOptions) -> Result<Connection> {
         let started = Instant::now();
-        let agents = Agents::find()?;
-        let dir = agents.dir_name();
+        let binaries = Binaries::find()?;
+        let dir = binaries.dir_name();
         let mut installed = false;
         loop {
             // _saved 留到握手完：登录阶段 ssh 要密码时用得上
@@ -122,30 +129,30 @@ impl Connection {
                 }
                 Started::Missing { os, arch } => {
                     if installed {
-                        bail!(tr("上传 agent 后还是启动不了"));
+                        bail!(tr("上传 kuaid 后还是启动不了"));
                     }
                     if os != "Linux" {
                         bail!("{}", tf!("暂时只支持 Linux 服务器，这台是 {os}", os));
                     }
-                    install(destination, options, &dir, &agents.binary_for(&arch)?)?;
+                    install(destination, options, &dir, &binaries.binary_for(&arch)?)?;
                     installed = true;
                 }
             }
         }
     }
 
-    /// 直接启动一个 agent 进程（测试用，比如本机的 `fr-agent --stdio`）。
-    pub fn spawn_agent(cmd: Command) -> Result<Connection> {
+    /// 直接启动一个 kuaid 进程（测试用，比如本机的 `kuaid --stdio`）。
+    pub fn spawn_stdio(cmd: Command) -> Result<Connection> {
         let started = Instant::now();
-        match start(cmd, false, tr("本机 agent"))? {
+        match start(cmd, false, tr("本机 kuaid"))? {
             Started::Ready(inner, hello) => Ok(Connection {
-                destination: tr("本机 agent").into(),
+                destination: tr("本机 kuaid").into(),
                 hello,
                 connect_time: started.elapsed(),
                 installed: false,
                 inner,
             }),
-            Started::Missing { .. } => bail!(tr("agent 没有启动")),
+            Started::Missing { .. } => bail!(tr("kuaid 没有启动")),
         }
     }
 
@@ -163,7 +170,7 @@ impl Connection {
         let call = self.call("list_dir", json!({ "path": path }), Vec::new());
         async move {
             let (result, _) = call.await?;
-            serde_json::from_value(result).context(tr("agent 返回的目录格式不对"))
+            serde_json::from_value(result).context(tr("kuaid 返回的目录格式不对"))
         }
         .boxed()
     }
@@ -182,7 +189,7 @@ impl Connection {
         async move {
             let (result, stdout) = call.await?;
             let result: GitResult =
-                serde_json::from_value(result).context(tr("agent 返回的结果格式不对"))?;
+                serde_json::from_value(result).context(tr("kuaid 返回的结果格式不对"))?;
             Ok(GitOutput {
                 code: result.code,
                 stdout,
@@ -247,7 +254,93 @@ impl Connection {
         }
     }
 
-    /// 发一个请求，等它的响应。返回的 future 被丢弃时向 agent 发取消。
+    /// 开（或者接上）一个终端：kuaid 里有名字是 `key` 的终端会话就接上它，没有就在 `cwd` 里开一个
+    /// 登录 shell。返回的流先给会话的编号，再是程序的输出（接上已有会话时，开头是还原屏幕的那一段），
+    /// 程序结束时给退出码。丢弃这个流只是断开，里面的程序接着跑；要结束它用 [`Self::term_close`]。
+    pub fn term_open(&self, key: &str, cwd: &str, cols: u16, rows: u16) -> TermStream {
+        let params = TermOpen {
+            key: key.to_string(),
+            cwd: cwd.to_string(),
+            cols,
+            rows,
+        };
+        self.term_stream("term_open", json!(params))
+    }
+
+    /// 接上指定编号的终端会话。
+    pub fn term_attach(&self, term: &str, cols: u16, rows: u16) -> TermStream {
+        self.term_stream(
+            "term_attach",
+            json!({ "term": term, "cols": cols, "rows": rows }),
+        )
+    }
+
+    fn term_stream(&self, method: &str, params: Value) -> TermStream {
+        let (tx, rx) = mpsc::unbounded();
+        let id = self.inner.next_id();
+        self.inner
+            .pending
+            .lock()
+            .unwrap()
+            .insert(id, Pending::Term(tx.clone()));
+        let request = Request {
+            id,
+            method: method.into(),
+            params,
+            bytes: 0,
+        };
+        if let Err(err) = self.inner.send(request, Vec::new()) {
+            self.inner.pending.lock().unwrap().remove(&id);
+            let _ = tx.unbounded_send(Err(err));
+        }
+        TermStream {
+            rx,
+            _cancel: Box::new(CancelOnDrop {
+                inner: Arc::downgrade(&self.inner),
+                id,
+            }),
+        }
+    }
+
+    /// 把用户敲的字写给终端里的程序。
+    pub fn term_input(&self, term: &str, bytes: Vec<u8>) {
+        let request = Request {
+            id: 0,
+            method: "term_input".into(),
+            params: json!({ "term": term }),
+            bytes: bytes.len() as u64,
+        };
+        let _ = self.inner.send(request, bytes);
+    }
+
+    pub fn term_resize(&self, term: &str, cols: u16, rows: u16) {
+        let request = Request {
+            id: 0,
+            method: "term_resize".into(),
+            params: json!({ "term": term, "cols": cols, "rows": rows }),
+            bytes: 0,
+        };
+        let _ = self.inner.send(request, Vec::new());
+    }
+
+    /// 结束终端里的程序，kuaid 不再留着这个会话。
+    pub fn term_close(&self, term: &str) -> BoxFuture<'static, Result<()>> {
+        let call = self.call("term_close", json!({ "term": term }), Vec::new());
+        async move { call.await.map(|_| ()) }.boxed()
+    }
+
+    /// kuaid 里现在有哪些终端会话。
+    pub fn term_list(&self) -> BoxFuture<'static, Result<Vec<TermInfo>>> {
+        let call = self.call("term_list", json!({}), Vec::new());
+        async move {
+            let (mut result, _) = call.await?;
+            serde_json::from_value(result["terms"].take())
+                .context(tr("kuaid 返回的结果格式不对"))
+        }
+        .boxed()
+    }
+
+    /// 发一个请求，等它的响应。返回的 future 被丢弃时向 kuaid 发取消。
     fn call(
         &self,
         method: &str,
@@ -286,7 +379,7 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        // 关掉标准输入，agent 读到结尾就退出；再杀掉 ssh，免得服务器那边卡住时它不退
+        // 关掉标准输入，kuaid 读到结尾就退出；再杀掉 ssh，免得服务器那边卡住时它不退
         self.inner.outgoing.lock().unwrap().take();
         if let Ok(mut child) = self.inner.child.lock() {
             let _ = child.kill();
@@ -308,7 +401,7 @@ impl Inner {
             .map_err(|_| anyhow!(tr("与服务器的连接已断开")))
     }
 
-    /// agent 替服务器上的 git 要密码：在另一个线程里问用户（要等用户填），再把回答发回去。
+    /// kuaid 替服务器上的 git 要密码：在另一个线程里问用户（要等用户填），再把回答发回去。
     fn ask(self: &Arc<Self>, ask_id: u64, prompt: String) {
         let inner = Arc::downgrade(self);
         std::thread::spawn(move || {
@@ -344,6 +437,19 @@ impl Inner {
                 Some(Pending::Watch(tx)) => {
                     let _ = tx.unbounded_send(());
                 }
+                Some(Pending::Term(tx)) => {
+                    // 流的第一条带着会话的编号，其余的是输出
+                    let item = match response.result.take() {
+                        Some(opened) => serde_json::from_value::<TermOpened>(opened)
+                            .map(|opened| TermItem::Opened {
+                                term: opened.term,
+                                created: opened.created,
+                            })
+                            .context(tr("kuaid 返回的结果格式不对")),
+                        None => Ok(TermItem::Output(payload)),
+                    };
+                    let _ = tx.unbounded_send(item);
+                }
                 _ => {}
             }
             return;
@@ -364,7 +470,7 @@ impl Inner {
             Pending::Stream(tx) => {
                 let item = outcome.and_then(|result| {
                     let result: GitResult =
-                        serde_json::from_value(result).context(tr("agent 返回的结果格式不对"))?;
+                        serde_json::from_value(result).context(tr("kuaid 返回的结果格式不对"))?;
                     Ok(StreamItem::Done(GitOutput {
                         code: result.code,
                         stdout: Vec::new(),
@@ -376,6 +482,14 @@ impl Inner {
             }
             // 监听只会以出错结束（比如目录不存在）：丢弃 tx，流结束
             Pending::Watch(_) => {}
+            Pending::Term(tx) => {
+                let item = outcome.and_then(|result| {
+                    let exit: TermExit = serde_json::from_value(result)
+                        .context(tr("kuaid 返回的结果格式不对"))?;
+                    Ok(TermItem::Exited(exit.exit))
+                });
+                let _ = tx.unbounded_send(item);
+            }
         }
     }
 
@@ -396,13 +510,16 @@ impl Inner {
                 Pending::Stream(tx) => {
                     let _ = tx.unbounded_send(Err(anyhow!(message.clone())));
                 }
+                Pending::Term(tx) => {
+                    let _ = tx.unbounded_send(Err(anyhow!(message.clone())));
+                }
                 Pending::Watch(_) => {}
             }
         }
     }
 }
 
-/// future 或流被丢弃时，如果请求还没完成，就从等待表里拿掉并通知 agent 杀掉 git。
+/// future 或流被丢弃时，如果请求还没完成，就从等待表里拿掉并通知 kuaid 杀掉 git。
 struct CancelOnDrop {
     inner: Weak<Inner>,
     id: u64,
@@ -426,7 +543,7 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// 启动 ssh（或 agent 本身），完成握手，开始收发。
+/// 启动 ssh（或 kuaid 本身），完成握手，开始收发。
 fn start(mut cmd: Command, expect_marker: bool, destination: &str) -> Result<Started> {
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -442,11 +559,11 @@ fn start(mut cmd: Command, expect_marker: bool, destination: &str) -> Result<Sta
     let stdout = child.stdout.take().context(tr("拿不到 ssh 的标准输出"))?;
     let stderr_tail = collect_stderr(child.stderr.take().context(tr("拿不到 ssh 的标准错误"))?);
 
-    // 握手请求先发出去，省一次往返。没装 agent 时远程的 sh 不读它，丢掉就是了
+    // 握手请求先发出去，省一次往返。没装 kuaid 时远程的 sh 不读它，丢掉就是了
     let hello = Request {
         id: 0,
         method: "hello".into(),
-        params: json!({}),
+        params: json!({ "protocol": PROTOCOL_VERSION }),
         bytes: 0,
     };
     let _ = protocol::write_message(&mut stdin, &hello, &[]);
@@ -483,15 +600,16 @@ fn start(mut cmd: Command, expect_marker: bool, destination: &str) -> Result<Sta
         bail!("{}", connect_error(destination, &stderr_tail, &[]));
     };
     if let Some(err) = response.error {
-        bail!("{}", tf!("agent 握手失败：{err}", err));
+        bail!("{}", tf!("kuaid 握手失败：{err}", err));
     }
     let hello: Hello = serde_json::from_value(response.result.unwrap_or_default())
-        .context(tr("agent 握手结果格式不对"))?;
-    if hello.protocol != PROTOCOL_VERSION {
+        .context(tr("kuaid 握手结果格式不对"))?;
+    // 常驻的 kuaid 可以比客户端新（别的电脑上的客户端把它升上去了），它认得旧客户端；比客户端旧不行
+    if hello.protocol < PROTOCOL_VERSION {
         bail!(
             "{}",
             tf!(
-                "agent 的协议版本是 {protocol}，客户端是 {PROTOCOL_VERSION}",
+                "服务器上的 kuaid 太旧（协议 {protocol}，客户端是 {PROTOCOL_VERSION}），没能换成新的。在服务器上运行 ~/.kuai/*/kuaid --stop 再连",
                 protocol = hello.protocol,
                 PROTOCOL_VERSION
             )
@@ -595,7 +713,7 @@ fn connect_error(destination: &str, stderr_tail: &Mutex<String>, noise: &[String
     message
 }
 
-/// 登录用的那部分 ssh 选项和环境变量：转发 agent、私钥、密码登录、要密码时怎么问。
+/// 登录用的那部分 ssh 选项和环境变量：转发 ssh-agent、私钥、密码登录、要密码时怎么问。
 /// 第三项要留到登录完成：留着它，这个 ssh 要密码、口令时才会用存着的自动回答。
 fn login(
     options: &ConnectOptions,
@@ -645,45 +763,6 @@ fn login(
     (args, env, saved)
 }
 
-/// 在终端里登录服务器要跑的命令。`_saved` 留着的时候，ssh 要密码、口令会用存着的自动回答。
-pub struct TerminalCommand {
-    pub program: PathBuf,
-    pub args: Vec<String>,
-    pub env: Vec<(String, String)>,
-    _saved: Option<crate::SavedSecret>,
-}
-
-/// 在终端里登录服务器、进到 `dir`：和连接 agent 用同一套登录选项，只是要一个终端（`-t`），
-/// 登录后换成用户的登录 shell。
-pub fn terminal_command(destination: &str, dir: &str, options: &ConnectOptions) -> TerminalCommand {
-    let (mut args, env, saved) = login(options, options.forward_agent);
-    // 目录用单引号包起来，里面的单引号换成 '\''
-    let quoted = format!("'{}'", dir.replace('\'', r"'\''"));
-    args.extend(
-        [
-            "-t",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ServerAliveInterval=15",
-            "-o",
-            "ServerAliveCountMax=4",
-            "--",
-            destination,
-        ]
-        .map(String::from),
-    );
-    args.push(format!("cd {quoted} && exec \"$SHELL\" -l"));
-    TerminalCommand {
-        program: ssh_program(),
-        args,
-        env,
-        _saved: saved,
-    }
-}
-
 /// 构造 ssh 命令。`--` 防止以 `-` 开头的目标被当成选项。
 /// 返回的第二项要留到登录完成：留着它，这个 ssh 要密码、口令时才会用存着的自动回答。
 fn ssh(
@@ -725,24 +804,25 @@ fn ssh_program() -> PathBuf {
     PathBuf::from("ssh")
 }
 
-/// 远程执行的启动脚本：agent 在就启动它，不在就报告系统和架构。
+/// 远程执行的启动脚本：这一版的 kuaid 装了就启动它的转接程序，没装就报告系统和架构。
 /// 包一层 `sh -c`，用户的登录 shell 是 fish 之类时也能跑。
 fn bootstrap_script(dir: &str) -> String {
     format!(
-        r#"sh -c 'A="$HOME/.kuai/{dir}/fr-agent"; if [ -x "$A" ]; then echo {START_MARKER}; exec "$A" --stdio; fi; echo "{MISSING_MARKER} $(uname -s) $(uname -m)"'"#
+        r#"sh -c 'A="$HOME/.kuai/{dir}/kuaid"; if [ -x "$A" ]; then echo {START_MARKER}; exec "$A" --connect; fi; echo "{MISSING_MARKER} $(uname -s) $(uname -m)"'"#
     )
 }
 
-/// 远程执行的安装脚本，agent 程序从标准输入进来。
+/// 远程执行的安装脚本，kuaid 程序从标准输入进来。
 fn install_script(dir: &str) -> String {
     format!(
-        r#"sh -c 'set -e; R="$HOME/.kuai"; V="{dir}"; mkdir -p "$R/$V"; cat > "$R/$V/fr-agent.tmp"; chmod 755 "$R/$V/fr-agent.tmp"; mv -f "$R/$V/fr-agent.tmp" "$R/$V/fr-agent"; cd "$R"; for x in *; do case "$x" in "$V") ;; [0-9]*) rm -rf -- "$x" ;; esac; done; rm -rf -- "$HOME/.fork-remote"'"#
+        r#"sh -c 'set -e; R="$HOME/.kuai"; V="{dir}"; mkdir -p "$R/$V"; cat > "$R/$V/kuaid.tmp"; chmod 755 "$R/$V/kuaid.tmp"; mv -f "$R/$V/kuaid.tmp" "$R/$V/kuaid"; K=$(cat "$R/run/current" 2>/dev/null || true); cd "$R"; for x in *; do case "$x" in "$V"|"$K") ;; [0-9]*) rm -rf -- "$x" ;; esac; done; rm -rf -- "$HOME/.fork-remote"'"#
     )
 }
 
-/// 经 ssh 的标准输入上传 agent：先写临时文件再改名，免得留下半个文件；
-/// 然后删掉 `~/.kuai/` 下其他版本的目录（名字以数字开头的），
-/// 还有 1.2.2 以前产品叫 fork-remote 时装在 `~/.fork-remote` 的旧 agent。
+/// 经 ssh 的标准输入上传 kuaid：先写临时文件再改名，免得留下半个文件；
+/// 然后删掉 `~/.kuai/` 下其他版本的目录（名字以数字开头的），只留刚装的这一版和常驻进程正在用的
+/// 那一版（它记在 `run/current` 里：下次连接时才换成新的，换之前它的程序不能没）；
+/// 还有 1.2.2 以前产品叫 fork-remote 时装在 `~/.fork-remote` 的旧程序。
 fn install(destination: &str, options: &ConnectOptions, dir: &str, binary: &[u8]) -> Result<()> {
     let script = install_script(dir);
     let (mut cmd, _saved) = ssh(destination, &script, options, false);
@@ -754,19 +834,19 @@ fn install(destination: &str, options: &ConnectOptions, dir: &str, binary: &[u8]
     let mut stdin = child.stdin.take().context(tr("拿不到 ssh 的标准输入"))?;
     let data = binary.to_vec();
     let writer = std::thread::spawn(move || stdin.write_all(&data));
-    let out = child.wait_with_output().context(tr("上传 agent 失败"))?;
+    let out = child.wait_with_output().context(tr("上传 kuaid 失败"))?;
     let written = writer.join();
     if !out.status.success() {
         bail!(
             "{}",
             tf!(
-                "上传 agent 失败：{stderr}",
+                "上传 kuaid 失败：{stderr}",
                 stderr = String::from_utf8_lossy(&out.stderr).trim()
             )
         );
     }
     if !matches!(written, Ok(Ok(()))) {
-        bail!(tr("上传 agent 时连接中断"));
+        bail!(tr("上传 kuaid 时连接中断"));
     }
     Ok(())
 }
@@ -823,29 +903,17 @@ mod tests {
     }
 
     #[test]
-    fn 终端里登录服务器的命令() {
-        let command = terminal_command(
-            "ssh://u@h:2222",
-            "/data/it's here",
-            &ConnectOptions {
-                identity_file: Some("C:/keys/id".into()),
-                ..Default::default()
-            },
-        );
-        let args = command.args;
-        let at = args.iter().position(|arg| arg == "-i").unwrap();
-        assert_eq!(args[at + 1], "C:/keys/id");
-        assert!(args.iter().any(|arg| arg == "-t"));
-        assert!(!args.iter().any(|arg| arg == "-T"));
-        // 目标和登录后要跑的命令在最后，前面有 --；目录里的单引号转义了
-        assert_eq!(
-            args[args.len() - 3..],
-            [
-                "--",
-                "ssh://u@h:2222",
-                r#"cd '/data/it'\''s here' && exec "$SHELL" -l"#
-            ]
-        );
+    fn 启动脚本接到常驻进程上_安装脚本不删正在用的那一版() {
+        let boot = bootstrap_script("1.5.0-abc");
+        assert!(boot.contains(r#"exec "$A" --connect"#));
+        assert!(boot.contains("/.kuai/1.5.0-abc/kuaid"));
+        let install = install_script("1.5.0-abc");
+        assert!(install.contains(r#"K=$(cat "$R/run/current" 2>/dev/null || true)"#));
+        assert!(install.contains(r#""$V"|"$K") ;;"#));
+        // 整个脚本包在单引号里，里面不能再有单引号
+        for script in [&boot, &install] {
+            assert_eq!(script.matches('\'').count(), 2, "{script}");
+        }
     }
 
     #[test]

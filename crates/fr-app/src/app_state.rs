@@ -88,7 +88,7 @@ impl AppState {
                     conn.connect_time.as_millis(),
                     conn.hello.git,
                     if conn.installed {
-                        "，上传了 agent"
+                        "，上传了 kuaid"
                     } else {
                         ""
                     }

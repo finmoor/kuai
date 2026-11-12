@@ -380,7 +380,7 @@ impl ManagerView {
                             body.child(div().text_sm().text_color(danger).child(found))
                         })
                         .child(div().text_xs().text_color(muted).child(tr(
-                            "密码、口令存在 Windows 凭据管理器。首次连接会往服务器的 ~/.kuai/ 装 agent。",
+                            "密码、口令存在 Windows 凭据管理器。首次连接会往服务器的 ~/.kuai/ 装 kuaid。",
                         ))),
                 )
                 .footer(
@@ -934,7 +934,7 @@ impl Render for ManagerView {
                         git = conn.hello.git.trim_start_matches("git version "),
                         ms = conn.connect_time.as_millis(),
                         installed = if conn.installed {
-                            tr(" · 刚装好 agent")
+                            tr(" · 刚装好 kuaid")
                         } else {
                             ""
                         }

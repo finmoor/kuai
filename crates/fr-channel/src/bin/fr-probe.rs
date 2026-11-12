@@ -1,9 +1,9 @@
-//! fr-probe：测仓库通道的延迟和耗时，也用来检查自动安装 agent。
+//! fr-probe：测仓库通道的延迟和耗时，也用来检查自动安装 kuaid。
 //!
 //! 用法：
 //!     fr-probe --repo <仓库路径> local                  本机通道（进程内启动 git）
-//!     fr-probe --repo <服务器上的仓库路径> <ssh 目标>      连服务器（需要时自动上传 agent）
-//!     fr-probe --repo <仓库路径> --agent <fr-agent 程序>   直接启动 agent 进程，测协议本身
+//!     fr-probe --repo <服务器上的仓库路径> <ssh 目标>      连服务器（需要时自动上传 kuaid）
+//!     fr-probe --repo <仓库路径> --kuaid <kuaid 程序>   直接启动 kuaid 进程，测协议本身
 //! 最后加 `--watch <秒数>`：不测速，只监听仓库这么久，每收到一次变化通知打一行。
 //! 例如：
 //!     fr-probe --repo .testdata/big-repo local
@@ -15,13 +15,20 @@
 //!     --secret-env <环境变量名>   密码（带 --password 时）或私钥口令放在这个环境变量里，ssh 问的时候自动回答；
 //!                                没给、或者答过一次 ssh 还问，就打出它问的话并当作取消
 //!     --connect-only             连上就退出，不测速
+//!
+//! 连服务器时测终端（开在 kuaid 里，名字用 `--repo` 给的路径，和客户端里那个仓库的终端是同一个）：
+//!     --term <命令>              开（或者接上）终端，敲这条命令，把之后几秒的输出打出来，然后断开；
+//!                                命令给空的只看不敲。终端里的程序接着跑，下次还能接上
+//!     --secs <秒数>              `--term` 看多久，默认 3
+//!     --term-list                列出 kuaid 里的终端会话
+//!     --term-close               结束这个仓库的终端
 
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use fr_channel::{Channel, ConnectOptions, Connection, StreamItem};
+use fr_channel::{Channel, ConnectOptions, Connection, StreamItem, TermItem};
 use futures::StreamExt as _;
 use futures::executor::block_on;
 
@@ -37,6 +44,7 @@ fn main() -> Result<()> {
         found
     };
     let (password_auth, connect_only) = (flag("--password"), flag("--connect-only"));
+    let (term_list, term_close) = (flag("--term-list"), flag("--term-close"));
     let value = |name: &str| args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone());
     let options = ConnectOptions {
         forward_agent: false,
@@ -45,7 +53,7 @@ fn main() -> Result<()> {
         secret: value("--secret-env").and_then(|name| std::env::var(name).ok()),
     };
     let ask = password_auth || options.secret.is_some();
-    let usage = "用法：fr-probe --repo <仓库路径> (local | <ssh 目标> | --agent <fr-agent 程序>)";
+    let usage = "用法：fr-probe --repo <仓库路径> (local | <ssh 目标> | --kuaid <kuaid 程序>)";
     let repo = args
         .windows(2)
         .find(|w| w[0] == "--repo")
@@ -55,7 +63,14 @@ fn main() -> Result<()> {
         .windows(2)
         .find(|w| w[0] == "--watch")
         .and_then(|w| w[1].parse().ok());
-    let is_option = |a: &str| matches!(a, "--repo" | "--watch" | "--key" | "--secret-env");
+    let term_command = value("--term");
+    let term_secs: u64 = value("--secs").and_then(|secs| secs.parse().ok()).unwrap_or(3);
+    let is_option = |a: &str| {
+        matches!(
+            a,
+            "--repo" | "--watch" | "--key" | "--secret-env" | "--term" | "--secs"
+        )
+    };
     let rest: Vec<&String> = args
         .iter()
         .enumerate()
@@ -65,12 +80,12 @@ fn main() -> Result<()> {
 
     let channel = match rest.as_slice() {
         [target] if *target == "local" => Channel::Local,
-        [flag, program] if *flag == "--agent" => {
+        [flag, program] if *flag == "--kuaid" => {
             let mut cmd = Command::new(program.as_str());
             cmd.arg("--stdio");
-            let conn = Connection::spawn_agent(cmd)?;
+            let conn = Connection::spawn_stdio(cmd)?;
             println!(
-                "启动本机 agent 并握手：{} ms · {:?}",
+                "启动本机 kuaid 并握手：{} ms · {:?}",
                 conn.connect_time.as_millis(),
                 conn.hello
             );
@@ -89,9 +104,9 @@ fn main() -> Result<()> {
                 "连接 {destination}：{} ms（{}）· {} · {} {} · 主目录 {}",
                 conn.connect_time.as_millis(),
                 if conn.installed {
-                    "上传了 agent"
+                    "上传了 kuaid"
                 } else {
-                    "agent 已装好"
+                    "kuaid 已装好"
                 },
                 conn.hello.git,
                 conn.hello.os,
@@ -103,11 +118,100 @@ fn main() -> Result<()> {
         _ => anyhow::bail!(usage),
     };
 
+    if term_list || term_close || term_command.is_some() {
+        let Channel::Remote(conn) = &channel else {
+            anyhow::bail!("终端只有连服务器时能测");
+        };
+        println!(
+            "kuaid {} {}{}",
+            conn.hello.version,
+            conn.hello.build,
+            if conn.hello.daemon { "，常驻" } else { "，不常驻" }
+        );
+        if let Some(command) = &term_command {
+            terminal(conn, &repo, command, Duration::from_secs(term_secs))?;
+        }
+        if term_close {
+            let terms = block_on(conn.term_list())?;
+            match terms.iter().find(|term| term.key == repo) {
+                Some(term) => {
+                    block_on(conn.term_close(&term.term))?;
+                    println!("结束了终端 {}", term.term);
+                }
+                None => println!("这个仓库没有终端"),
+            }
+        }
+        if term_list {
+            let terms = block_on(conn.term_list())?;
+            println!("终端会话 {} 个", terms.len());
+            for term in terms {
+                println!(
+                    "  {}  {}  {}×{}  {}  接着 {} 个客户端  开了 {} 秒  {}",
+                    term.term,
+                    term.key,
+                    term.cols,
+                    term.rows,
+                    if term.alive { "在跑" } else { "已结束" },
+                    term.attached,
+                    term.age,
+                    term.title.unwrap_or_default(),
+                );
+            }
+        }
+        return Ok(());
+    }
+
     match watch_secs {
         _ if connect_only => Ok(()),
         Some(secs) => watch(&channel, &repo, Duration::from_secs(secs)),
         None => block_on(probe(&channel, &repo)),
     }
+}
+
+/// 开（或者接上）这个仓库的终端，敲一条命令，把 `duration` 这么久里收到的输出原样打出来，然后断开。
+fn terminal(conn: &Connection, repo: &str, command: &str, duration: Duration) -> Result<()> {
+    use std::io::Write as _;
+    let mut stream = conn.term_open(repo, repo, 100, 30);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        block_on(async {
+            while let Some(item) = stream.next().await {
+                if tx.send(item).is_err() {
+                    return;
+                }
+            }
+        });
+    });
+    let started = Instant::now();
+    let mut bytes = 0usize;
+    while let Some(left) = duration.checked_sub(started.elapsed()) {
+        match rx.recv_timeout(left) {
+            Ok(Ok(TermItem::Opened { term, created })) => {
+                println!(
+                    "终端 {term}：{}",
+                    if created { "新开的" } else { "接上了原来的" }
+                );
+                if !command.is_empty() {
+                    conn.term_input(&term, format!("{command}\r").into_bytes());
+                }
+            }
+            Ok(Ok(TermItem::Output(output))) => {
+                bytes += output.len();
+                let mut out = std::io::stdout().lock();
+                out.write_all(&output)?;
+                out.flush()?;
+            }
+            Ok(Ok(TermItem::Exited(code))) => {
+                println!("\n终端里的程序结束了，退出码 {code:?}");
+                return Ok(());
+            }
+            Ok(Err(err)) => return Err(err),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(_) => anyhow::bail!("终端的流意外结束"),
+        }
+    }
+    println!("\n（收到 {bytes} 字节，断开；终端里的程序接着跑）");
+    Ok(())
 }
 
 /// 监听仓库一段时间，每收到一次变化通知打一行。
