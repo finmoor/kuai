@@ -1,4 +1,4 @@
-//! 设置页：常规（语言、开机自启、托盘）、外观（深色浅色、配色）、关于。
+//! 设置页：常规（语言、开机自启、托盘）、外观（深色浅色、配色）、关于（版本、检查更新、源代码）。
 //!
 //! 每一项改了马上生效、马上存盘，没有「确定」「应用」。这里只改 [`AppState`] 里的设置；
 //! 换主题、换语言、建托盘图标这些要动窗口的事，由主窗口（`workspace.rs`）看到设置变了再去做。
@@ -19,17 +19,24 @@ use gpui_kit::*;
 use crate::app_state::AppState;
 use crate::palette::PALETTES;
 use crate::settings::{AUTO_FETCH_CHOICES, ThemeChoice};
+use crate::update::{self, Updater};
 
 pub struct SettingsPage {
     app: Entity<AppState>,
-    _observe: Subscription,
+    updater: Entity<Updater>,
+    _observe: [Subscription; 2],
 }
 
 impl SettingsPage {
-    pub fn new(app: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let observe = cx.observe(&app, |_, _, cx| cx.notify());
+    pub fn new(app: Entity<AppState>, updater: Entity<Updater>, cx: &mut Context<Self>) -> Self {
+        let observe = [
+            cx.observe(&app, |_, _, cx| cx.notify()),
+            // 检查、下载的进度变了，关于页跟着画
+            cx.observe(&updater, |_, _, cx| cx.notify()),
+        ];
         Self {
             app,
+            updater,
             _observe: observe,
         }
     }
@@ -297,6 +304,42 @@ impl SettingsPage {
     }
 
     fn about(&self) -> SettingPage {
+        let updater = self.updater.clone();
+        let version =
+            SettingItem::render(move |_, _, cx| crate::update_view::about_version(&updater, cx));
+        let check_updates = {
+            let (get, set) = (self.app.clone(), self.app.clone());
+            SettingItem::new(
+                tr("自动检查更新"),
+                SettingField::switch(
+                    move |cx| get.read(cx).settings.check_updates,
+                    move |on, cx| {
+                        set.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| s.check_updates = on)
+                        })
+                    },
+                ),
+            )
+            .description(tr("启动时和之后每 6 小时问一次 GitHub，只看有没有新版本。"))
+        };
+        let source = SettingItem::new(
+            tr("源代码"),
+            SettingField::render(|_, _, _| {
+                Button::new("open-repo")
+                    .small()
+                    .icon(Icon::new(IconName::ExternalLink))
+                    .label(tr("打开"))
+                    .on_click(|_, window, cx| {
+                        let result = crate::shell::open_url(&update::repo_url());
+                        crate::shell::report(result, window, cx);
+                    })
+            }),
+        )
+        .description(
+            update::repo_url()
+                .trim_start_matches("https://")
+                .to_string(),
+        );
         let file = crate::settings::file();
         let folder = file.parent().map(|dir| dir.to_string_lossy().to_string());
         let path: SharedString = file.to_string_lossy().to_string().into();
@@ -306,22 +349,14 @@ impl SettingsPage {
             .group(
                 SettingGroup::new()
                     .title("Kuai")
+                    .item(version)
+                    .item(check_updates)
+                    .item(source)
                     .item(SettingItem::render(move |_, _, cx| {
                         let muted = cx.theme().muted_foreground;
                         let folder = folder.clone();
                         v_flex()
                             .gap_3()
-                            .child(
-                                v_flex()
-                                    .gap_1()
-                                    .child(div().text_sm().child(fr_core::tf!(
-                                        "版本 {version}",
-                                        version = env!("CARGO_PKG_VERSION")
-                                    )))
-                                    .child(div().text_xs().text_color(muted).child(tr(
-                                        "能打开服务器上仓库的 Git 客户端：本机和服务器上的仓库用同一套界面。",
-                                    ))),
-                            )
                             .child(
                                 v_flex()
                                     .gap_1()
@@ -334,17 +369,19 @@ impl SettingsPage {
                                             .child(path.clone()),
                                     ),
                             )
-                            .child(h_flex().child(
-                                Button::new("open-settings-folder")
-                                    .small()
-                                    .label(tr("打开所在的文件夹"))
-                                    .on_click(move |_, window, cx| {
-                                        if let Some(folder) = &folder {
-                                            let result = crate::shell::open_folder(folder);
-                                            crate::shell::report(result, window, cx);
-                                        }
-                                    }),
-                            ))
+                            .child(
+                                h_flex().child(
+                                    Button::new("open-settings-folder")
+                                        .small()
+                                        .label(tr("打开所在的文件夹"))
+                                        .on_click(move |_, window, cx| {
+                                            if let Some(folder) = &folder {
+                                                let result = crate::shell::open_folder(folder);
+                                                crate::shell::report(result, window, cx);
+                                            }
+                                        }),
+                                ),
+                            )
                     })),
             )
     }

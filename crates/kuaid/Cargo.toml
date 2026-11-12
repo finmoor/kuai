@@ -3,6 +3,8 @@ name = "kuaid"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 # 服务器上的常驻程序：在服务器上执行 git、托管终端会话，经 ssh 的 stdin/stdout 和客户端通信。
 # 只能依赖纯 Rust 的库，才能从 Windows 直接交叉编译出 Linux 静态程序。

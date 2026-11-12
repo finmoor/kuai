@@ -19,6 +19,8 @@ mod terminal;
 mod text;
 mod tray;
 mod ui;
+mod update;
+mod update_view;
 mod win;
 mod workspace;
 
@@ -110,13 +112,42 @@ pub(crate) fn with_main_window(cx: &mut App, f: impl FnOnce(&mut Window, &mut Ap
     });
 }
 
+/// 安装版的卸载程序在删文件之前调用（`tools/installer/kuai.iss`），不开窗口：
+/// - `--has-saved-passwords`：凭据管理器里存着 Kuai 的密码、口令时退出码 0，没有是 1；
+/// - `--uninstall`：开机自启指向这个程序的话删掉（指向别处的，比如另一份解压版，不动）；
+///   再带 `--forget-passwords` 时把存的密码、口令也删掉。
+fn uninstall_command() -> Option<i32> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let has = |flag: &str| args.iter().any(|arg| arg == flag);
+    if has("--has-saved-passwords") {
+        return Some(if secrets::saved_count() > 0 { 0 } else { 1 });
+    }
+    if !has("--uninstall") {
+        return None;
+    }
+    if autostart::enabled() {
+        let _ = autostart::set(false);
+    }
+    if has("--forget-passwords") {
+        secrets::forget_all();
+    }
+    Some(0)
+}
+
 fn main() {
     // 被 git 或 ssh 当作 askpass 启动时：去问已经开着的主程序，打出回答就退出
     if let Some(code) = fr_core::askpass::run_helper() {
         std::process::exit(code);
     }
+    if let Some(code) = uninstall_command() {
+        std::process::exit(code);
+    }
     if std::env::var_os("FR_LOG").is_some() {
         let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Info));
+    }
+    // 上次下好了新版本、没点重启就退出了：先换上，拉起新版本，这个进程就不开窗口了
+    if update::apply_staged_at_startup() {
+        return;
     }
 
     let mut settings = settings::load();
@@ -213,6 +244,7 @@ fn main() {
 
             let saved_window = settings.window;
             let app = cx.new(|_| AppState::new(settings));
+            let updater = cx.new(|cx| update::Updater::new(app.clone(), cx));
             // 标题栏自己画（标签页放在里面），所以用组件库配套的窗口选项
             let options = WindowOptions {
                 window_bounds: Some(appearance::initial_bounds(saved_window, cx)),
@@ -228,7 +260,7 @@ fn main() {
                     window.set_debug_frame_overlay_mode(DebugFrameOverlayMode::Minimal);
                 }
                 // 主题、语言、托盘都由工作区按设置应用
-                let workspace = cx.new(|cx| Workspace::new(app, prompts, window, cx));
+                let workspace = cx.new(|cx| Workspace::new(app, updater, prompts, window, cx));
                 cx.set_global(MainWorkspace(workspace.downgrade(), window.window_handle()));
                 if start_minimized {
                     workspace.update(cx, |ws, _| ws.start_in_tray());

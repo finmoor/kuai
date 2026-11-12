@@ -9,7 +9,10 @@
 //!
 //! 快捷键：F5 刷新、Ctrl+W 关标签页、Ctrl+Tab 切标签页、Ctrl+F 搜索提交、Ctrl+P 快速打开仓库、
 //! Ctrl+1 本地修改、Ctrl+2 所有提交、Ctrl+, 设置、Ctrl+Shift+T 重新打开刚关掉的标签页、
-//! Ctrl+` 打开、收起当前仓库底下的终端。
+//! Ctrl+` 当前仓库在 Git、终端两页之间切换。
+//!
+//! 有新版本时标题栏上齿轮左边多一个小牌（`update_view.rs`），点「重启完成升级」后这里先问一下
+//! 本机终端，再换上新版本、拉起新的 Kuai、自己退出。
 //!
 //! 关标签页时：有写操作在做就先拦一下；提交说明框里没提交的内容记下来，再打开这个仓库时放回去。
 //! 关掉的标签页每个工作区记最近 10 个（存在设置里），手滑关错了能找回来；
@@ -40,6 +43,7 @@ use crate::settings::RepoEntry;
 use crate::settings_page::SettingsPage;
 use crate::tray::{Tray, TrayAction};
 use crate::ui;
+use crate::update::{self, UpdateEvent, Updater};
 use crate::win::{self, Hwnd};
 
 /// 标题栏的高度。标签页 28 高，上下各留 5。
@@ -66,6 +70,7 @@ struct Applied {
 
 pub struct Workspace {
     app: Entity<AppState>,
+    updater: Entity<Updater>,
     manager: Entity<ManagerView>,
     settings_page: Entity<SettingsPage>,
     /// 当前工作区的标签页
@@ -94,12 +99,13 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(
         app: Entity<AppState>,
+        updater: Entity<Updater>,
         prompts: Prompts,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let manager = cx.new(|cx| ManagerView::new(app.clone(), cx));
-        let settings_page = cx.new(|cx| SettingsPage::new(app.clone(), cx));
+        let settings_page = cx.new(|cx| SettingsPage::new(app.clone(), updater.clone(), cx));
         let quitting = Rc::new(Cell::new(false));
         let subscriptions = vec![
             cx.subscribe_in(&manager, window, |this, _, event, window, cx| match event {
@@ -132,6 +138,11 @@ impl Workspace {
                 if !window.is_window_active() {
                     this.hide_if_minimized(cx);
                 }
+            }),
+            // 升级：小牌跟着检查、下载的进度变；点了「重启完成升级」先问一下再重启
+            cx.observe(&updater, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&updater, window, |this, _, event, window, cx| match event {
+                UpdateEvent::Restart => this.restart_for_update(window, cx),
             }),
         ];
         // 关闭到托盘：点关闭按钮时不退出，把窗口藏起来
@@ -188,8 +199,28 @@ impl Workspace {
             });
         }
         let count = app.read(cx).settings.workspaces.len();
+        // 刚升级完：说一声，给个看更新说明的按钮
+        if updater.read(cx).updated_from.is_some() {
+            cx.defer_in(window, |_, window, cx| {
+                let version = env!("CARGO_PKG_VERSION");
+                let notification = Notification::success(tf!("已升到 {version}", version)).action(
+                    move |_, _, _| {
+                        Button::new("update-notes")
+                            .small()
+                            .label(tr("看看改了什么"))
+                            .on_click(move |_, window, cx| {
+                                let page =
+                                    format!("{}/releases/tag/v{version}", update::repo_url());
+                                crate::shell::report(crate::shell::open_url(&page), window, cx);
+                            })
+                    },
+                );
+                window.push_notification(notification, cx);
+            });
+        }
         let mut this = Self {
             app: app.clone(),
+            updater,
             manager,
             settings_page,
             tabs: Vec::new(),
@@ -269,6 +300,50 @@ impl Workspace {
         }
         self.applied = Some(wanted);
         window.refresh();
+    }
+
+    /// 点了「重启完成升级」：本机终端里还有程序在跑就先问一下（服务器上的终端开在 kuaid 里，
+    /// 不受影响），再换上新版本、拉起新的 Kuai、自己退出。换没成的话，小牌上显示原因。
+    fn restart_for_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let terminals = self.live_terminals(cx);
+        let (updater, quitting) = (self.updater.clone(), self.quitting.clone());
+        let restart = Rc::new(move |cx: &mut App| {
+            if updater.update(cx, |u, cx| u.install_and_relaunch(cx)) {
+                quitting.set(true);
+                cx.quit();
+            }
+        });
+        if terminals == 0 {
+            restart(cx);
+            return;
+        }
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let restart = restart.clone();
+            alert
+                .title(tr("重启 Kuai 完成升级"))
+                .description(tf!(
+                    "还有 {n} 个本机终端开着，重启会结束里面的程序。服务器上的终端不受影响。",
+                    n = terminals
+                ))
+                .on_ok(|_, _, _| false)
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("cancel")
+                                .label(tr("取消"))
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("ok")
+                                .label(tr("重启"))
+                                .with_variant(ButtonVariant::Primary)
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    restart(cx);
+                                }),
+                        ),
+                )
+        });
     }
 
     fn on_tray(&mut self, action: TrayAction, cx: &mut Context<Self>) {
@@ -1204,6 +1279,11 @@ impl Workspace {
                 // 最小宽度算，直接把标签页排在这一行里的话，开多了会把整行撑宽，
                 // 右边的设置和窗口按钮被挤出窗口
                 .child(div().relative().flex_1().min_w_0().h_full().child(strip))
+                // 有新版本、正在下、下好了：齿轮左边一个小牌，点开看说明、升级
+                .children(
+                    crate::update_view::title_pill(&self.updater, cx)
+                        .map(|pill| div().occlude().flex_none().child(pill)),
+                )
                 .child(
                     div().occlude().mr(px(4.)).text_color(muted).child(
                         Button::new("open-settings")

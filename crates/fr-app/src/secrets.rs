@@ -4,11 +4,14 @@
 //! 每台服务器一条，名字是 `kuai:server:<服务器 id>`。环境变量 FR_SECRETS_PREFIX 可以换掉
 //! 前面那段（测试用，免得测试留下的和真的混在一起）。
 
+/// 凭据名字前面那段。
+fn prefix() -> String {
+    std::env::var("FR_SECRETS_PREFIX").unwrap_or_else(|_| "kuai:server:".to_string())
+}
+
 /// 凭据的名字。
 fn target(server_id: &str) -> String {
-    let prefix =
-        std::env::var("FR_SECRETS_PREFIX").unwrap_or_else(|_| "kuai:server:".to_string());
-    format!("{prefix}{server_id}")
+    format!("{}{server_id}", prefix())
 }
 
 /// 这台服务器存着的密码或口令；没存、读不了都是 None。
@@ -24,6 +27,18 @@ pub fn set(server_id: &str, account: &str, secret: &str) -> Result<(), String> {
 /// 删掉；本来就没有也算成。
 pub fn delete(server_id: &str) {
     imp::delete(&target(server_id));
+}
+
+/// 凭据管理器里存着几条 Kuai 的密码、口令（包括设置里已经没有的服务器留下的）。
+pub fn saved_count() -> usize {
+    imp::list(&format!("{}*", prefix())).len()
+}
+
+/// 把 Kuai 存的密码、口令全删掉（卸载时问过人以后用）。
+pub fn forget_all() {
+    for name in imp::list(&format!("{}*", prefix())) {
+        imp::delete(&name);
+    }
 }
 
 #[cfg(windows)]
@@ -58,6 +73,12 @@ mod imp {
             credential: *mut *mut Credential,
         ) -> i32;
         fn CredDeleteW(target: *const u16, kind: u32, flags: u32) -> i32;
+        fn CredEnumerateW(
+            filter: *const u16,
+            flags: u32,
+            count: *mut u32,
+            credentials: *mut *mut *mut Credential,
+        ) -> i32;
         fn CredFree(buffer: *const c_void);
     }
 
@@ -132,6 +153,41 @@ mod imp {
         // SAFETY：只传一个以 0 结尾的名字；没有这条时返回失败，不用管
         unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) };
     }
+
+    /// 名字和 `filter`（末尾可以带 `*`）对得上的普通凭据的名字。
+    pub fn list(filter: &str) -> Vec<String> {
+        let filter = wide(filter);
+        let mut count = 0u32;
+        let mut items: *mut *mut Credential = null_mut();
+        // SAFETY：成功时 items 指向 count 个凭据指针，名字是以 0 结尾的 UTF-16；
+        // 读完整块用一次 CredFree 还回去。一条都没有时返回失败
+        unsafe {
+            if CredEnumerateW(filter.as_ptr(), 0, &mut count, &mut items) == 0 || items.is_null() {
+                return Vec::new();
+            }
+            let names = std::slice::from_raw_parts(items, count as usize)
+                .iter()
+                .filter(|item| !item.is_null() && (***item).kind == CRED_TYPE_GENERIC)
+                .filter_map(|item| from_wide((**item).target_name))
+                .collect();
+            CredFree(items.cast());
+            names
+        }
+    }
+
+    /// SAFETY：`ptr` 为空，或者指向以 0 结尾的 UTF-16
+    unsafe fn from_wide(ptr: *const u16) -> Option<String> {
+        if ptr.is_null() {
+            return None;
+        }
+        let mut len = 0;
+        // SAFETY：见上，读到 0 为止
+        while unsafe { *ptr.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY：前 len 个都在缓冲区里
+        String::from_utf16(unsafe { std::slice::from_raw_parts(ptr, len) }).ok()
+    }
 }
 
 #[cfg(not(windows))]
@@ -143,6 +199,9 @@ mod imp {
         None
     }
     pub fn delete(_: &str) {}
+    pub fn list(_: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -166,6 +225,21 @@ mod tests {
         assert_eq!(imp::read(&name), None);
         // 删两次不出错
         imp::delete(&name);
+    }
+
+    #[test]
+    fn 按前缀列出来() {
+        let prefix = format!("kuai-test:list-{}:", std::process::id());
+        for id in ["a", "b"] {
+            imp::write(&format!("{prefix}{id}"), "tester", "x").unwrap();
+        }
+        let mut names = imp::list(&format!("{prefix}*"));
+        names.sort();
+        assert_eq!(names, [format!("{prefix}a"), format!("{prefix}b")]);
+        for name in names {
+            imp::delete(&name);
+        }
+        assert!(imp::list(&format!("{prefix}*")).is_empty());
     }
 
     #[test]

@@ -215,6 +215,12 @@ pub struct Settings {
     /// 上次关闭时窗口的位置和大小
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<WindowState>,
+    /// 启动时和之后每 6 小时问一次 GitHub 有没有新版本（见 `update.rs`）
+    #[serde(default = "default_true")]
+    pub check_updates: bool,
+    /// 点过「跳过这一版」的版本号：标题栏上不再提示它
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_version: Option<String>,
 }
 
 /// 用哪套主题。
@@ -263,6 +269,8 @@ impl Default for Settings {
             layout: Layout::default(),
             repo_memos: Vec::new(),
             window: None,
+            check_updates: true,
+            skipped_version: None,
         };
         settings.normalize();
         settings

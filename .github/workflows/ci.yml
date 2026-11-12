@@ -1,0 +1,30 @@
+# 推到 main、提 PR 时跑测试。
+# kuaid 常驻那一套（拉起、终端断开后还在、原地升级）只能在 Linux 上测，单独一个 ubuntu 的任务。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 测试
+        run: cargo test --workspace
+
+  kuaid-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: kuaid 的测试（含 tests/linux.rs）
+        run: cargo test -p kuaid

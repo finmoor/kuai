@@ -161,6 +161,16 @@ pub fn open_file(path: &str) -> Result<(), String> {
     spawn(cmd, tr("这个文件"))
 }
 
+/// 在默认浏览器里打开网址（只开 https 的）。不经 cmd：网址里的 `&` 会被 cmd 当成命令分隔。
+pub fn open_url(url: &str) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err(tf!("不打开这个网址：{url}", url));
+    }
+    let mut cmd = Command::new("rundll32.exe");
+    cmd.args(["url.dll,FileProtocolHandler", url]);
+    spawn(cmd, tr("浏览器"))
+}
+
 /// 在终端里打开本机目录：有 Windows Terminal 用它，没有就用 cmd。
 pub fn open_terminal(dir: &str) -> Result<(), String> {
     let dir = windows_path(dir);

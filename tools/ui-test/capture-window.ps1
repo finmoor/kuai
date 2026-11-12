@@ -1,5 +1,8 @@
+[CmdletBinding()]
 param(
-    [Parameter(Mandatory)] [int]$ProcessId,
+    [Parameter(Mandatory, ParameterSetName = 'process')] [int]$ProcessId,
+    # 按窗口句柄截：进程的主窗口不是要截的那个时用，比如安装程序（见 wizard.ps1 -List）
+    [Parameter(Mandatory, ParameterSetName = 'window')] [long]$Hwnd,
     [Parameter(Mandatory)] [string]$Out
 )
 # 用 PrintWindow（PW_RENDERFULLCONTENT）取窗口内容：窗口被别的窗口挡住也能截，不用把它切到前台。
@@ -16,16 +19,20 @@ public static class PrintW {
 }
 "@
 [PrintW]::SetProcessDPIAware() | Out-Null
-$p = Get-Process -Id $ProcessId
-if ($p.MainWindowHandle -eq 0) { throw "没有窗口" }
+if ($PSCmdlet.ParameterSetName -eq 'window') {
+    $window = [IntPtr]$Hwnd
+} else {
+    $window = (Get-Process -Id $ProcessId).MainWindowHandle
+    if ($window -eq 0) { throw "没有窗口" }
+}
 $r = New-Object PrintW+RECT
-[PrintW]::GetWindowRect($p.MainWindowHandle, [ref]$r) | Out-Null
+[PrintW]::GetWindowRect($window, [ref]$r) | Out-Null
 $w = $r.Right - $r.Left
 $h = $r.Bottom - $r.Top
 $bmp = New-Object System.Drawing.Bitmap $w, $h
 $g = [System.Drawing.Graphics]::FromImage($bmp)
 $hdc = $g.GetHdc()
-$ok = [PrintW]::PrintWindow($p.MainWindowHandle, $hdc, 2)
+$ok = [PrintW]::PrintWindow($window, $hdc, 2)
 $g.ReleaseHdc($hdc)
 $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
 $g.Dispose(); $bmp.Dispose()

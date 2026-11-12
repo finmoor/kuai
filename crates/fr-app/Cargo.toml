@@ -3,6 +3,8 @@ name = "fr-app"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [build-dependencies]
 # 把图标和版本信息嵌进 exe（用 Windows SDK 里的 rc.exe）
@@ -29,6 +31,13 @@ raw-window-handle = "0.6"
 alacritty_terminal = "0.26"
 # 往终端里发剪贴板里的图片：位图转成 PNG（GPUI 也用它，不多带一个库）
 image = { version = "0.25", default-features = false, features = ["png", "bmp", "tiff", "ico", "pnm"] }
+# 检查更新、点一下升级（update.rs）：问 GitHub Releases、下载发布包（ureq，rustls），
+# 核对 SHA-256，解压 zip，换掉正在运行的 kuai.exe（Windows 上只能改名、不能删，self-replace 处理）
+ureq = { version = "3.5.2", features = ["json"] }
+zip = { version = "9.5.1", default-features = false, features = ["deflate"] }
+self-replace = "1.5.1"
+semver = "1.0.28"
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 # 托盘图标和它的右键菜单（最小化到托盘、关闭到托盘）

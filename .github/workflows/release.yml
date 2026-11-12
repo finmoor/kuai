@@ -1,0 +1,73 @@
+# 推 v1.8.0 这样的标签就发版：测试、打包，把安装程序 kuai-<版本>-windows-x64-setup.exe 和
+# 解压版 kuai-<版本>-windows-x64.zip 传到 GitHub Releases。
+# 发布说明取自 CHANGELOG.md 里这个版本的那一节。GitHub 会给附件算 SHA-256（API 的 assets[].digest），
+# Kuai 升级时拿它核对下载的文件，所以不另传校验文件。
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 标签和 Cargo.toml 的版本号要一致
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:TAG) { throw "Cargo.toml 是 $version，标签是 $env:TAG" }
+
+      - name: 测试
+        run: cargo test --workspace
+
+      # 编安装程序用。直接下官方 GitHub 上的安装包，和本机用的同一版，核对 SHA-256
+      # （和 winget 清单 JRSoftware.InnoSetup 6.7.3 里记的一样）
+      - name: 装 Inno Setup 6.7.3
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe'
+          $exe = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
+          Invoke-WebRequest $url -OutFile $exe
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash
+          if ($hash -ne '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732') {
+            throw "Inno Setup 安装包的 SHA-256 不对：$hash"
+          }
+          Start-Process $exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/CURRENTUSER' -Wait
+          $iscc = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { throw "没装上：$iscc" }
+          "ISCC=$iscc" >> $env:GITHUB_ENV
+
+      - name: 打包
+        shell: pwsh
+        run: ./tools/package.ps1
+
+      - name: 发布说明
+        shell: pwsh
+        run: |
+          $version = $env:TAG.TrimStart('v')
+          $notes = ./tools/release-notes.ps1 $version
+          $download = "下载：安装版 kuai-$version-windows-x64-setup.exe（推荐），解压即用版 kuai-$version-windows-x64.zip。" +
+            "第一次运行时 Windows 可能提示「已保护你的电脑」（程序没有代码签名），点「更多信息」再点「仍要运行」。"
+          "$notes`n`n$download" | Set-Content -Encoding utf8NoBOM notes.md
+
+      - name: 传到 GitHub Releases
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = Get-ChildItem dist -Filter 'kuai-*-windows-x64.zip' | Select-Object -First 1
+          $setup = Get-ChildItem dist -Filter 'kuai-*-windows-x64-setup.exe' | Select-Object -First 1
+          if (-not $zip -or -not $setup) { throw '缺发布包或安装程序' }
+          gh release create $env:TAG $setup.FullName $zip.FullName --title "Kuai $env:TAG" --notes-file notes.md --verify-tag

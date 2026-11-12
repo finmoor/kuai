@@ -6,6 +6,17 @@ Windows 上界面和操作习惯接近 Fork 的 Git 客户端，最终目标是�
 
 > 名字 2026-11-11 定的：不用叉子（Fork）改用筷子，「筷」也谐音「快」。在这之前暂时叫 fork-remote，仓库目录、crate 前缀 `fr-`、环境变量 `FR_*` 还是那时候的，当内部代号留着。
 
+## 下载
+
+到 [GitHub Releases](https://github.com/finmoor/kuai/releases) 下载，两种任选：
+
+- **安装版** `kuai-<版本>-windows-x64-setup.exe`（推荐）：装在自己的用户目录下（`%LOCALAPPDATA%\Programs\Kuai`），不要管理员权限；开始菜单里有，「设置 → 应用」里能卸载。
+- **解压版** `kuai-<版本>-windows-x64.zip`：解压出来的 Kuai 文件夹放哪都行，双击 `kuai.exe`。
+
+要 64 位的 Windows 10 或 11，PATH 里有 git，用 Windows 自带的 OpenSSH；服务器那边是 Linux（x86_64），不要 root。程序没有代码签名，第一次运行时 Windows 可能提示「已保护你的电脑」，点「更多信息」再点「仍要运行」。
+
+以后有新版本时，标题栏齿轮左边会出现「可以升级」，点开看说明、点一下就升（安装版在后台跑新的安装程序，解压版原地换文件）；「设置 → 关于」里也能检查。服务器上的 kuaid 不用管，新版连上时它自己跟着换。
+
 ## 技术栈
 
 - 客户端：Rust + GPUI，经 [gpui-kit](https://github.com/longbridge/gpui-kit) 0.9 引入（gpui-pre 快照、gpui-base、gpui-component）。
@@ -24,7 +35,10 @@ Windows 上界面和操作习惯接近 Fork 的 Git 客户端，最终目标是�
 | `crates/kuaid` | 服务器上的常驻程序 `kuaid`：执行 git、托管终端会话 |
 | `tools/gen-test-repo.py` | 生成性能测试用的大仓库 |
 | `tools/ui-test/` | 界面测试脚本：建测试仓库、截窗口、往测试窗口投递点击和输入（不动真实鼠标） |
-| `tools/package.ps1` | 打发布包：客户端加 Linux 版 kuaid，输出到 `dist/` |
+| `tools/package.ps1` | 打发布包：客户端加 Linux 版 kuaid，出安装程序和解压版的 zip，输出到 `dist/` |
+| `tools/installer/` | 安装程序的脚本（Inno Setup 6，`kuai.iss`）和简体中文的界面文字 |
+| `tools/release-notes.ps1`、`CHANGELOG.md` | 发版时的发布说明：取 `CHANGELOG.md` 里这个版本的那一节 |
+| `.github/workflows/` | 推代码时跑测试（`ci.yml`，kuaid 的 Linux 测试也在这里跑）；推 `v*` 标签时打包发版（`release.yml`） |
 | `tools/make-icon.py` | 画应用图标，输出 `crates/fr-app/assets/icon.ico` |
 
 ## 快捷键
@@ -79,13 +93,21 @@ cargo run --release -p fr-channel --bin fr-probe -- --repo <服务器上的仓�
 cargo test --workspace
 
 # kuaid 常驻那一套（拉起、终端断开后还在、原地升级）只能在 Linux 上测：交叉编译出测试程序，
-# 连同 kuaid 拷到 Linux 机器上跑，见 crates/kuaid/tests/linux.rs 开头
+# 连同 kuaid 拷到 Linux 机器上跑，见 crates/kuaid/tests/linux.rs 开头；GitHub Actions 的 ci.yml 在 ubuntu 上直接跑
 cargo test --no-run --release -p kuaid --target x86_64-unknown-linux-musl
 
-# 打发布包：dist/kuai-<版本>-windows-x64/ 和同名 zip，解压即用
+# 打发布包：dist/kuai-<版本>-windows-x64-setup.exe（安装程序）和 dist/kuai-<版本>-windows-x64.zip
+# （解压出来是一个 Kuai 文件夹）。要 Inno Setup 6（winget install JRSoftware.InnoSetup --scope user）；
+# 包里的第三方库许可证清单由 tools/third-party-licenses.py 生成，要 Python 3
 pwsh tools/package.ps1
 ```
+
+发版：改 `Cargo.toml` 的版本号，在 `CHANGELOG.md` 加上这个版本的一节（每条一句话，Kuai 的升级小窗里会列出来），提交后打标签 `v<版本>` 推上去，`release.yml` 测试、打包、建 GitHub Release。Kuai 检查更新时只认 `kuai-*-windows-x64-setup.exe`（安装版用）和 `kuai-*-windows-x64.zip`（解压版用）这两个附件。
 
 设置存在 `%APPDATA%\kuai\settings.json`；环境变量 `FR_SETTINGS` 可以换成别的文件，测试时不碰自己的设置（开机自启写的是注册表，测试时用 `FR_AUTOSTART_KEY` 换一个键）。
 
 界面上新加一句话：源码里直接写中文、包上 `tr("…")`（带变量用 `tf!`），再到 `crates/fr-core/locales/en.json` 里补英文；没补的话 `cargo test -p fr-core` 会把缺的列出来。在 Git Bash 里给 Windows 程序传 `/data/...` 这类路径会被改写，所以上面测服务器那条要加 `MSYS_NO_PATHCONV=1`。
+
+## 许可证
+
+MIT 或 Apache-2.0，任选其一，见 [LICENSE-MIT](LICENSE-MIT)、[LICENSE-APACHE](LICENSE-APACHE)。界面图标是 [Lucide](https://lucide.dev)（ISC 许可），经 gpui-kit 带进来。用到的第三方库和它们的许可证在发布包的 `THIRD-PARTY-LICENSES.txt` 里。

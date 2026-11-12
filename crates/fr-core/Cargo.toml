@@ -3,6 +3,8 @@ name = "fr-core"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 # 核心逻辑：调用 git、解析输出、计算提交图布局。不依赖界面，客户端和 kuaid 共用。
 [dependencies]
