@@ -1,6 +1,6 @@
 //! 设置：服务器列表、仓库列表、工作区和各自开着的标签页、语言、主题、托盘和窗口位置。
 //!
-//! 存在 `%APPDATA%\fork-remote\settings.json`，不存密码（服务器的密码、私钥口令在系统的凭据管理器里，
+//! 存在 `%APPDATA%\kuai\settings.json`，不存密码（服务器的密码、私钥口令在系统的凭据管理器里，
 //! 见 `secrets`）。环境变量 FR_SETTINGS 可以指定别的文件（测试用）。
 
 use fr_core::tf;
@@ -22,10 +22,15 @@ fn default_auto_fetch() -> u32 {
     10
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// 可以选的自动获取间隔（分钟）；0 是不自动获取。
 pub const AUTO_FETCH_CHOICES: [u32; 6] = [0, 5, 10, 15, 30, 60];
 
 /// 各块的大小（逻辑像素），拖分隔条改的。没拖过的是空，按默认值或窗口大小算。
+/// 仓库页上「全部仓库」展没展开也记在这里。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Layout {
     /// 仓库页侧栏的宽度
@@ -40,6 +45,12 @@ pub struct Layout {
     /// 详情区左边一栏（说明、改动的文件）的宽度
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details_width: Option<f32>,
+    /// 仓库页底下终端的高度
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_height: Option<f32>,
+    /// 仓库页上「全部仓库」展开着（工作区里还没有仓库时不看这一项，一直展开）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub all_repos: bool,
 }
 
 /// 一个仓库自己记的东西：起的名字、隐藏了哪些分支、最近用过的提交说明。
@@ -78,7 +89,7 @@ impl RepoMemo {
     }
 }
 
-/// 一个工作区：一组仓库标签页。
+/// 一个工作区：它的仓库，和其中开着的那些标签页。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabGroup {
     pub name: String,
@@ -87,6 +98,65 @@ pub struct TabGroup {
     /// 选中的标签页：0 是仓库管理器，1 起是 `tabs` 里的
     #[serde(default)]
     pub active: usize,
+    /// 最近关掉的标签页，新的在后；重新打开了就从这里去掉
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub closed: Vec<RepoEntry>,
+    /// 这个工作区的仓库：在这里打开过的都算，关标签页不移出，要明确「从工作区移除」。
+    /// 一个仓库可以在几个工作区里
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<RepoEntry>,
+    /// 固定的标签页：排在最前面，没有关闭按钮，Ctrl+W 和中键也关不掉
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned: Vec<RepoEntry>,
+}
+
+impl TabGroup {
+    /// 最多记几个关掉的标签页
+    pub const MAX_CLOSED: usize = 10;
+
+    /// 记下刚关掉的标签页。
+    pub fn note_closed(&mut self, entry: RepoEntry) {
+        self.closed.retain(|e| *e != entry);
+        self.closed.push(entry);
+        let extra = self.closed.len().saturating_sub(Self::MAX_CLOSED);
+        self.closed.drain(..extra);
+    }
+
+    /// 把仓库加进这个工作区（已经在就不动）。
+    pub fn adopt(&mut self, entry: &RepoEntry) {
+        if !self.repos.contains(entry) {
+            self.repos.push(entry.clone());
+        }
+    }
+
+    /// 把仓库从这个工作区去掉：不再是它的仓库，也不算刚关掉的、固定的。开着的标签页由调用方关。
+    pub fn drop_repo(&mut self, entry: &RepoEntry) {
+        self.repos.retain(|e| e != entry);
+        self.closed.retain(|e| e != entry);
+        self.pinned.retain(|e| e != entry);
+    }
+
+    pub fn is_pinned(&self, entry: &RepoEntry) -> bool {
+        self.pinned.contains(entry)
+    }
+
+    /// 固定的标签页排到最前面，各自内部的先后不变。选中的还是原来那个仓库。
+    pub fn pinned_first(&mut self) {
+        let current = self
+            .active
+            .checked_sub(1)
+            .and_then(|ix| self.tabs.get(ix))
+            .cloned();
+        let pinned = &self.pinned;
+        self.tabs.sort_by_key(|tab| !pinned.contains(tab));
+        if let Some(current) = current {
+            self.active = self
+                .tabs
+                .iter()
+                .position(|tab| *tab == current)
+                .map_or(0, |ix| ix + 1);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +202,12 @@ pub struct Settings {
     /// 工作区有改动时切换分支、拉取：先贮藏，做完再恢复
     #[serde(default)]
     pub stash_before_switch: bool,
+    /// 标签页上显示关闭按钮；关了以后用中键、Ctrl+W 或右键菜单关，免得手滑点到
+    #[serde(default = "default_true")]
+    pub tab_close_button: bool,
+    /// 本机仓库的终端用哪个程序（`shell::local_shells` 里的 id）；空着自动挑
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub terminal_shell: String,
     #[serde(default)]
     pub layout: Layout,
     /// 各个仓库自己记的东西
@@ -183,6 +259,8 @@ impl Default for Settings {
             auto_fetch_minutes: default_auto_fetch(),
             diff_split: false,
             stash_before_switch: false,
+            tab_close_button: true,
+            terminal_shell: String::new(),
             layout: Layout::default(),
             repo_memos: Vec::new(),
             window: None,
@@ -200,13 +278,34 @@ impl Settings {
                 name: tr("默认").to_string(),
                 tabs: std::mem::take(&mut self.open_tabs),
                 active: self.active_tab,
+                ..TabGroup::default()
             });
         }
         self.open_tabs.clear();
         self.active_tab = 0;
         self.active_workspace = self.active_workspace.min(self.workspaces.len() - 1);
+        let repos = &self.repos;
         for group in &mut self.workspaces {
             group.active = group.active.min(group.tabs.len());
+            // 关掉的标签页：又开着的、仓库已经不在列表里的都不用记
+            let tabs = &group.tabs;
+            group
+                .closed
+                .retain(|e| repos.contains(e) && !tabs.contains(e));
+            // 工作区的仓库：开着的、刚关掉的都算（1.4 以前的设置里没有这一项，就是这样补出来的）；
+            // 已经不在仓库列表里、也没开着的去掉
+            for entry in group.tabs.iter().chain(&group.closed) {
+                if !group.repos.contains(entry) {
+                    group.repos.push(entry.clone());
+                }
+            }
+            let tabs = &group.tabs;
+            group
+                .repos
+                .retain(|e| repos.contains(e) || tabs.contains(e));
+            // 固定的只能是开着的
+            group.pinned.retain(|e| tabs.contains(e));
+            group.pinned_first();
         }
         // 手改设置文件写了别的数：收到最近的一档
         if !AUTO_FETCH_CHOICES.contains(&self.auto_fetch_minutes) {
@@ -418,18 +517,46 @@ impl RepoEntry {
     }
 }
 
+/// `%APPDATA%` 下放设置的文件夹。
+const DIR: &str = "kuai";
+/// 1.2.2 以前产品还叫 fork-remote 时用的文件夹。
+const LEGACY_DIR: &str = "fork-remote";
+const FILE: &str = "settings.json";
+
+fn appdata() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 pub fn file() -> PathBuf {
     if let Some(path) = std::env::var_os("FR_SETTINGS") {
         return path.into();
     }
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("fork-remote")
-        .join("settings.json")
+    appdata().join(DIR).join(FILE)
+}
+
+/// 改名以前的设置搬过来：新文件夹里还没有设置、旧文件夹里有的时候才搬，只会发生一次。
+fn adopt_legacy(appdata: &std::path::Path) {
+    let (old, new) = (appdata.join(LEGACY_DIR), appdata.join(DIR));
+    if new.join(FILE).exists() || !old.join(FILE).exists() {
+        return;
+    }
+    // 整个文件夹改名；新文件夹已经在了就改不成，那就只拷设置文件
+    if std::fs::rename(&old, &new).is_ok() {
+        return;
+    }
+    let copied =
+        std::fs::create_dir_all(&new).and_then(|()| std::fs::copy(old.join(FILE), new.join(FILE)));
+    if let Err(err) = copied {
+        log::warn!("旧设置（{}）没搬过来：{err}", old.display());
+    }
 }
 
 pub fn load() -> Settings {
+    if std::env::var_os("FR_SETTINGS").is_none() {
+        adopt_legacy(&appdata());
+    }
     let path = file();
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Settings::default();
@@ -491,9 +618,78 @@ mod tests {
             .name()
             .to_string()
         };
-        assert_eq!(name(r"C:\work\fork-remote"), "fork-remote");
+        assert_eq!(name(r"C:\work\kuai"), "kuai");
         assert_eq!(name("/data/workspaces/big-repo/"), "big-repo");
         assert_eq!(name("repo"), "repo");
+    }
+
+    #[test]
+    fn 工作区的仓库清单() {
+        let repo = |path: &str| RepoEntry {
+            server: None,
+            path: path.into(),
+        };
+        // 旧设置里没有清单：开着的、刚关掉的补进去
+        let old = r#"{"repos":[{"path":"a"},{"path":"b"},{"path":"c"},{"path":"d"}],
+            "workspaces":[{"name":"w","tabs":[{"path":"a"},{"path":"b"}],"active":2,
+            "closed":[{"path":"c"}]}]}"#;
+        let mut settings: Settings = serde_json::from_str(old).unwrap();
+        settings.normalize();
+        let group = &settings.workspaces[0];
+        assert_eq!(group.repos, [repo("a"), repo("b"), repo("c")]);
+
+        // 仓库从列表里去掉了：清单里也没有；固定的排最前，选中的还是原来那个
+        settings.repos.retain(|r| r.path != "c");
+        settings.workspaces[0].pinned = vec![repo("b"), repo("不存在")];
+        settings.normalize();
+        let group = &settings.workspaces[0];
+        assert_eq!(group.repos, [repo("a"), repo("b")]);
+        assert_eq!(group.pinned, [repo("b")]);
+        assert_eq!(group.tabs, [repo("b"), repo("a")]);
+        assert_eq!(group.active, 1);
+
+        // 从工作区去掉：不再补回来
+        settings.workspaces[0].tabs.retain(|r| r.path != "a");
+        settings.workspaces[0].note_closed(repo("a"));
+        settings.workspaces[0].drop_repo(&repo("a"));
+        settings.normalize();
+        assert_eq!(settings.workspaces[0].repos, [repo("b")]);
+        assert!(settings.workspaces[0].closed.is_empty());
+    }
+
+    #[test]
+    fn 改名以前的设置搬到新文件夹() {
+        let root = std::env::temp_dir().join(format!("kuai-test-adopt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (old, new) = (root.join(LEGACY_DIR), root.join(DIR));
+
+        // 两边都没有：什么也不做
+        std::fs::create_dir_all(&root).unwrap();
+        adopt_legacy(&root);
+        assert!(!new.exists());
+
+        // 只有旧的：整个文件夹搬过来
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join(FILE), "旧的").unwrap();
+        adopt_legacy(&root);
+        assert_eq!(std::fs::read_to_string(new.join(FILE)).unwrap(), "旧的");
+        assert!(!old.exists());
+
+        // 新的已经有设置：旧的再出现也不覆盖
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join(FILE), "又一份旧的").unwrap();
+        adopt_legacy(&root);
+        assert_eq!(std::fs::read_to_string(new.join(FILE)).unwrap(), "旧的");
+
+        // 新文件夹在、里面没有设置：只拷设置文件
+        std::fs::remove_file(new.join(FILE)).unwrap();
+        adopt_legacy(&root);
+        assert_eq!(
+            std::fs::read_to_string(new.join(FILE)).unwrap(),
+            "又一份旧的"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

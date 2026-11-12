@@ -136,7 +136,7 @@ impl RepoView {
     }
 
     /// 写操作的实现：依次执行 `steps`，有一步失败就停。
-    fn run_steps(
+    pub(super) fn run_steps(
         &mut self,
         label: impl Into<SharedString>,
         steps: Vec<Step>,
@@ -701,7 +701,7 @@ impl RepoView {
         let millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis());
-        let marker = format!("fork-remote-{millis}");
+        let marker = format!("kuai-{millis}");
         let message = tf!(
             "{label}之前自动贮藏的改动（{marker}）",
             label,
@@ -1256,13 +1256,13 @@ mod tests {
     #[test]
     fn 按记号找自动贮藏的那一份() {
         let list = "stash@{0}\x1faaa\x1f1700000002\x1fOn main: 手工贮藏的\0\
-                    stash@{1}\x1fbbb\x1f1700000001\x1fOn main: 切换分支之前自动贮藏的改动（fork-remote-123）\0";
+                    stash@{1}\x1fbbb\x1f1700000001\x1fOn main: 切换分支之前自动贮藏的改动（kuai-123）\0";
         assert_eq!(
-            find_stash(list.as_bytes(), "fork-remote-123").as_deref(),
+            find_stash(list.as_bytes(), "kuai-123").as_deref(),
             Some("stash@{1}")
         );
-        assert_eq!(find_stash(list.as_bytes(), "fork-remote-999"), None);
-        assert_eq!(find_stash(b"", "fork-remote-123"), None);
+        assert_eq!(find_stash(list.as_bytes(), "kuai-999"), None);
+        assert_eq!(find_stash(b"", "kuai-123"), None);
     }
 
     #[test]

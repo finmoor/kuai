@@ -1,13 +1,13 @@
 //! 服务器的登录密码、私钥口令：存在 Windows 凭据管理器里（「控制面板 › 凭据管理器 › Windows 凭据」
 //! 的「普通凭据」），由系统按登录用户加密，`settings.json` 里不存。
 //!
-//! 每台服务器一条，名字是 `fork-remote:server:<服务器 id>`。环境变量 FR_SECRETS_PREFIX 可以换掉
+//! 每台服务器一条，名字是 `kuai:server:<服务器 id>`。环境变量 FR_SECRETS_PREFIX 可以换掉
 //! 前面那段（测试用，免得测试留下的和真的混在一起）。
 
 /// 凭据的名字。
 fn target(server_id: &str) -> String {
     let prefix =
-        std::env::var("FR_SECRETS_PREFIX").unwrap_or_else(|_| "fork-remote:server:".to_string());
+        std::env::var("FR_SECRETS_PREFIX").unwrap_or_else(|_| "kuai:server:".to_string());
     format!("{prefix}{server_id}")
 }
 
@@ -152,7 +152,7 @@ mod tests {
     /// 直接给名字，不经 `target()`：测试并行跑，不去改环境变量。
     #[test]
     fn 存进去读得出来_删了就没有() {
-        let name = format!("fork-remote-test:unit-{}", std::process::id());
+        let name = format!("kuai-test:unit-{}", std::process::id());
         imp::delete(&name);
         assert_eq!(imp::read(&name), None);
 
@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn 太长的存不下() {
-        let name = format!("fork-remote-test:long-{}", std::process::id());
+        let name = format!("kuai-test:long-{}", std::process::id());
         assert!(imp::write(&name, "tester", &"x".repeat(2000)).is_err());
         assert_eq!(imp::read(&name), None);
     }

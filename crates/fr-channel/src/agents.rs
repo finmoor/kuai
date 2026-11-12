@@ -40,7 +40,7 @@ impl Agents {
         Ok(Agents { found, build })
     }
 
-    /// 服务器上 `~/.fork-remote/` 下的目录名。
+    /// 服务器上 `~/.kuai/` 下的目录名。
     pub fn dir_name(&self) -> String {
         format!(
             "{}-{:012x}",

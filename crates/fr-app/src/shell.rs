@@ -4,14 +4,15 @@
 
 use fr_core::i18n::tr;
 use fr_core::tf;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::{App, Window};
 
-use crate::settings::{Server, Target};
+use crate::settings::{RepoEntry, Server, Target};
+use crate::terminal::Launch;
 
 /// CREATE_NO_WINDOW：不弹出控制台窗口
 const NO_WINDOW: u32 = 0x0800_0000;
@@ -35,13 +36,103 @@ fn windows_path(path: &str) -> String {
 
 /// PATH 里有没有这个程序（按 Windows 的习惯补上常见的扩展名）。
 fn in_path(name: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&paths).any(|dir| {
+    find_in_path(name).is_some()
+}
+
+/// 这个程序在 PATH 里的完整路径。
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).find_map(|dir| {
         ["", ".exe", ".cmd", ".bat"]
             .iter()
-            .any(|ext| dir.join(format!("{name}{ext}")).is_file())
+            .map(|ext| dir.join(format!("{name}{ext}")))
+            .find(|path| path.is_file())
+    })
+}
+
+/// 内置终端在本机仓库里可以开的一种 shell。
+pub struct LocalShell {
+    /// 存在设置里的名字
+    pub id: &'static str,
+    pub label: &'static str,
+    pub program: PathBuf,
+    pub args: Vec<String>,
+}
+
+/// 这台电脑上找得到的 shell，按自动挑选的先后排：PowerShell 7、Windows PowerShell、
+/// 命令提示符、Git Bash。
+pub fn local_shells() -> Vec<LocalShell> {
+    let mut shells = Vec::new();
+    let mut add = |id, label, program: Option<PathBuf>, args: &[&str]| {
+        if let Some(program) = program {
+            shells.push(LocalShell {
+                id,
+                label,
+                program,
+                args: args.iter().map(|arg| arg.to_string()).collect(),
+            });
+        }
+    };
+    add("pwsh", "PowerShell 7", find_in_path("pwsh"), &["-NoLogo"]);
+    add(
+        "powershell",
+        "Windows PowerShell",
+        find_in_path("powershell"),
+        &["-NoLogo"],
+    );
+    add("cmd", tr("命令提示符"), find_in_path("cmd"), &[]);
+    // Git Bash：git 装在 …\Git\cmd\git.exe，bash 在旁边的 bin 里
+    let bash = find_in_path("git")
+        .and_then(|git| Some(git.parent()?.parent()?.join("bin").join("bash.exe")))
+        .filter(|bash| bash.is_file());
+    add("git-bash", "Git Bash", bash, &["--login", "-i"]);
+    shells
+}
+
+/// 内置终端要跑什么：本机仓库是设置里选的 shell（没选、选的找不到了就用第一个找得到的），
+/// 服务器上的仓库是 ssh 登录过去并进到仓库目录。
+pub fn terminal_launch(
+    entry: &RepoEntry,
+    server: Option<&Server>,
+    preferred: &str,
+) -> Result<Launch, String> {
+    if entry.server.is_none() {
+        let mut shells = local_shells();
+        let at = shells
+            .iter()
+            .position(|shell| shell.id == preferred)
+            .unwrap_or(0);
+        if shells.is_empty() {
+            return Err(tr("找不到可以用的 shell（PowerShell、cmd）。").into());
+        }
+        let shell = shells.swap_remove(at);
+        return Ok(Launch {
+            program: shell.program.to_string_lossy().into_owned(),
+            args: shell.args,
+            cwd: Some(PathBuf::from(windows_path(&entry.path))),
+            env: Vec::new(),
+            keep: None,
+        });
+    }
+    let server = server.ok_or_else(|| tr("找不到这台服务器的设置").to_string())?;
+    if !in_path("ssh") {
+        return Err(tr(
+            "PATH 里没有 ssh。在「设置 › 系统 › 可选功能」里装上「OpenSSH 客户端」再试。",
+        )
+        .into());
+    }
+    let command = fr_channel::terminal_command(
+        &server.destination,
+        &entry.path,
+        &crate::app_state::connect_options(server),
+    );
+    Ok(Launch {
+        program: command.program.to_string_lossy().into_owned(),
+        args: command.args.clone(),
+        cwd: None,
+        env: command.env.clone(),
+        // 留着它，ssh 要密码、口令时才会用存着的自动回答
+        keep: Some(Box::new(command)),
     })
 }
 

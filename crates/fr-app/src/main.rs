@@ -15,6 +15,7 @@ mod secrets;
 mod settings;
 mod settings_page;
 mod shell;
+mod terminal;
 mod text;
 mod tray;
 mod ui;
@@ -30,7 +31,7 @@ use crate::settings::RepoEntry;
 use crate::workspace::Workspace;
 
 gpui_kit::actions!(
-    fork_remote,
+    kuai,
     [
         ToggleFrameOverlay,
         Refresh,
@@ -41,7 +42,9 @@ gpui_kit::actions!(
         QuickOpen,
         ShowChanges,
         ShowHistory,
-        OpenSettings
+        OpenSettings,
+        ReopenTab,
+        OpenTerminal
     ]
 );
 
@@ -168,7 +171,15 @@ fn main() {
                 KeyBinding::new("ctrl-1", ShowChanges, None),
                 KeyBinding::new("ctrl-2", ShowHistory, None),
                 KeyBinding::new("ctrl-,", OpenSettings, None),
+                KeyBinding::new("ctrl-shift-t", ReopenTab, None),
+                KeyBinding::new("ctrl-`", OpenTerminal, None),
             ]);
+            // 焦点在终端里时，这几个键是 shell 和里面的程序要用的（删一个词、往前搜、上一条命令……），
+            // 不当成上面的快捷键。切标签页、设置、Ctrl+` 这些终端用不到的照常
+            cx.bind_keys(
+                ["f5", "ctrl-w", "ctrl-f", "ctrl-p"]
+                    .map(|key| KeyBinding::new(key, NoAction, Some("Terminal"))),
+            );
             workspace_action::<OpenSettings>(cx, |ws, _, cx| ws.toggle_settings(cx));
             workspace_action::<Refresh>(cx, |ws, _, cx| ws.refresh_active(cx));
             workspace_action::<CloseTab>(cx, |ws, window, cx| ws.close_active(window, cx));
@@ -182,6 +193,10 @@ fn main() {
             workspace_action::<PrevTab>(cx, |ws, _, cx| ws.cycle_tab(-1, cx));
             workspace_action::<FindCommit>(cx, |ws, window, cx| ws.find_commit(window, cx));
             workspace_action::<QuickOpen>(cx, |ws, window, cx| ws.quick_open(window, cx));
+            workspace_action::<ReopenTab>(cx, |ws, window, cx| ws.reopen_closed(window, cx));
+            workspace_action::<OpenTerminal>(cx, |ws, window, cx| {
+                ws.terminal_in_active(window, cx)
+            });
             cx.on_action(|_: &ToggleFrameOverlay, cx: &mut App| {
                 for handle in cx.windows() {
                     handle
@@ -197,7 +212,7 @@ fn main() {
                 window_bounds: Some(appearance::initial_bounds(saved_window, cx)),
                 window_min_size: Some(size(px(appearance::MIN_SIZE.0), px(appearance::MIN_SIZE.1))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("fork-remote".into()),
+                    title: Some("Kuai".into()),
                     ..gpui_kit::component::TitleBar::title_bar_options()
                 }),
                 ..gpui_kit::component::TitleBar::window_options()

@@ -25,7 +25,6 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffFile, DiffFileStatus, DiffMode, DiffState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
@@ -1154,7 +1153,7 @@ impl RepoView {
                     )
                     .tooltip({
                         let path = file.path.clone();
-                        move |window, cx| Tooltip::new(path.clone()).build(window, cx)
+                        move |window, cx| ui::tip(path.clone(), window, cx)
                     })
                     .context_menu(menu)
                     .into_any_element()
@@ -1987,7 +1986,7 @@ fn ref_badges(
                 .line_height(px(18.))
                 .text_color(colors.muted)
                 .child(format!("+{}", labels.len() - shown))
-                .tooltip(move |window, cx| Tooltip::new(hidden.clone()).build(window, cx))
+                .tooltip(move |window, cx| ui::tip(hidden.clone(), window, cx))
                 .into_any_element(),
         );
     }

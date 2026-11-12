@@ -1,0 +1,1078 @@
+//! 内置终端：仓库页底下的一块，在仓库目录里开一个 shell（服务器上的仓库是 ssh 登录过去）。
+//!
+//! 进程和终端仿真交给 `alacritty_terminal`：它在 Windows 上用 ConPTY 开伪终端，后台线程读
+//! 程序的输出、解析转义序列、维护字符格子。这里做三件事：
+//!
+//! - 画：每帧把格子拍下来（[`snapshot`]），背景一块块填，字按样式连成一段段画。等宽靠
+//!   「每个字形固定前进一格」（中文等宽字符是两格），不靠字体自己的宽度，回退字体也对得齐。
+//! - 输入：功能键和 Ctrl、Alt 组合在 `keys` 里编码；普通的字和输入法上屏的字由系统经
+//!   [`EntityInputHandler`] 送进来。
+//! - 生命周期：面板第一次画出来、知道能放几行几列时才启动进程；进程结束后画面留着，
+//!   按回车重新启动；这个视图丢弃时进程跟着结束。
+
+mod colors;
+mod keys;
+
+use std::any::Any;
+use std::borrow::Cow;
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::ops::Range;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
+use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{
+    Column as GridColumn, Line as GridLine, Point as GridPoint, Side as GridSide,
+};
+use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::tty::{self, Options, Shell};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
+use fr_core::i18n::tr;
+use fr_core::tf;
+use futures::StreamExt as _;
+use futures::channel::mpsc;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::prelude::*;
+use gpui_kit::*;
+
+use colors::Palette;
+
+/// 终端用的等宽字体和字号；行高取字号的 1.25 倍（制表符画的线上下接得上）。
+const FONT: &str = "Consolas";
+const FONT_SIZE: f32 = 13.;
+const LINE_HEIGHT: f32 = 16.;
+/// 字和面板边缘之间留的空
+const PADDING: f32 = 8.;
+
+/// 终端里要跑的程序。
+pub struct Launch {
+    pub program: String,
+    pub args: Vec<String>,
+    /// 启动时所在的目录；空着用本程序的
+    pub cwd: Option<PathBuf>,
+    /// 额外的环境变量
+    pub env: Vec<(String, String)>,
+    /// 进程活着的时候要一直留着的东西（登录服务器时自动回答密码的登记）
+    pub keep: Option<Box<dyn Any>>,
+}
+
+/// 把仿真器的事件送回界面线程。
+#[derive(Clone)]
+struct Proxy(mpsc::UnboundedSender<TermEvent>);
+
+impl EventListener for Proxy {
+    fn send_event(&self, event: TermEvent) {
+        let _ = self.0.unbounded_send(event);
+    }
+}
+
+/// 几行几列。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Grid {
+    cols: usize,
+    rows: usize,
+}
+
+impl Dimensions for Grid {
+    fn total_lines(&self) -> usize {
+        self.rows
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.cols
+    }
+}
+
+fn window_size(grid: Grid, cell: Size<Pixels>) -> WindowSize {
+    WindowSize {
+        num_lines: grid.rows as u16,
+        num_cols: grid.cols as u16,
+        cell_width: f32::from(cell.width).round() as u16,
+        cell_height: f32::from(cell.height).round() as u16,
+    }
+}
+
+/// 上一帧画在哪、每格多大：鼠标的位置靠它换成第几行第几列。
+#[derive(Clone, Copy, Default)]
+struct Geometry {
+    origin: Point<Pixels>,
+    cell: Size<Pixels>,
+    grid: Option<Grid>,
+    /// 光标那一格在窗口里的位置（输入法的候选框跟着它）
+    cursor: Option<Bounds<Pixels>>,
+}
+
+/// 一个跑着的终端进程。丢弃时进程结束。
+struct Session {
+    term: Arc<FairMutex<Term<Proxy>>>,
+    sender: EventLoopSender,
+    grid: Grid,
+    cell: Size<Pixels>,
+    _keep: Option<Box<dyn Any>>,
+    _events: Task<()>,
+}
+
+impl Session {
+    fn spawn(
+        launch: Launch,
+        grid: Grid,
+        cell: Size<Pixels>,
+        cx: &mut Context<TerminalView>,
+    ) -> std::io::Result<Self> {
+        let (tx, mut rx) = mpsc::unbounded();
+        let proxy = Proxy(tx);
+        let term = Term::new(Config::default(), &grid, proxy.clone());
+        let term = Arc::new(FairMutex::new(term));
+        let mut env: HashMap<String, String> = launch.env.into_iter().collect();
+        env.entry("TERM".into())
+            .or_insert_with(|| "xterm-256color".into());
+        env.entry("COLORTERM".into())
+            .or_insert_with(|| "truecolor".into());
+        let options = Options {
+            // 命令行是直接拼的，程序路径里有空格要自己加引号；参数由库按 C 运行时的规则转义
+            shell: Some(Shell::new(quoted(&launch.program), launch.args)),
+            working_directory: launch.cwd,
+            drain_on_exit: true,
+            env,
+            #[cfg(target_os = "windows")]
+            escape_args: true,
+        };
+        let pty = tty::new(&options, window_size(grid, cell), 0)?;
+        let event_loop = EventLoop::new(term.clone(), proxy, pty, true, false)?;
+        let sender = event_loop.channel();
+        event_loop.spawn();
+        let events = cx.spawn(async move |this, cx| {
+            while let Some(event) = rx.next().await {
+                if this
+                    .update(cx, |this, cx| this.on_event(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            term,
+            sender,
+            grid,
+            cell,
+            _keep: launch.keep,
+            _events: events,
+        })
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // 读输出的线程收到后退出，伪终端跟着关掉，里面的进程结束
+        let _ = self.sender.send(Msg::Shutdown);
+    }
+}
+
+fn quoted(program: &str) -> String {
+    if program.contains([' ', '\t']) && !program.starts_with('"') {
+        format!("\"{program}\"")
+    } else {
+        program.to_string()
+    }
+}
+
+/// 启动终端时调用，算出要跑什么；失败时返回给用户看的原因。每次（重新）启动都算一遍。
+type Launcher = Box<dyn Fn(&App) -> Result<Launch, String>>;
+
+pub struct TerminalView {
+    launcher: Launcher,
+    session: Option<Session>,
+    /// 启动不了的原因
+    error: Option<SharedString>,
+    /// 进程结束了（里面是退出码），画面留着
+    exited: Option<Option<i32>>,
+    focus: FocusHandle,
+    geometry: Rc<Cell<Geometry>>,
+    /// 输入法正在组的字，还没上屏
+    marked: Option<String>,
+    /// 正按着左键拖选
+    selecting: bool,
+    /// 滚轮滚了不到一行的零头
+    scroll_rest: f32,
+    /// 程序自己设的标题（OSC 0、2）
+    title: Option<SharedString>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl Focusable for TerminalView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl TerminalView {
+    pub fn new(
+        launcher: impl Fn(&App) -> Result<Launch, String> + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let focus = cx.focus_handle();
+        let subscriptions = vec![
+            cx.on_focus(&focus, window, |this, _, cx| this.focus_changed(true, cx)),
+            cx.on_blur(&focus, window, |this, _, cx| this.focus_changed(false, cx)),
+        ];
+        Self {
+            launcher: Box::new(launcher),
+            session: None,
+            error: None,
+            exited: None,
+            focus,
+            geometry: Rc::default(),
+            marked: None,
+            selecting: false,
+            scroll_rest: 0.,
+            title: None,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    /// 里面的进程还在跑。
+    pub fn is_alive(&self) -> bool {
+        self.session.is_some() && self.exited.is_none()
+    }
+
+    /// 程序自己设的标题。Windows 上 shell 刚启动时标题是它自己的完整路径，只留文件名。
+    pub fn title(&self) -> Option<SharedString> {
+        let title = self.title.as_ref()?;
+        let is_program_path =
+            title.to_lowercase().ends_with(".exe") && title.contains(['\\', '/']);
+        match title.rsplit(['\\', '/']).next() {
+            Some(name) if is_program_path => Some(name.to_string().into()),
+            _ => Some(title.clone()),
+        }
+    }
+
+    /// 结束里面的进程，重新开一个（下一帧知道大小了再启动）。
+    pub fn restart(&mut self, cx: &mut Context<Self>) {
+        self.session = None;
+        self.error = None;
+        self.exited = None;
+        self.title = None;
+        self.marked = None;
+        cx.notify();
+    }
+
+    fn mode(&self) -> TermMode {
+        self.session
+            .as_ref()
+            .map_or(TermMode::NONE, |session| *session.term.lock().mode())
+    }
+
+    /// 面板画出来时调用：还没启动就按这个大小启动，大小变了就告诉程序。
+    fn fit(&mut self, grid: Grid, cell: Size<Pixels>, cx: &mut Context<Self>) {
+        match &mut self.session {
+            None if self.error.is_none() => self.start(grid, cell, cx),
+            Some(session) if session.grid != grid => {
+                session.grid = grid;
+                session.cell = cell;
+                session.term.lock().resize(grid);
+                let _ = session
+                    .sender
+                    .send(Msg::Resize(window_size(grid, cell)));
+            }
+            _ => {}
+        }
+    }
+
+    fn start(&mut self, grid: Grid, cell: Size<Pixels>, cx: &mut Context<Self>) {
+        self.exited = None;
+        let spawned = (self.launcher)(cx).and_then(|launch| {
+            Session::spawn(launch, grid, cell, cx).map_err(|err| err.to_string())
+        });
+        match spawned {
+            Ok(session) => self.session = Some(session),
+            Err(err) => self.error = Some(tf!("终端启动不了：{err}", err).into()),
+        }
+    }
+
+    fn on_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {
+        match event {
+            TermEvent::PtyWrite(text) => self.write(text.into_bytes()),
+            TermEvent::Title(title) => self.title = Some(title.into()),
+            TermEvent::ResetTitle => self.title = None,
+            TermEvent::ClipboardStore(_, text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            // 程序问某个颜色是什么（常用来判断终端是深色还是浅色）
+            TermEvent::ColorRequest(index, format) => {
+                let theme = cx.theme();
+                let palette = Palette::new(theme.foreground, theme.background, theme.is_dark());
+                let color = match index {
+                    0..=255 => Color::Indexed(index as u8),
+                    256 => Color::Named(NamedColor::Foreground),
+                    257 => Color::Named(NamedColor::Background),
+                    258 => Color::Named(NamedColor::Cursor),
+                    _ => return,
+                };
+                if let Some(session) = &self.session {
+                    let rgb = {
+                        let term = session.term.lock();
+                        colors::to_rgb(palette.resolve(color, term.colors()))
+                    };
+                    self.write(format(rgb).into_bytes());
+                }
+            }
+            TermEvent::TextAreaSizeRequest(format) => {
+                if let Some(session) = &self.session {
+                    let size = window_size(session.grid, session.cell);
+                    self.write(format(size).into_bytes());
+                }
+            }
+            TermEvent::ChildExit(status) => self.exited = Some(status.code()),
+            TermEvent::Exit => {
+                self.exited.get_or_insert(None);
+            }
+            // 读剪贴板（OSC 52 的读）不给：服务器上的程序不该能拿到本机剪贴板里的东西
+            TermEvent::ClipboardLoad(..) => {}
+            TermEvent::Wakeup
+            | TermEvent::Bell
+            | TermEvent::MouseCursorDirty
+            | TermEvent::CursorBlinkingChange => {}
+        }
+        cx.notify();
+    }
+
+    /// 往程序的输入里写。
+    fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
+        if let (Some(session), None) = (&self.session, self.exited) {
+            let _ = session.sender.send(Msg::Input(bytes.into()));
+        }
+    }
+
+    /// 用户敲进去的东西：先回到最底下、去掉选区，再写。
+    fn input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        if let Some(session) = &self.session {
+            let mut term = session.term.lock();
+            term.scroll_display(Scroll::Bottom);
+            term.selection = None;
+        }
+        self.write(bytes);
+        cx.notify();
+    }
+
+    fn focus_changed(&mut self, focused: bool, cx: &mut Context<Self>) {
+        if self.mode().contains(TermMode::FOCUS_IN_OUT) {
+            self.write(if focused { &b"\x1b[I"[..] } else { &b"\x1b[O"[..] });
+        }
+        if !focused {
+            self.marked = None;
+        }
+        cx.notify();
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let session = self.session.as_ref()?;
+        let text = session.term.lock().selection_to_string()?;
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn copy(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        if let Some(session) = &self.session {
+            session.term.lock().selection = None;
+        }
+        cx.notify();
+    }
+
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        let bracketed = self.mode().contains(TermMode::BRACKETED_PASTE);
+        self.input(keys::paste(&text, bracketed), cx);
+    }
+
+    fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let mods = &keystroke.modifiers;
+        let key = keystroke.key.as_str();
+        // Alt+F4 留给系统关窗口
+        if mods.alt && key == "f4" {
+            return;
+        }
+        if !self.is_alive() {
+            if key == "enter" {
+                self.restart(cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
+        let only_ctrl = mods.control && !mods.alt && !mods.platform;
+        // 复制：Ctrl+Shift+C；选着字的时候 Ctrl+C 也是复制（没选字时是中断程序）
+        if only_ctrl && key == "c" && (mods.shift || self.selected_text().is_some()) {
+            self.copy(cx);
+            cx.stop_propagation();
+            return;
+        }
+        // 粘贴：Ctrl+V、Ctrl+Shift+V、Shift+Insert
+        let shift_insert = key == "insert" && mods.shift && !mods.control && !mods.alt;
+        if (only_ctrl && key == "v") || shift_insert {
+            self.paste(cx);
+            cx.stop_propagation();
+            return;
+        }
+        // Shift+翻页：翻看前面的输出
+        if mods.shift && !mods.control && !mods.alt && matches!(key, "pageup" | "pagedown") {
+            if let Some(session) = &self.session {
+                session.term.lock().scroll_display(if key == "pageup" {
+                    Scroll::PageUp
+                } else {
+                    Scroll::PageDown
+                });
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        let app_cursor = self.mode().contains(TermMode::APP_CURSOR);
+        if let Some(bytes) = keys::encode(keystroke, app_cursor) {
+            self.input(bytes, cx);
+            cx.stop_propagation();
+        }
+    }
+
+    /// 窗口里的一个位置在第几行第几列，偏在这一格的左半边还是右半边。
+    fn grid_point(&self, position: Point<Pixels>) -> Option<(GridPoint, GridSide)> {
+        let geometry = self.geometry.get();
+        let grid = geometry.grid?;
+        let session = self.session.as_ref()?;
+        let x = (f32::from(position.x - geometry.origin.x) / f32::from(geometry.cell.width))
+            .clamp(0., grid.cols as f32 - 0.01);
+        let y = (f32::from(position.y - geometry.origin.y) / f32::from(geometry.cell.height))
+            .clamp(0., grid.rows as f32 - 0.01);
+        let side = if x.fract() < 0.5 {
+            GridSide::Left
+        } else {
+            GridSide::Right
+        };
+        let offset = session.term.lock().grid().display_offset() as i32;
+        let point = GridPoint::new(GridLine(y as i32 - offset), GridColumn(x as usize));
+        Some((point, side))
+    }
+
+    fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus.focus(window, cx);
+        let Some((point, side)) = self.grid_point(event.position) else {
+            return;
+        };
+        // 单击开始拖选，双击选一个词，三击选一行
+        let kind = match event.click_count {
+            0 | 1 => SelectionType::Simple,
+            2 => SelectionType::Semantic,
+            _ => SelectionType::Lines,
+        };
+        if let Some(session) = &self.session {
+            session.term.lock().selection = Some(Selection::new(kind, point, side));
+        }
+        self.selecting = true;
+        cx.notify();
+    }
+
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.selecting {
+            return;
+        }
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.selecting = false;
+            return;
+        }
+        let Some((point, side)) = self.grid_point(event.position) else {
+            return;
+        };
+        if let Some(session) = &self.session
+            && let Some(selection) = session.term.lock().selection.as_mut()
+        {
+            selection.update(point, side);
+        }
+        cx.notify();
+    }
+
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.selecting = false;
+        // 只点了一下没拖：不算选了东西
+        if let Some(session) = &self.session {
+            let mut term = session.term.lock();
+            if term.selection.as_ref().is_some_and(Selection::is_empty) {
+                term.selection = None;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 右键：选着字就复制，没选就粘贴（和 Windows 终端一样）。
+    fn on_right_click(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus.focus(window, cx);
+        if self.selected_text().is_some() {
+            self.copy(cx);
+        } else if self.is_alive() {
+            self.paste(cx);
+        }
+    }
+
+    fn on_scroll(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let cell = self.geometry.get().cell.height.max(px(1.));
+        let moved = f32::from(event.delta.pixel_delta(cell).y) / f32::from(cell) + self.scroll_rest;
+        let lines = moved.trunc() as i32;
+        self.scroll_rest = moved - lines as f32;
+        cx.stop_propagation();
+        if lines == 0 {
+            return;
+        }
+        let mode = *session.term.lock().mode();
+        if mode.contains(TermMode::ALT_SCREEN) {
+            // 全屏的程序（less、vim）没有可以往回翻的输出：滚轮当上下键
+            let app_cursor = mode.contains(TermMode::APP_CURSOR);
+            let key: &[u8] = match (lines > 0, app_cursor) {
+                (true, false) => b"\x1b[A",
+                (true, true) => b"\x1bOA",
+                (false, false) => b"\x1b[B",
+                (false, true) => b"\x1bOB",
+            };
+            self.write(key.repeat(lines.unsigned_abs() as usize));
+        } else {
+            session.term.lock().scroll_display(Scroll::Delta(lines));
+        }
+        cx.notify();
+    }
+
+    /// 进程没在跑时，盖在画面底下的一句话。
+    fn notice(&self) -> Option<SharedString> {
+        if let Some(error) = &self.error {
+            return Some(tf!("{error} 按回车重试。", error).into());
+        }
+        match self.exited? {
+            Some(0) | None => Some(tr("进程已结束。按回车重新启动。").into()),
+            Some(code) => Some(tf!("进程已结束（退出码 {code}）。按回车重新启动。", code).into()),
+        }
+    }
+}
+
+impl EntityInputHandler for TerminalView {
+    fn text_for_range(
+        &mut self,
+        _: Range<usize>,
+        _: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        self.marked
+            .as_ref()
+            .map(|marked| 0..marked.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.marked = None;
+        cx.notify();
+    }
+
+    /// 打出来的字、输入法上屏的字。
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked = None;
+        if !text.is_empty() && self.is_alive() {
+            self.input(text.as_bytes().to_vec(), cx);
+        }
+        cx.notify();
+    }
+
+    /// 输入法正在组字：先画在光标那里，不发给程序。
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        new_text: &str,
+        _: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked = (!new_text.is_empty()).then(|| new_text.to_string());
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _: Range<usize>,
+        _: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        self.geometry.get().cursor
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+impl Render for TerminalView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (background, muted, bar) = (theme.background, theme.muted_foreground, theme.secondary);
+        let (for_prepaint, for_paint) = (cx.entity(), cx.entity());
+        div()
+            .id("terminal")
+            .relative()
+            .size_full()
+            .px(px(PADDING))
+            .pt(px(4.))
+            .bg(background)
+            .cursor_text()
+            .track_focus(&self.focus)
+            .key_context("Terminal")
+            .on_key_down(cx.listener(Self::on_key))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_click))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_scroll(cx.listener(Self::on_scroll))
+            .child(
+                canvas(
+                    move |bounds, window, cx| prepaint(&for_prepaint, bounds, window, cx),
+                    move |bounds, frame, window, cx| paint(&for_paint, bounds, frame, window, cx),
+                )
+                .size_full(),
+            )
+            .when_some(self.notice(), |this, notice| {
+                this.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .px(px(PADDING))
+                        .py_1()
+                        .bg(bar)
+                        .text_xs()
+                        .text_color(muted)
+                        .child(notice),
+                )
+            })
+    }
+}
+
+/// 一段样式相同、挨在一起的字。
+struct Run {
+    row: usize,
+    col: usize,
+    /// 下一个字该在第几列；不是就得另起一段
+    next: usize,
+    text: String,
+    /// 两格宽的字（中文等）
+    wide: bool,
+    /// 带组合符号的字：单独画，不强制每个字形一格
+    single: bool,
+    style: Style,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct Style {
+    color: Hsla,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strike: bool,
+}
+
+/// 光标该怎么画。
+struct CursorDraw {
+    row: usize,
+    col: usize,
+    wide: bool,
+    shape: CursorShape,
+    /// 光标下面的字：实心块光标要用背景色把它重画一遍
+    ch: char,
+}
+
+/// 一帧要画的东西：从格子上拍下来的，画的时候不再碰仿真器。
+struct Frame {
+    origin: Point<Pixels>,
+    cell: Size<Pixels>,
+    /// 背景和默认不一样的格子：第几行、从第几列起、几列、什么颜色
+    rects: Vec<(usize, usize, usize, Hsla)>,
+    runs: Vec<Run>,
+    cursor: Option<CursorDraw>,
+    foreground: Hsla,
+    background: Hsla,
+    focused: bool,
+    marked: Option<String>,
+}
+
+fn prepaint(
+    view: &Entity<TerminalView>,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Frame> {
+    let font_size = px(FONT_SIZE);
+    let font_id = window.text_system().resolve_font(&font(FONT));
+    let cell_width = window
+        .text_system()
+        .advance(font_id, font_size, 'm')
+        .map(|advance| advance.width)
+        .unwrap_or(font_size * 0.55);
+    let cell = size(cell_width, px(LINE_HEIGHT));
+    let grid = Grid {
+        cols: ((bounds.size.width / cell.width).floor() as usize).max(2),
+        rows: ((bounds.size.height / cell.height).floor() as usize).max(1),
+    };
+    // 面板小得放不下几个字（正在收起、窗口极小）：不启动、不改大小
+    if bounds.size.width < cell.width * 4. || bounds.size.height < cell.height {
+        return None;
+    }
+    view.update(cx, |this, cx| this.fit(grid, cell, cx));
+
+    let theme = cx.theme();
+    let palette = Palette::new(theme.foreground, theme.background, theme.is_dark());
+    let selection = theme.selection;
+    let this = view.read(cx);
+    let session = this.session.as_ref()?;
+    let (rects, runs, cursor) = snapshot(&session.term.lock(), &palette, selection);
+    let focused = this.focus.is_focused(window);
+    let frame = Frame {
+        origin: bounds.origin,
+        cell,
+        rects,
+        runs,
+        // 进程结束了就不画光标
+        cursor: cursor.filter(|_| this.exited.is_none()),
+        foreground: palette.foreground,
+        background: palette.background,
+        focused,
+        marked: this.marked.clone(),
+    };
+    let cursor_bounds = frame.cursor.as_ref().map(|cursor| frame.cell_bounds(cursor.row, cursor.col, 1));
+    this.geometry.set(Geometry {
+        origin: bounds.origin,
+        cell,
+        grid: Some(grid),
+        cursor: cursor_bounds,
+    });
+    Some(frame)
+}
+
+type Snapshot = (Vec<(usize, usize, usize, Hsla)>, Vec<Run>, Option<CursorDraw>);
+
+/// 把现在看得见的格子拍成要画的背景块、文字段和光标。
+fn snapshot(term: &Term<Proxy>, palette: &Palette, selection_color: Hsla) -> Snapshot {
+    let content = term.renderable_content();
+    let offset = content.display_offset as i32;
+    let overrides = content.colors;
+    let selection = content.selection;
+    let cursor_at = content.cursor.point;
+    let cursor_shape = content.cursor.shape;
+    let mut rects: Vec<(usize, usize, usize, Hsla)> = Vec::new();
+    let mut runs: Vec<Run> = Vec::new();
+    let mut current: Option<Run> = None;
+    let mut cursor = None;
+    let flush = |current: &mut Option<Run>, runs: &mut Vec<Run>| {
+        if let Some(mut run) = current.take() {
+            let kept = run.text.trim_end_matches(' ').len();
+            run.text.truncate(kept);
+            if !run.text.is_empty() {
+                runs.push(run);
+            }
+        }
+    };
+    for indexed in content.display_iter {
+        let point = indexed.point;
+        let row = point.line.0 + offset;
+        if row < 0 {
+            continue;
+        }
+        let (row, col) = (row as usize, point.column.0);
+        let cell = indexed.cell;
+        let flags = cell.flags;
+        // 两格宽的字后面那一格是占位的，不画
+        if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+            continue;
+        }
+        let wide = flags.contains(Flags::WIDE_CHAR);
+        let width = if wide { 2 } else { 1 };
+        let mut fg = palette.resolve(cell.fg, overrides);
+        let mut bg = palette.resolve(cell.bg, overrides);
+        let mut default_bg = cell.bg == Color::Named(NamedColor::Background);
+        if flags.contains(Flags::INVERSE) {
+            std::mem::swap(&mut fg, &mut bg);
+            default_bg = false;
+        }
+        if flags.contains(Flags::DIM) {
+            fg = colors::dim(fg);
+        }
+        if selection.is_some_and(|range| range.contains(point)) {
+            bg = selection_color;
+            default_bg = false;
+        }
+        if !default_bg {
+            match rects.last_mut() {
+                Some((r, c, n, color)) if *r == row && *c + *n == col && *color == bg => {
+                    *n += width;
+                }
+                _ => rects.push((row, col, width, bg)),
+            }
+        }
+        if point == cursor_at && cursor_shape != CursorShape::Hidden {
+            cursor = Some(CursorDraw {
+                row,
+                col,
+                wide,
+                shape: cursor_shape,
+                ch: cell.c,
+            });
+        }
+        let underline = flags.intersects(Flags::ALL_UNDERLINES);
+        let strike = flags.contains(Flags::STRIKEOUT);
+        let blank = cell.c == ' ' || cell.c == '\t' || flags.contains(Flags::HIDDEN);
+        if blank {
+            // 空格接在前一段后面（省得一个词一段），划线不一样时才断开；开头的空格不用画
+            match &mut current {
+                Some(run)
+                    if run.row == row
+                        && run.next == col
+                        && !run.wide
+                        && !run.single
+                        && run.style.underline == underline
+                        && run.style.strike == strike =>
+                {
+                    run.text.push(' ');
+                    run.next += 1;
+                }
+                _ => flush(&mut current, &mut runs),
+            }
+            continue;
+        }
+        let style = Style {
+            color: fg,
+            bold: flags.contains(Flags::BOLD),
+            italic: flags.contains(Flags::ITALIC),
+            underline,
+            strike,
+        };
+        let marks = cell.zerowidth().filter(|marks| !marks.is_empty());
+        let joins = current.as_ref().is_some_and(|run| {
+            run.row == row
+                && run.next == col
+                && run.wide == wide
+                && !run.single
+                && run.style == style
+        });
+        if joins && marks.is_none() {
+            let run = current.as_mut().unwrap();
+            run.text.push(cell.c);
+            run.next += width;
+        } else {
+            flush(&mut current, &mut runs);
+            let mut text = String::from(cell.c);
+            text.extend(marks.into_iter().flatten());
+            current = Some(Run {
+                row,
+                col,
+                next: col + width,
+                text,
+                wide,
+                single: marks.is_some(),
+                style,
+            });
+        }
+    }
+    flush(&mut current, &mut runs);
+    (rects, runs, cursor)
+}
+
+impl Frame {
+    fn cell_bounds(&self, row: usize, col: usize, cols: usize) -> Bounds<Pixels> {
+        Bounds::new(
+            point(
+                self.origin.x + self.cell.width * col as f32,
+                self.origin.y + self.cell.height * row as f32,
+            ),
+            size(self.cell.width * cols as f32, self.cell.height),
+        )
+    }
+}
+
+fn text_run(len: usize, style: Style) -> TextRun {
+    let mut font = font(FONT);
+    if style.bold {
+        font = font.bold();
+    }
+    if style.italic {
+        font = font.italic();
+    }
+    TextRun {
+        len,
+        font,
+        color: style.color,
+        background_color: None,
+        underline: style.underline.then_some(UnderlineStyle {
+            thickness: px(1.),
+            color: Some(style.color),
+            wavy: false,
+        }),
+        strikethrough: style.strike.then_some(StrikethroughStyle {
+            thickness: px(1.),
+            color: Some(style.color),
+        }),
+    }
+}
+
+fn paint(
+    view: &Entity<TerminalView>,
+    bounds: Bounds<Pixels>,
+    frame: Option<Frame>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let focus = view.read(cx).focus.clone();
+    // 不管里面有没有东西，焦点在这里时打的字都归它
+    window.handle_input(&focus, ElementInputHandler::new(bounds, view.clone()), cx);
+    let Some(frame) = frame else {
+        return;
+    };
+    let font_size = px(FONT_SIZE);
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        for &(row, col, cols, color) in &frame.rects {
+            window.paint_quad(fill(frame.cell_bounds(row, col, cols), color));
+        }
+        for run in &frame.runs {
+            let force = match (run.single, run.wide) {
+                (true, _) => None,
+                (false, true) => Some(frame.cell.width * 2.),
+                (false, false) => Some(frame.cell.width),
+            };
+            let text: SharedString = run.text.clone().into();
+            let line = window.text_system().shape_line(
+                text,
+                font_size,
+                &[text_run(run.text.len(), run.style)],
+                force,
+            );
+            let origin = frame.cell_bounds(run.row, run.col, 1).origin;
+            let _ = line.paint(origin, frame.cell.height, TextAlign::Left, None, window, cx);
+        }
+        if let Some(cursor) = &frame.cursor {
+            let cols = if cursor.wide { 2 } else { 1 };
+            let area = frame.cell_bounds(cursor.row, cursor.col, cols);
+            let color = frame.foreground;
+            let shape = if frame.focused {
+                cursor.shape
+            } else {
+                CursorShape::HollowBlock
+            };
+            match shape {
+                CursorShape::Block => {
+                    window.paint_quad(fill(area, color));
+                    if cursor.ch != ' ' {
+                        let text: SharedString = cursor.ch.to_string().into();
+                        let style = Style {
+                            color: frame.background,
+                            bold: false,
+                            italic: false,
+                            underline: false,
+                            strike: false,
+                        };
+                        let line = window.text_system().shape_line(
+                            text.clone(),
+                            font_size,
+                            &[text_run(text.len(), style)],
+                            None,
+                        );
+                        let _ = line.paint(
+                            area.origin,
+                            frame.cell.height,
+                            TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        );
+                    }
+                }
+                CursorShape::Beam => {
+                    let beam = Bounds::new(area.origin, size(px(2.), area.size.height));
+                    window.paint_quad(fill(beam, color));
+                }
+                CursorShape::Underline => {
+                    let line = Bounds::new(
+                        point(area.origin.x, area.origin.y + area.size.height - px(2.)),
+                        size(area.size.width, px(2.)),
+                    );
+                    window.paint_quad(fill(line, color));
+                }
+                CursorShape::HollowBlock => {
+                    window.paint_quad(outline(area, color, BorderStyle::Solid));
+                }
+                CursorShape::Hidden => {}
+            }
+        }
+        // 输入法正在组的字：画在光标那里，带下划线
+        if let (Some(marked), Some(cursor)) = (&frame.marked, &frame.cursor) {
+            let text: SharedString = marked.clone().into();
+            let style = Style {
+                color: frame.foreground,
+                bold: false,
+                italic: false,
+                underline: true,
+                strike: false,
+            };
+            let line = window.text_system().shape_line(
+                text.clone(),
+                font_size,
+                &[text_run(text.len(), style)],
+                None,
+            );
+            let origin = frame.cell_bounds(cursor.row, cursor.col, 1).origin;
+            let cover = Bounds::new(origin, size(line.width, frame.cell.height));
+            window.paint_quad(fill(cover, frame.background));
+            let _ = line.paint(origin, frame.cell.height, TextAlign::Left, None, window, cx);
+        }
+    });
+}

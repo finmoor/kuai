@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 
-const VALUE: &str = "fork-remote";
+const VALUE: &str = "Kuai";
 /// 开机自启带的参数：有托盘就直接收进托盘，不弹窗口。
 pub const MINIMIZED_FLAG: &str = "--minimized";
 
@@ -106,17 +106,17 @@ mod tests {
 
     #[test]
     fn 启动项指向这个程序才算开着() {
-        let exe = r"C:\Tools\fork-remote\fork-remote.exe";
+        let exe = r"C:\Tools\Kuai\kuai.exe";
         let command = command_for(exe);
         assert_eq!(
             command,
-            r#""C:\Tools\fork-remote\fork-remote.exe" --minimized"#
+            r#""C:\Tools\Kuai\kuai.exe" --minimized"#
         );
         assert!(points_to(&command, exe));
         // 路径大小写不一样也算
         assert!(points_to(&command, &exe.to_lowercase()));
         // 程序挪了位置：注册表里还是旧路径，不算开着
-        assert!(!points_to(&command, r"D:\Apps\fork-remote.exe"));
+        assert!(!points_to(&command, r"D:\Apps\kuai.exe"));
         // 别的东西写的、没加引号的
         assert!(!points_to(exe, exe));
         assert!(!points_to("", exe));

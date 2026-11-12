@@ -8,10 +8,10 @@ fn main() {
     let mut resource = winresource::WindowsResource::new();
     resource
         .set_icon("assets/icon.ico")
-        .set("ProductName", "fork-remote")
+        .set("ProductName", "Kuai")
         .set(
             "FileDescription",
-            "fork-remote：能打开服务器上仓库的 Git 客户端",
+            "Kuai：能打开服务器上仓库的 Git 客户端",
         );
     if let Err(err) = resource.compile() {
         // 没装 Windows SDK 时嵌不了图标，程序照样能用

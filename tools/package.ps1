@@ -1,6 +1,6 @@
-# 打发布包：dist\fork-remote-<版本>-windows-x64\ 和同名的 zip。
+# 打发布包：dist\kuai-<版本>-windows-x64\ 和同名的 zip。
 #
-# 包里有客户端 fork-remote.exe，和连服务器时要上传的 Linux 版 agent（agents\<编译目标>\fr-agent）。
+# 包里有客户端 kuai.exe，和连服务器时要上传的 Linux 版 agent（agents\<编译目标>\fr-agent）。
 # 解压到哪都能直接运行，不用安装；机器上要有 git（要在 PATH 里）和 Windows 自带的 OpenSSH。
 #
 # 用法：pwsh tools/package.ps1
@@ -9,7 +9,7 @@ $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
 
 $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-$name = "fork-remote-$version-windows-x64"
+$name = "kuai-$version-windows-x64"
 $out = Join-Path $root "dist\$name"
 
 cargo build --release -p fr-app
@@ -28,7 +28,7 @@ foreach ($target in $targets) {
 
 if (Test-Path $out) { Remove-Item -Recurse -Force $out }
 New-Item -ItemType Directory -Force $out | Out-Null
-Copy-Item target\release\fr-app.exe (Join-Path $out 'fork-remote.exe')
+Copy-Item target\release\fr-app.exe (Join-Path $out 'kuai.exe')
 foreach ($target in $targets) {
     $dir = Join-Path $out "agents\$target"
     New-Item -ItemType Directory -Force $dir | Out-Null

@@ -4,6 +4,8 @@
 //! 右边上面是工具栏（当前分支、获取、拉取、推送、贮藏……），下面按侧栏选中的项显示
 //! 本地修改（按文件、按块、按行暂存，提交）或提交历史（提交图、详情、改动）。
 //! 本机仓库和服务器上的仓库共用这一套，经 [`Channel`] 执行 git。
+//! 右边最底下可以开一个终端（工具栏的「终端」或 Ctrl+`）：在仓库目录里的 shell，
+//! 服务器上的仓库是 ssh 登录过去。收起面板不结束里面的程序，关标签页才结束。
 //!
 //! 什么时候刷新：连上以后、切到这个标签页、切回这个窗口、每次写操作之后，还有文件监听报告
 //! 仓库有变化时（在编辑器里存了文件、在终端里提交了），都重读工作区状态、引用和贮藏；
@@ -38,12 +40,15 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::app_state::AppState;
 use crate::settings::RepoEntry;
+use crate::terminal::TerminalView;
 use crate::ui;
 
 /// 工具栏的高度；侧栏顶上写仓库名字的那一块和它一样高，底边对得齐。
@@ -115,6 +120,10 @@ pub struct RepoView {
     auto_fetch: auto_fetch::AutoFetch,
     /// 窗口内容区的大小，每帧更新；各块的大小按它收
     viewport: Size<Pixels>,
+    /// 底下的终端；第一次打开面板时才建，之后收起面板也留着（里面的程序接着跑）
+    terminal: Option<Entity<TerminalView>>,
+    /// 终端的面板开没开
+    terminal_open: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -167,6 +176,8 @@ impl RepoView {
             activity: activity::Log::default(),
             auto_fetch: auto_fetch::AutoFetch::new(cx),
             viewport: window.viewport_size(),
+            terminal: None,
+            terminal_open: false,
             _subscriptions: subscriptions,
         };
         // 测试开关：FR_TEST_VIEW=changes 打开仓库时直接显示本地修改
@@ -604,6 +615,26 @@ impl RepoView {
                 .on_click(cx.listener(|this, _, window, cx| this.new_branch_dialog(window, cx))),
             )
             .child(separator())
+            .child(
+                tool_button(
+                    "terminal",
+                    IconName::SquareTerminal,
+                    tr("终端"),
+                    if self.entry.server.is_some() {
+                        tr("终端：登录服务器，进到仓库目录（Ctrl+`）")
+                    } else {
+                        tr("终端：在仓库目录里开一个 shell（Ctrl+`）")
+                    },
+                    false,
+                    true,
+                    0,
+                    cx,
+                )
+                .selected(self.terminal_open)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.show_terminal(!this.terminal_open, window, cx)
+                })),
+            )
             .child(self.render_open_button(cx))
             .child(
                 tool_button(
@@ -633,7 +664,134 @@ impl RepoView {
             )
     }
 
-    /// 「打开」按钮：把仓库交给终端、VS Code 或资源管理器。
+    /// 底下终端里的程序是不是还在跑（关标签页前要问一下）。
+    pub fn terminal_alive(&self, cx: &App) -> bool {
+        self.terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.read(cx).is_alive())
+    }
+
+    /// 打开或收起终端的面板。打开时焦点放进终端；收起不结束里面的程序。
+    pub fn show_terminal(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if open {
+            let terminal = match &self.terminal {
+                Some(terminal) => terminal.clone(),
+                None => {
+                    let (entry, app) = (self.entry.clone(), self.app.clone());
+                    let terminal = cx.new(|cx| {
+                        TerminalView::new(
+                            move |cx| {
+                                let app = app.read(cx);
+                                let server = entry.server.as_deref().and_then(|id| app.server(id));
+                                let shell = &app.settings.terminal_shell;
+                                crate::shell::terminal_launch(&entry, server, shell)
+                            },
+                            window,
+                            cx,
+                        )
+                    });
+                    self.terminal = Some(terminal.clone());
+                    terminal
+                }
+            };
+            terminal.focus_handle(cx).focus(window, cx);
+        } else if self.terminal_focused(window, cx) {
+            // 焦点还留在看不见的终端上的话，键盘就没反应了
+            window.blur(cx);
+        }
+        self.terminal_open = open;
+        cx.notify();
+    }
+
+    fn terminal_focused(&self, window: &Window, cx: &App) -> bool {
+        self.terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.focus_handle(cx).is_focused(window))
+    }
+
+    /// Ctrl+`：没开就打开；开着但焦点不在里面就把焦点放进去；焦点在里面就收起。
+    pub fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let open = !(self.terminal_open && self.terminal_focused(window, cx));
+        self.show_terminal(open, window, cx);
+    }
+
+    /// 结束终端里的程序并收起面板。
+    fn end_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_terminal(false, window, cx);
+        self.terminal = None;
+    }
+
+    /// 终端的面板：上面一条标题（重新启动、结束、收起），下面是终端。
+    fn render_terminal(&self, height: f32, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let terminal = self.terminal.clone()?;
+        let theme = cx.theme();
+        let (border, muted, fg) = (theme.border, theme.muted_foreground, theme.foreground);
+        // 程序自己设了标题（多半是「用户@主机: 目录」）就显示它
+        let title = terminal.read(cx).title();
+        let restart = terminal.clone();
+        let panel = v_flex()
+            .relative()
+            .flex_none()
+            .h(px(height))
+            .border_t_1()
+            .border_color(border)
+            .child(self.split_handle(layout::Split::TerminalHeight, cx))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .h(px(30.))
+                    .pl(px(10.))
+                    .pr(px(6.))
+                    .gap(px(6.))
+                    .text_color(muted)
+                    .child(ui::icon(IconName::SquareTerminal).flex_none())
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_sm()
+                            .text_color(fg)
+                            .child(tr("终端")),
+                    )
+                    .when_some(title, |bar, title| {
+                        bar.child(ui::clipped("terminal-title", title).text_xs())
+                    })
+                    .child(div().flex_1().min_w(px(4.)))
+                    .child(
+                        Button::new("terminal-restart")
+                            .ghost()
+                            .xsmall()
+                            .icon(ui::icon(IconName::RotateCw))
+                            .tooltip(tr("结束里面的程序，重新开一个"))
+                            .on_click(move |_, _, cx| {
+                                restart.update(cx, |terminal, cx| terminal.restart(cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("terminal-end")
+                            .ghost()
+                            .xsmall()
+                            .icon(ui::icon(IconName::Trash))
+                            .tooltip(tr("结束终端"))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.end_terminal(window, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("terminal-hide")
+                            .ghost()
+                            .xsmall()
+                            .icon(ui::icon(IconName::ChevronDown))
+                            .tooltip(tr("收起，里面的程序接着跑（Ctrl+`）"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_terminal(false, window, cx)
+                            })),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().child(terminal));
+        Some(panel.into_any_element())
+    }
+
+    /// 「打开」按钮：把仓库交给外面的终端、VS Code 或资源管理器。
     fn render_open_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let dir = self.entry.path.clone();
         let server = self
@@ -657,7 +815,7 @@ impl RepoView {
                 // 服务器上的仓库：终端经 ssh 登录，VS Code 走 Remote-SSH
                 Some(server) => {
                     let dest2 = server.destination.clone();
-                    menu.item(PopupMenuItem::new(tr("在终端里打开（ssh）")).on_click(
+                    menu.item(PopupMenuItem::new(tr("在外部终端里打开（ssh）")).on_click(
                         move |_, window, cx| {
                             let result = crate::shell::open_terminal_ssh(&server, &a);
                             crate::shell::report(result, window, cx);
@@ -674,9 +832,11 @@ impl RepoView {
                 }
                 None => menu
                     .item(
-                        PopupMenuItem::new(tr("在终端里打开")).on_click(move |_, window, cx| {
-                            crate::shell::report(crate::shell::open_terminal(&a), window, cx)
-                        }),
+                        PopupMenuItem::new(tr("在外部终端里打开")).on_click(
+                            move |_, window, cx| {
+                                crate::shell::report(crate::shell::open_terminal(&a), window, cx)
+                            },
+                        ),
                     )
                     .item(PopupMenuItem::new(tr("在 VS Code 里打开")).on_click(
                         move |_, window, cx| {
@@ -902,6 +1062,10 @@ impl Render for RepoView {
         let banner = self
             .in_progress
             .map(|state| self.render_in_progress(state, cx).into_any_element());
+        let terminal = self
+            .terminal_open
+            .then(|| self.render_terminal(sizes.terminal_height, cx))
+            .flatten();
         h_flex()
             .size_full()
             // 拖分隔条：不管鼠标拖到哪一块上面，都由这里按位置算大小
@@ -918,7 +1082,8 @@ impl Render for RepoView {
                     .h_full()
                     .child(self.render_toolbar(cx))
                     .children(banner)
-                    .child(div().flex_1().min_h_0().child(main)),
+                    .child(div().flex_1().min_h_0().child(main))
+                    .children(terminal),
             )
     }
 }

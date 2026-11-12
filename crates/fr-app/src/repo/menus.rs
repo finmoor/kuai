@@ -15,7 +15,7 @@ use gpui_kit::*;
 use super::changes::Area;
 use super::dialogs::{Ask, ref_name_error};
 use super::history::Scope;
-use super::ops::{Step, args};
+use super::ops::{Step, args, failure};
 use super::sidebar::SideItem;
 use super::sidebar::SideSection;
 use super::{RepoEvent, RepoView};
@@ -304,6 +304,19 @@ impl RepoView {
                 let branch = self.refs.branches.get(i)?.clone();
                 let full = format!("refs/heads/{}", branch.name);
                 let (only, hidden) = (self.is_only(&full), self.hidden_refs(cx).contains(&full));
+                // 不是当前分支时从哪拉取：它的上游；没设上游就看默认远程上有没有同名的分支
+                let pull_from = branch
+                    .upstream
+                    .clone()
+                    .filter(|_| !branch.gone)
+                    .or_else(|| {
+                        let candidate = format!("{}/{}", self.default_remote(), branch.name);
+                        self.refs
+                            .remotes
+                            .iter()
+                            .any(|remote| remote.name == candidate)
+                            .then_some(candidate)
+                    });
                 Some(Box::new(move |mut menu, _, _| {
                     let name = branch.name.clone();
                     if !branch.current {
@@ -326,6 +339,23 @@ impl RepoView {
                                 move |this, w, cx| this.rebase_onto(c.clone(), c.clone(), w, cx),
                             ))
                             .separator();
+                    }
+                    // 拉取：当前分支和工具栏上的「拉取」一样；别的分支不用切过去，只在能快进时更新
+                    if branch.current {
+                        menu = menu.item(item(
+                            &view,
+                            tf!("拉取 {name}", name),
+                            |this, w, cx| this.pull(false, w, cx),
+                        ));
+                    } else if let Some(upstream) = pull_from.clone() {
+                        let branch = name.clone();
+                        menu = menu.item(item(
+                            &view,
+                            tf!("拉取 {name}（只快进，不用切换）", name),
+                            move |this, w, cx| {
+                                this.fast_forward_branch(branch.clone(), upstream.clone(), w, cx)
+                            },
+                        ));
                     }
                     let (a, b, c, d) = (branch.clone(), branch.clone(), name.clone(), name.clone());
                     menu = menu
@@ -1013,6 +1043,47 @@ impl RepoView {
                     },
                 );
             },
+        );
+    }
+
+    /// 拉取一个不是当前的本地分支：从 `upstream`（`远程/分支`）获取，能快进就把分支挪过去，
+    /// 工作区不动。本地有上游没有的提交时 git 会拒绝（那得切过去合并或变基）。
+    fn fast_forward_branch(
+        &mut self,
+        name: String,
+        upstream: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((remote, remote_branch)) = upstream.split_once('/') else {
+            return;
+        };
+        let fetch = vec![
+            "fetch".into(),
+            "--progress".into(),
+            remote.into(),
+            format!("{remote_branch}:{name}"),
+        ];
+        self.run_steps(
+            tr("拉取"),
+            vec![Step::net(fetch)],
+            window,
+            cx,
+            Box::new(move |_, result, window, cx| match result {
+                Ok(_) => {
+                    let text = tf!("{name} 已更新到 {upstream}", name, upstream);
+                    window.push_notification(Notification::success(text), cx);
+                }
+                Err(text) if text.contains("non-fast-forward") => {
+                    let text = tf!(
+                        "{name} 上有 {upstream} 没有的提交，快进不了。切换到 {name} 再拉取。",
+                        name,
+                        upstream
+                    );
+                    window.push_notification(Notification::warning(text).autohide(false), cx);
+                }
+                Err(text) => failure(window, cx, tr("拉取"), text),
+            }),
         );
     }
 

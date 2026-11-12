@@ -77,14 +77,17 @@ pub fn clipped_with_tip(
             if cut.get() {
                 full_text_tip(tip.clone(), window, cx)
             } else {
-                // 没被截掉：给一个什么都不画的提示
-                cx.new(|_| Empty).into()
+                // 没被截掉
+                no_tip(cx)
             }
         })
 }
 
 /// 显示全文的提示：太长就折行，不撑出窗口。
 pub fn full_text_tip(text: SharedString, window: &mut Window, cx: &mut App) -> AnyView {
+    if menu_is_open(window) {
+        return no_tip(cx);
+    }
     Tooltip::element(move |_, _| {
         // 文字里的换行各占一行
         v_flex()
@@ -102,6 +105,9 @@ pub fn two_line_tip(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyView {
+    if menu_is_open(window) {
+        return no_tip(cx);
+    }
     let muted = cx.theme().muted_foreground;
     Tooltip::element(move |_, _| {
         v_flex()
@@ -111,6 +117,71 @@ pub fn two_line_tip(
             .child(div().text_xs().text_color(muted).child(sub.clone()))
     })
     .build(window, cx)
+}
+
+/// 主窗口根上放一个：右键菜单弹出来时，不让悬停提示盖在它上面。配合 [`menu_is_open`] 用。
+///
+/// gpui 的提示排上队以后，半秒到了就弹，那时只看鼠标还在不在元素的矩形里，不管上面是不是
+/// 已经盖了菜单（gpui `div.rs` 里 `handle_tooltip_mouse_move` 的 TODO 说的就是这个）。
+/// 鼠标挪到标签页上马上点右键，提示正好盖住菜单最上面几项。按下鼠标只收掉已经显示的提示，
+/// 排着队的只有「鼠标移走了」才取消，所以按下右键时补发一次移到窗口外的鼠标移动。松开右键时
+/// gpui 会把鼠标位置记回真实的，不用再补一次移回去。
+///
+/// 监听直接挂在窗口上，不看鼠标在哪个元素上：标题栏里的标签页挡着下层的悬停判断（`occlude`，
+/// 不然点它会变成拖窗口），根元素的 `capture_any_mouse_down` 在标签页上收不到。
+pub fn tooltip_guard() -> impl IntoElement {
+    canvas(
+        |_, _, _| {},
+        |_, _, window, _| {
+            window.on_mouse_event(|event: &MouseDownEvent, phase, window, cx| {
+                // 正拖着东西的时候不插手
+                if phase != DispatchPhase::Capture
+                    || event.button != MouseButton::Right
+                    || cx.has_active_drag()
+                {
+                    return;
+                }
+                let modifiers = window.modifiers();
+                // 等这次按下处理完再发，不在事件处理中间插一个事件
+                window.defer(cx, move |window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::MouseMove(MouseMoveEvent {
+                            position: point(px(-1.), px(-1.)),
+                            pressed_button: None,
+                            modifiers,
+                        }),
+                        cx,
+                    );
+                });
+            });
+        },
+    )
+    .absolute()
+    .size_0()
+}
+
+/// 有弹出菜单开着（右键菜单、下拉菜单）。这时不弹悬停提示：菜单贴着鼠标弹出来，鼠标稍微一动
+/// 又回到下面的元素上，提示就会盖住菜单最上面几项。菜单开着时焦点在它身上，看焦点一路上的
+/// 键位上下文里有没有组件库菜单的那个名字。
+fn menu_is_open(window: &Window) -> bool {
+    window
+        .context_stack()
+        .iter()
+        .any(|context| context.contains("PopupMenu"))
+}
+
+/// 什么都不画的提示：该弹的时候发现不用弹（文字没被截掉、有菜单开着）。
+fn no_tip(cx: &mut App) -> AnyView {
+    cx.new(|_| Empty).into()
+}
+
+/// 一行字的提示。自己写 `.tooltip(闭包)` 的地方都用 [`tip`]、[`full_text_tip`]、[`two_line_tip`]，
+/// 不直接用 `Tooltip::new`：这三个在有菜单开着时不弹。
+pub fn tip(text: impl Into<SharedString>, window: &mut Window, cx: &mut App) -> AnyView {
+    if menu_is_open(window) {
+        return no_tip(cx);
+    }
+    Tooltip::new(text.into()).build(window, cx)
 }
 
 /// 计数的小块：侧栏「本地修改」后面的数字、分组里有几项。

@@ -24,7 +24,7 @@ use futures::future::BoxFuture;
 
 pub use fr_core::askpass::PromptKind;
 pub use fr_core::protocol::{DirEntry, DirListing, Hello};
-pub use remote::{ConnectOptions, Connection};
+pub use remote::{ConnectOptions, Connection, TerminalCommand, terminal_command};
 
 /// 一次 git 调用的结果。
 #[derive(Debug, Clone, Default)]

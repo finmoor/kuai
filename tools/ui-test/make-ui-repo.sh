@@ -51,7 +51,7 @@ mod tests {
     }
 }
 EOF
-printf '# 界面测试仓库\n\n用来看 fork-remote 的本地修改界面。\n' > README.md
+printf '# 界面测试仓库\n\n用来看 Kuai 的本地修改界面。\n' > README.md
 printf '第一版说明\n第二行\n第三行\n' > docs/说明.md
 printf 'old\n' > docs/old.txt
 git add -A

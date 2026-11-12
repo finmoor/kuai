@@ -139,10 +139,62 @@ impl SettingsPage {
             )
             .description(tr("切换分支、检出、拉取前有没提交的改动时，默认怎么处理。"))
         };
+        let tab_close = {
+            let (get, set) = (app.clone(), app.clone());
+            SettingItem::new(
+                tr("标签页上显示关闭按钮"),
+                SettingField::switch(
+                    move |cx| get.read(cx).settings.tab_close_button,
+                    move |on, cx| {
+                        set.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| s.tab_close_button = on)
+                        })
+                    },
+                ),
+            )
+            .description(tr(
+                "怕手滑就关掉：改用中键、Ctrl+W 或右键菜单关。关错了按 Ctrl+Shift+T 找回。",
+            ))
+        };
+        let shell = {
+            let (get, set) = (app.clone(), app.clone());
+            // 存的是空字符串时自动挑；下拉里的项不能是空的，用 auto 代替
+            let mut options: Vec<(SharedString, SharedString)> =
+                vec![("auto".into(), tr("自动").into())];
+            options.extend(
+                crate::shell::local_shells()
+                    .into_iter()
+                    .map(|shell| (shell.id.into(), shell.label.into())),
+            );
+            SettingItem::new(
+                tr("本机仓库的终端"),
+                SettingField::dropdown(
+                    options,
+                    move |cx| match get.read(cx).settings.terminal_shell.as_str() {
+                        "" => "auto".into(),
+                        id => id.to_string().into(),
+                    },
+                    move |value: SharedString, cx| {
+                        let id = match value.as_ref() {
+                            "auto" => String::new(),
+                            id => id.to_string(),
+                        };
+                        set.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| s.terminal_shell = id)
+                        });
+                    },
+                ),
+            )
+            .description(tr(
+                "新开的终端生效。服务器上的仓库用服务器上的登录 shell。",
+            ))
+        };
         SettingPage::new(tr("常规"))
             .icon(Icon::new(IconName::Settings2))
             .default_open(true)
             .group(SettingGroup::new().title(tr("语言")).item(language))
+            .group(SettingGroup::new().title(tr("标签页")).item(tab_close))
+            .group(SettingGroup::new().title(tr("终端")).item(shell))
             .group(
                 SettingGroup::new()
                     .title(tr("启动和关闭"))
@@ -253,7 +305,7 @@ impl SettingsPage {
             .default_open(true)
             .group(
                 SettingGroup::new()
-                    .title("fork-remote")
+                    .title("Kuai")
                     .item(SettingItem::render(move |_, _, cx| {
                         let muted = cx.theme().muted_foreground;
                         let folder = folder.clone();

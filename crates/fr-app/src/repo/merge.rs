@@ -20,7 +20,6 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffConflict, DiffConflictResolution, DiffFile, DiffState};
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, WindowExt as _, h_flex,
     v_flex,
@@ -406,7 +405,7 @@ impl RepoView {
                             .text_sm()
                             .text_color(muted)
                             .child(path)
-                            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)),
+                            .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx)),
                     )
                     .child(
                         Button::new("merge-save")

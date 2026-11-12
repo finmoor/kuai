@@ -25,6 +25,8 @@ encoding_rs = "0.8"
 similar = "2"
 # 拿窗口句柄，让系统标题栏跟着深色主题（appearance.rs）
 raw-window-handle = "0.6"
+# 内置终端：伪终端（Windows 上是 ConPTY）和终端仿真，画由 terminal/ 自己来
+alacritty_terminal = "0.26"
 
 [target.'cfg(windows)'.dependencies]
 # 托盘图标和它的右键菜单（最小化到托盘、关闭到托盘）

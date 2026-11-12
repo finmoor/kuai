@@ -70,12 +70,7 @@ impl AppState {
             .spawn(async move {
                 let server =
                     server.ok_or_else(|| SharedString::from(tr("找不到这台服务器的设置")))?;
-                let options = ConnectOptions {
-                    forward_agent: server.forward_agent,
-                    identity_file: server.key_file().map(str::to_string),
-                    password_auth: server.auth == Auth::Password,
-                    secret: crate::secrets::get(&server.id),
-                };
+                let options = connect_options(&server);
                 Connection::connect(&server.destination, &options)
                     .map(Arc::new)
                     .map_err(|err| SharedString::from(format!("{err:#}")))
@@ -168,6 +163,7 @@ impl AppState {
         self.settings
             .repos
             .retain(|r| r.server.as_deref() != Some(id));
+        self.settings.normalize();
         self.conns.remove(id);
         // 存着的密码、口令跟着删掉
         crate::secrets::delete(id);
@@ -186,6 +182,7 @@ impl AppState {
     /// 从列表里去掉仓库；仓库本身不动。
     pub fn remove_repo(&mut self, entry: &RepoEntry, cx: &mut Context<Self>) {
         self.settings.repos.retain(|r| r != entry);
+        self.settings.normalize();
         self.save();
         cx.notify();
     }
@@ -194,10 +191,49 @@ impl AppState {
     pub fn set_open_tabs(&mut self, tabs: Vec<RepoEntry>, active: usize) {
         let group = self.settings.workspace_mut();
         if group.tabs != tabs || group.active != active {
+            // 重新打开了的不算「关掉的」了；在这个工作区里打开的仓库就是它的仓库
+            group.closed.retain(|e| !tabs.contains(e));
+            for tab in &tabs {
+                group.adopt(tab);
+            }
+            group.pinned.retain(|e| tabs.contains(e));
             group.tabs = tabs;
             group.active = active;
             self.save();
         }
+    }
+
+    /// 把仓库从当前工作区去掉（它还在仓库列表里，别的工作区里的也不动）。
+    pub fn remove_from_workspace(&mut self, entry: &RepoEntry, cx: &mut Context<Self>) {
+        self.settings.workspace_mut().drop_repo(entry);
+        self.save();
+        cx.notify();
+    }
+
+    /// 固定、取消固定当前工作区里的一个标签页；返回现在是不是固定的。
+    pub fn toggle_pinned(&mut self, entry: &RepoEntry, cx: &mut Context<Self>) -> bool {
+        let group = self.settings.workspace_mut();
+        let pinned = !group.is_pinned(entry);
+        group.pinned.retain(|e| e != entry);
+        if pinned {
+            group.pinned.push(entry.clone());
+        }
+        group.pinned_first();
+        self.save();
+        cx.notify();
+        pinned
+    }
+
+    /// 记下当前工作区刚关掉的一个标签页（Ctrl+Shift+T 和快速打开里能找回来）。
+    pub fn note_closed_tab(&mut self, entry: RepoEntry) {
+        if self.settings.repos.contains(&entry) {
+            self.settings.workspace_mut().note_closed(entry);
+        }
+    }
+
+    /// 当前工作区最近关掉的标签页，最近的在前。
+    pub fn closed_tabs(&self) -> Vec<RepoEntry> {
+        self.settings.workspace().closed.iter().rev().cloned().collect()
     }
 
     /// 改设置里的几项（语言、主题、托盘……）并存盘。
@@ -216,8 +252,7 @@ impl AppState {
         );
         self.settings.workspaces.push(TabGroup {
             name,
-            tabs: Vec::new(),
-            active: 0,
+            ..TabGroup::default()
         });
         self.save();
         cx.notify();
@@ -262,9 +297,11 @@ impl AppState {
         }
     }
 
-    /// 往另一个工作区里加一个标签页（把标签页移过去时用）。
+    /// 往另一个工作区里加一个标签页（把标签页移过去时用）：仓库也成了那个工作区的。
     pub fn push_tab_to_workspace(&mut self, ix: usize, entry: RepoEntry, cx: &mut Context<Self>) {
         if let Some(group) = self.settings.workspaces.get_mut(ix) {
+            group.closed.retain(|e| *e != entry);
+            group.adopt(&entry);
             if !group.tabs.contains(&entry) {
                 group.tabs.push(entry);
             }
@@ -342,6 +379,16 @@ impl AppState {
         if let Err(err) = settings::save(&self.settings) {
             log::error!("{err:#}");
         }
+    }
+}
+
+/// 登录这台服务器用的选项：私钥、密码登录、存着的密码或口令。
+pub(crate) fn connect_options(server: &Server) -> ConnectOptions {
+    ConnectOptions {
+        forward_agent: server.forward_agent,
+        identity_file: server.key_file().map(str::to_string),
+        password_auth: server.auth == Auth::Password,
+        secret: crate::secrets::get(&server.id),
     }
 }
 

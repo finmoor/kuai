@@ -36,7 +36,7 @@ impl Tray {
 
         let menu = Menu::new();
         let show = MenuItem::with_id("show", tr("显示窗口"), true, None);
-        let quit = MenuItem::with_id("quit", tr("退出 fork-remote"), true, None);
+        let quit = MenuItem::with_id("quit", tr("退出 Kuai"), true, None);
         menu.append_items(&[&show, &PredefinedMenuItem::separator(), &quit])
             .map_err(|err| log::warn!("建托盘菜单失败：{err}"))
             .ok()?;
@@ -44,7 +44,7 @@ impl Tray {
             .map_err(|err| log::warn!("读托盘图标失败：{err}"))
             .ok()?;
         let icon = TrayIconBuilder::new()
-            .with_tooltip("fork-remote")
+            .with_tooltip("Kuai")
             .with_icon(icon)
             .with_menu(Box::new(menu))
             // 左键留给「显示窗口」，菜单只在右键出

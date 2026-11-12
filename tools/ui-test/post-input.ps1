@@ -97,10 +97,10 @@ switch ($Action) {
         Post 0x0205 ([IntPtr]0) (LParam $X $Y)
     }
     'key' {
-        # 按键：-Text 给名字（enter、esc、f5、up、down、tab、delete、space、left、right、pageup、pagedown、home、end、comma），
+        # 按键：-Text 给名字（enter、esc、f5、up、down、tab、delete、space、left、right、pageup、pagedown、home、end、comma、backtick），
         # 或者一个字母、数字（配 -Mods ctrl 用，比如 Ctrl+P）
         $name = $Text.ToLower()
-        $vk = @{ enter = 0x0D; esc = 0x1B; f5 = 0x74; up = 0x26; down = 0x28; tab = 0x09; delete = 0x2E; space = 0x20; left = 0x25; right = 0x27; pageup = 0x21; pagedown = 0x22; end = 0x23; home = 0x24; comma = 0xBC }[$name]
+        $vk = @{ enter = 0x0D; esc = 0x1B; f5 = 0x74; up = 0x26; down = 0x28; tab = 0x09; delete = 0x2E; space = 0x20; left = 0x25; right = 0x27; pageup = 0x21; pagedown = 0x22; end = 0x23; home = 0x24; comma = 0xBC; backtick = 0xC0 }[$name]
         if (-not $vk -and $name -match '^[a-z0-9]$') { $vk = [int][char]$name.ToUpper() }
         if (-not $vk) { throw "不认识的按键 $Text" }
         Post 0x0100 ([IntPtr]$vk) ([IntPtr]1)

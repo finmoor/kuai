@@ -1,6 +1,6 @@
 //! fr-agent：在服务器上执行 git，经 stdin/stdout 和客户端通信。
 //!
-//! 客户端经 `ssh <主机> ~/.fork-remote/<版本>/fr-agent --stdio` 启动它。
+//! 客户端经 `ssh <主机> ~/.kuai/<版本>/fr-agent --stdio` 启动它。
 //! 不开端口、不常驻：stdin 关闭（SSH 断开）就退出。协议见 `fr_core::protocol`。
 //!
 //! agent 尽量少做事：`git` 方法执行客户端给的任意 git 参数，原样回传输出，

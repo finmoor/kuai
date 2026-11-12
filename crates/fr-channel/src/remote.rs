@@ -595,6 +595,95 @@ fn connect_error(destination: &str, stderr_tail: &Mutex<String>, noise: &[String
     message
 }
 
+/// 登录用的那部分 ssh 选项和环境变量：转发 agent、私钥、密码登录、要密码时怎么问。
+/// 第三项要留到登录完成：留着它，这个 ssh 要密码、口令时才会用存着的自动回答。
+fn login(
+    options: &ConnectOptions,
+    forward_agent: bool,
+) -> (
+    Vec<String>,
+    Vec<(String, String)>,
+    Option<crate::SavedSecret>,
+) {
+    let mut args: Vec<String> = Vec::new();
+    let mut env: Vec<(String, String)> = Vec::new();
+    let mut saved = None;
+    let mut add = |items: &[&str]| args.extend(items.iter().map(|item| item.to_string()));
+    if forward_agent {
+        add(&["-A"]);
+    }
+    if let Some(key) = &options.identity_file {
+        // 指定了私钥就只用它，不把 ssh-agent 里的密钥挨个试一遍（试多了服务器会直接断开）
+        add(&["-i", key, "-o", "IdentitiesOnly=yes"]);
+    }
+    if options.password_auth {
+        add(&[
+            "-o",
+            "PreferredAuthentications=keyboard-interactive,password",
+        ]);
+    }
+    match crate::ssh_env() {
+        // 要密码或密钥口令时 ssh 启动 askpass 程序来问我们：存着的自动回答，没存的由界面弹窗
+        // 密码只问一次：ssh 默认问三次，用户点了取消它还会接着再问两次。输错了点「重试」重连
+        Some(askpass) => {
+            env.extend(askpass.iter().cloned());
+            add(&["-o", "NumberOfPasswordPrompts=1"]);
+            if let Some(secret) = &options.secret {
+                let kind = if options.password_auth {
+                    crate::PromptKind::Password
+                } else {
+                    crate::PromptKind::Passphrase
+                };
+                let entry = crate::SavedSecret::register(secret, kind);
+                env.push((fr_core::askpass::TAG_ENV.to_string(), entry.tag().to_string()));
+                saved = Some(entry);
+            }
+        }
+        // 没有界面可以弹窗（比如测试工具）：只用密钥，要密码就直接失败
+        None => add(&["-o", "BatchMode=yes"]),
+    }
+    (args, env, saved)
+}
+
+/// 在终端里登录服务器要跑的命令。`_saved` 留着的时候，ssh 要密码、口令会用存着的自动回答。
+pub struct TerminalCommand {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    _saved: Option<crate::SavedSecret>,
+}
+
+/// 在终端里登录服务器、进到 `dir`：和连接 agent 用同一套登录选项，只是要一个终端（`-t`），
+/// 登录后换成用户的登录 shell。
+pub fn terminal_command(destination: &str, dir: &str, options: &ConnectOptions) -> TerminalCommand {
+    let (mut args, env, saved) = login(options, options.forward_agent);
+    // 目录用单引号包起来，里面的单引号换成 '\''
+    let quoted = format!("'{}'", dir.replace('\'', r"'\''"));
+    args.extend(
+        [
+            "-t",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=4",
+            "--",
+            destination,
+        ]
+        .map(String::from),
+    );
+    args.push(format!("cd {quoted} && exec \"$SHELL\" -l"));
+    TerminalCommand {
+        program: ssh_program(),
+        args,
+        env,
+        _saved: saved,
+    }
+}
+
 /// 构造 ssh 命令。`--` 防止以 `-` 开头的目标被当成选项。
 /// 返回的第二项要留到登录完成：留着它，这个 ssh 要密码、口令时才会用存着的自动回答。
 fn ssh(
@@ -604,43 +693,9 @@ fn ssh(
     forward_agent: bool,
 ) -> (Command, Option<crate::SavedSecret>) {
     let mut cmd = Command::new(ssh_program());
-    let mut saved = None;
-    if forward_agent {
-        cmd.arg("-A");
-    }
-    if let Some(key) = &options.identity_file {
-        // 指定了私钥就只用它，不把 ssh-agent 里的密钥挨个试一遍（试多了服务器会直接断开）
-        cmd.arg("-i").arg(key);
-        cmd.args(["-o", "IdentitiesOnly=yes"]);
-    }
-    if options.password_auth {
-        cmd.args([
-            "-o",
-            "PreferredAuthentications=keyboard-interactive,password",
-        ]);
-    }
-    match crate::ssh_env() {
-        // 要密码或密钥口令时 ssh 启动 askpass 程序来问我们：存着的自动回答，没存的由界面弹窗
-        // 密码只问一次：ssh 默认问三次，用户点了取消它还会接着再问两次。输错了点「重试」重连
-        Some(env) => {
-            cmd.envs(env.iter().map(|(k, v)| (k, v)));
-            cmd.args(["-o", "NumberOfPasswordPrompts=1"]);
-            if let Some(secret) = &options.secret {
-                let kind = if options.password_auth {
-                    crate::PromptKind::Password
-                } else {
-                    crate::PromptKind::Passphrase
-                };
-                let entry = crate::SavedSecret::register(secret, kind);
-                cmd.env(fr_core::askpass::TAG_ENV, entry.tag());
-                saved = Some(entry);
-            }
-        }
-        // 没有界面可以弹窗（比如测试工具）：只用密钥，要密码就直接失败
-        None => {
-            cmd.args(["-o", "BatchMode=yes"]);
-        }
-    }
+    let (args, env, saved) = login(options, forward_agent);
+    cmd.args(args);
+    cmd.envs(env);
     cmd.args([
         "-T",
         // 第一次连的主机自动记进 known_hosts；记录过的密钥对不上仍然拒绝
@@ -674,16 +729,22 @@ fn ssh_program() -> PathBuf {
 /// 包一层 `sh -c`，用户的登录 shell 是 fish 之类时也能跑。
 fn bootstrap_script(dir: &str) -> String {
     format!(
-        r#"sh -c 'A="$HOME/.fork-remote/{dir}/fr-agent"; if [ -x "$A" ]; then echo {START_MARKER}; exec "$A" --stdio; fi; echo "{MISSING_MARKER} $(uname -s) $(uname -m)"'"#
+        r#"sh -c 'A="$HOME/.kuai/{dir}/fr-agent"; if [ -x "$A" ]; then echo {START_MARKER}; exec "$A" --stdio; fi; echo "{MISSING_MARKER} $(uname -s) $(uname -m)"'"#
+    )
+}
+
+/// 远程执行的安装脚本，agent 程序从标准输入进来。
+fn install_script(dir: &str) -> String {
+    format!(
+        r#"sh -c 'set -e; R="$HOME/.kuai"; V="{dir}"; mkdir -p "$R/$V"; cat > "$R/$V/fr-agent.tmp"; chmod 755 "$R/$V/fr-agent.tmp"; mv -f "$R/$V/fr-agent.tmp" "$R/$V/fr-agent"; cd "$R"; for x in *; do case "$x" in "$V") ;; [0-9]*) rm -rf -- "$x" ;; esac; done; rm -rf -- "$HOME/.fork-remote"'"#
     )
 }
 
 /// 经 ssh 的标准输入上传 agent：先写临时文件再改名，免得留下半个文件；
-/// 然后删掉 `~/.fork-remote/` 下其他版本的目录（名字以数字开头的）。
+/// 然后删掉 `~/.kuai/` 下其他版本的目录（名字以数字开头的），
+/// 还有 1.2.2 以前产品叫 fork-remote 时装在 `~/.fork-remote` 的旧 agent。
 fn install(destination: &str, options: &ConnectOptions, dir: &str, binary: &[u8]) -> Result<()> {
-    let script = format!(
-        r#"sh -c 'set -e; R="$HOME/.fork-remote"; V="{dir}"; mkdir -p "$R/$V"; cat > "$R/$V/fr-agent.tmp"; chmod 755 "$R/$V/fr-agent.tmp"; mv -f "$R/$V/fr-agent.tmp" "$R/$V/fr-agent"; cd "$R"; for x in *; do case "$x" in "$V") ;; [0-9]*) rm -rf -- "$x" ;; esac; done'"#
-    );
+    let script = install_script(dir);
     let (mut cmd, _saved) = ssh(destination, &script, options, false);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -759,6 +820,32 @@ mod tests {
             "PreferredAuthentications=keyboard-interactive,password"
         ));
         assert!(!has(&password, "-i"));
+    }
+
+    #[test]
+    fn 终端里登录服务器的命令() {
+        let command = terminal_command(
+            "ssh://u@h:2222",
+            "/data/it's here",
+            &ConnectOptions {
+                identity_file: Some("C:/keys/id".into()),
+                ..Default::default()
+            },
+        );
+        let args = command.args;
+        let at = args.iter().position(|arg| arg == "-i").unwrap();
+        assert_eq!(args[at + 1], "C:/keys/id");
+        assert!(args.iter().any(|arg| arg == "-t"));
+        assert!(!args.iter().any(|arg| arg == "-T"));
+        // 目标和登录后要跑的命令在最后，前面有 --；目录里的单引号转义了
+        assert_eq!(
+            args[args.len() - 3..],
+            [
+                "--",
+                "ssh://u@h:2222",
+                r#"cd '/data/it'\''s here' && exec "$SHELL" -l"#
+            ]
+        );
     }
 
     #[test]

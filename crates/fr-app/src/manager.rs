@@ -1,6 +1,8 @@
 //! 仓库管理器：本机仓库和各台服务器上的仓库；添加本机仓库、添加和编辑服务器、打开服务器上的仓库。
 //!
-//! 本机和每台服务器各是一张卡片：顶上一条写名字、连接状态和能做的事，下面列仓库，点一行打开。
+//! 最上面一张卡片是当前工作区的仓库（开着的、没开的分开列），手滑关掉的在这里找。
+//! 下面的「全部仓库」可以收起：本机和每台服务器各是一张卡片，顶上一条写名字、连接状态和能做的事，
+//! 下面列仓库，点一行打开。
 //! 移除仓库、移除服务器都先问一下；服务器的「编辑」「移除」收在行尾的 ⋯ 菜单里，不和常用按钮挨着。
 
 use std::cell::{Cell, RefCell};
@@ -24,13 +26,17 @@ use gpui_kit::*;
 use crate::app_state::{AppState, ConnStatus};
 use crate::browser::{BrowserEvent, RemoteBrowser};
 use crate::clone::{CloneEvent, CloneView};
-use crate::settings::{Auth, RepoEntry, Server, Target};
+use crate::settings::{Auth, RepoEntry, Server, TabGroup, Target};
 use crate::ui;
 
 pub enum ManagerEvent {
     Open(RepoEntry),
     /// 给这个仓库改名（对话框由主窗口开）
     Rename(RepoEntry),
+    /// 把这个仓库从当前工作区移除（主窗口来问，开着的标签页也由它关）
+    RemoveFromWorkspace(RepoEntry),
+    /// 打开「快速打开」
+    QuickOpen,
 }
 
 pub struct ManagerView {
@@ -374,7 +380,7 @@ impl ManagerView {
                             body.child(div().text_sm().text_color(danger).child(found))
                         })
                         .child(div().text_xs().text_color(muted).child(tr(
-                            "密码、口令存在 Windows 凭据管理器。首次连接会往服务器的 ~/.fork-remote/ 装 agent。",
+                            "密码、口令存在 Windows 凭据管理器。首次连接会往服务器的 ~/.kuai/ 装 agent。",
                         ))),
                 )
                 .footer(
@@ -505,6 +511,179 @@ impl ManagerView {
         });
     }
 
+    /// 工作区卡片里的一行：点了打开（已经开着就切过去）。`recent` 是刚关掉的，行尾标出来。
+    fn render_member(
+        &self,
+        entry: &RepoEntry,
+        open: bool,
+        recent: bool,
+        colors: Colors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let app = self.app.read(cx);
+        let id = SharedString::from(format!(
+            "member:{}:{}",
+            entry.server.as_deref().unwrap_or(""),
+            entry.path
+        ));
+        // 本机和各台服务器的混在一起列：服务器上的在名字后面写上是哪台，和标签页、快速打开里一个写法
+        let name = app.repo_title(entry);
+        let place: SharedString = entry.path.clone().into();
+        let glyph = if entry.server.is_some() {
+            IconName::Server
+        } else {
+            IconName::FolderGit2
+        };
+        let (open_entry, leave, menu_entry) = (entry.clone(), entry.clone(), entry.clone());
+        let view = cx.entity().downgrade();
+        h_flex()
+            .id(ElementId::Name(id))
+            .h(px(46.))
+            .px(px(10.))
+            .gap(px(12.))
+            .rounded(px(7.))
+            .cursor_pointer()
+            .hover(|s| s.bg(colors.hover))
+            .on_click(cx.listener(move |this, _, _, cx| this.open(open_entry.clone(), cx)))
+            .child(
+                ui::icon(glyph)
+                    .flex_none()
+                    .text_color(if open { colors.accent } else { colors.muted }),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        ui::clipped("name", name)
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM),
+                    )
+                    .child(
+                        ui::clipped("path", place)
+                            .text_xs()
+                            .text_color(colors.muted),
+                    ),
+            )
+            .when(recent, |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(colors.muted)
+                        .child(tr("刚关掉")),
+                )
+            })
+            .child(
+                Button::new("leave")
+                    .ghost()
+                    .xsmall()
+                    .icon(ui::icon(IconName::CircleMinus).text_color(colors.muted))
+                    .tooltip(tr("从工作区移除"))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(ManagerEvent::RemoveFromWorkspace(leave.clone()));
+                    })),
+            )
+            .context_menu(move |menu, _, _| {
+                let (leave_view, rename_view) = (view.clone(), view.clone());
+                let (leave, rename) = (menu_entry.clone(), menu_entry.clone());
+                let path = menu_entry.path.clone();
+                menu.item(
+                    PopupMenuItem::new(tr("从工作区移除")).on_click(move |_, _, cx| {
+                        leave_view
+                            .update(cx, |_, cx| {
+                                cx.emit(ManagerEvent::RemoveFromWorkspace(leave.clone()))
+                            })
+                            .ok();
+                    }),
+                )
+                .separator()
+                .item(PopupMenuItem::new(tr("改名…")).on_click(move |_, _, cx| {
+                    rename_view
+                        .update(cx, |_, cx| cx.emit(ManagerEvent::Rename(rename.clone())))
+                        .ok();
+                }))
+                .item(
+                    PopupMenuItem::new(tr("复制仓库路径")).on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                    }),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// 最上面那张卡片：当前工作区的仓库。开着的在上（按标签页的顺序），没开的在下（刚关掉的排前）。
+    fn render_workspace_card(
+        &self,
+        group: &TabGroup,
+        colors: Colors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let closed: Vec<&RepoEntry> = group.closed.iter().rev().collect();
+        let idle = group
+            .repos
+            .iter()
+            .filter(|e| !group.tabs.contains(e) && !group.closed.contains(e));
+        let away: Vec<(&RepoEntry, bool)> = closed
+            .iter()
+            .map(|e| (*e, true))
+            .chain(idle.map(|e| (e, false)))
+            .collect();
+        let (open_count, away_count) = (group.tabs.len(), away.len());
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if open_count > 0 {
+            rows.push(group_label(tf!("开着 · {n}", n = open_count), colors));
+            for entry in &group.tabs {
+                rows.push(self.render_member(entry, true, false, colors, cx));
+            }
+        }
+        if away_count > 0 {
+            rows.push(group_label(tf!("没开 · {n}", n = away_count), colors));
+            for (entry, recent) in away {
+                rows.push(self.render_member(entry, false, recent, colors, cx));
+            }
+        }
+        card(
+            card_header(
+                "workspace",
+                IconName::Layers,
+                group.name.clone().into(),
+                Some(tr("当前工作区").into()),
+                status_line(
+                    "workspace",
+                    None,
+                    // 空的工作区只说没有仓库，不再跟一句「0 个开着」
+                    if open_count + away_count == 0 {
+                        tf!("{n} 个仓库", n = 0usize).into()
+                    } else {
+                        tf!(
+                            "{n} 个仓库，{open} 个开着",
+                            n = open_count + away_count,
+                            open = open_count
+                        )
+                        .into()
+                    },
+                    colors,
+                ),
+                vec![
+                    Button::new("quick-open")
+                        .small()
+                        .icon(ui::icon(IconName::Search))
+                        .label(tr("快速打开…"))
+                        .tooltip("Ctrl+P")
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(ManagerEvent::QuickOpen)))
+                        .into_any_element(),
+                ],
+                colors,
+            ),
+            None,
+            rows,
+            tr("这个工作区里还没有仓库。打开一个，它就归到这里。"),
+            colors,
+        )
+    }
+
     fn render_repo(&self, entry: &RepoEntry, colors: Colors, cx: &mut Context<Self>) -> AnyElement {
         let id = SharedString::from(format!(
             "repo:{}:{}",
@@ -608,7 +787,7 @@ struct Colors {
 }
 
 /// 移除之前问一下。`danger` 时按钮是红的，回车不执行，要明确点按钮。
-fn confirm(
+pub(crate) fn confirm(
     title: String,
     description: String,
     ok: &'static str,
@@ -872,6 +1051,50 @@ impl Render for ManagerView {
             ));
         }
 
+        // 当前工作区的仓库先列出来；别的都在「全部仓库」里，工作区里有仓库时可以收起
+        let group = settings.workspace();
+        let workspace_card = self.render_workspace_card(group, colors, cx);
+        let collapsible = !group.repos.is_empty();
+        let all_open = settings.layout.all_repos || !collapsible;
+        let all_header = h_flex()
+            .id("all-repos")
+            .h(px(30.))
+            .px(px(6.))
+            .gap(px(8.))
+            .rounded(px(ui::RADIUS))
+            .when(collapsible, |row| {
+                row.cursor_pointer()
+                    .hover(|s| s.bg(colors.hover))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.app.update(cx, |app, cx| {
+                            app.edit_layout(cx, |layout| layout.all_repos = !layout.all_repos)
+                        });
+                    }))
+                    .child(
+                        ui::icon_small(if all_open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .text_color(colors.muted),
+                    )
+            })
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(tr("全部仓库")),
+            )
+            .child(ui::count_pill(settings.repos.len(), false, cx))
+            .when(!all_open, |row| {
+                row.child(
+                    div()
+                        .text_xs()
+                        .text_color(colors.muted)
+                        .child(tr("添加、克隆仓库在这里")),
+                )
+            });
+
         div()
             .id("manager")
             .size_full()
@@ -917,9 +1140,23 @@ impl Render for ManagerView {
                                     })),
                             ),
                     )
-                    .children(sections),
+                    .child(workspace_card)
+                    .child(all_header)
+                    .when(all_open, |page| page.children(sections)),
             )
     }
+}
+
+/// 卡片里一组的小标题（「开着 · 3」）。
+fn group_label(text: String, colors: Colors) -> AnyElement {
+    div()
+        .px(px(10.))
+        .pt(px(8.))
+        .pb(px(2.))
+        .text_xs()
+        .text_color(colors.muted)
+        .child(text)
+        .into_any_element()
 }
 
 /// 状态的那一行：一个小圆点（没有就不画）加一句话。

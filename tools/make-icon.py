@@ -1,17 +1,38 @@
 """画应用图标，输出 crates/fr-app/assets/icon.ico（16 到 256 像素几种大小）。
 
-图案是自己画的：深色圆角方块上一小段提交图，主线三个提交，右边分出一条线再连到服务器那头的一个点。
+图案是自己画的：深色圆角方块上一个 K。竖线是提交历史（上下各一个提交），一双筷子从右边伸过来
+夹住中间那个提交。产品叫 Kuai（筷子），缩到 16 像素还认得出是 K。
 改了图案重新运行：python tools/make-icon.py（要装 Pillow）。
 """
+import math
 from pathlib import Path
 
 from PIL import Image, ImageDraw
 
 SIZE = 1024  # 先画大图再缩小，边缘平滑
 BACKGROUND = (24, 32, 48, 255)
-MAIN = (96, 165, 250, 255)  # 主线：蓝
-BRANCH = (52, 211, 153, 255)  # 分出去的线：绿
-DOT_FILL = (24, 32, 48, 255)
+LINE = (96, 165, 250, 255)  # 提交历史：蓝
+PICKED = (251, 191, 36, 255)  # 被夹住的那个提交：黄
+STICK_LIGHT = (241, 226, 196, 255)  # 两根筷子一浅一深
+STICK_DARK = (214, 170, 110, 255)
+
+
+def stick(d: ImageDraw.ImageDraw, start, end, w_start: int, w_end: int, color) -> None:
+    """一根筷子：从粗的一头到细的一头，两头是圆的。"""
+    (x1, y1), (x2, y2) = start, end
+    angle = math.atan2(y2 - y1, x2 - x1)
+    nx, ny = -math.sin(angle), math.cos(angle)
+    d.polygon(
+        [
+            (x1 + nx * w_start, y1 + ny * w_start),
+            (x2 + nx * w_end, y2 + ny * w_end),
+            (x2 - nx * w_end, y2 - ny * w_end),
+            (x1 - nx * w_start, y1 - ny * w_start),
+        ],
+        fill=color,
+    )
+    d.ellipse((x1 - w_start, y1 - w_start, x1 + w_start, y1 + w_start), fill=color)
+    d.ellipse((x2 - w_end, y2 - w_end, x2 + w_end, y2 + w_end), fill=color)
 
 
 def draw() -> Image.Image:
@@ -19,25 +40,20 @@ def draw() -> Image.Image:
     d = ImageDraw.Draw(image)
     d.rounded_rectangle((48, 48, SIZE - 48, SIZE - 48), radius=200, fill=BACKGROUND)
 
-    width = 72
-    left, right = 370, 680
-    top, middle, bottom = 250, 512, 774
+    x, top, middle, bottom = 330, 236, 512, 788
 
-    # 主线
-    d.line((left, top, left, bottom), fill=MAIN, width=width)
-    # 分支：从下面的提交拐出去，到右上的提交
-    d.line((left, bottom, left, 690), fill=MAIN, width=width)
-    d.arc((left, 520, left + 2 * (right - left), 860), start=180, end=270, fill=BRANCH, width=width)
-    d.line((right, 520, right, 380), fill=BRANCH, width=width)
+    def dot(cx: int, cy: int, color, radius: int = 92, hole: int = 44) -> None:
+        d.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=color)
+        d.ellipse((cx - hole, cy - hole, cx + hole, cy + hole), fill=BACKGROUND)
 
-    def dot(x: int, y: int, color) -> None:
-        radius, hole = 92, 44
-        d.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color)
-        d.ellipse((x - hole, y - hole, x + hole, y + hole), fill=DOT_FILL)
-
-    for y in (top, middle, bottom):
-        dot(left, y, MAIN)
-    dot(right, 350, BRANCH)
+    # 提交历史
+    d.line((x, top, x, bottom), fill=LINE, width=72)
+    # 一双筷子，细的一头夹着中间的提交
+    stick(d, (742, 214), (x + 70, middle - 54), 46, 26, STICK_LIGHT)
+    stick(d, (742, 810), (x + 70, middle + 54), 46, 26, STICK_DARK)
+    dot(x, top, LINE)
+    dot(x, bottom, LINE)
+    dot(x, middle, PICKED, radius=100, hole=48)
     return image
 
 

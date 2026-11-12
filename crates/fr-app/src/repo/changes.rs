@@ -20,7 +20,6 @@ use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffLineRange, DiffMo
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, WindowExt as _, h_flex,
     v_flex,
@@ -32,6 +31,7 @@ use super::layout::Split;
 use super::ops::Step;
 use super::stage_diff::{Row, StageDiff};
 use super::{Mode, RepoView};
+use crate::ui;
 
 const FILE_ROW_HEIGHT: f32 = 24.;
 /// diff 里每一行（包括块标题）的高度。uniform_list 按量出来的一行给所有行排版，
@@ -1479,7 +1479,7 @@ impl RepoView {
                                 Some(orig) => format!("{orig} → {}", entry.path).into(),
                                 None => entry.path.clone().into(),
                             };
-                            move |window, cx| Tooltip::new(full.clone()).build(window, cx)
+                            move |window, cx| ui::tip(full.clone(), window, cx)
                         })
                         .context_menu(menu)
                         .into_any_element(),
@@ -1700,7 +1700,7 @@ impl RepoView {
                     .child(title.clone())
                     .tooltip({
                         let title: SharedString = title.into();
-                        move |window, cx| Tooltip::new(title.clone()).build(window, cx)
+                        move |window, cx| ui::tip(title.clone(), window, cx)
                     }),
             );
         // 选中行以后的按钮单独占一行，不和文件名、「暂存文件」挤在一起：窗口窄的时候那一行放不下。

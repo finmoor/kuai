@@ -8,9 +8,12 @@
 //! 的标签页留在内存里（正在做的操作不会被打断），只是不显示。
 //!
 //! 快捷键：F5 刷新、Ctrl+W 关标签页、Ctrl+Tab 切标签页、Ctrl+F 搜索提交、Ctrl+P 快速打开仓库、
-//! Ctrl+1 本地修改、Ctrl+2 所有提交、Ctrl+, 设置。
+//! Ctrl+1 本地修改、Ctrl+2 所有提交、Ctrl+, 设置、Ctrl+Shift+T 重新打开刚关掉的标签页、
+//! Ctrl+` 打开、收起当前仓库底下的终端。
 //!
 //! 关标签页时：有写操作在做就先拦一下；提交说明框里没提交的内容记下来，再打开这个仓库时放回去。
+//! 关掉的标签页每个工作区记最近 10 个（存在设置里），手滑关错了能找回来；
+//! 设置里还可以把标签页上的关闭按钮藏起来。
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -102,6 +105,10 @@ impl Workspace {
             cx.subscribe_in(&manager, window, |this, _, event, window, cx| match event {
                 ManagerEvent::Open(entry) => this.open(entry.clone(), window, cx),
                 ManagerEvent::Rename(entry) => this.rename_repo(entry.clone(), window, cx),
+                ManagerEvent::RemoveFromWorkspace(entry) => {
+                    this.remove_from_workspace(entry.clone(), window, cx)
+                }
+                ManagerEvent::QuickOpen => this.quick_open(window, cx),
             }),
             // 设置变了：服务器改名要刷新标签上的名字；服务器被移除了，它上面的仓库的标签页跟着关掉；
             // 主题、语言、托盘的选项变了就应用到窗口上
@@ -137,13 +144,47 @@ impl Workspace {
                     && this
                         .read_with(cx, |this, _| this.tray.is_some())
                         .unwrap_or(false);
-                match (to_tray, win::hwnd(window)) {
-                    (true, Some(hwnd)) => {
-                        win::hide(hwnd);
-                        false
-                    }
-                    _ => true,
+                if let (true, Some(hwnd)) = (to_tray, win::hwnd(window)) {
+                    win::hide(hwnd);
+                    return false;
                 }
+                // 真要退出：终端里还有程序在跑就先问一下
+                let terminals = this
+                    .read_with(cx, |this, cx| this.live_terminals(cx))
+                    .unwrap_or(0);
+                if terminals == 0 || quitting.get() {
+                    return true;
+                }
+                let quitting = quitting.clone();
+                window.open_alert_dialog(cx, move |alert, _, _| {
+                    let quitting = quitting.clone();
+                    alert
+                        .title(tr("退出？"))
+                        .description(tf!(
+                            "还有 {n} 个终端开着，退出会结束里面的程序。",
+                            n = terminals
+                        ))
+                        .on_ok(|_, _, _| false)
+                        .footer(
+                            DialogFooter::new()
+                                .child(
+                                    Button::new("cancel")
+                                        .label(tr("不退出"))
+                                        .on_click(|_, window, cx| window.close_dialog(cx)),
+                                )
+                                .child(
+                                    Button::new("ok")
+                                        .label(tr("结束并退出"))
+                                        .with_variant(ButtonVariant::Danger)
+                                        .on_click(move |_, window, cx| {
+                                            window.close_dialog(cx);
+                                            quitting.set(true);
+                                            cx.quit();
+                                        }),
+                                ),
+                        )
+                });
+                false
             });
         }
         let count = app.read(cx).settings.workspaces.len();
@@ -263,6 +304,20 @@ impl Workspace {
             }
             _ => false,
         }
+    }
+
+    /// 各个工作区里一共有几个终端还跑着程序。
+    fn live_terminals(&self, cx: &App) -> usize {
+        self.tabs
+            .iter()
+            .chain(
+                self.parked
+                    .iter()
+                    .flatten()
+                    .flat_map(|(tabs, _)| tabs.iter()),
+            )
+            .filter(|tab| tab.view.read(cx).terminal_alive(cx))
+            .count()
     }
 
     /// 服务器被移除了：它上面的仓库的标签页跟着关掉（各个工作区里的都关）。
@@ -395,18 +450,29 @@ impl Workspace {
         }
     }
 
-    /// 关标签页。这一页有写操作在做时不直接关：联网的操作问一下要不要取消，
+    /// 关标签页。固定着的不关。这一页有写操作在做时不直接关：联网的操作问一下要不要取消，
     /// 改工作区、暂存区的操作（提交、变基）等它做完，中途杀掉会把仓库留在半截状态。
     fn close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(ix) else {
             return;
         };
-        let (busy, cancellable) = {
+        if self.is_pinned(&tab.entry, cx) {
+            let text = tr("这个标签页固定着，取消固定才能关。");
+            window.push_notification(Notification::info(text), cx);
+            return;
+        }
+        let (busy, cancellable, terminal) = {
             let view = tab.view.read(cx);
-            (view.busy(), view.cancellable())
+            (view.busy(), view.cancellable(), view.terminal_alive(cx))
         };
+        let entry = tab.entry.clone();
         let Some(op) = busy else {
-            self.close_now(ix, cx);
+            if terminal {
+                let text = tr("终端里的程序还在跑，关掉标签页会结束它。").to_string();
+                self.confirm_close(entry, text, tr("结束并关闭"), window, cx);
+            } else {
+                self.close_now(ix, cx);
+            }
             return;
         };
         if !cancellable {
@@ -414,13 +480,25 @@ impl Workspace {
             window.push_notification(Notification::warning(text), cx);
             return;
         }
-        let entry = tab.entry.clone();
+        let text = tf!("这个仓库正在{op}，关掉标签页会取消它。", op);
+        self.confirm_close(entry, text, tr("取消操作并关闭"), window, cx);
+    }
+
+    /// 关标签页前问一下：`description` 说关掉会怎样，`ok` 是确认按钮上的字。
+    fn confirm_close(
+        &mut self,
+        entry: RepoEntry,
+        description: String,
+        ok: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let workspace = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let (workspace, entry) = (workspace.clone(), entry.clone());
             alert
                 .title(tr("关掉这个标签页？"))
-                .description(tf!("这个仓库正在{op}，关掉标签页会取消它。", op))
+                .description(description.clone())
                 // 回车不执行，要明确点按钮
                 .on_ok(|_, _, _| false)
                 .footer(
@@ -432,7 +510,7 @@ impl Workspace {
                         )
                         .child(
                             Button::new("ok")
-                                .label(tr("取消操作并关闭"))
+                                .label(ok)
                                 .with_variant(ButtonVariant::Danger)
                                 .on_click(move |_, window, cx| {
                                     window.close_dialog(cx);
@@ -461,6 +539,8 @@ impl Workspace {
         if !draft.trim().is_empty() {
             self.drafts.push((tab.entry.clone(), draft));
         }
+        let entry = tab.entry.clone();
+        self.app.update(cx, |app, _| app.note_closed_tab(entry));
         // 关掉的是当前页：留在同一个位置（原来右边那一页），右边没有了才往左；
         // 关掉的是它前面的页，选中位置跟着前移
         if self.active > ix + 1 {
@@ -471,18 +551,101 @@ impl Workspace {
         cx.notify();
     }
 
-    /// 关掉除了第 `keep` 个以外的标签页（`None` 是全关）。正在做操作的留着不关。
+    /// 固定、取消固定第 `ix` 个标签页。固定的排到最前面，选中的还是原来那一页。
+    fn toggle_pin(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(entry) = self.tabs.get(ix).map(|tab| tab.entry.clone()) else {
+            return;
+        };
+        let current = self
+            .active
+            .checked_sub(1)
+            .and_then(|ix| self.tabs.get(ix))
+            .map(|tab| tab.entry.clone());
+        self.app
+            .update(cx, |app, cx| app.toggle_pinned(&entry, cx));
+        let pinned = self.app.read(cx).settings.workspace().pinned.clone();
+        self.tabs.sort_by_key(|tab| !pinned.contains(&tab.entry));
+        if let Some(current) = current {
+            self.active = self
+                .tabs
+                .iter()
+                .position(|tab| tab.entry == current)
+                .map_or(0, |ix| ix + 1);
+        }
+        self.reveal_active_tab();
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn is_pinned(&self, entry: &RepoEntry, cx: &App) -> bool {
+        self.app.read(cx).settings.workspace().is_pinned(entry)
+    }
+
+    /// 把仓库从当前工作区移除（先问一下）：开着的标签页跟着关，仓库还在「全部仓库」里。
+    fn remove_from_workspace(
+        &mut self,
+        entry: RepoEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab = self.tabs.iter().find(|tab| tab.entry == entry);
+        if let Some(tab) = tab {
+            let view = tab.view.read(cx);
+            if view.busy().is_some() || view.terminal_alive(cx) {
+                let text = tr("这个仓库正在做操作或终端还开着，先处理完再移除。");
+                window.push_notification(Notification::warning(text), cx);
+                return;
+            }
+        }
+        let open = tab.is_some();
+        let (name, workspace) = {
+            let app = self.app.read(cx);
+            (
+                app.repo_name(&entry),
+                app.settings.workspace().name.clone(),
+            )
+        };
+        let this = cx.entity().downgrade();
+        crate::manager::confirm(
+            tf!("把 {name} 从工作区「{workspace}」移除？", name, workspace),
+            if open {
+                tr("开着的标签页会关掉。仓库还在「全部仓库」里。").to_string()
+            } else {
+                tr("仓库还在「全部仓库」里。").to_string()
+            },
+            tr("移除"),
+            false,
+            window,
+            cx,
+            move |cx| {
+                this.update(cx, |this, cx| {
+                    if let Some(at) = this.tabs.iter().position(|tab| tab.entry == entry) {
+                        this.close_now(at, cx);
+                    }
+                    this.app
+                        .update(cx, |app, cx| app.remove_from_workspace(&entry, cx));
+                })
+                .ok();
+            },
+        );
+    }
+
+    /// 关掉除了第 `keep` 个以外的标签页（`None` 是全关）。固定的不关；
+    /// 正在做操作的、终端里还跑着程序的也留着，并说一声。
     fn close_others(&mut self, keep: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
         let keep_entry = keep
             .and_then(|ix| self.tabs.get(ix))
             .map(|tab| tab.entry.clone());
+        let pinned = self.app.read(cx).settings.workspace().pinned.clone();
         let mut skipped = 0;
         let targets: Vec<RepoEntry> = self
             .tabs
             .iter()
             .filter(|tab| Some(&tab.entry) != keep_entry.as_ref())
+            .filter(|tab| !pinned.contains(&tab.entry))
             .filter(|tab| {
-                let busy = tab.view.read(cx).busy().is_some();
+                let view = tab.view.read(cx);
+                let busy = view.busy().is_some() || view.terminal_alive(cx);
                 skipped += busy as usize;
                 !busy
             })
@@ -502,7 +665,10 @@ impl Workspace {
             self.persist(cx);
         }
         if skipped > 0 {
-            let text = tf!("有 {n} 个标签页正在做操作，留着没关。", n = skipped);
+            let text = tf!(
+                "有 {n} 个标签页正在做操作或终端还开着，留着没关。",
+                n = skipped
+            );
             window.push_notification(Notification::warning(text), cx);
         }
         cx.notify();
@@ -543,6 +709,25 @@ impl Workspace {
             self.toggle_settings(cx);
         } else if let Some(ix) = self.active.checked_sub(1) {
             self.close(ix, window, cx);
+        }
+    }
+
+    /// Ctrl+Shift+T：重新打开这个工作区里最近关掉的标签页。
+    pub fn reopen_closed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.app.read(cx).closed_tabs().into_iter().next() {
+            Some(entry) => self.open(entry, window, cx),
+            None => {
+                let text = tr("这个工作区里没有刚关掉的标签页。");
+                window.push_notification(Notification::info(text), cx);
+            }
+        }
+    }
+
+    /// Ctrl+`：打开、收起当前仓库底下的终端。
+    pub fn terminal_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_repo() {
+            tab.view
+                .update(cx, |view, cx| view.toggle_terminal(window, cx));
         }
     }
 
@@ -704,12 +889,11 @@ impl Workspace {
             window.push_notification(Notification::warning(text), cx);
             return;
         }
-        if self
-            .tabs
-            .iter()
-            .any(|tab| tab.view.read(cx).busy().is_some())
-        {
-            let text = tr("这个工作区里有标签页正在做操作，等它做完再删。");
+        if self.tabs.iter().any(|tab| {
+            let view = tab.view.read(cx);
+            view.busy().is_some() || view.terminal_alive(cx)
+        }) {
+            let text = tr("这个工作区里有标签页正在做操作或终端还开着，先处理完再删。");
             window.push_notification(Notification::warning(text), cx);
             return;
         }
@@ -762,7 +946,7 @@ impl Workspace {
         cx.notify();
     }
 
-    /// 把一个标签页移到另一个工作区。
+    /// 把一个标签页移到另一个工作区：仓库也跟着换，不再是这个工作区的。
     fn move_tab(&mut self, ix: usize, to: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(ix) else {
             return;
@@ -772,9 +956,16 @@ impl Workspace {
             window.push_notification(Notification::warning(text), cx);
             return;
         }
+        // 移过去是在那边重新打开，终端带不过去
+        if tab.view.read(cx).terminal_alive(cx) {
+            let text = tr("这个仓库的终端还开着，先结束终端再移。");
+            window.push_notification(Notification::warning(text), cx);
+            return;
+        }
         let entry = tab.entry.clone();
         self.close_now(ix, cx);
         self.app.update(cx, |app, cx| {
+            app.remove_from_workspace(&entry, cx);
             app.push_tab_to_workspace(to, entry.clone(), cx)
         });
         // 那个工作区的标签页已经建好了（切过去过）：给它补上这一页
@@ -806,7 +997,7 @@ impl Workspace {
         )
     }
 
-    /// 一个标签页：图标、名字、关闭按钮。`ix` 是 `tabs` 里的下标。
+    /// 一个标签页：图标、名字、关闭按钮（固定着的是一个图钉）。`ix` 是 `tabs` 里的下标。
     fn render_repo_tab(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let tab = &self.tabs[ix];
         let app = self.app.read(cx);
@@ -823,7 +1014,10 @@ impl Workspace {
         } else {
             IconName::FolderGit2
         };
-        let accent = cx.theme().primary;
+        let (accent, muted) = (cx.theme().primary, cx.theme().muted_foreground);
+        let pinned = app.settings.workspace().is_pinned(&tab.entry);
+        let show_close = app.settings.tab_close_button && !pinned;
+        let can_reopen = !app.settings.workspace().closed.is_empty();
         let close = tab_close(("close-tab", ix), selected, cx).on_click(cx.listener(
             move |this, _, window, cx| {
                 cx.stop_propagation();
@@ -855,9 +1049,30 @@ impl Workspace {
             .when(changes > 0, |tab| {
                 tab.child(div().flex_none().size(px(6.)).rounded_full().bg(accent))
             })
-            .child(close)
+            // 固定着的没有关闭按钮，那个位置是一个图钉
+            .when(pinned, |tab| {
+                tab.child(
+                    div()
+                        .flex_none()
+                        .size(px(16.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(muted)
+                        .child(ui::icon_small(IconName::Pin)),
+                )
+            })
+            .when(show_close, |tab| tab.child(close))
             .context_menu(move |menu, _, cx| {
-                tab_menu(menu, ix, entry.clone(), &menu_app, &menu_this, cx)
+                tab_menu(
+                    menu,
+                    ix,
+                    entry.clone(),
+                    can_reopen,
+                    &menu_app,
+                    &menu_this,
+                    cx,
+                )
             })
             .into_any_element()
     }
@@ -1069,7 +1284,8 @@ fn workspace_menu(
     let current = settings.active_workspace;
     for (ix, group) in settings.workspaces.iter().enumerate() {
         let this = this.clone();
-        let label = tf!("{name}（{n}）", name = group.name, n = group.tabs.len());
+        // 括号里是这个工作区有几个仓库，不是开着几个标签页：全关了它也不是空的
+        let label = tf!("{name}（{n}）", name = group.name, n = group.repos.len());
         menu = menu.item(PopupMenuItem::new(label).checked(ix == current).on_click(
             move |_, window, cx| {
                 this.update(cx, |this, cx| this.switch_workspace(ix, window, cx))
@@ -1106,17 +1322,34 @@ fn tab_menu(
     menu: PopupMenu,
     ix: usize,
     entry: RepoEntry,
+    can_reopen: bool,
     app: &Entity<AppState>,
     this: &WeakEntity<Workspace>,
     cx: &App,
 ) -> PopupMenu {
     let (close, others, all, rename) = (this.clone(), this.clone(), this.clone(), this.clone());
+    let (reopen, pin, leave) = (this.clone(), this.clone(), this.clone());
+    let leave_entry = entry.clone();
     let path = entry.path.clone();
+    let pinned = app.read(cx).settings.workspace().is_pinned(&entry);
     let mut menu = menu
         .item(
-            PopupMenuItem::new(tr("关闭")).on_click(move |_, window, cx| {
-                close.update(cx, |this, cx| this.close(ix, window, cx)).ok();
+            PopupMenuItem::new(if pinned {
+                tr("取消固定")
+            } else {
+                tr("固定标签页")
+            })
+            .on_click(move |_, _, cx| {
+                pin.update(cx, |this, cx| this.toggle_pin(ix, cx)).ok();
             }),
+        )
+        .separator()
+        .item(
+            PopupMenuItem::new(tr("关闭"))
+                .disabled(pinned)
+                .on_click(move |_, window, cx| {
+                    close.update(cx, |this, cx| this.close(ix, window, cx)).ok();
+                }),
         )
         .item(
             PopupMenuItem::new(tr("关闭其他标签页")).on_click(move |_, window, cx| {
@@ -1130,6 +1363,15 @@ fn tab_menu(
                 all.update(cx, |this, cx| this.close_others(None, window, cx))
                     .ok();
             }),
+        )
+        .item(
+            PopupMenuItem::new(tr("重新打开刚关掉的（Ctrl+Shift+T）"))
+                .disabled(!can_reopen)
+                .on_click(move |_, window, cx| {
+                    reopen
+                        .update(cx, |this, cx| this.reopen_closed(window, cx))
+                        .ok();
+                }),
         )
         .separator();
     // 移到别的工作区：有别的工作区才列出来
@@ -1149,10 +1391,17 @@ fn tab_menu(
             ),
         );
     }
-    if settings.workspaces.len() > 1 {
-        menu = menu.separator();
-    }
     menu.item(
+        PopupMenuItem::new(tr("从工作区移除")).on_click(move |_, window, cx| {
+            leave
+                .update(cx, |this, cx| {
+                    this.remove_from_workspace(leave_entry.clone(), window, cx)
+                })
+                .ok();
+        }),
+    )
+    .separator()
+    .item(
         PopupMenuItem::new(tr("改名…")).on_click(move |_, window, cx| {
             rename
                 .update(cx, |this, cx| this.rename_repo(entry.clone(), window, cx))
@@ -1245,6 +1494,7 @@ impl Render for Workspace {
             .size_full()
             .bg(bg)
             .text_color(fg)
+            .child(ui::tooltip_guard())
             .child(title_bar)
             .child(div().flex_1().min_h_0().child(content))
     }
@@ -1284,14 +1534,34 @@ impl QuickOpen {
     }
 
     /// 匹配输入内容的仓库：名字、路径、服务器名里有这几个字（不分大小写）。
-    fn matches(&self, cx: &App) -> Vec<(RepoEntry, SharedString)> {
+    /// 先是这个工作区里刚关掉的（最近关的在最上），再是这个工作区别的仓库，最后是其余的。
+    /// 第三项是行尾标的小字：刚关掉、开着。
+    fn matches(&self, cx: &App) -> Vec<(RepoEntry, SharedString, Option<&'static str>)> {
         let needle = self.input.read(cx).value().trim().to_lowercase();
         let app = self.app.read(cx);
-        app.settings
+        let group = app.settings.workspace();
+        let closed = app.closed_tabs();
+        let members = group
             .repos
             .iter()
-            .map(|entry| (entry.clone(), app.repo_title(entry)))
-            .filter(|(entry, title)| {
+            .filter(|entry| !closed.contains(entry))
+            .map(|entry| (entry.clone(), group.tabs.contains(entry).then(|| tr("开着"))));
+        let rest = app
+            .settings
+            .repos
+            .iter()
+            .filter(|entry| !group.repos.contains(entry))
+            .map(|entry| (entry.clone(), None));
+        closed
+            .iter()
+            .map(|entry| (entry.clone(), Some(tr("刚关掉"))))
+            .chain(members)
+            .chain(rest)
+            .map(|(entry, mark)| {
+                let title = app.repo_title(&entry);
+                (entry, title, mark)
+            })
+            .filter(|(entry, title, _)| {
                 needle.is_empty()
                     || title.to_lowercase().contains(&needle)
                     || entry.path.to_lowercase().contains(&needle)
@@ -1300,7 +1570,7 @@ impl QuickOpen {
     }
 
     fn pick_selected(&mut self, cx: &mut Context<Self>) {
-        if let Some((entry, _)) = self.matches(cx).into_iter().nth(self.selected) {
+        if let Some((entry, ..)) = self.matches(cx).into_iter().nth(self.selected) {
             cx.emit(Picked(entry));
         }
     }
@@ -1331,7 +1601,7 @@ impl Render for QuickOpen {
         let rows: Vec<AnyElement> = matches
             .into_iter()
             .enumerate()
-            .map(|(ix, (entry, title))| {
+            .map(|(ix, (entry, title, mark))| {
                 let path = entry.path.clone();
                 let glyph = if entry.server.is_some() {
                     IconName::Server
@@ -1360,6 +1630,15 @@ impl Render for QuickOpen {
                                     .text_color(muted),
                             ),
                     )
+                    .when_some(mark, |row, mark| {
+                        row.child(div().flex_1()).child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(mark),
+                        )
+                    })
                     .into_any_element()
             })
             .collect();
