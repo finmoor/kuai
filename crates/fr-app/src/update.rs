@@ -193,7 +193,7 @@ impl Updater {
                 discard_staged();
                 let log = update_dir().join(SETUP_LOG);
                 let problem =
-                    Problem::Install(tf!("安装程序没装上，记录在 {path}", path = log.display()));
+                    Problem::Install(tf!("安装失败，日志位于 {path}", path = log.display()));
                 stage = Stage::Failed {
                     release: None,
                     problem,
@@ -383,7 +383,7 @@ impl Updater {
                 let finished = match rx.try_recv() {
                     Ok(None) => None,
                     Ok(Some(result)) => Some(result),
-                    Err(_) => Some(Err(Problem::Download(tr("下载中断了").into()))),
+                    Err(_) => Some(Err(Problem::Download(tr("下载已中断").into()))),
                 };
                 let keep_going = this
                     .update(cx, |this, cx| {
@@ -528,12 +528,12 @@ fn fetch_latest() -> Result<Option<Release>> {
         .call();
     let mut response = match response {
         Err(ureq::Error::StatusCode(404)) => return Ok(None),
-        other => other.with_context(|| tf!("连不上 {host}", host = host_of(&url)))?,
+        other => other.with_context(|| tf!("无法连接 {host}", host = host_of(&url)))?,
     };
     let release: GhRelease = response
         .body_mut()
         .read_json()
-        .context(tr("GitHub 返回的结果看不懂"))?;
+        .context(tr("无法解析 GitHub 返回的数据"))?;
     Ok(parse_release(release, kind()))
 }
 
@@ -643,7 +643,7 @@ fn install_dir() -> Result<PathBuf, Problem> {
     }
     let dir = exe
         .parent()
-        .ok_or_else(|| Problem::Install(tr("找不到程序所在的文件夹").into()))?
+        .ok_or_else(|| Problem::Install(tr("未找到程序所在的文件夹").into()))?
         .to_path_buf();
     let probe = dir.join(".kuai-write-test");
     match File::create(&probe) {
@@ -659,7 +659,7 @@ fn install_dir() -> Result<PathBuf, Problem> {
 fn fetch_and_stage(release: &Release, got: &AtomicU64, cancel: &AtomicBool) -> Result<(), Problem> {
     let Some(expected) = &release.asset.sha256 else {
         return Err(Problem::Download(
-            tr("GitHub 上没记这个文件的校验值").into(),
+            tr("GitHub 未提供此文件的校验值").into(),
         ));
     };
     let dir = update_dir();
@@ -698,7 +698,7 @@ fn download(url: &str, dest: &Path, got: &AtomicU64, cancel: &AtomicBool) -> Res
     let mut response = agent(Duration::from_secs(30 * 60))
         .get(url)
         .call()
-        .with_context(|| tf!("连不上 {host}", host = host_of(url)))?;
+        .with_context(|| tf!("无法连接 {host}", host = host_of(url)))?;
     let mut reader = response.body_mut().as_reader();
     let mut file = File::create(dest)?;
     let mut hasher = Sha256::new();
@@ -707,7 +707,7 @@ fn download(url: &str, dest: &Path, got: &AtomicU64, cancel: &AtomicBool) -> Res
         if cancel.load(Ordering::Relaxed) {
             drop(file);
             let _ = fs::remove_file(dest);
-            bail!(tr("取消了"));
+            bail!(tr("已取消"));
         }
         let n = reader.read(&mut buf)?;
         if n == 0 {
@@ -737,7 +737,7 @@ fn extract(zip: &Path, out: &Path) -> Result<()> {
         let file = archive.by_index(i)?;
         let name = file
             .enclosed_name()
-            .ok_or_else(|| anyhow!(tr("发布包里有不安全的路径")))?;
+            .ok_or_else(|| anyhow!(tr("发布包中包含不安全的路径")))?;
         entries.push((name, file.is_dir()));
     }
     let top = common_top(&entries);
@@ -761,7 +761,7 @@ fn extract(zip: &Path, out: &Path) -> Result<()> {
         io::copy(&mut file, &mut File::create(&path)?)?;
     }
     if !out.join("kuai.exe").is_file() {
-        bail!(tr("发布包里没有 kuai.exe"));
+        bail!(tr("发布包中缺少 kuai.exe"));
     }
     fs::write(out.join(READY_MARK), b"")?;
     Ok(())
@@ -782,7 +782,7 @@ fn common_top(entries: &[(PathBuf, bool)]) -> Option<PathBuf> {
 /// 换上暂存目录里的新版本，打开新的 Kuai。成功后调用方马上退出。
 fn install_and_launch(staging: &Path) -> Result<()> {
     if !staging.join(READY_MARK).is_file() {
-        bail!(tr("新版本没下完"));
+        bail!(tr("新版本未下载完成"));
     }
     let setup = staging.join(SETUP_EXE);
     if setup.is_file() {
@@ -797,7 +797,7 @@ fn install_and_launch(staging: &Path) -> Result<()> {
 /// 没装上的话新的 Kuai 不会打开；下次启动时读到记号里还是自己的版本号，就知道没装上。
 fn run_setup(setup: &Path) -> Result<()> {
     let exe = std::env::current_exe()?;
-    let dir = exe.parent().context(tr("找不到程序所在的文件夹"))?;
+    let dir = exe.parent().context(tr("未找到程序所在的文件夹"))?;
     let dir = dir.to_string_lossy();
     let dir = dir.strip_prefix(r"\\?\").unwrap_or(&dir);
     let _ = fs::write(update_dir().join(DONE_MARK), env!("CARGO_PKG_VERSION"));
@@ -812,7 +812,7 @@ fn run_setup(setup: &Path) -> Result<()> {
         .arg(format!("/LOG={}", update_dir().join(SETUP_LOG).display()))
         .arg(format!("/waitpid={}", std::process::id()))
         .spawn()
-        .context(tr("启动不了安装程序"))?;
+        .context(tr("无法启动安装程序"))?;
     Ok(())
 }
 
@@ -820,12 +820,12 @@ fn run_setup(setup: &Path) -> Result<()> {
 /// 返回 exe 的路径（已经是新版本了）。
 fn install(staging: &Path) -> Result<PathBuf> {
     if !staging.join(READY_MARK).is_file() {
-        bail!(tr("新版本没下完"));
+        bail!(tr("新版本未下载完成"));
     }
     let exe = std::env::current_exe()?;
-    let dir = exe.parent().context(tr("找不到程序所在的文件夹"))?;
+    let dir = exe.parent().context(tr("未找到程序所在的文件夹"))?;
     copy_tree(staging, staging, dir)?;
-    self_replace::self_replace(staging.join("kuai.exe")).context(tr("换不了 kuai.exe"))?;
+    self_replace::self_replace(staging.join("kuai.exe")).context(tr("无法替换 kuai.exe"))?;
     let _ = fs::write(update_dir().join(DONE_MARK), env!("CARGO_PKG_VERSION"));
     // 换上了就删掉：万一新程序报的版本号不比现在新（发版时标签打错），启动时也不会一遍遍地换
     let _ = fs::remove_dir_all(staging);
@@ -846,7 +846,7 @@ fn copy_tree(root: &Path, from: &Path, to: &Path) -> Result<()> {
             copy_tree(root, &path, to)?;
         } else {
             fs::copy(&path, &target)
-                .with_context(|| tf!("换不了 {path}", path = target.display()))?;
+                .with_context(|| tf!("无法替换 {path}", path = target.display()))?;
         }
     }
     Ok(())
@@ -860,7 +860,7 @@ fn relaunch(exe: &Path) -> Result<()> {
     std::process::Command::new(exe)
         .args(args)
         .spawn()
-        .context(tr("启动不了新版本"))?;
+        .context(tr("无法启动新版本"))?;
     Ok(())
 }
 

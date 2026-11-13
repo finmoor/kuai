@@ -46,9 +46,9 @@ impl Kind {
     fn label(self) -> &'static str {
         match self {
             Kind::Pick => tr("保留"),
-            Kind::Reword => tr("改说明"),
-            Kind::Squash => tr("并入下面那个"),
-            Kind::Fixup => tr("并入下面那个，说明不要"),
+            Kind::Reword => tr("修改说明"),
+            Kind::Squash => tr("并入下方提交"),
+            Kind::Fixup => tr("并入下方提交并丢弃说明"),
             // 英文里别处的「丢弃」是 Discard（丢掉没提交的改动），变基的这一项叫 Drop
             Kind::Drop => trc("变基", "丢弃"),
         }
@@ -57,11 +57,11 @@ impl Kind {
     /// 菜单里的说明。
     fn detail(self) -> &'static str {
         tr(match self {
-            Kind::Pick => tr_key("保留（pick）：原样留着"),
-            Kind::Reword => tr_key("改说明（reword）：内容不变，换一段说明"),
-            Kind::Squash => tr_key("并入下面那个（squash）：合成一个，两边的说明都留"),
-            Kind::Fixup => tr_key("并入下面那个，不要说明（fixup）：合成一个，只留下面那个的说明"),
-            Kind::Drop => tr_key("丢弃（drop）：这个提交的改动不要了"),
+            Kind::Pick => tr_key("保留（pick）：保持原样"),
+            Kind::Reword => tr_key("修改说明（reword）：改动不变，仅修改提交说明"),
+            Kind::Squash => tr_key("并入下方提交（squash）：合并为一个提交，保留两者的说明"),
+            Kind::Fixup => tr_key("并入下方提交并丢弃说明（fixup）：合并为一个提交，仅保留下方提交的说明"),
+            Kind::Drop => tr_key("丢弃（drop）：删除此提交及其改动"),
         })
     }
 }
@@ -155,7 +155,7 @@ impl RebaseEditor {
         // 什么都没改就点开始：变基一遍也是原样，不做了
         if self.untouched() {
             window.close_dialog(cx);
-            let note = tr("顺序和做法都没改，没有变基。");
+            let note = tr("顺序和操作均未更改，未执行变基。");
             window.push_notification(Notification::info(note), cx);
             return;
         }
@@ -163,11 +163,11 @@ impl RebaseEditor {
         if let Err(problem) = rebase::check(&items) {
             self.problem = Some(
                 match problem {
-                    Problem::NothingLeft => tr("不能全都丢弃，至少留一个提交。"),
+                    Problem::NothingLeft => tr("不能丢弃全部提交，至少保留一个。"),
                     Problem::NothingToMeldInto => {
-                        tr("最早的那个提交不能「并入下面那个」：下面没有提交了。")
+                        tr("最早的提交无法「并入下方提交」：下方没有提交。")
                     }
-                    Problem::EmptyMessage => tr("有一个提交选了「改说明」，但说明是空的。"),
+                    Problem::EmptyMessage => tr("有提交选择了「修改说明」，但说明为空。"),
                 }
                 .into(),
             );
@@ -219,7 +219,7 @@ impl Render for RebaseEditor {
                             .xsmall()
                             .ghost()
                             .icon(ui::icon_small(IconName::ArrowUp))
-                            .tooltip(tr("往上挪：排到更新的位置"))
+                            .tooltip(tr("上移：移到较新的位置"))
                             .disabled(ix == 0)
                             .on_click(
                                 cx.listener(move |this, _, _, cx| this.move_row(ix, true, cx)),
@@ -230,7 +230,7 @@ impl Render for RebaseEditor {
                             .xsmall()
                             .ghost()
                             .icon(ui::icon_small(IconName::ArrowDown))
-                            .tooltip(tr("往下挪：排到更早的位置"))
+                            .tooltip(tr("下移：移到较早的位置"))
                             .disabled(last)
                             .on_click(
                                 cx.listener(move |this, _, _, cx| this.move_row(ix, false, cx)),
@@ -330,7 +330,7 @@ impl Render for RebaseEditor {
             .count();
         let reworded = self.rows.iter().filter(|r| r.kind == Kind::Reword).count();
         let summary = tf!(
-            "{count} 个提交：并入 {melded}，改说明 {reworded}，丢弃 {dropped}；做完剩 {left} 个。",
+            "{count} 个提交：并入 {melded} 个，修改说明 {reworded} 个，丢弃 {dropped} 个；完成后剩余 {left} 个。",
             count,
             melded,
             reworded,
@@ -340,17 +340,17 @@ impl Render for RebaseEditor {
         v_flex()
             .gap_3()
             .child(div().text_xs().text_color(muted).whitespace_normal().child(tr(
-                "新的在上面。箭头调顺序，下拉里选怎么处理。提交会重新生成（哈希会变），已推送的做完要强制推送。",
+                "最新的提交在最上方。使用箭头调整顺序，在下拉列表中选择操作。提交将重新生成（哈希会改变），已推送的提交完成后需要强制推送。",
             )))
             .when(merges > 0, |d| {
                 d.child(div().text_xs().text_color(warning).whitespace_normal().child(tf!(
-                    "其中有 {merges} 个合并提交：变基会把历史拉直，不保留合并关系。",
+                    "其中包含 {merges} 个合并提交。变基后历史将变为线性，不保留合并关系。",
                     merges
                 )))
             })
             .when(self.autostash, |d| {
                 d.child(div().text_xs().text_color(muted).whitespace_normal().child(tr(
-                    "没提交的改动会先贮藏，做完自动放回（--autostash）。",
+                    "未提交的改动将先贮藏，完成后自动恢复（--autostash）。",
                 )))
             })
             .child(
@@ -405,13 +405,13 @@ impl RepoView {
     ) {
         if let Some(running) = &self.op {
             window.push_notification(
-                Notification::warning(tf!("等「{running}」做完再试", running)),
+                Notification::warning(tf!("请等待「{running}」完成后重试", running)),
                 cx,
             );
             return;
         }
         if let Some(state) = self.in_progress {
-            let text = tf!("{name}还没做完，先完成或中止。", name = state.name());
+            let text = tf!("{name}尚未完成，请先完成或中止。", name = state.name());
             window.push_notification(Notification::warning(text), cx);
             return;
         }
@@ -440,12 +440,12 @@ impl RepoView {
                     .map(|out| rebase::parse_list(&out))
                     .unwrap_or_default();
                 let problem = if !on_branch {
-                    Some(tr("这个提交不在当前分支上。先切换到包含它的分支。").to_string())
+                    Some(tr("此提交不在当前分支上。请先切换到包含该提交的分支。").to_string())
                 } else if commits.is_empty() {
-                    Some(tr("这个提交之后没有别的提交，不用整理。").to_string())
+                    Some(tr("此提交之后没有其他提交，无需整理。").to_string())
                 } else if commits.len() > MAX_COMMITS {
                     Some(tf!(
-                        "这个提交之后有 {n} 个提交，一次最多整理 {max} 个。选近一点的提交。",
+                        "此提交之后有 {n} 个提交，一次最多整理 {max} 个。请选择更近的提交。",
                         n = commits.len(),
                         max = MAX_COMMITS
                     ))
@@ -503,7 +503,7 @@ impl RepoView {
             .filter(|item| matches!(item.action, Action::Pick | Action::Reword(_)))
             .count();
         self.run_op(tr("变基"), args, None, window, cx, move |_, _, w, cx| {
-            let text = tf!("整理完了，现在这一段是 {kept} 个提交", kept);
+            let text = tf!("整理完成，该范围现有 {kept} 个提交", kept);
             w.push_notification(Notification::success(text), cx);
         });
     }

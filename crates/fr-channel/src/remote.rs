@@ -135,10 +135,10 @@ impl Connection {
                 }
                 Started::Missing { os, arch } => {
                     if installed {
-                        bail!(tr("上传 kuaid 后还是启动不了"));
+                        bail!(tr("上传 kuaid 后仍无法启动"));
                     }
                     if os != "Linux" {
-                        bail!("{}", tf!("暂时只支持 Linux 服务器，这台是 {os}", os));
+                        bail!("{}", tf!("目前仅支持 Linux 服务器，该服务器为 {os}", os));
                     }
                     install(destination, options, &dir, &binaries.binary_for(&arch)?)?;
                     installed = true;
@@ -158,7 +158,7 @@ impl Connection {
                 installed: false,
                 inner,
             }),
-            Started::Missing { .. } => bail!(tr("kuaid 没有启动")),
+            Started::Missing { .. } => bail!(tr("kuaid 未启动")),
         }
     }
 
@@ -176,7 +176,7 @@ impl Connection {
         let call = self.call("list_dir", json!({ "path": path }), Vec::new());
         async move {
             let (result, _) = call.await?;
-            serde_json::from_value(result).context(tr("kuaid 返回的目录格式不对"))
+            serde_json::from_value(result).context(tr("kuaid 返回的目录格式错误"))
         }
         .boxed()
     }
@@ -195,7 +195,7 @@ impl Connection {
         async move {
             let (result, stdout) = call.await?;
             let result: GitResult =
-                serde_json::from_value(result).context(tr("kuaid 返回的结果格式不对"))?;
+                serde_json::from_value(result).context(tr("kuaid 返回的结果格式错误"))?;
             Ok(GitOutput {
                 code: result.code,
                 stdout,
@@ -341,7 +341,7 @@ impl Connection {
         async move {
             let (mut result, _) = call.await?;
             serde_json::from_value(result["terms"].take())
-                .context(tr("kuaid 返回的结果格式不对"))
+                .context(tr("kuaid 返回的结果格式错误"))
         }
         .boxed()
     }
@@ -389,7 +389,7 @@ fn upload_blocking(
     let (mut reader, total): (Box<dyn Read>, u64) = match source {
         UploadSource::File(path) => {
             let file =
-                File::open(&path).with_context(|| tf!("打不开 {path}", path = path.display()))?;
+                File::open(&path).with_context(|| tf!("无法打开 {path}", path = path.display()))?;
             let total = file.metadata().map(|meta| meta.len()).unwrap_or(0);
             (Box::new(file), total)
         }
@@ -404,7 +404,7 @@ fn upload_blocking(
             .by_ref()
             .take(UPLOAD_CHUNK as u64)
             .read_to_end(&mut chunk)
-            .context(tr("读文件时出错"))?;
+            .context(tr("读取文件失败"))?;
         Ok(chunk)
     };
     let mut upload = String::new();
@@ -424,7 +424,7 @@ fn upload_blocking(
         drop(connection);
         let (result, _) = futures::executor::block_on(call)?;
         let reply: FilePutReply =
-            serde_json::from_value(result).context(tr("kuaid 返回的结果格式不对"))?;
+            serde_json::from_value(result).context(tr("kuaid 返回的结果格式错误"))?;
         upload = reply.upload;
         let progress = UploadItem::Progress {
             sent: reply.received,
@@ -449,7 +449,7 @@ fn upload_blocking(
             return Ok(());
         }
         if done {
-            let path = reply.path.context(tr("kuaid 返回的结果格式不对"))?;
+            let path = reply.path.context(tr("kuaid 返回的结果格式错误"))?;
             let _ = tx.unbounded_send(Ok(UploadItem::Done(path)));
             return Ok(());
         }
@@ -557,7 +557,7 @@ impl Inner {
                                 term: opened.term,
                                 created: opened.created,
                             })
-                            .context(tr("kuaid 返回的结果格式不对")),
+                            .context(tr("kuaid 返回的结果格式错误")),
                         None => Ok(TermItem::Output(payload)),
                     };
                     let _ = tx.unbounded_send(item);
@@ -582,7 +582,7 @@ impl Inner {
             Pending::Stream(tx) => {
                 let item = outcome.and_then(|result| {
                     let result: GitResult =
-                        serde_json::from_value(result).context(tr("kuaid 返回的结果格式不对"))?;
+                        serde_json::from_value(result).context(tr("kuaid 返回的结果格式错误"))?;
                     Ok(StreamItem::Done(GitOutput {
                         code: result.code,
                         stdout: Vec::new(),
@@ -597,7 +597,7 @@ impl Inner {
             Pending::Term(tx) => {
                 let item = outcome.and_then(|result| {
                     let exit: TermExit = serde_json::from_value(result)
-                        .context(tr("kuaid 返回的结果格式不对"))?;
+                        .context(tr("kuaid 返回的结果格式错误"))?;
                     Ok(TermItem::Exited(exit.exit))
                 });
                 let _ = tx.unbounded_send(item);
@@ -667,9 +667,9 @@ fn start(mut cmd: Command, expect_marker: bool, destination: &str) -> Result<Sta
             to_string_lossy = cmd.get_program().to_string_lossy()
         )
     })?;
-    let mut stdin = child.stdin.take().context(tr("拿不到 ssh 的标准输入"))?;
-    let stdout = child.stdout.take().context(tr("拿不到 ssh 的标准输出"))?;
-    let stderr_tail = collect_stderr(child.stderr.take().context(tr("拿不到 ssh 的标准错误"))?);
+    let mut stdin = child.stdin.take().context(tr("无法获取 ssh 的标准输入"))?;
+    let stdout = child.stdout.take().context(tr("无法获取 ssh 的标准输出"))?;
+    let stderr_tail = collect_stderr(child.stderr.take().context(tr("无法获取 ssh 的标准错误"))?);
 
     // 握手请求先发出去，省一次往返。没装 kuaid 时远程的 sh 不读它，丢掉就是了
     let hello = Request {
@@ -715,13 +715,13 @@ fn start(mut cmd: Command, expect_marker: bool, destination: &str) -> Result<Sta
         bail!("{}", tf!("kuaid 握手失败：{err}", err));
     }
     let hello: Hello = serde_json::from_value(response.result.unwrap_or_default())
-        .context(tr("kuaid 握手结果格式不对"))?;
+        .context(tr("kuaid 握手响应格式错误"))?;
     // 常驻的 kuaid 可以比客户端新（别的电脑上的客户端把它升上去了），它认得旧客户端；比客户端旧不行
     if hello.protocol < PROTOCOL_VERSION {
         bail!(
             "{}",
             tf!(
-                "服务器上的 kuaid 太旧（协议 {protocol}，客户端是 {PROTOCOL_VERSION}），没能换成新的。在服务器上运行 ~/.kuai/*/kuaid --stop 再连",
+                "服务器上的 kuaid 版本过旧（协议 {protocol}，客户端为 {PROTOCOL_VERSION}），且无法自动替换。请在服务器上运行 ~/.kuai/*/kuaid --stop 后重新连接",
                 protocol = hello.protocol,
                 PROTOCOL_VERSION
             )
@@ -801,17 +801,17 @@ fn connect_error(destination: &str, stderr_tail: &Mutex<String>, noise: &[String
     std::thread::sleep(Duration::from_millis(50));
     let stderr = stderr_tail.lock().unwrap().trim().to_string();
     let hint = if stderr.contains("Permission denied") {
-        tr("登录被拒绝：密钥或密码不对，或者取消了输入")
+        tr("登录被拒绝：密钥或密码错误，或已取消输入")
     } else if stderr.contains("Could not resolve hostname") {
-        tr("找不到这个主机名")
+        tr("无法解析主机名")
     } else if stderr.contains("timed out") {
         tr("连接超时")
     } else if stderr.contains("Connection refused") {
-        tr("对方拒绝连接，检查 SSH 服务和端口")
+        tr("连接被拒绝，请检查 SSH 服务和端口")
     } else if stderr.contains("Host key verification failed")
         || stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
     {
-        tr("主机密钥和 known_hosts 里的不一致，先在终端里用 ssh 确认")
+        tr("主机密钥与 known_hosts 中的记录不一致，请先在终端中使用 ssh 确认")
     } else {
         tr("连接失败")
     };
@@ -943,7 +943,7 @@ fn install(destination: &str, options: &ConnectOptions, dir: &str, binary: &[u8]
         .stderr(Stdio::piped());
     no_window(&mut cmd);
     let mut child = cmd.spawn().context(tr("无法启动 ssh"))?;
-    let mut stdin = child.stdin.take().context(tr("拿不到 ssh 的标准输入"))?;
+    let mut stdin = child.stdin.take().context(tr("无法获取 ssh 的标准输入"))?;
     let data = binary.to_vec();
     let writer = std::thread::spawn(move || stdin.write_all(&data));
     let out = child.wait_with_output().context(tr("上传 kuaid 失败"))?;

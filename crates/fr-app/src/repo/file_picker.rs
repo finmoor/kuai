@@ -46,7 +46,7 @@ impl FilePicker {
         cx: &mut Context<Self>,
     ) -> Self {
         let input =
-            cx.new(|cx| InputState::new(window, cx).placeholder(tr("文件名或路径里的几个字")));
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("文件名或路径中的关键字")));
         let subscription = cx.subscribe(&input, |this: &mut Self, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.selected = 0;
@@ -56,7 +56,7 @@ impl FilePicker {
         let load = cx.spawn(async move |this, cx| {
             let files = match list.await.and_then(|out| out.ok()) {
                 Ok(bytes) => Files::Ready(parse_files(&bytes)),
-                Err(err) => Files::Failed(tf!("读不到文件列表：{err}", err).into()),
+                Err(err) => Files::Failed(tf!("无法读取文件列表：{err}", err).into()),
             };
             this.update(cx, |this, cx| {
                 this.files = files;
@@ -202,7 +202,7 @@ impl Render for FilePicker {
             Files::Ready(_) if total == 0 => Some((tr("没有匹配的文件").into(), muted)),
             Files::Ready(_) if total > shown => Some((
                 tf!(
-                    "匹配 {total} 个，只列前 {shown} 个；多输几个字缩小范围",
+                    "共 {total} 个匹配项，仅显示前 {shown} 个，请输入更多字符以缩小范围",
                     total,
                     shown
                 )
@@ -226,7 +226,7 @@ impl Render for FilePicker {
                 note.map(|(text, color)| div().px_2().text_xs().text_color(color).child(text)),
             )
             .child(div().px_2().text_xs().text_color(muted).child(tr(
-                "回车或点一下看文件历史；右边的「逐行追溯」看每行是谁改的。",
+                "按 Enter 或点击查看文件历史；点击右侧的「逐行追溯」可查看每行的修改者。",
             )))
     }
 }
@@ -242,7 +242,7 @@ pub(super) fn open(picker: Entity<FilePicker>, window: &mut Window, cx: &mut App
         }
         let on_enter = picker.clone();
         dialog
-            .title(tr("选一个文件"))
+            .title(tr("选择文件"))
             .w(px(640.))
             .on_ok(move |_, _, cx| {
                 on_enter.update(cx, |picker, cx| picker.pick_selected(false, cx));

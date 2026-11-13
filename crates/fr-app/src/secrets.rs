@@ -96,7 +96,7 @@ mod imp {
         // 内容按 UTF-16 存，和系统自己、别的程序存的普通凭据一样
         let blob: Vec<u8> = secret.encode_utf16().flat_map(u16::to_le_bytes).collect();
         if blob.len() > MAX_BLOB {
-            return Err(fr_core::i18n::tr("太长了，系统的凭据管理器存不下").into());
+            return Err(fr_core::i18n::tr("内容过长，无法保存到 Windows 凭据管理器").into());
         }
         let (target, account) = (wide(target), wide(account));
         let credential = Credential {
@@ -193,7 +193,7 @@ mod imp {
 #[cfg(not(windows))]
 mod imp {
     pub fn write(_: &str, _: &str, _: &str) -> Result<(), String> {
-        Err(fr_core::i18n::tr("这个系统上还不能保存密码").into())
+        Err(fr_core::i18n::tr("当前系统不支持保存密码").into())
     }
     pub fn read(_: &str) -> Option<String> {
         None

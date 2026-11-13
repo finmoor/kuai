@@ -172,7 +172,7 @@ impl Workspace {
                     alert
                         .title(tr("退出？"))
                         .description(tf!(
-                            "还有 {n} 个终端开着，退出会结束里面的程序。",
+                            "有 {n} 个终端正在运行，退出将结束其中的程序。",
                             n = terminals
                         ))
                         .on_ok(|_, _, _| false)
@@ -180,7 +180,7 @@ impl Workspace {
                             DialogFooter::new()
                                 .child(
                                     Button::new("cancel")
-                                        .label(tr("不退出"))
+                                        .label(tr("取消"))
                                         .on_click(|_, window, cx| window.close_dialog(cx)),
                                 )
                                 .child(
@@ -203,11 +203,11 @@ impl Workspace {
         if updater.read(cx).updated_from.is_some() {
             cx.defer_in(window, |_, window, cx| {
                 let version = env!("CARGO_PKG_VERSION");
-                let notification = Notification::success(tf!("已升到 {version}", version)).action(
+                let notification = Notification::success(tf!("已更新到 {version}", version)).action(
                     move |_, _, _| {
                         Button::new("update-notes")
                             .small()
-                            .label(tr("看看改了什么"))
+                            .label(tr("查看更新内容"))
                             .on_click(move |_, window, cx| {
                                 let page =
                                     format!("{}/releases/tag/v{version}", update::repo_url());
@@ -320,9 +320,9 @@ impl Workspace {
         window.open_alert_dialog(cx, move |alert, _, _| {
             let restart = restart.clone();
             alert
-                .title(tr("重启 Kuai 完成升级"))
+                .title(tr("重启 Kuai 以完成更新"))
                 .description(tf!(
-                    "还有 {n} 个本机终端开着，重启会结束里面的程序。服务器上的终端不受影响。",
+                    "有 {n} 个本机终端正在运行，重启将结束其中的程序。服务器上的终端不受影响。",
                     n = terminals
                 ))
                 .on_ok(|_, _, _| false)
@@ -482,10 +482,10 @@ impl Workspace {
         let app = self.app.clone();
         let current = app.read(cx).repo_name(&entry).to_string();
         ask_name(
-            tr("仓库改名"),
-            tr("显示的名字，留空用目录名"),
+            tr("重命名仓库"),
+            tr("显示名称，留空则使用目录名"),
             current,
-            tr("改名"),
+            tr("重命名"),
             true,
             window,
             cx,
@@ -532,7 +532,7 @@ impl Workspace {
             return;
         };
         if self.is_pinned(&tab.entry, cx) {
-            let text = tr("这个标签页固定着，取消固定才能关。");
+            let text = tr("此标签页已固定，取消固定后才能关闭。");
             window.push_notification(Notification::info(text), cx);
             return;
         }
@@ -543,7 +543,7 @@ impl Workspace {
         let entry = tab.entry.clone();
         let Some(op) = busy else {
             if terminal {
-                let text = tr("终端里的程序还在跑，关掉标签页会结束它。").to_string();
+                let text = tr("终端中的程序仍在运行，关闭标签页将结束该程序。").to_string();
                 self.confirm_close(entry, text, tr("结束并关闭"), window, cx);
             } else {
                 self.close_now(ix, cx);
@@ -551,11 +551,11 @@ impl Workspace {
             return;
         };
         if !cancellable {
-            let text = tf!("这个仓库正在{op}，等它做完再关。", op);
+            let text = tf!("此仓库正在{op}，请等待完成后再关闭。", op);
             window.push_notification(Notification::warning(text), cx);
             return;
         }
-        let text = tf!("这个仓库正在{op}，关掉标签页会取消它。", op);
+        let text = tf!("此仓库正在{op}，关闭标签页将取消该操作。", op);
         self.confirm_close(entry, text, tr("取消操作并关闭"), window, cx);
     }
 
@@ -572,7 +572,7 @@ impl Workspace {
         window.open_alert_dialog(cx, move |alert, _, _| {
             let (workspace, entry) = (workspace.clone(), entry.clone());
             alert
-                .title(tr("关掉这个标签页？"))
+                .title(tr("关闭此标签页？"))
                 .description(description.clone())
                 // 回车不执行，要明确点按钮
                 .on_ok(|_, _, _| false)
@@ -580,7 +580,7 @@ impl Workspace {
                     DialogFooter::new()
                         .child(
                             Button::new("cancel")
-                                .label(tr("不关"))
+                                .label(tr("取消"))
                                 .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
                         .child(
@@ -667,7 +667,7 @@ impl Workspace {
         if let Some(tab) = tab {
             let view = tab.view.read(cx);
             if view.busy().is_some() || view.terminal_alive(cx) {
-                let text = tr("这个仓库正在做操作或终端还开着，先处理完再移除。");
+                let text = tr("此仓库正在执行操作或有运行中的终端，请处理完毕后再移除。");
                 window.push_notification(Notification::warning(text), cx);
                 return;
             }
@@ -682,11 +682,11 @@ impl Workspace {
         };
         let this = cx.entity().downgrade();
         crate::manager::confirm(
-            tf!("把 {name} 从工作区「{workspace}」移除？", name, workspace),
+            tf!("将 {name} 从工作区「{workspace}」移除？", name, workspace),
             if open {
-                tr("开着的标签页会关掉。仓库还在「全部仓库」里。").to_string()
+                tr("已打开的标签页将关闭，仓库仍保留在「全部仓库」中。").to_string()
             } else {
-                tr("仓库还在「全部仓库」里。").to_string()
+                tr("仓库仍保留在「全部仓库」中。").to_string()
             },
             tr("移除"),
             false,
@@ -741,7 +741,7 @@ impl Workspace {
         }
         if skipped > 0 {
             let text = tf!(
-                "有 {n} 个标签页正在做操作或终端还开着，留着没关。",
+                "{n} 个标签页正在执行操作或有运行中的终端，未关闭。",
                 n = skipped
             );
             window.push_notification(Notification::warning(text), cx);
@@ -792,7 +792,7 @@ impl Workspace {
         match self.app.read(cx).closed_tabs().into_iter().next() {
             Some(entry) => self.open(entry, window, cx),
             None => {
-                let text = tr("这个工作区里没有刚关掉的标签页。");
+                let text = tr("此工作区中没有最近关闭的标签页。");
                 window.push_notification(Notification::info(text), cx);
             }
         }
@@ -927,7 +927,7 @@ impl Workspace {
         let this = cx.entity().downgrade();
         ask_name(
             tr("新建工作区"),
-            tr("工作区的名字，比如「公司」「个人」"),
+            tr("工作区名称，例如「公司」「个人」"),
             String::new(),
             tr("新建"),
             false,
@@ -949,10 +949,10 @@ impl Workspace {
         let old = self.app.read(cx).settings.workspace().name.clone();
         let app = self.app.clone();
         ask_name(
-            tr("给工作区改名"),
-            tr("新的名字"),
+            tr("重命名工作区"),
+            tr("新名称"),
             old,
-            tr("改名"),
+            tr("重命名"),
             false,
             window,
             cx,
@@ -968,7 +968,7 @@ impl Workspace {
             (settings.workspace().name.clone(), settings.workspaces.len())
         };
         if count <= 1 {
-            let text = tr("只剩这一个工作区了，不能删。");
+            let text = tr("这是最后一个工作区，无法删除。");
             window.push_notification(Notification::warning(text), cx);
             return;
         }
@@ -976,7 +976,7 @@ impl Workspace {
             let view = tab.view.read(cx);
             view.busy().is_some() || view.terminal_alive(cx)
         }) {
-            let text = tr("这个工作区里有标签页正在做操作或终端还开着，先处理完再删。");
+            let text = tr("此工作区中有标签页正在执行操作或有运行中的终端，请处理完毕后再删除。");
             window.push_notification(Notification::warning(text), cx);
             return;
         }
@@ -987,9 +987,9 @@ impl Workspace {
             alert
                 .title(tf!("删除工作区「{name}」？", name))
                 .description(if tabs == 0 {
-                    tr("这个工作区里没有开着的标签页。").to_string()
+                    tr("此工作区中没有打开的标签页。").to_string()
                 } else {
-                    tf!("里面的 {tabs} 个标签页会关掉，仓库还在列表里。", tabs)
+                    tf!("其中的 {tabs} 个标签页将关闭，仓库仍保留在列表中。", tabs)
                 })
                 .on_ok(|_, _, _| false)
                 .footer(
@@ -1035,13 +1035,13 @@ impl Workspace {
             return;
         };
         if let Some(op) = tab.view.read(cx).busy() {
-            let text = tf!("这个仓库正在{op}，等它做完再移。", op);
+            let text = tf!("此仓库正在{op}，请等待完成后再移动。", op);
             window.push_notification(Notification::warning(text), cx);
             return;
         }
         // 移过去是在那边重新打开，终端带不过去
         if tab.view.read(cx).terminal_alive(cx) {
-            let text = tr("这个仓库的终端还开着，先结束终端再移。");
+            let text = tr("此仓库的终端仍在运行，请先结束终端再移动。");
             window.push_notification(Notification::warning(text), cx);
             return;
         }
@@ -1390,7 +1390,7 @@ fn workspace_menu(
             }),
         )
         .item(
-            PopupMenuItem::new(tr("给当前工作区改名…")).on_click(move |_, window, cx| {
+            PopupMenuItem::new(tr("重命名当前工作区…")).on_click(move |_, window, cx| {
                 rename
                     .update(cx, |this, cx| this.rename_workspace(window, cx))
                     .ok();
@@ -1453,7 +1453,7 @@ fn tab_menu(
             }),
         )
         .item(
-            PopupMenuItem::new(tr("重新打开刚关掉的（Ctrl+Shift+T）"))
+            PopupMenuItem::new(tr("重新打开已关闭的标签页（Ctrl+Shift+T）"))
                 .disabled(!can_reopen)
                 .on_click(move |_, window, cx| {
                     reopen
@@ -1471,7 +1471,7 @@ fn tab_menu(
         }
         let this = this.clone();
         menu = menu.item(
-            PopupMenuItem::new(tf!("移到工作区「{name}」", name = group.name)).on_click(
+            PopupMenuItem::new(tf!("移动到工作区「{name}」", name = group.name)).on_click(
                 move |_, window, cx| {
                     this.update(cx, |this, cx| this.move_tab(ix, to, window, cx))
                         .ok();
@@ -1490,7 +1490,7 @@ fn tab_menu(
     )
     .separator()
     .item(
-        PopupMenuItem::new(tr("改名…")).on_click(move |_, window, cx| {
+        PopupMenuItem::new(tr("重命名…")).on_click(move |_, window, cx| {
             rename
                 .update(cx, |this, cx| this.rename_repo(entry.clone(), window, cx))
                 .ok();
@@ -1605,7 +1605,7 @@ impl EventEmitter<Picked> for QuickOpen {}
 impl QuickOpen {
     fn new(app: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input =
-            cx.new(|cx| InputState::new(window, cx).placeholder(tr("仓库名或路径里的几个字")));
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("仓库名称或路径中的关键字")));
         let subscription = cx.subscribe(&input, |this: &mut Self, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 // 筛选的字变了：回到第一个
@@ -1633,7 +1633,7 @@ impl QuickOpen {
             .repos
             .iter()
             .filter(|entry| !closed.contains(entry))
-            .map(|entry| (entry.clone(), group.tabs.contains(entry).then(|| tr("开着"))));
+            .map(|entry| (entry.clone(), group.tabs.contains(entry).then(|| tr("已打开"))));
         let rest = app
             .settings
             .repos
@@ -1642,7 +1642,7 @@ impl QuickOpen {
             .map(|entry| (entry.clone(), None));
         closed
             .iter()
-            .map(|entry| (entry.clone(), Some(tr("刚关掉"))))
+            .map(|entry| (entry.clone(), Some(tr("最近关闭"))))
             .chain(members)
             .chain(rest)
             .map(|(entry, mark)| {

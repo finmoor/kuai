@@ -51,7 +51,7 @@ impl Pty {
             .write(true)
             .custom_flags(libc::O_NOCTTY)
             .open("/dev/ptmx")
-            .context("打不开 /dev/ptmx")?;
+            .context("无法打开 /dev/ptmx")?;
         let fd = master.as_raw_fd();
         let mut name = [0 as libc::c_char; 128];
         // SAFETY: fd 是刚打开的伪终端主端；name 的长度如实给了
@@ -61,12 +61,12 @@ impl Pty {
                 && libc::ptsname_r(fd, name.as_mut_ptr(), name.len()) == 0
         };
         if !ready {
-            return Err(std::io::Error::last_os_error()).context("伪终端用不了");
+            return Err(std::io::Error::last_os_error()).context("伪终端不可用");
         }
         // SAFETY: ptsname_r 成功后 name 里是以 0 结尾的字符串
         let slave_path = unsafe { CStr::from_ptr(name.as_ptr()) }
             .to_str()
-            .context("伪终端的名字不是 UTF-8")?
+            .context("伪终端名称不是 UTF-8")?
             .to_string();
         set_size(fd, spawn.size);
         let slave = OpenOptions::new()
@@ -74,7 +74,7 @@ impl Pty {
             .write(true)
             .custom_flags(libc::O_NOCTTY)
             .open(&slave_path)
-            .with_context(|| format!("打不开 {slave_path}"))?;
+            .with_context(|| format!("无法打开 {slave_path}"))?;
 
         let shell = login_shell();
         let name = shell.rsplit('/').next().unwrap_or("sh");
@@ -101,7 +101,7 @@ impl Pty {
         }
         let child = cmd
             .spawn()
-            .with_context(|| format!("启动不了 {shell}"))?;
+            .with_context(|| format!("无法启动 {shell}"))?;
         // 不留 Child：结束没结束自己按进程号查（升级换程序后也只剩进程号）
         Ok(Pty::new(master, child.id() as i32))
     }
@@ -110,7 +110,7 @@ impl Pty {
     pub fn adopt(fd: RawFd, pid: i32) -> Result<Pty> {
         // SAFETY: fcntl 只是查这个描述符在不在
         if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
-            return Err(std::io::Error::last_os_error()).context("带过来的伪终端不在了");
+            return Err(std::io::Error::last_os_error()).context("接管的伪终端已不存在");
         }
         set_cloexec(fd, true);
         // SAFETY: 这个描述符是上一个程序专门留给我们的，没有别人用

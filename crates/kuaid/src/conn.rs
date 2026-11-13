@@ -312,7 +312,7 @@ fn handle(
         }
         "term_open" => {
             let opened = serde_json::from_value::<TermOpen>(request.params)
-                .context("term_open 参数不对")
+                .context("term_open 参数无效")
                 .and_then(|params| {
                     let env = term_env(shared, conn);
                     shared.terms.open(&params, env, conn.id, id, &conn.out)
@@ -345,7 +345,7 @@ fn handle(
         }
         "file_put" => {
             let reply = serde_json::from_value::<FilePut>(request.params)
-                .context("file_put 参数不对")
+                .context("file_put 参数无效")
                 .and_then(|params| conn.uploads.lock().unwrap().put(params, &payload))
                 .and_then(|reply| Ok(serde_json::to_value(reply)?));
             conn.reply(id, reply);
@@ -354,7 +354,7 @@ fn handle(
             let exe = param("exe").and_then(Value::as_str).unwrap_or_default();
             let failed = match &shared.control {
                 Some(control) => control.upgrade(shared, exe),
-                None => anyhow::anyhow!("不是常驻进程，不能升级"),
+                None => anyhow::anyhow!("非常驻进程，无法升级"),
             };
             conn.reply(id, Err(failed));
         }
@@ -364,7 +364,7 @@ fn handle(
                 conn.out.drain(Duration::from_secs(2));
                 control.shutdown(shared);
             }
-            None => conn.reply(id, Err(anyhow::anyhow!("不是常驻进程"))),
+            None => conn.reply(id, Err(anyhow::anyhow!("非常驻进程"))),
         },
         _ => conn.reply(id, simple(shared, &request)),
     }
@@ -400,7 +400,7 @@ fn simple(shared: &Shared, request: &Request) -> Result<Value> {
 }
 
 fn term_params(request: &Request) -> Result<TermParams> {
-    serde_json::from_value(request.params.clone()).context("终端的参数不对")
+    serde_json::from_value(request.params.clone()).context("终端参数无效")
 }
 
 /// 终端里的 shell 多带的环境变量：这条连接转发了 ssh-agent 的话，给它一个不随连接变的地址。
@@ -418,7 +418,7 @@ fn term_env(shared: &Shared, conn: &Conn) -> Vec<(String, String)> {
 /// 启动 git，在单独的线程里收输出，处理请求的线程接着读下一个请求。
 fn start_git(conn: &Arc<Conn>, request: Request, payload: Vec<u8>) {
     let id = request.id;
-    let params: GitParams = match serde_json::from_value(request.params).context("git 参数不对")
+    let params: GitParams = match serde_json::from_value(request.params).context("git 参数无效")
     {
         Ok(params) => params,
         Err(err) => return conn.reply(id, Err(err)),

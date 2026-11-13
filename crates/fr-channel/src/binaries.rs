@@ -27,14 +27,14 @@ impl Binaries {
         for (arch, triple) in TARGETS {
             if let Some(path) = candidates(triple).into_iter().find(|p| p.is_file()) {
                 let bytes = std::fs::read(&path)
-                    .with_context(|| tf!("读不了 {path}", path = path.display()))?;
+                    .with_context(|| tf!("无法读取 {path}", path = path.display()))?;
                 build = fnv1a(build, &bytes);
                 found.push((*arch, path));
             }
         }
         if found.is_empty() {
             bail!(tr(
-                "找不到 Linux 版 kuaid 程序。开发时先运行 `cargo build-kuaid`；也可以用环境变量 FR_KUAID_DIR 指定目录"
+                "未找到 Linux 版 kuaid。开发环境请先运行 `cargo build-kuaid`，或通过环境变量 FR_KUAID_DIR 指定目录"
             ));
         }
         Ok(Binaries { found, build })
@@ -55,12 +55,12 @@ impl Binaries {
             bail!(
                 "{}",
                 tf!(
-                    "服务器的 CPU 架构是 {arch}，没有这个架构的 kuaid 程序",
+                    "服务器的 CPU 架构为 {arch}，暂无该架构的 kuaid",
                     arch
                 )
             );
         };
-        std::fs::read(path).with_context(|| tf!("读不了 {path}", path = path.display()))
+        std::fs::read(path).with_context(|| tf!("无法读取 {path}", path = path.display()))
     }
 }
 

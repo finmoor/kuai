@@ -411,7 +411,7 @@ impl RepoView {
                     tf!("分离的 HEAD（{head}）", head = &head[..head.len().min(8)]).into(),
                     false,
                 ),
-                (None, None) => (tr("还没有提交").into(), false),
+                (None, None) => (tr("暂无提交").into(), false),
             },
             None => ("…".into(), false),
         };
@@ -510,7 +510,7 @@ impl RepoView {
                         Button::new("cancel-op")
                             .xsmall()
                             .label(tr("取消"))
-                            .tooltip(tr("中止这次操作"))
+                            .tooltip(tr("中止此操作"))
                             .on_click(cx.listener(|this, _, _, cx| this.cancel_op(cx))),
                     )
                 })
@@ -534,7 +534,7 @@ impl RepoView {
                             "fetch",
                             IconName::ArrowDownToDot,
                             tr("获取"),
-                            tr("git fetch --all；右键有更多选项"),
+                            tr("git fetch --all；右键查看更多选项"),
                             running(tr("获取")) || self.auto_fetching(),
                             idle,
                             0,
@@ -553,7 +553,7 @@ impl RepoView {
                             "pull",
                             IconName::ArrowDownToLine,
                             tr("拉取"),
-                            tr("git pull；右键有更多选项"),
+                            tr("git pull；右键查看更多选项"),
                             running(tr("拉取")),
                             idle,
                             behind,
@@ -572,7 +572,7 @@ impl RepoView {
                             "push",
                             IconName::ArrowUpFromLine,
                             tr("推送"),
-                            tr("git push；右键有更多选项"),
+                            tr("git push；右键查看更多选项"),
                             running(tr("推送")),
                             idle,
                             ahead,
@@ -589,9 +589,9 @@ impl RepoView {
                     IconName::Archive,
                     tr("贮藏"),
                     if has_changes {
-                        tr("git stash push：把现在的改动收起来")
+                        tr("git stash push：贮藏当前改动")
                     } else {
-                        tr("没有可以贮藏的改动")
+                        tr("没有可贮藏的改动")
                     },
                     running(tr("贮藏")),
                     idle && has_changes,
@@ -605,7 +605,7 @@ impl RepoView {
                     "pop",
                     IconName::ArchiveRestore,
                     tr("弹出"),
-                    tr("git stash pop：恢复最近一次贮藏并删掉它"),
+                    tr("git stash pop：恢复最近一次贮藏并将其删除"),
                     running(tr("弹出贮藏")),
                     idle && has_stash,
                     0,
@@ -633,7 +633,7 @@ impl RepoView {
                     "refresh",
                     IconName::RotateCw,
                     tr("刷新"),
-                    tr("重读状态和提交历史（F5）"),
+                    tr("刷新状态和提交历史（F5）"),
                     self.refreshing && self.op.is_none(),
                     true,
                     0,
@@ -646,7 +646,7 @@ impl RepoView {
                     "activity",
                     IconName::Activity,
                     tr("活动"),
-                    tr("执行过的 git 命令和输出"),
+                    tr("已执行的 git 命令及输出"),
                     false,
                     true,
                     self.activity_running(),
@@ -680,14 +680,14 @@ impl RepoView {
                 // 服务器上的仓库：终端经 ssh 登录，VS Code 走 Remote-SSH
                 Some(server) => {
                     let dest2 = server.destination.clone();
-                    menu.item(PopupMenuItem::new(tr("在外部终端里打开（ssh）")).on_click(
+                    menu.item(PopupMenuItem::new(tr("在外部终端中打开（ssh）")).on_click(
                         move |_, window, cx| {
                             let result = crate::shell::open_terminal_ssh(&server, &a);
                             crate::shell::report(result, window, cx);
                         },
                     ))
                     .item(
-                        PopupMenuItem::new(tr("在 VS Code 里打开（Remote-SSH）")).on_click(
+                        PopupMenuItem::new(tr("在 VS Code 中打开（Remote-SSH）")).on_click(
                             move |_, window, cx| {
                                 let result = crate::shell::open_vscode_remote(&dest2, &b);
                                 crate::shell::report(result, window, cx);
@@ -697,18 +697,18 @@ impl RepoView {
                 }
                 None => menu
                     .item(
-                        PopupMenuItem::new(tr("在外部终端里打开")).on_click(
+                        PopupMenuItem::new(tr("在外部终端中打开")).on_click(
                             move |_, window, cx| {
                                 crate::shell::report(crate::shell::open_terminal(&a), window, cx)
                             },
                         ),
                     )
-                    .item(PopupMenuItem::new(tr("在 VS Code 里打开")).on_click(
+                    .item(PopupMenuItem::new(tr("在 VS Code 中打开")).on_click(
                         move |_, window, cx| {
                             crate::shell::report(crate::shell::open_vscode(&b), window, cx)
                         },
                     ))
-                    .item(PopupMenuItem::new(tr("在资源管理器里打开")).on_click(
+                    .item(PopupMenuItem::new(tr("在资源管理器中打开")).on_click(
                         move |_, window, cx| {
                             crate::shell::report(crate::shell::open_folder(&c), window, cx)
                         },
@@ -742,21 +742,21 @@ impl RepoView {
         };
         let text = if conflicts > 0 {
             tf!(
-                "{name}停在一半：还有 {conflicts} 个文件有冲突。在「本地修改」里解决后点「{go}」。",
+                "{name}已暂停：还有 {conflicts} 个文件存在冲突。请在「本地修改」中解决后点击「{go}」。",
                 name = state.name(),
                 conflicts,
                 go
             )
         } else if empty {
             tf!(
-                "{name}停在一半：这个提交没有带来改动（内容已经有了）。点「跳过这个提交」继续。",
+                "{name}已暂停：此提交没有产生改动（内容已存在）。请点击「跳过此提交」继续。",
                 name = state.name()
             )
         } else if state == InProgress::Merge {
-            tr("合并停在一半：冲突都解决了，点「提交合并」。说明没写就用默认的。").into()
+            tr("合并尚未完成：冲突已全部解决，请点击「提交合并」。未填写说明时将使用默认说明。").into()
         } else {
             tf!(
-                "{name}停在一半：冲突都解决了，点「继续」。",
+                "{name}已暂停：冲突已全部解决，请点击「继续」。",
                 name = state.name()
             )
         };
@@ -786,7 +786,7 @@ impl RepoView {
                 bar.child(
                     Button::new("op-skip")
                         .small()
-                        .label(tr("跳过这个提交"))
+                        .label(tr("跳过此提交"))
                         .disabled(!idle)
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.skip_in_progress(state, window, cx)

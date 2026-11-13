@@ -482,7 +482,7 @@ impl RepoView {
                     let (view, entry) = (view.clone(), entry.clone());
                     let path = entry.path.clone();
                     menu.item(
-                        gpui_kit::component::menu::PopupMenuItem::new(tr("改名…")).on_click(
+                        gpui_kit::component::menu::PopupMenuItem::new(tr("重命名…")).on_click(
                             move |_, _, cx| {
                                 view.update(cx, |_, cx| {
                                     cx.emit(super::RepoEvent::Rename(entry.clone()))
@@ -537,7 +537,7 @@ impl RepoView {
                 })
                 .child(ui::icon(icon).flex_none())
                 .child(label)
-                .tooltip(|window, cx| ui::tip(tr("Git、终端两页来回切（Ctrl+`）"), window, cx))
+                .tooltip(|window, cx| ui::tip(tr("在 Git 和终端页面之间切换（Ctrl+`）"), window, cx))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if this.page != page {
                         this.show_page(page, window, cx);
@@ -644,13 +644,13 @@ impl RepoView {
                     vec![
                         Button::new("branch-checkout")
                             .label(tr("切换"))
-                            .tooltip(tr("git checkout，双击这一行也可以"))
+                            .tooltip(tr("git checkout（也可双击此行）"))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.checkout_branch(&checkout, window, cx)
                             })),
                         Button::new("branch-delete")
                             .label(tr("删除…"))
-                            .tooltip(tr("git branch -d：删除这个本地分支"))
+                            .tooltip(tr("git branch -d：删除此本地分支"))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.delete_branch(delete.clone(), window, cx)
                             })),
@@ -670,19 +670,19 @@ impl RepoView {
                     vec![
                         Button::new("stash-apply")
                             .label(tr("应用"))
-                            .tooltip(tr("git stash apply：恢复改动，贮藏留着"))
+                            .tooltip(tr("git stash apply：恢复改动并保留贮藏"))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.stash_apply(apply.clone(), window, cx)
                             })),
                         Button::new("stash-pop")
                             .label(tr("弹出"))
-                            .tooltip(tr("git stash pop：恢复改动并删掉这个贮藏"))
+                            .tooltip(tr("git stash pop：恢复改动并删除此贮藏"))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.stash_pop(pop.clone(), window, cx)
                             })),
                         Button::new("stash-drop")
                             .label(tr("删除…"))
-                            .tooltip(tr("git stash drop：删掉这个贮藏，不恢复改动"))
+                            .tooltip(tr("git stash drop：删除此贮藏，不恢复改动"))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.stash_drop(drop.0.clone(), drop.1.clone(), window, cx)
                             })),
@@ -890,7 +890,7 @@ impl RepoView {
                                         .flex_none()
                                         .text_size(px(11.))
                                         .text_color(danger)
-                                        .child(tr("上游已删")),
+                                        .child(tr("上游已删除")),
                                 )
                             })
                             .when(!detail.is_empty(), |r| {

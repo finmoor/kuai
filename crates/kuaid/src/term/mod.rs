@@ -29,7 +29,7 @@ const KEEP_ENDED: Duration = Duration::from_secs(24 * 3600);
 /// 还原屏幕的那一段按这么大一块块发
 const DUMP_CHUNK: usize = 64 * 1024;
 /// 客户端收得太慢、输出积压太多时，断开它的时候说的话
-const LAGGING: &str = "终端的输出积压太多，已经断开；重新接上就能接着用";
+const LAGGING: &str = "终端输出积压过多，连接已断开；重新连接后可继续使用";
 
 /// 伪终端那一层。
 pub trait Backend: Send + Sync {
@@ -303,7 +303,7 @@ impl Registry {
     /// 这个系统上开不了终端（Windows 上的 kuaid 只拿来测协议）。
     #[cfg(any(test, not(unix)))]
     pub fn unsupported() -> Registry {
-        Registry::new(Box::new(|_| anyhow::bail!("这个系统上的 kuaid 不能开终端")))
+        Registry::new(Box::new(|_| anyhow::bail!("当前系统上的 kuaid 不支持终端")))
     }
 
     /// `term_open`：有同名的会话就接上，没有就开一个。
@@ -334,7 +334,7 @@ impl Registry {
             size,
             env,
         })
-        .with_context(|| format!("在 {} 里开不了终端", params.cwd))?;
+        .with_context(|| format!("无法在 {} 中打开终端", params.cwd))?;
         let session = Arc::new(Session {
             id: id.clone(),
             key: params.key.clone(),
@@ -366,7 +366,7 @@ impl Registry {
         request: u64,
         out: &Outbox,
     ) -> Result<()> {
-        let session = self.get(term).context("没有这个终端会话（可能已经结束了）")?;
+        let session = self.get(term).context("终端会话不存在（可能已结束）")?;
         session.attach(conn, request, out, size, false);
         Ok(())
     }

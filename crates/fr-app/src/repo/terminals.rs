@@ -334,7 +334,7 @@ impl RepoView {
                                 .py(px(4.))
                                 .text_xs()
                                 .text_color(muted)
-                                .child(tr("没有开着的终端")),
+                                .child(tr("没有打开的终端")),
                         )
                     }),
             )
@@ -375,7 +375,7 @@ impl RepoView {
                     .group_hover("terminal-row", |s| s.visible())
             })
             .child(ui::icon_small(IconName::X))
-            .tooltip(|window, cx| ui::tip(tr("结束这个终端"), window, cx))
+            .tooltip(|window, cx| ui::tip(tr("结束此终端"), window, cx))
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
                 this.end_terminal(index, window, cx);
@@ -424,14 +424,14 @@ impl RepoView {
             .context_menu(move |menu, _, _| {
                 let (attach, restart, end) = (view.clone(), view.clone(), view.clone());
                 menu.item(
-                    PopupMenuItem::new(tr("发图片、文件…")).on_click(move |_, window, cx| {
+                    PopupMenuItem::new(tr("发送图片或文件…")).on_click(move |_, window, cx| {
                         attach
                             .update(cx, |this, cx| this.attach_to_terminal(index, window, cx))
                             .ok();
                     }),
                 )
                 .item(
-                    PopupMenuItem::new(tr("重开")).on_click(move |_, window, cx| {
+                    PopupMenuItem::new(tr("重启")).on_click(move |_, window, cx| {
                         restart
                             .update(cx, |this, cx| this.restart_terminal(index, window, cx))
                             .ok();
@@ -479,11 +479,11 @@ impl RepoView {
         );
         let place: SharedString = match &self.entry.server {
             Some(_) => tf!(
-                "开在 {place} 上，关了 Kuai 也接着跑",
+                "运行在 {place} 上，关闭 Kuai 后仍会继续运行",
                 place = self.place(cx)
             )
             .into(),
-            None => tr("开在本机，在仓库目录里").into(),
+            None => tr("运行在本机的仓库目录中").into(),
         };
         let index = self.terminals.active;
         let title = self.active_terminal().map(|view| {
@@ -536,8 +536,8 @@ impl RepoView {
                     tool_button(
                         "terminal-attach",
                         IconName::Paperclip,
-                        tr("发文件"),
-                        tr("发图片、文件（也可以拖进来，或者复制后按 Ctrl+V）"),
+                        tr("发送文件"),
+                        tr("发送图片或文件（也可拖放到此处，或复制后按 Ctrl+V）"),
                         false,
                         true,
                         0,
@@ -551,8 +551,8 @@ impl RepoView {
                     tool_button(
                         "terminal-restart",
                         IconName::RotateCw,
-                        tr("重开"),
-                        tr("结束里面的程序，重新开一个"),
+                        tr("重启"),
+                        tr("结束当前程序并重新启动"),
                         false,
                         true,
                         0,
@@ -585,21 +585,21 @@ impl RepoView {
                 div()
                     .text_base()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(tr("这个仓库没有开着的终端")),
+                    .child(tr("此仓库没有打开的终端")),
             )
             .child(
                 Button::new("terminal-first")
                     .primary()
                     .small()
                     .icon(ui::icon(IconName::Plus))
-                    .label(tr("开一个终端"))
+                    .label(tr("打开终端"))
                     .on_click(cx.listener(|this, _, window, cx| this.new_terminal(window, cx))),
             )
             .child(
                 div()
                     .text_xs()
                     .text_color(muted)
-                    .child(tr("或者按 Ctrl+Shift+`")),
+                    .child(tr("或按 Ctrl+Shift+`")),
             )
             .into_any_element()
     }

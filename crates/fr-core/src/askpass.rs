@@ -105,7 +105,7 @@ fn answer_one(
     (&mut reader).take(MAX_PROMPT).read_line(&mut line)?;
     let ask: Ask = serde_json::from_str(&line)?;
     if ask.token != expected {
-        anyhow::bail!(tr("口令不对"));
+        anyhow::bail!(tr("口令错误"));
     }
     let answer = Answer {
         answer: on_prompt(&ask.prompt, ask.tag.as_deref()),
@@ -178,7 +178,7 @@ impl Listener {
     #[cfg(not(unix))]
     fn bind(_dir: &Path) -> Result<(Listener, String)> {
         let listener =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).context(tr("无法在本机开监听口"))?;
+            std::net::TcpListener::bind(("127.0.0.1", 0)).context(tr("无法在本机打开监听端口"))?;
         let addr = listener.local_addr()?.to_string();
         Ok((Listener::Tcp(listener), addr))
     }

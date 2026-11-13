@@ -123,8 +123,8 @@ pub fn spawn_env(
     let mut child = cmd
         .spawn()
         .with_context(|| tf!("无法启动 git {join}", join = args.join(" ")))?;
-    let stdout = child.stdout.take().context(tr("拿不到 git 的标准输出"))?;
-    let mut stderr = child.stderr.take().context(tr("拿不到 git 的标准错误"))?;
+    let stdout = child.stdout.take().context(tr("无法获取 git 的标准输出"))?;
+    let mut stderr = child.stderr.take().context(tr("无法获取 git 的标准错误"))?;
     let stdin_writer = match (stdin, child.stdin.take()) {
         (Some(data), Some(mut pipe)) => Some(std::thread::spawn(move || {
             // git 提前退出时这里会写失败，结果以退出码为准
@@ -186,7 +186,7 @@ impl Running {
             .lock()
             .map_err(|_| anyhow!(tr("git 进程状态损坏")))?
             .wait()
-            .context(tr("等待 git 结束失败"))?;
+            .context(tr("等待 git 退出失败"))?;
         Ok(Finished {
             code: status.code(),
             stderr: String::from_utf8_lossy(&stderr).trim_end().to_string(),

@@ -29,7 +29,7 @@ pub fn report(result: Result<(), String>, window: &mut Window, cx: &mut App) {
 fn spawn(mut cmd: Command, what: &str) -> Result<(), String> {
     cmd.spawn()
         .map(|_| ())
-        .map_err(|err| tf!("打不开{what}：{err}", what, err))
+        .map_err(|err| tf!("无法打开{what}：{err}", what, err))
 }
 
 fn windows_path(path: &str) -> String {
@@ -110,7 +110,7 @@ pub fn terminal_launch(
             .position(|shell| shell.id == preferred)
             .unwrap_or(0);
         if shells.is_empty() {
-            return Err(tr("找不到可以用的 shell（PowerShell、cmd）。").into());
+            return Err(tr("未找到可用的 shell（PowerShell、cmd）。").into());
         }
         let shell = shells.swap_remove(at);
         return Ok(Launch::Local(LocalLaunch {
@@ -122,7 +122,7 @@ pub fn terminal_launch(
         }));
     };
     if app.read(cx).server(server).is_none() {
-        return Err(tr("找不到这台服务器的设置").into());
+        return Err(tr("未找到该服务器的设置").into());
     }
     let connecting = app.update(cx, |app, cx| app.connect(server, cx));
     Ok(Launch::Remote(RemoteLaunch {
@@ -153,18 +153,18 @@ pub fn open_file(path: &str) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     let path = windows_path(path);
     if !Path::new(&path).is_file() {
-        return Err(tf!("文件不在了：{path}", path));
+        return Err(tf!("文件不存在：{path}", path));
     }
     let mut cmd = Command::new("cmd.exe");
     cmd.args(["/c", "start", "", &path])
         .creation_flags(NO_WINDOW);
-    spawn(cmd, tr("这个文件"))
+    spawn(cmd, tr("此文件"))
 }
 
 /// 在默认浏览器里打开网址（只开 https 的）。不经 cmd：网址里的 `&` 会被 cmd 当成命令分隔。
 pub fn open_url(url: &str) -> Result<(), String> {
     if !url.starts_with("https://") {
-        return Err(tf!("不打开这个网址：{url}", url));
+        return Err(tf!("不支持打开此网址：{url}", url));
     }
     let mut cmd = Command::new("rundll32.exe");
     cmd.args(["url.dll,FileProtocolHandler", url]);
@@ -188,7 +188,7 @@ pub fn open_terminal(dir: &str) -> Result<(), String> {
 pub fn open_terminal_ssh(server: &Server, dir: &str) -> Result<(), String> {
     if !in_path("ssh") {
         return Err(tr(
-            "PATH 里没有 ssh。在「设置 › 系统 › 可选功能」里装上「OpenSSH 客户端」再试。",
+            "PATH 中未找到 ssh。请在「设置 › 系统 › 可选功能」中安装「OpenSSH 客户端」后重试。",
         )
         .into());
     }
@@ -211,7 +211,7 @@ pub fn open_terminal_ssh(server: &Server, dir: &str) -> Result<(), String> {
 }
 
 fn no_code() -> &'static str {
-    tr("找不到 VS Code 的命令行（code）。安装 VS Code 时勾上「添加到 PATH」，然后重开本程序。")
+    tr("未找到 VS Code 命令行工具（code）。请在安装 VS Code 时勾选「添加到 PATH」，然后重启 Kuai。")
 }
 
 /// 用 VS Code 打开本机的目录或文件。`code` 是个 cmd 脚本，要经 cmd 启动。

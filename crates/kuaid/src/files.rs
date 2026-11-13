@@ -74,11 +74,11 @@ impl Uploads {
         let upload = self
             .open
             .get_mut(&id)
-            .context("这次上传已经不在了（连接断过，或者已经传完）")?;
+            .context("上传会话不存在（连接曾断开，或已上传完成）")?;
         if let Err(err) = upload.file.write_all(bytes) {
             // 多半是盘满了：已经收到的不留
             self.open.remove(&id);
-            return Err(err).context("文件写不下去");
+            return Err(err).context("写入文件失败");
         }
         upload.received += bytes.len() as u64;
         let received = upload.received;
@@ -117,7 +117,7 @@ impl Uploads {
         }
         let file = options
             .open(&part)
-            .with_context(|| format!("建不了 {}", part.display()))?;
+            .with_context(|| format!("无法创建 {}", part.display()))?;
         self.open.insert(
             id.clone(),
             Upload {
@@ -134,7 +134,7 @@ impl Uploads {
 impl Upload {
     /// 传完了：给它起正式的名字，返回完整路径。重名的在后面加 -2、-3……
     fn finish(self, dir: &Path) -> Result<String> {
-        self.file.sync_all().context("文件写不下去")?;
+        self.file.sync_all().context("写入文件失败")?;
         let (stem, ext) = match self.name.rfind('.') {
             Some(dot) if dot > 0 => self.name.split_at(dot),
             _ => (self.name.as_str(), ""),
@@ -150,16 +150,16 @@ impl Upload {
                 Ok(()) => return Ok(path.to_string_lossy().into_owned()),
                 Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
                 Err(err) => {
-                    return Err(err).with_context(|| format!("放不到 {}", path.display()));
+                    return Err(err).with_context(|| format!("无法保存到 {}", path.display()));
                 }
             }
         }
-        bail!("叫 {} 的文件太多了", self.name)
+        bail!("名为 {} 的文件过多", self.name)
     }
 }
 
 fn create_private_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("建不了 {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("无法创建 {}", dir.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;

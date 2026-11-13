@@ -376,7 +376,7 @@ fn 拉起常驻进程_终端在客户端走了以后还在() {
     // 状态命令看得到它
     let (ok, status) = home.run(&exe, "--status");
     assert!(ok, "{status}");
-    assert!(status.contains(&again.term) && status.contains("在跑"), "{status}");
+    assert!(status.contains(&again.term) && status.contains("运行中"), "{status}");
 
     // 这条连接没带 ssh-agent 转发：它新开的终端里没有，常驻进程没记着拉起它的那条连接的
     let (plain_stream, plain) = second.open("plain", &home.dir);

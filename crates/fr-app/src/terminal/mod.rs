@@ -584,14 +584,14 @@ impl TerminalView {
         let launch = match (self.launcher)(cx) {
             Ok(launch) => launch,
             Err(err) => {
-                self.error = Some(tf!("终端启动不了：{err}", err).into());
+                self.error = Some(tf!("终端启动失败：{err}", err).into());
                 return;
             }
         };
         match launch {
             Launch::Local(launch) => match Session::spawn(launch, grid, cell, cx) {
                 Ok(session) => self.session = Some(session),
-                Err(err) => self.error = Some(tf!("终端启动不了：{err}", err).into()),
+                Err(err) => self.error = Some(tf!("终端启动失败：{err}", err).into()),
             },
             // 服务器上的：先等连接（多半已经连着，马上就好）
             Launch::Remote(launch) => {
@@ -608,7 +608,7 @@ impl TerminalView {
                                 this.session = Some(session);
                             }
                             Err(err) => {
-                                this.error = Some(tf!("连不上服务器：{err}", err).into());
+                                this.error = Some(tf!("无法连接服务器：{err}", err).into());
                             }
                         }
                         cx.notify();
@@ -803,9 +803,9 @@ impl TerminalView {
         }
         self.flash = None;
         let refuse = if !self.is_alive() {
-            Some(tr("终端没在跑，发不了。"))
+            Some(tr("终端未运行，无法发送。"))
         } else if self.sending.is_some() {
-            Some(tr("上一批还没发完。"))
+            Some(tr("上一批文件尚未发送完成。"))
         } else {
             None
         };
@@ -843,7 +843,7 @@ impl TerminalView {
                         let name = item.name();
                         let source = match item {
                             Attachment::File(path) if path.is_dir() => {
-                                failed = Some(tf!("文件夹发不了，先打成压缩包：{name}", name).into());
+                                failed = Some(tf!("无法发送文件夹，请先压缩：{name}", name).into());
                                 break;
                             }
                             Attachment::File(path) => UploadSource::File(path),
@@ -878,7 +878,7 @@ impl TerminalView {
                                 Ok(UploadItem::Done(remote)) => path = Some(remote),
                                 Err(err) => {
                                     let err = format!("{err:#}");
-                                    failed = Some(tf!("{name} 没传上去：{err}", name, err).into());
+                                    failed = Some(tf!("{name} 上传失败：{err}", name, err).into());
                                 }
                             }
                         }
@@ -886,7 +886,7 @@ impl TerminalView {
                             Some(path) => paths.push(path),
                             None => {
                                 failed.get_or_insert_with(|| {
-                                    tf!("{name} 没传上去：和服务器的连接断了", name).into()
+                                    tf!("{name} 上传失败：与服务器的连接已断开", name).into()
                                 });
                                 break;
                             }
@@ -944,7 +944,7 @@ impl TerminalView {
         }
         // 正在传文件时 Esc 是不传了（不交给程序）
         if key == "escape" && self.sending.take().is_some() {
-            self.flash = Some(tr("不传了。").into());
+            self.flash = Some(tr("已取消上传。").into());
             cx.stop_propagation();
             cx.notify();
             return;
@@ -1101,13 +1101,13 @@ impl TerminalView {
     /// 进程没在跑（或者够不着）时，盖在画面底下的一句话。
     fn notice(&self) -> Option<SharedString> {
         if let Some(error) = &self.error {
-            return Some(tf!("{error} 按回车重试。", error).into());
+            return Some(tf!("{error} 按 Enter 重试。", error).into());
         }
         if self.connecting.is_some() {
             return Some(tr("正在连接服务器…").into());
         }
         if self.lost && self.exited.is_none() {
-            return Some(tr("和服务器断开了，里面的程序还在跑。按回车重新接上。").into());
+            return Some(tr("与服务器的连接已断开，终端中的程序仍在运行。按 Enter 重新连接。").into());
         }
         match self.exited {
             Some(Some(0) | None) => return Some(tr("进程已结束。按回车重新启动。").into()),
@@ -1140,9 +1140,9 @@ impl Sending {
         };
         if self.count > 1 {
             let (index, count) = (self.index + 1, self.count);
-            tf!("正在传第 {index}/{count} 个 {name}{progress}。按 Esc 不传了。", index, count, name, progress).into()
+            tf!("正在上传第 {index}/{count} 个文件 {name}{progress}。按 Esc 取消。", index, count, name, progress).into()
         } else {
-            tf!("正在传 {name}{progress}。按 Esc 不传了。", name, progress).into()
+            tf!("正在上传 {name}{progress}。按 Esc 取消。", name, progress).into()
         }
     }
 }

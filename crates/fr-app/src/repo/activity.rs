@@ -193,7 +193,7 @@ impl Render for ActivityPanel {
                     .py_6()
                     .text_sm()
                     .text_color(muted)
-                    .child(tr("还没有记录。提交、切换分支、获取、推送之后会列在这里。")),
+                    .child(tr("暂无记录。提交、切换分支、获取、推送等操作将记录在此处。")),
             );
         }
         let rows: Vec<AnyElement> = entries
@@ -302,7 +302,7 @@ impl Render for ActivityPanel {
                                 .overflow_y_scroll()
                                 .text_color(muted)
                                 .child(if entry.output.is_empty() {
-                                    SharedString::from(tr("（没有输出）"))
+                                    SharedString::from(tr("（无输出）"))
                                 } else {
                                     entry.output.clone()
                                 }),
@@ -345,7 +345,7 @@ impl Render for ActivityPanel {
                             .text_xs()
                             .text_color(muted)
                             .child(tr(
-                                "点一行看 git 的输出。只记改东西和联网的命令，关掉标签页就清空。",
+                                "点击一行查看 git 输出。仅记录会修改仓库或访问网络的命令，关闭标签页后清空。",
                             )),
                     )
                     .child(

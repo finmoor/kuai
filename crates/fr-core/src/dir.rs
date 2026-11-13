@@ -24,9 +24,9 @@ pub fn list_dir(path: &str) -> Result<DirListing> {
             None => p.to_string(),
         },
     };
-    let dir = std::fs::canonicalize(&path).with_context(|| tf!("打不开 {path}", path))?;
+    let dir = std::fs::canonicalize(&path).with_context(|| tf!("无法打开 {path}", path))?;
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(&dir).with_context(|| tf!("读不了 {dir}", dir = show(&dir)))?
+    for entry in std::fs::read_dir(&dir).with_context(|| tf!("无法读取 {dir}", dir = show(&dir)))?
     {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();

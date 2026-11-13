@@ -1,21 +1,21 @@
 # Kuai（筷子）
 
-Windows 上界面和操作习惯接近 Fork 的 Git 客户端，最终目标是彻底替代 Fork（本机仓库也管）。
+Windows 上的 Git 客户端，界面和操作方式接近 Fork，目标是完全替代 Fork（本机仓库和服务器上的仓库都能管理）。
 
-和 Fork 的区别有两处。一是能打开服务器上的仓库：「添加服务器」时在服务器上装一个类似 VS Code Server 的常驻程序 `kuaid`，经 SSH 的 stdin/stdout 通信；不要 root、不开网络端口、服务器不用联网。服务器上仓库的 git 命令都在服务器上执行，Windows 这边只收结果。二是在同一个程序里用终端写代码（1.5 起的方向）：每个仓库分 Git、终端两页（1.7 起），终端页里跑 Claude Code、Codex 这类工具，切到 Git 页看它改了什么、按行挑着收；服务器上的终端开在 `kuaid` 里，关了 Kuai、断了线它都接着跑。
+与 Fork 相比有两点不同。一是可以打开服务器上的仓库：添加服务器时，会在服务器上安装类似 VS Code Server 的常驻程序 `kuaid`，通过 SSH 的 stdin/stdout 通信；不需要 root 权限，不开放网络端口，服务器也无需联网。服务器上仓库的 git 命令都在服务器上执行，Windows 端只接收结果。二是可以在同一个程序中用终端编程（1.5 起）：每个仓库分为 Git 和终端两页（1.7 起），在终端页中运行 Claude Code、Codex 等工具，再切换到 Git 页查看改动、按行暂存；服务器上的终端运行在 `kuaid` 中，关闭 Kuai 或断线后仍会继续运行。
 
 > 名字 2026-11-11 定的：不用叉子（Fork）改用筷子，「筷」也谐音「快」。在这之前暂时叫 fork-remote，仓库目录、crate 前缀 `fr-`、环境变量 `FR_*` 还是那时候的，当内部代号留着。
 
 ## 下载
 
-到 [GitHub Releases](https://github.com/finmoor/kuai/releases) 下载，两种任选：
+从 [GitHub Releases](https://github.com/finmoor/kuai/releases) 下载，以下两种任选其一：
 
-- **安装版** `kuai-<版本>-windows-x64-setup.exe`（推荐）：装在自己的用户目录下（`%LOCALAPPDATA%\Programs\Kuai`），不要管理员权限；开始菜单里有，「设置 → 应用」里能卸载。
-- **解压版** `kuai-<版本>-windows-x64.zip`：解压出来的 Kuai 文件夹放哪都行，双击 `kuai.exe`。
+- **安装版** `kuai-<版本>-windows-x64-setup.exe`（推荐）：安装在用户目录下（`%LOCALAPPDATA%\Programs\Kuai`），无需管理员权限；可从开始菜单启动，可在「设置 → 应用」中卸载。
+- **解压版** `kuai-<版本>-windows-x64.zip`：解压得到的 Kuai 文件夹可放在任意位置，双击 `kuai.exe` 运行。
 
-要 64 位的 Windows 10 或 11，PATH 里有 git，用 Windows 自带的 OpenSSH；服务器那边是 Linux（x86_64），不要 root。程序没有代码签名，第一次运行时 Windows 可能提示「已保护你的电脑」，点「更多信息」再点「仍要运行」。
+运行要求：64 位 Windows 10 或 11，PATH 中有 git，使用 Windows 自带的 OpenSSH；服务器为 Linux（x86_64），无需 root 权限。程序未进行代码签名，首次运行时 Windows 可能提示「Windows 已保护你的电脑」，请点击「更多信息」，再点击「仍要运行」。
 
-以后有新版本时，标题栏齿轮左边会出现「可以升级」，点开看说明、点一下就升（安装版在后台跑新的安装程序，解压版原地换文件）；「设置 → 关于」里也能检查。服务器上的 kuaid 不用管，新版连上时它自己跟着换。
+有新版本时，标题栏齿轮左侧会显示更新提示，点击可查看更新内容并一键更新（安装版在后台运行新的安装程序，解压版直接替换文件）；也可在「设置 → 关于」中检查更新。服务器上的 kuaid 无需单独更新，新版 Kuai 连接时会自动替换。
 
 ## 技术栈
 
@@ -45,29 +45,29 @@ Windows 上界面和操作习惯接近 Fork 的 Git 客户端，最终目标是�
 
 | 按键 | 作用 |
 |---|---|
-| F5 | 重读当前仓库的状态和提交历史 |
-| Ctrl+Enter | 提交（焦点在提交说明框、文件列表、改动内容里都行） |
-| Ctrl+1、Ctrl+2 | 切到 Git 页的本地修改、所有提交，键盘焦点跟过去 |
+| F5 | 刷新当前仓库的状态和提交历史 |
+| Ctrl+Enter | 提交（焦点位于提交说明框、文件列表或改动内容中时均可） |
+| Ctrl+1、Ctrl+2 | 切换到 Git 页的本地修改、所有提交，并将键盘焦点移到该处 |
 | Ctrl+F | 搜索提交 |
-| Ctrl+P | 快速打开仓库（上下键选，回车打开） |
-| Ctrl+, | 打开、关掉设置页 |
-| Ctrl+W | 关掉当前标签页（有操作在做会先拦一下） |
-| Ctrl+Tab、Ctrl+Shift+Tab | 下一个、上一个标签页 |
-| Ctrl+Shift+T | 重新打开刚关掉的标签页 |
-| Ctrl+` | 当前仓库在 Git、终端两页之间切换 |
-| Ctrl+Shift+` | 当前仓库再开一个终端，切到终端页 |
+| Ctrl+P | 快速打开仓库（上下方向键选择，Enter 打开） |
+| Ctrl+, | 打开或关闭设置页 |
+| Ctrl+W | 关闭当前标签页（有操作正在执行时会先提示） |
+| Ctrl+Tab、Ctrl+Shift+Tab | 切换到下一个、上一个标签页 |
+| Ctrl+Shift+T | 重新打开最近关闭的标签页 |
+| Ctrl+` | 在当前仓库的 Git 页和终端页之间切换 |
+| Ctrl+Shift+` | 为当前仓库新建终端，并切换到终端页 |
 
-列表里的按键（先点一下列表或者用 Ctrl+1、Ctrl+2 把焦点放过去）：
+列表中的按键（先点击列表，或用 Ctrl+1、Ctrl+2 将焦点移到列表）：
 
-| 在哪 | 按键 |
+| 位置 | 按键 |
 |---|---|
-| 本地修改的文件列表 | 上下键换文件，Shift+上下连选，Ctrl+A 全选这一栏；空格或回车暂存、取消暂存；Delete 丢弃（会先问）；右键头进到改动内容里。鼠标 Ctrl、Shift 加点击也能多选 |
-| 改动内容 | 上下键在改动行之间走，Shift+上下连选；空格或回车暂存、取消暂存选中的行；Delete 丢弃选中的行（会先问）；左键头回文件列表。并排着看时改成在行号上按住拖动选行，空格、Delete 一样 |
+| 本地修改的文件列表 | 上下方向键切换文件，Shift+上下方向键连续选择，Ctrl+A 全选该栏；空格键或 Enter 暂存、取消暂存；Delete 丢弃（会先确认）；右方向键进入改动内容。按住 Ctrl 或 Shift 点击也可多选 |
+| 改动内容 | 上下方向键在改动行之间移动，Shift+上下方向键连续选择；空格键或 Enter 暂存、取消暂存所选行；Delete 丢弃所选行（会先确认）；左方向键返回文件列表。并排显示时改为在行号上拖动以选择行，空格键和 Delete 的作用不变 |
 | 提交列表 | 上下键、PageUp、PageDown、Home、End |
-| 侧栏 | 上下键换选中的项，回车等于双击（切换分支）；选中文件夹时左键头收起、右键头展开 |
-| 逐行追溯 | 上下键、PageUp、PageDown、Home、End 选行，回车跳到改这一行的提交，Esc 关闭 |
+| 侧栏 | 上下方向键切换选中项，Enter 相当于双击（切换分支）；选中文件夹时左方向键折叠、右方向键展开 |
+| 逐行追溯 | 上下方向键、PageUp、PageDown、Home、End 选择行，Enter 跳转到修改该行的提交，Esc 关闭 |
 
-焦点在终端里时，F5、Ctrl+W、Ctrl+F、Ctrl+P 交给终端里的程序（shell 里它们是删一个词、往前搜、上一条命令），其余的照常。终端里：Ctrl+C 中断（选着字时是复制），Ctrl+Shift+C 复制，Ctrl+V、Shift+Insert 粘贴（剪贴板里是图片、文件时贴进去的是它们的路径），右键是「选着字就复制、没选就粘贴」，Shift+PageUp、PageDown 和滚轮翻前面的输出。
+焦点位于终端中时，F5、Ctrl+W、Ctrl+F、Ctrl+P 交由终端中的程序处理（在 shell 中分别用于删除一个词、向前搜索、调出上一条命令），其他快捷键不变。终端中：Ctrl+C 中断（选中文字时为复制），Ctrl+Shift+C 复制，Ctrl+V、Shift+Insert 粘贴（剪贴板中为图片或文件时，粘贴的是其路径）；右键在有选中文字时复制，否则粘贴；Shift+PageUp、Shift+PageDown 和鼠标滚轮可查看之前的输出。
 
 ## 构建与运行
 
@@ -102,7 +102,7 @@ cargo test --no-run --release -p kuaid --target x86_64-unknown-linux-musl
 pwsh tools/package.ps1
 ```
 
-发版：改 `Cargo.toml` 的版本号，在 `CHANGELOG.md` 加上这个版本的一节（每条一句话，Kuai 的升级小窗里会列出来），提交后打标签 `v<版本>` 推上去，`release.yml` 测试、打包、建 GitHub Release。Kuai 检查更新时只认 `kuai-*-windows-x64-setup.exe`（安装版用）和 `kuai-*-windows-x64.zip`（解压版用）这两个附件。
+发版：改 `Cargo.toml` 的版本号，在 `CHANGELOG.md` 加上这个版本的一节（每条一句话，会显示在 Kuai 的更新提示中），提交后打标签 `v<版本>` 推上去，`release.yml` 测试、打包、建 GitHub Release。Kuai 检查更新时只认 `kuai-*-windows-x64-setup.exe`（安装版用）和 `kuai-*-windows-x64.zip`（解压版用）这两个附件。
 
 设置存在 `%APPDATA%\kuai\settings.json`；环境变量 `FR_SETTINGS` 可以换成别的文件，测试时不碰自己的设置（开机自启写的是注册表，测试时用 `FR_AUTOSTART_KEY` 换一个键）。
 

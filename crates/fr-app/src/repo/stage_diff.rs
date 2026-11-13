@@ -119,14 +119,14 @@ impl StageDiff {
             }
         }
         let notice: Option<SharedString> = if file.is_combined() {
-            Some(tr("有冲突：点「解决冲突…」逐处选；在别处改好的，点「标记为已解决」").into())
+            Some(tr("存在冲突：点击「解决冲突…」逐处选择；如已在其他位置解决，请点击「标记为已解决」").into())
         } else if file.is_binary() {
-            Some(tr("二进制文件，只能整个文件操作").into())
+            Some(tr("二进制文件，只能对整个文件操作").into())
         } else if file.hunks.is_empty() {
             Some(if out.is_empty() {
                 tr("没有内容改动").into()
             } else {
-                tr("没有文本改动（比如只改了权限），只能整个文件操作").into()
+                tr("没有文本改动（例如仅修改了权限），只能对整个文件操作").into()
             })
         } else {
             None

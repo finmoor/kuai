@@ -116,7 +116,7 @@ impl RepoView {
                     Ok(Ok(text)) => text,
                     Ok(Err(_)) => {
                         view.error = Some(
-                            tr("这个文件不是 UTF-8 编码，这里改不了。在外部编辑器里解决后，回「本地修改」点「标记为已解决」。")
+                            tr("此文件不是 UTF-8 编码，无法在此编辑。请在外部编辑器中解决后，回到「本地修改」点击「标记为已解决」。")
                                 .into(),
                         );
                         cx.notify();
@@ -243,12 +243,12 @@ impl RepoView {
                     view.manual = false;
                 }
                 Ok(_) => {
-                    let note = tr("已经没有冲突标记了。改好就点「保存并标记为已解决」。");
+                    let note = tr("已无冲突标记。确认无误后，请点击「保存并标记为已解决」。");
                     window.push_notification(Notification::info(note), cx);
                 }
                 Err(_) => {
                     let note =
-                        tr("冲突标记不完整（<<<<<<<、=======、>>>>>>> 要成套）。补全或者删掉。");
+                        tr("冲突标记不完整（<<<<<<<、=======、>>>>>>> 须成组出现）。请补全或删除。");
                     window.push_notification(Notification::warning(note), cx);
                 }
             }
@@ -273,7 +273,7 @@ impl RepoView {
             Some(0) => {}
             Some(left) => {
                 let note = tf!(
-                    "还有 {left} 处冲突没解决：每处选一边，或在「手动编辑」里改好再保存。",
+                    "还有 {left} 处冲突未解决：请逐处选择版本，或在「手动编辑」中修改后保存。",
                     left
                 );
                 window.push_notification(Notification::warning(note), cx);
@@ -281,7 +281,7 @@ impl RepoView {
             }
             None => {
                 let note = tr(
-                    "还有不完整的冲突标记（<<<<<<<、=======、>>>>>>>）。在「手动编辑」里删干净再保存。",
+                    "仍有不完整的冲突标记（<<<<<<<、=======、>>>>>>>）。请在「手动编辑」中删除后再保存。",
                 );
                 window.push_notification(Notification::warning(note), cx);
                 return;
@@ -346,10 +346,10 @@ impl RepoView {
         let status: SharedString = if view.loading {
             tr("正在读取文件…").into()
         } else if manual {
-            tr("手动编辑：直接改文件的内容，冲突标记（<<<<<<<、=======、>>>>>>>）要删干净。").into()
+            tr("手动编辑：直接修改文件内容，并删除所有冲突标记（<<<<<<<、=======、>>>>>>>）。").into()
         } else {
             tf!(
-                "{total} 处冲突，已选 {picked} 处。用每处右上角的按钮选一边，或两边都留。",
+                "共 {total} 处冲突，已选择 {picked} 处。请使用每处右上角的按钮选择一方，或保留双方。",
                 total,
                 picked
             )
@@ -422,7 +422,7 @@ impl RepoView {
                             .small()
                             .ghost()
                             .label(tr("关闭"))
-                            .tooltip(tr("不保存，回到本地修改"))
+                            .tooltip(tr("不保存并返回「本地修改」"))
                             .on_click(cx.listener(|this, _, _, cx| this.close_merge_editor(cx))),
                     ),
             )
@@ -448,7 +448,7 @@ impl RepoView {
                         bar.child(
                             Button::new("merge-all-ours")
                                 .xsmall()
-                                .label(tf!("全部用{ours}", ours))
+                                .label(tf!("全部采用{ours}", ours))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.merge_pick_all(DiffConflictResolution::Current, cx)
                                 })),
@@ -456,7 +456,7 @@ impl RepoView {
                         .child(
                             Button::new("merge-all-theirs")
                                 .xsmall()
-                                .label(tf!("全部用{theirs}", theirs))
+                                .label(tf!("全部采用{theirs}", theirs))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.merge_pick_all(DiffConflictResolution::Incoming, cx)
                                 })),

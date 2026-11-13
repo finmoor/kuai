@@ -44,7 +44,7 @@ pub struct Paths {
 
 impl Paths {
     pub fn new() -> Result<Paths> {
-        let home = std::env::var_os("HOME").context("没有 HOME 环境变量")?;
+        let home = std::env::var_os("HOME").context("未设置 HOME 环境变量")?;
         Ok(Paths {
             run: PathBuf::from(home).join(".kuai").join("run"),
         })
@@ -56,7 +56,7 @@ impl Paths {
             .recursive(true)
             .mode(0o700)
             .create(&self.run)
-            .with_context(|| format!("建不了 {}", self.run.display()))?;
+            .with_context(|| format!("无法创建 {}", self.run.display()))?;
         // 已经有的话把权限收紧（目录可能是别的版本建的）
         let _ = std::fs::set_permissions(&self.run, std::fs::Permissions::from_mode(0o700));
         Ok(())
@@ -166,7 +166,7 @@ impl Control for Daemon {
         if self.upgrading.swap(true, Ordering::AcqRel) {
             return anyhow!("正在升级");
         }
-        log(&format!("升级：换成 {}", exe.display()));
+        log(&format!("升级：替换为 {}", exe.display()));
         shared.kill_git();
         // 从这里起不再读终端的输出：程序写的东西留在伪终端里，新程序接着读
         let gate = pty::freeze();
@@ -188,7 +188,7 @@ impl Control for Daemon {
                 for fd in &kept {
                     pty::set_cloexec(*fd, true);
                 }
-                anyhow!(err).context(format!("启动不了 {}", exe.display()))
+                anyhow!(err).context(format!("无法启动 {}", exe.display()))
             }
             Err(err) => err,
         };
@@ -200,7 +200,7 @@ impl Control for Daemon {
     }
 
     fn shutdown(&self, shared: &Shared) -> ! {
-        log("收到退出的请求");
+        log("收到退出请求");
         shared.terms.close_all();
         // 等终端里的程序收到挂断退出
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -256,7 +256,7 @@ pub fn run(resume: Option<&str>) -> Result<()> {
     let build = crate::build();
     let _ = std::fs::write(paths.current(), &build);
     log(&format!(
-        "{}：kuaid {} {build}，进程号 {}，带过来 {adopted} 个终端",
+        "{}：kuaid {} {build}，进程号 {}，接管 {adopted} 个终端",
         if resume.is_some() { "升级完成" } else { "启动" },
         crate::VERSION,
         std::process::id(),
@@ -287,7 +287,7 @@ pub fn run(resume: Option<&str>) -> Result<()> {
                 for_idle.terms.sweep();
                 if for_idle.idle_for() >= IDLE {
                     idle_paths.clear();
-                    log("闲了很久，退出");
+                    log("空闲超时，退出");
                     std::process::exit(0);
                 }
             }
@@ -299,7 +299,7 @@ pub fn run(resume: Option<&str>) -> Result<()> {
         let stream = match stream {
             Ok(stream) => stream,
             Err(err) => {
-                log(&format!("接不了新连接：{err}"));
+                log(&format!("无法接受新连接：{err}"));
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
@@ -309,10 +309,10 @@ pub fn run(resume: Option<&str>) -> Result<()> {
             .name("kuaid-conn".into())
             .spawn(move || match stream.try_clone() {
                 Ok(reader) => conn::serve(&shared, reader, stream),
-                Err(err) => log(&format!("新连接用不了：{err}")),
+                Err(err) => log(&format!("新连接不可用：{err}")),
             });
         if let Err(err) = spawned {
-            log(&format!("开不了线程：{err}"));
+            log(&format!("无法创建线程：{err}"));
         }
     }
     Ok(())
@@ -326,7 +326,7 @@ fn start_fresh(paths: &Paths) -> Result<Option<(UnixListener, File)>> {
         .write(true)
         .mode(0o600)
         .open(paths.lock())
-        .with_context(|| format!("打不开 {}", paths.lock().display()))?;
+        .with_context(|| format!("无法打开 {}", paths.lock().display()))?;
     // SAFETY: lock 是刚打开的文件
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Ok(None);
@@ -335,7 +335,7 @@ fn start_fresh(paths: &Paths) -> Result<Option<(UnixListener, File)>> {
     let socket = paths.socket();
     let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)
-        .with_context(|| format!("建不了 {}", socket.display()))?;
+        .with_context(|| format!("无法创建 {}", socket.display()))?;
     let _ = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600));
     Ok(Some((listener, lock)))
 }
@@ -376,7 +376,7 @@ fn write_handoff(
         .write(true)
         .mode(0o600)
         .open(path)
-        .with_context(|| format!("写不了 {}", path.display()))?;
+        .with_context(|| format!("无法写入 {}", path.display()))?;
     serde_json::to_writer(&mut file, &handoff)?;
     file.write_all(b"\n")?;
     for f in frozen {
@@ -388,12 +388,12 @@ fn write_handoff(
 
 /// 读交接文件，把上一个程序留下的监听套接字、文件锁、终端会话接过来。返回接过来几个终端。
 fn resume_from(path: &Path, terms: &Registry) -> Result<(UnixListener, File, usize)> {
-    let file = File::open(path).with_context(|| format!("读不了 {}", path.display()))?;
+    let file = File::open(path).with_context(|| format!("无法读取 {}", path.display()))?;
     let _ = std::fs::remove_file(path);
     let mut reader = BufReader::new(file);
     let mut line = String::new();
     reader.read_line(&mut line)?;
-    let handoff: Handoff = serde_json::from_str(&line).context("交接文件的格式不对")?;
+    let handoff: Handoff = serde_json::from_str(&line).context("交接文件格式错误")?;
     if handoff.format == 0 || handoff.listener < 0 || handoff.lock < 0 {
         bail!("交接文件不完整");
     }
@@ -413,7 +413,7 @@ fn resume_from(path: &Path, terms: &Registry) -> Result<(UnixListener, File, usi
         let mut dump = vec![0u8; session.dump as usize];
         reader
             .read_exact(&mut dump)
-            .context("交接文件里屏幕的内容不全")?;
+            .context("交接文件中的屏幕内容不完整")?;
         let exit = session.exited.then_some(session.exit);
         let backend: Box<dyn Backend> = if exit.is_some() {
             Box::new(Ended)
@@ -421,7 +421,7 @@ fn resume_from(path: &Path, terms: &Registry) -> Result<(UnixListener, File, usi
             match Pty::adopt(session.fd, session.pid) {
                 Ok(pty) => Box::new(pty),
                 Err(err) => {
-                    log(&format!("终端 {} 接不过来：{err:#}", session.id));
+                    log(&format!("无法接管终端 {}：{err:#}", session.id));
                     continue;
                 }
             }

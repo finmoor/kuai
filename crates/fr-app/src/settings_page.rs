@@ -64,7 +64,7 @@ impl SettingsPage {
                     },
                 ),
             )
-            .description(tr("马上生效；已弹出的通知不变。"))
+            .description(tr("立即生效，已显示的通知不受影响。"))
         };
         let autostart = SettingItem::new(
             tr("开机时自动启动"),
@@ -78,11 +78,11 @@ impl SettingsPage {
                 },
             ),
         )
-        .description(tr("登录 Windows 后自动启动；开了托盘选项时直接进托盘。"));
+        .description(tr("登录 Windows 后自动启动；如已开启托盘选项，将直接最小化到托盘。"));
         let minimize = {
             let (get, set) = (app.clone(), app.clone());
             SettingItem::new(
-                tr("最小化时收到托盘"),
+                tr("最小化到托盘"),
                 SettingField::switch(
                     move |cx| get.read(cx).settings.minimize_to_tray,
                     move |on, cx| {
@@ -92,12 +92,12 @@ impl SettingsPage {
                     },
                 ),
             )
-            .description(tr("最小化后任务栏不留按钮，点托盘图标回来。"))
+            .description(tr("最小化后不在任务栏显示，点击托盘图标可恢复窗口。"))
         };
         let close = {
             let (get, set) = (app.clone(), app.clone());
             SettingItem::new(
-                tr("关闭窗口时收到托盘，不退出"),
+                tr("关闭窗口时最小化到托盘"),
                 SettingField::switch(
                     move |cx| get.read(cx).settings.close_to_tray,
                     move |on, cx| {
@@ -107,7 +107,7 @@ impl SettingsPage {
                     },
                 ),
             )
-            .description(tr("点关闭按钮只是藏起窗口；退出在托盘图标的右键菜单里。"))
+            .description(tr("点击关闭按钮仅隐藏窗口，可从托盘图标的右键菜单退出。"))
         };
         let auto_fetch = {
             let (get, set) = (app.clone(), app.clone());
@@ -128,13 +128,13 @@ impl SettingsPage {
                 ),
             )
             .description(tr(
-                "在后台定时获取正在看的仓库（git fetch --all）。要密码时跳过，不弹窗。",
+                "定时在后台获取当前查看的仓库（git fetch --all），需要密码时跳过，不弹出提示。",
             ))
         };
         let stash = {
             let (get, set) = (app.clone(), app.clone());
             SettingItem::new(
-                tr("有改动时切换分支、拉取：默认先贮藏"),
+                tr("默认先贮藏未提交的改动"),
                 SettingField::switch(
                     move |cx| get.read(cx).settings.stash_before_switch,
                     move |on, cx| {
@@ -144,7 +144,7 @@ impl SettingsPage {
                     },
                 ),
             )
-            .description(tr("切换分支、检出、拉取前有没提交的改动时，默认怎么处理。"))
+            .description(tr("切换分支、检出或拉取时，对未提交改动的默认处理方式。"))
         };
         let tab_close = {
             let (get, set) = (app.clone(), app.clone());
@@ -160,7 +160,7 @@ impl SettingsPage {
                 ),
             )
             .description(tr(
-                "怕手滑就关掉：改用中键、Ctrl+W 或右键菜单关。关错了按 Ctrl+Shift+T 找回。",
+                "关闭此项可避免误关；仍可用鼠标中键、Ctrl+W 或右键菜单关闭标签页，按 Ctrl+Shift+T 可恢复。",
             ))
         };
         let shell = {
@@ -193,7 +193,7 @@ impl SettingsPage {
                 ),
             )
             .description(tr(
-                "新开的终端生效。服务器上的仓库用服务器上的登录 shell。",
+                "对新打开的终端生效。服务器上的仓库使用服务器的登录 shell。",
             ))
         };
         SettingPage::new(tr("常规"))
@@ -222,7 +222,7 @@ impl SettingsPage {
         let mode = {
             let (get, set) = (app.clone(), app.clone());
             SettingItem::new(
-                tr("深色还是浅色"),
+                tr("颜色模式"),
                 SettingField::dropdown(
                     ThemeChoice::ALL
                         .iter()
@@ -238,7 +238,7 @@ impl SettingsPage {
                     },
                 ),
             )
-            .description(tr("「跟随系统」跟着 Windows 的深色、浅色设置走。"))
+            .description(tr("「跟随系统」将跟随 Windows 的深色或浅色设置。"))
         };
         let palette_item = |dark: bool| {
             let (get, set) = (app.clone(), app.clone());
@@ -249,9 +249,9 @@ impl SettingsPage {
                 .collect();
             SettingItem::new(
                 if dark {
-                    tr("深色时用的配色")
+                    tr("深色模式配色")
                 } else {
-                    tr("浅色时用的配色")
+                    tr("浅色模式配色")
                 },
                 SettingField::scrollable_dropdown(
                     options,
@@ -290,7 +290,7 @@ impl SettingsPage {
             )
             .group(
                 SettingGroup::new()
-                    .title(tr("配色一览"))
+                    .title(tr("全部配色"))
                     .item(SettingItem::render({
                         let app = app.clone();
                         move |_, window, cx| {
@@ -320,7 +320,7 @@ impl SettingsPage {
                     },
                 ),
             )
-            .description(tr("启动时和之后每 6 小时问一次 GitHub，只看有没有新版本。"))
+            .description(tr("启动时及之后每 6 小时检查一次 GitHub 上的新版本。"))
         };
         let source = SettingItem::new(
             tr("源代码"),
@@ -373,7 +373,7 @@ impl SettingsPage {
                                 h_flex().child(
                                     Button::new("open-settings-folder")
                                         .small()
-                                        .label(tr("打开所在的文件夹"))
+                                        .label(tr("打开所在文件夹"))
                                         .on_click(move |_, window, cx| {
                                             if let Some(folder) = &folder {
                                                 let result = crate::shell::open_folder(folder);
@@ -485,7 +485,7 @@ fn swatches(app: &Entity<AppState>, active: &'static str, cx: &App) -> AnyElemen
             div()
                 .text_xs()
                 .text_color(muted)
-                .child(tr("点一个就换成它。")),
+                .child(tr("点击即可切换。")),
         )
         .child(cards)
         .into_any_element()

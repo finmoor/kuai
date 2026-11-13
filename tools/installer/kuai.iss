@@ -68,9 +68,9 @@ Name: "zh"; MessagesFile: "ChineseSimplified.isl"
 
 [CustomMessages]
 en.ForgetPasswords=Also delete the server passwords and key passphrases Kuai saved in Windows Credential Manager?
-zh.ForgetPasswords=把 Kuai 存在 Windows 凭据管理器里的服务器密码、私钥口令也删掉吗？
-en.CloseKuai=Kuai is still running. Quit Kuai (also from its tray icon), then click Retry.
-zh.CloseKuai=Kuai 还开着。先退出 Kuai（收在托盘里的也要退出），再点「重试」。
+zh.ForgetPasswords=是否同时删除 Kuai 保存在 Windows 凭据管理器中的服务器密码和私钥口令？
+en.CloseKuai=Kuai is running. Quit Kuai (including from the system tray), then click Retry.
+zh.CloseKuai=Kuai 正在运行。请先退出 Kuai（包括托盘中的 Kuai），然后点击「重试」。
 
 [Messages]
 ; 不显示「准备安装」页，任务页上的按钮是「安装」（见 CurPageChanged），说明跟着改

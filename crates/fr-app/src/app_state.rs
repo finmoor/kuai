@@ -69,7 +69,7 @@ impl AppState {
             .background_executor()
             .spawn(async move {
                 let server =
-                    server.ok_or_else(|| SharedString::from(tr("找不到这台服务器的设置")))?;
+                    server.ok_or_else(|| SharedString::from(tr("未找到该服务器的设置")))?;
                 let options = connect_options(&server);
                 Connection::connect(&server.destination, &options)
                     .map(Arc::new)

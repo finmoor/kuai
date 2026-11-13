@@ -64,10 +64,10 @@ impl CloneView {
     ) -> Self {
         let url = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder(tr("仓库地址，比如 git@example.com:team/project.git"))
+                .placeholder(tr("仓库地址，例如 git@example.com:team/project.git"))
         });
-        let parent = cx.new(|cx| InputState::new(window, cx).placeholder(tr("放在哪个目录下")));
-        let name = cx.new(|cx| InputState::new(window, cx).placeholder(tr("填了地址会自动带出来")));
+        let parent = cx.new(|cx| InputState::new(window, cx).placeholder(tr("存放位置")));
+        let name = cx.new(|cx| InputState::new(window, cx).placeholder(tr("根据地址自动填写")));
         // 默认目录：本机用已有仓库所在的目录，没有就用用户目录；服务器用主目录
         let mut status = None;
         let mut connect = None;
@@ -106,7 +106,7 @@ impl CloneView {
                                 }
                                 Err(err) => {
                                     this.status =
-                                        Some((tf!("连不上服务器：{err}", err).into(), true))
+                                        Some((tf!("无法连接服务器：{err}", err).into(), true))
                                 }
                             }
                             cx.notify();
@@ -190,9 +190,9 @@ impl CloneView {
         let parent = self.parent.read(cx).value().trim().to_string();
         let name = self.name.read(cx).value().trim().to_string();
         let problem = if url.is_empty() {
-            Some(tr("填写仓库地址").to_string())
+            Some(tr("请填写仓库地址").to_string())
         } else if parent.is_empty() {
-            Some(tr("填写放在哪个目录下").to_string())
+            Some(tr("请填写存放位置").to_string())
         } else {
             name_error(&name)
         };
@@ -281,12 +281,12 @@ impl CloneView {
         drop(_task);
         if self.server.is_some() {
             self.status = Some((
-                tf!("克隆已中止。服务器上的 {target} 可能留着下了一半的内容：先删掉它，或者换个文件夹名再克隆。", target)
+                tf!("克隆已中止。服务器上的 {target} 可能残留未完成的内容，请先删除该目录，或更换文件夹名称后重新克隆。", target)
                 .into(),
                 true,
             ));
         } else if created {
-            self.status = Some((tr("克隆已中止，正在删除下了一半的目录…").into(), false));
+            self.status = Some((tr("克隆已中止，正在删除未完成的目录…").into(), false));
             let path = target.clone();
             let remove = cx.background_executor().spawn(async move {
                 // git 进程刚被杀掉，文件可能还占着，多试几次
@@ -308,11 +308,11 @@ impl CloneView {
                     if this.running.is_none() {
                         this.status = Some(match result {
                             Ok(()) => (
-                                tf!("克隆已中止，下了一半的 {target} 已经删掉。", target).into(),
+                                tf!("克隆已中止，未完成的 {target} 已删除。", target).into(),
                                 false,
                             ),
                             Err(err) => (
-                                tf!("克隆已中止，但下了一半的 {target} 没删掉（{err}），请手动删除。", target, err)
+                                tf!("克隆已中止，但未能删除未完成的 {target}（{err}），请手动删除。", target, err)
                                 .into(),
                                 true,
                             ),
@@ -337,7 +337,7 @@ impl CloneView {
                     files: false,
                     directories: true,
                     multiple: false,
-                    prompt: Some(tr("克隆到这个目录下").into()),
+                    prompt: Some(tr("克隆到此目录").into()),
                 });
                 cx.spawn_in(window, async move |this, cx| {
                     let Ok(Ok(Some(paths))) = picked.await else {
@@ -374,7 +374,7 @@ impl CloneView {
                 .detach();
                 window.open_dialog(cx, move |dialog, _, _| {
                     dialog
-                        .title(tr("克隆到哪个目录下"))
+                        .title(tr("选择存放位置"))
                         .w(px(640.))
                         // 回车是「前往」输入的路径，不是关掉对话框
                         .on_ok(|_, _, _| false)
@@ -396,12 +396,12 @@ fn join(parent: &str, name: &str, local: bool) -> String {
 /// 文件夹名不能用时的说明。
 fn name_error(name: &str) -> Option<String> {
     if name.is_empty() {
-        Some(tr("填写文件夹名").into())
+        Some(tr("请填写文件夹名称").into())
     } else if name == "."
         || name == ".."
         || name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|'])
     {
-        Some(tr("文件夹名里不能有 / \\ : * ? \" < > |。放在哪个目录在上面填。").into())
+        Some(tr("文件夹名称不能包含 / \\ : * ? \" < > |。存放位置请在上方填写。").into())
     } else {
         None
     }
@@ -413,7 +413,7 @@ fn dir_not_empty(path: &Path) -> bool {
 
 fn exists_text(target: &str) -> String {
     tf!(
-        "{target} 已经存在且不是空的。换个文件夹名，或者先删掉它。",
+        "{target} 已存在且不为空。请更换文件夹名称，或先删除该目录。",
         target
     )
 }
@@ -427,10 +427,10 @@ fn explain(err: &str, target: &str) -> String {
         || lower.contains("does not appear to be a git repository")
         || lower.contains("does not exist")
     {
-        Some(tr("找不到这个仓库。检查地址对不对，这个账号有没有权限。").to_string())
+        Some(tr("未找到仓库。请检查地址是否正确，以及该账号是否有访问权限。").to_string())
     } else if lower.contains("no such file or directory") || lower.contains("cannot find the path")
     {
-        Some(tr("放仓库的目录不存在。先在服务器上建好，或点「浏览…」选一个。").to_string())
+        Some(tr("存放位置不存在。请先在服务器上创建该目录，或点击「浏览…」选择。").to_string())
     } else {
         crate::repo::explain(err).map(str::to_string)
     };
@@ -473,8 +473,8 @@ impl Render for CloneView {
         let busy = self.running.is_some();
         let label = move |text: &'static str| div().text_xs().text_color(muted).child(text);
         let hint = match &self.server {
-            None => tr("克隆到这台电脑上。目录不存在会新建。"),
-            Some(_) => tr("由服务器去连远程仓库；放仓库的目录要已经存在。"),
+            None => tr("克隆到本机。目录不存在时将自动创建。"),
+            Some(_) => tr("由服务器连接远程仓库，存放位置须已存在。"),
         };
         // 实际会克隆到哪里：克隆期间显示的是开始时定下来的
         let target = match &self.running {
@@ -490,7 +490,7 @@ impl Render for CloneView {
                     div()
                         .flex_1()
                         .text_sm()
-                        .child(tr("中止克隆？已经下载的部分不会保留。")),
+                        .child(tr("中止克隆？已下载的内容将不会保留。")),
                 )
                 .child(
                     Button::new("keep")
@@ -540,7 +540,7 @@ impl Render for CloneView {
                     .child(Input::new(&self.url).disabled(busy)),
             )
             .child(
-                v_flex().gap_1().child(label(tr("放在这个目录下"))).child(
+                v_flex().gap_1().child(label(tr("选择此目录"))).child(
                     h_flex()
                         .gap_2()
                         .child(
@@ -561,7 +561,7 @@ impl Render for CloneView {
             .child(
                 v_flex()
                     .gap_1()
-                    .child(label(tr("文件夹名")))
+                    .child(label(tr("文件夹名称")))
                     .child(Input::new(&self.name).disabled(busy)),
             )
             .child(
@@ -570,7 +570,7 @@ impl Render for CloneView {
                     .text_xs()
                     .text_color(muted)
                     .when_some(target, |view, target| {
-                        view.child(div().child(tf!("会克隆到：{target}", target)))
+                        view.child(div().child(tf!("将克隆到：{target}", target)))
                     })
                     .child(hint),
             )
@@ -625,7 +625,7 @@ mod tests {
             "fatal: destination path 'app' already exists and is not an empty directory.",
             "/home/me/app",
         );
-        assert!(text.starts_with("/home/me/app 已经存在"), "{text}");
+        assert!(text.starts_with("/home/me/app 已存在"), "{text}");
         assert!(text.contains("destination path"), "{text}");
         // 认不出来的原样显示
         assert_eq!(explain("fatal: 奇怪的错误", "/x"), "fatal: 奇怪的错误");

@@ -42,7 +42,7 @@ mod imp {
     }
 
     fn exe() -> Result<String> {
-        let path = std::env::current_exe().context(tr("找不到程序自己的路径"))?;
+        let path = std::env::current_exe().context(tr("无法获取程序路径"))?;
         let path = path.to_string_lossy();
         Ok(path.strip_prefix(r"\\?\").unwrap_or(&path).to_string())
     }
@@ -62,15 +62,15 @@ mod imp {
         if on {
             let (key, _) = hkcu
                 .create_subkey(key_path())
-                .context(tr("打不开启动项的注册表键"))?;
+                .context(tr("无法打开启动项注册表键"))?;
             key.set_value(VALUE, &command_for(&exe()?))
-                .context(tr("写启动项失败"))?;
+                .context(tr("添加启动项失败"))?;
         } else if let Ok(key) = hkcu.open_subkey_with_flags(key_path(), winreg::enums::KEY_WRITE) {
             match key.delete_value(VALUE) {
                 Ok(()) => {}
                 // 本来就没有这一项
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err).context(tr("删启动项失败")),
+                Err(err) => return Err(err).context(tr("删除启动项失败")),
             }
         }
         Ok(())
@@ -86,7 +86,7 @@ mod imp {
     }
 
     pub fn set(_on: bool) -> Result<()> {
-        anyhow::bail!(tr("这个系统上还不支持开机自启"))
+        anyhow::bail!(tr("当前系统不支持开机自动启动"))
     }
 }
 

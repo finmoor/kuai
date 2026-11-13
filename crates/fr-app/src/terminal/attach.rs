@@ -61,7 +61,7 @@ pub fn image_attachment(image: &Image, now: DateTime<Local>) -> Result<Attachmen
 }
 
 fn to_png(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let failed = |err: image::ImageError| tf!("剪贴板里的图片读不了：{err}", err);
+    let failed = |err: image::ImageError| tf!("无法读取剪贴板中的图片：{err}", err);
     let decoded = image::load_from_memory(bytes).map_err(failed)?;
     let mut png = Vec::new();
     decoded
@@ -79,7 +79,7 @@ pub fn local_paths(items: Vec<Attachment>) -> Result<Vec<String>, String> {
             Attachment::File(path) => Ok(path.to_string_lossy().into_owned()),
             Attachment::Image { name, bytes } => {
                 let path = save_image(&dir, &name, &bytes)
-                    .map_err(|err| tf!("图片存不下来：{err}", err))?;
+                    .map_err(|err| tf!("无法保存图片：{err}", err))?;
                 Ok(path.to_string_lossy().into_owned())
             }
         })
@@ -109,7 +109,7 @@ fn save_image(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> 
             Err(err) => return Err(err),
         }
     }
-    Err(std::io::Error::other(tr("同名的文件太多了")))
+    Err(std::io::Error::other(tr("同名文件过多")))
 }
 
 fn sweep(dir: &Path, now: SystemTime) {

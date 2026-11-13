@@ -58,8 +58,8 @@ jobs:
         run: |
           $version = $env:TAG.TrimStart('v')
           $notes = ./tools/release-notes.ps1 $version
-          $download = "下载：安装版 kuai-$version-windows-x64-setup.exe（推荐），解压即用版 kuai-$version-windows-x64.zip。" +
-            "第一次运行时 Windows 可能提示「已保护你的电脑」（程序没有代码签名），点「更多信息」再点「仍要运行」。"
+          $download = "下载：安装版 kuai-$version-windows-x64-setup.exe（推荐），解压版 kuai-$version-windows-x64.zip。" +
+            "程序未进行代码签名，首次运行时 Windows 可能提示「Windows 已保护你的电脑」，请点击「更多信息」，再点击「仍要运行」。"
           "$notes`n`n$download" | Set-Content -Encoding utf8NoBOM notes.md
 
       - name: 传到 GitHub Releases

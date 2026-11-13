@@ -114,9 +114,9 @@ impl ManagerView {
         let old_auth = old.auth;
         let secret_hint = move |auth: Auth| {
             if had_secret && auth == old_auth {
-                tr("已保存，不改就留空")
+                tr("已保存，如不修改请留空")
             } else {
-                tr("不填则连接时问")
+                tr("留空则在连接时输入")
             }
         };
         let mut input = |value: &str, placeholder: &'static str, masked: bool| {
@@ -134,19 +134,19 @@ impl ManagerView {
         };
         let host = input(
             &target.host,
-            tr("主机名、IP，或 ~/.ssh/config 里的别名"),
+            tr("主机名、IP 或 ~/.ssh/config 中的别名"),
             false,
         );
         let port = input(&target.port, "22", false);
-        let user = input(&target.user, tr("不填用 ssh 的默认"), false);
+        let user = input(&target.user, tr("留空则使用 ssh 默认值"), false);
         let key = input(
             old.identity_file.as_deref().unwrap_or_default(),
-            tr("不填用默认密钥和 ssh-agent"),
+            tr("留空则使用默认密钥和 ssh-agent"),
             false,
         );
         let passphrase = input("", secret_hint(Auth::Key), true);
         let password = input("", secret_hint(Auth::Password), true);
-        let name = input(&old.name, tr("默认用主机名"), false);
+        let name = input(&old.name, tr("默认使用主机名"), false);
 
         let app = self.app.clone();
         let view = cx.entity().downgrade();
@@ -193,19 +193,19 @@ impl ManagerView {
                         target.port = port.trim().to_string();
                     }
                     if target.host.is_empty() {
-                        return fail(tr("还没有填主机"), window);
+                        return fail(tr("请填写主机"), window);
                     }
                     if !target.port.is_empty() && !target.port_ok() {
-                        return fail(tr("端口要填 1～65535 的数字"), window);
+                        return fail(tr("端口须为 1～65535 之间的数字"), window);
                     }
                     let key = key.trim();
                     if auth == Auth::Key && !key.is_empty() {
                         if key.to_lowercase().ends_with(".pub") {
-                            return fail(tr("这是公钥，要选不带 .pub 的私钥文件"), window);
+                            return fail(tr("这是公钥文件，请选择不带 .pub 后缀的私钥文件"), window);
                         }
                         // ~ 开头的由 ssh 自己展开，这里不查
                         if !key.starts_with('~') && !std::path::Path::new(key).is_file() {
-                            return fail(tr("找不到这个私钥文件"), window);
+                            return fail(tr("未找到私钥文件"), window);
                         }
                     }
                     let mut label = name.trim().to_string();
@@ -237,7 +237,7 @@ impl ManagerView {
                     if !secret.is_empty() {
                         if let Err(err) = crate::secrets::set(&id, &account, &secret) {
                             window.push_notification(
-                                Notification::error(tf!("密码没存上，连接时会问：{err}", err)),
+                                Notification::error(tf!("密码保存失败，连接时需重新输入：{err}", err)),
                                 cx,
                             );
                         }
@@ -250,7 +250,7 @@ impl ManagerView {
                         if editing {
                             window.push_notification(
                                 Notification::info(tr(
-                                    "已按新参数重连；开着的标签页关掉重开后生效。",
+                                    "已使用新设置重新连接，已打开的标签页需重新打开后生效。",
                                 )),
                                 cx,
                             );
@@ -281,11 +281,11 @@ impl ManagerView {
                     Button::new("forget-secret")
                         .ghost()
                         .xsmall()
-                        .label(tr("清除已保存的"))
+                        .label(tr("清除"))
                         .on_click(move |_, window, cx| {
                             forget.set(true);
                             input.update(cx, |state, cx| {
-                                state.set_placeholder(tr("不填则连接时问"), window, cx)
+                                state.set_placeholder(tr("留空则在连接时输入"), window, cx)
                             });
                             window.refresh();
                         })
@@ -366,7 +366,7 @@ impl ManagerView {
                         .child(field(tr("名称"), Input::new(&name)))
                         .child(
                             Checkbox::new("forward-agent")
-                                .label(tr("转发本机的 ssh-agent（只对信任的服务器开）"))
+                                .label(tr("转发本机的 ssh-agent（仅对受信任的服务器启用）"))
                                 .checked(forward_agent.get())
                                 .on_click({
                                     let forward_agent = forward_agent.clone();
@@ -380,7 +380,7 @@ impl ManagerView {
                             body.child(div().text_sm().text_color(danger).child(found))
                         })
                         .child(div().text_xs().text_color(muted).child(tr(
-                            "密码、口令存在 Windows 凭据管理器。首次连接会往服务器的 ~/.kuai/ 装 kuaid。",
+                            "密码和私钥口令保存在 Windows 凭据管理器中。首次连接时将在服务器的 ~/.kuai/ 中安装 kuaid。",
                         ))),
                 )
                 .footer(
@@ -415,7 +415,7 @@ impl ManagerView {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some(tr("选私钥文件").into()),
+            prompt: Some(tr("选择私钥文件").into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = picked.await else {
@@ -571,7 +571,7 @@ impl ManagerView {
                         .flex_none()
                         .text_xs()
                         .text_color(colors.muted)
-                        .child(tr("刚关掉")),
+                        .child(tr("最近关闭")),
                 )
             })
             .child(
@@ -599,7 +599,7 @@ impl ManagerView {
                     }),
                 )
                 .separator()
-                .item(PopupMenuItem::new(tr("改名…")).on_click(move |_, _, cx| {
+                .item(PopupMenuItem::new(tr("重命名…")).on_click(move |_, _, cx| {
                     rename_view
                         .update(cx, |_, cx| cx.emit(ManagerEvent::Rename(rename.clone())))
                         .ok();
@@ -633,13 +633,13 @@ impl ManagerView {
         let (open_count, away_count) = (group.tabs.len(), away.len());
         let mut rows: Vec<AnyElement> = Vec::new();
         if open_count > 0 {
-            rows.push(group_label(tf!("开着 · {n}", n = open_count), colors));
+            rows.push(group_label(tf!("已打开 · {n}", n = open_count), colors));
             for entry in &group.tabs {
                 rows.push(self.render_member(entry, true, false, colors, cx));
             }
         }
         if away_count > 0 {
-            rows.push(group_label(tf!("没开 · {n}", n = away_count), colors));
+            rows.push(group_label(tf!("未打开 · {n}", n = away_count), colors));
             for (entry, recent) in away {
                 rows.push(self.render_member(entry, false, recent, colors, cx));
             }
@@ -658,7 +658,7 @@ impl ManagerView {
                         tf!("{n} 个仓库", n = 0usize).into()
                     } else {
                         tf!(
-                            "{n} 个仓库，{open} 个开着",
+                            "{n} 个仓库，{open} 个已打开",
                             n = open_count + away_count,
                             open = open_count
                         )
@@ -679,7 +679,7 @@ impl ManagerView {
             ),
             None,
             rows,
-            tr("这个工作区里还没有仓库。打开一个，它就归到这里。"),
+            tr("此工作区中暂无仓库。打开的仓库将归入此工作区。"),
             colors,
         )
     }
@@ -731,7 +731,7 @@ impl ManagerView {
                     .ghost()
                     .xsmall()
                     .icon(ui::icon(IconName::Pencil).text_color(colors.muted))
-                    .tooltip(tr("改名"))
+                    .tooltip(tr("重命名"))
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.stop_propagation();
                         cx.emit(ManagerEvent::Rename(rename.clone()));
@@ -742,13 +742,13 @@ impl ManagerView {
                     .ghost()
                     .xsmall()
                     .icon(ui::icon(IconName::X).text_color(colors.muted))
-                    .tooltip(tr("从列表里移除"))
+                    .tooltip(tr("从列表中移除"))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         let (app, entry) = (this.app.clone(), remove.clone());
                         confirm(
-                            tf!("从列表里移除 {name}？", name = &remove_name),
-                            tf!("{path}\n只从列表里移除，仓库本身不动。", path = remove.path),
+                            tf!("从列表中移除 {name}？", name = &remove_name),
+                            tf!("{path}\n仅从列表中移除，仓库本身不受影响。", path = remove.path),
                             tr("移除"),
                             false,
                             window,
@@ -760,7 +760,7 @@ impl ManagerView {
             .context_menu(move |menu, _, _| {
                 let (view, entry) = (view.clone(), menu_entry.clone());
                 let path = entry.path.clone();
-                menu.item(PopupMenuItem::new(tr("改名…")).on_click(move |_, _, cx| {
+                menu.item(PopupMenuItem::new(tr("重命名…")).on_click(move |_, _, cx| {
                     view.update(cx, |_, cx| cx.emit(ManagerEvent::Rename(entry.clone())))
                         .ok();
                 }))
@@ -909,7 +909,7 @@ impl Render for ManagerView {
             ),
             None,
             local,
-            tr("还没有本机仓库。点「添加本机仓库…」或「克隆…」。"),
+            tr("暂无本机仓库。请点击「添加本机仓库…」或「克隆…」。"),
             colors,
         )];
 
@@ -934,7 +934,7 @@ impl Render for ManagerView {
                         git = conn.hello.git.trim_start_matches("git version "),
                         ms = conn.connect_time.as_millis(),
                         installed = if conn.installed {
-                            tr(" · 刚装好 kuaid")
+                            tr(" · 已安装 kuaid")
                         } else {
                             ""
                         }
@@ -992,7 +992,7 @@ impl Render for ManagerView {
                     .small()
                     .ghost()
                     .icon(ui::icon(IconName::Ellipsis))
-                    .tooltip(tr("编辑、移除这台服务器"))
+                    .tooltip(tr("编辑或移除此服务器"))
                     .dropdown_menu(move |menu, _, _| {
                         let (view, edit) = (menu_view.clone(), menu_server.clone());
                         let (app, remove) = (menu_app.clone(), menu_server.clone());
@@ -1012,14 +1012,14 @@ impl Render for ManagerView {
                                     String::new()
                                 } else {
                                     tf!(
-                                        "它的 {n} 个仓库也从列表里移除，开着的标签页会关掉。",
+                                        "该服务器的 {n} 个仓库也将从列表中移除，已打开的标签页将关闭。",
                                         n = repo_count
                                     )
                                 };
                                 confirm(
                                     tf!("移除服务器 {name}？", name = remove.name),
                                     tf!(
-                                        "{destination}\n{repos}服务器上的东西不动。",
+                                        "{destination}\n{repos}服务器上的内容不受影响。",
                                         destination = remove.destination,
                                         repos = repos
                                     ),
@@ -1046,7 +1046,7 @@ impl Render for ManagerView {
                 ),
                 failure,
                 repos,
-                tr("还没有这台服务器上的仓库。点「打开仓库…」挑一个。"),
+                tr("暂无此服务器上的仓库。请点击「打开仓库…」选择。"),
                 colors,
             ));
         }
@@ -1091,7 +1091,7 @@ impl Render for ManagerView {
                     div()
                         .text_xs()
                         .text_color(colors.muted)
-                        .child(tr("添加、克隆仓库在这里")),
+                        .child(tr("在此添加或克隆仓库")),
                 )
             });
 
@@ -1127,7 +1127,7 @@ impl Render for ManagerView {
                                         div()
                                             .text_sm()
                                             .text_color(colors.muted)
-                                            .child(tr("点仓库在新标签页里打开。")),
+                                            .child(tr("点击仓库即可在新标签页中打开。")),
                                     ),
                             )
                             .child(

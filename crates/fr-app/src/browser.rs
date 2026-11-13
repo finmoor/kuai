@@ -69,7 +69,7 @@ impl RemoteBrowser {
         cx: &mut Context<Self>,
     ) -> Self {
         let input =
-            cx.new(|cx| InputState::new(window, cx).placeholder(tr("服务器上的路径，回车前往")));
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("服务器上的路径，按 Enter 前往")));
         let subscription = cx.subscribe_in(
             &input,
             window,
@@ -119,7 +119,7 @@ impl RemoteBrowser {
                         &path
                     };
                     SharedString::from(tf!(
-                        "进不去 {shown}：{err}",
+                        "无法进入 {shown}：{err}",
                         shown,
                         err = format!("{:#}", err)
                     ))
@@ -172,7 +172,7 @@ impl RemoteBrowser {
                     .and_then(|out| out.ok())
                     .map_err(|err| {
                         SharedString::from(tf!(
-                            "{path} 不是 git 仓库：选一个标着「仓库」的目录。\n{err}",
+                            "{path} 不是 git 仓库，请选择标有「仓库」的目录。\n{err}",
                             path,
                             err = format!("{:#}", err)
                         ))
@@ -276,9 +276,9 @@ impl Render for RemoteBrowser {
         let pick_dir = self.pick_dir;
         let hint: SharedString = match (&self.status, is_repo) {
             (Some((text, _)), _) => text.clone(),
-            (None, _) if pick_dir => tr("点目录进去；仓库会克隆到选中的目录下面").into(),
-            (None, true) => tr("这个目录是仓库，可以打开").into(),
-            (None, false) => tr("点目录进去；标着「仓库」的可以打开").into(),
+            (None, _) if pick_dir => tr("点击目录进入；仓库将克隆到所选目录下").into(),
+            (None, true) => tr("此目录是仓库，可以打开").into(),
+            (None, false) => tr("点击目录进入；标有「仓库」的目录可直接打开").into(),
         };
         let hint_color = match &self.status {
             Some((_, true)) => danger,
@@ -328,7 +328,7 @@ impl Render for RemoteBrowser {
                     .child(if pick_dir {
                         Button::new("pick")
                             .primary()
-                            .label(tr("克隆到这个目录下"))
+                            .label(tr("克隆到此目录"))
                             .disabled(!has_listing || self.busy)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(listing) = &this.listing {
@@ -340,7 +340,7 @@ impl Render for RemoteBrowser {
                         // 确实不在仓库里就在下面说明
                         Button::new("open")
                             .primary()
-                            .label(tr("打开这个仓库"))
+                            .label(tr("打开此仓库"))
                             .disabled(!has_listing || self.busy)
                             .on_click(cx.listener(|this, _, window, cx| this.open(window, cx)))
                     }),

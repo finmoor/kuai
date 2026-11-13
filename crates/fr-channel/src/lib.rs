@@ -52,7 +52,7 @@ impl GitOutput {
             Some(0) => Ok(self.stdout),
             Some(code) if self.stderr.is_empty() => bail!("{}", tf!("git 退出码 {code}", code)),
             Some(_) => bail!("{}", self.stderr),
-            None => bail!(tr("git 被中止")),
+            None => bail!(tr("git 已中止")),
         }
     }
 }

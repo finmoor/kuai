@@ -136,7 +136,7 @@ fn open(request: Request, window: &mut Window, cx: &mut App) {
                         div()
                             .text_xs()
                             .text_color(muted)
-                            .child(tr("这是 git 或 ssh 的原始提示，填的内容不会保存。")),
+                            .child(tr("此为 git 或 ssh 的原始提示，输入的内容不会被保存。")),
                     ),
             )
             .footer(

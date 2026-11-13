@@ -187,7 +187,7 @@ impl History {
             match_pos: None,
             details: None,
             diff: cx.new(|cx| DiffState::new(Vec::new(), cx)),
-            diff_info: tr("点选一个提交查看改动").into(),
+            diff_info: tr("选择一个提交以查看改动").into(),
             diff_task: None,
             last_rows_build: (Duration::ZERO, 0),
             bench: None,
@@ -298,7 +298,7 @@ impl RepoView {
                         };
                     }
                     Some(Err(err)) => break Err(format!("{err:#}")),
-                    None => break Err(tr("读取中断").into()),
+                    None => break Err(tr("读取已中断").into()),
                 }
             };
             let _ = tx.unbounded_send(Progress::Done(outcome));
@@ -363,7 +363,7 @@ impl RepoView {
         self.history.details = None;
         self.history.files.clear();
         self.history.diff_task = None;
-        self.history.diff_info = tr("点选一个提交查看改动").into();
+        self.history.diff_info = tr("选择一个提交以查看改动").into();
         self.history
             .diff
             .update(cx, |state, cx| state.set_files(Vec::new(), cx));
@@ -651,13 +651,13 @@ impl RepoView {
         let mut label: String = match &scope {
             Scope::All => tr("所有分支").into(),
             Scope::Current => match &current {
-                Some(branch) => tf!("只看 {branch}", branch),
-                None => tr("只看当前的 HEAD").into(),
+                Some(branch) => tf!("仅显示 {branch}", branch),
+                None => tr("仅当前 HEAD").into(),
             },
-            Scope::Only { name, .. } => tf!("只看 {name}", name),
+            Scope::Only { name, .. } => tf!("仅显示 {name}", name),
         };
         if scope == Scope::All && !hidden.is_empty() {
-            label = tf!("{label}（隐藏了 {n} 个）", label, n = hidden.len());
+            label = tf!("{label}（已隐藏 {n} 个）", label, n = hidden.len());
         }
         let filtered = scope != Scope::All || !hidden.is_empty();
         let accent = cx.theme().primary;
@@ -684,17 +684,17 @@ impl RepoView {
                 menu = menu
                     .item(pick(tr("所有分支").into(), Scope::All, scope == Scope::All))
                     .item(pick(
-                        tr("只看当前分支（和它的上游）").into(),
+                        tr("仅当前分支（及其上游）").into(),
                         Scope::Current,
                         scope == Scope::Current,
                     ));
                 if let Scope::Only { name, .. } = &scope {
-                    menu = menu.item(pick(tf!("只看 {name}", name).into(), scope.clone(), true));
+                    menu = menu.item(pick(tf!("仅显示 {name}", name).into(), scope.clone(), true));
                 }
                 if !hidden.is_empty() {
                     menu = menu
                         .separator()
-                        .item(PopupMenuItem::label(tr("隐藏起来的（点一下取消隐藏）")));
+                        .item(PopupMenuItem::label(tr("已隐藏（点击取消隐藏）")));
                     for full in hidden.iter().take(12) {
                         let (view, full) = (view.clone(), full.clone());
                         menu =
@@ -841,9 +841,9 @@ impl RepoView {
             if in_file && let Ok(bytes) = &out {
                 let patch = show::parse(bytes).1;
                 if patch.iter().all(u8::is_ascii_whitespace) {
-                    whole = tr("这个提交里文件还叫别的名字，下面是全部改动 · ");
+                    whole = tr("该文件在此提交中使用其他名称，以下为全部改动 · ");
                 } else if has_older && is_new_file_patch(patch) {
-                    whole = tr("文件在这个提交里改了名，下面是全部改动 · ");
+                    whole = tr("该文件在此提交中被重命名，以下为全部改动 · ");
                 }
                 if !whole.is_empty() {
                     let mut args = show::args(&id);
@@ -947,7 +947,7 @@ impl RepoView {
             state.set_placeholder(tr("搜索提交：说明、作者、哈希"), window, cx)
         });
         if self.history.selected.is_none() {
-            self.history.diff_info = tr("点选一个提交查看改动").into();
+            self.history.diff_info = tr("选择一个提交以查看改动").into();
         }
     }
 
@@ -1164,7 +1164,7 @@ impl RepoView {
             let text = if self.history.selected.is_some() {
                 tr("正在读取…")
             } else {
-                tr("没有选中提交")
+                tr("未选中提交")
             };
             return div()
                 .p_3()
@@ -1226,7 +1226,7 @@ impl RepoView {
             ));
         }
         let parents = if d.parents.is_empty() {
-            tr("没有（这是第一个提交）").to_string()
+            tr("无（这是第一个提交）").to_string()
         } else {
             d.parents.iter().map(short).collect::<Vec<_>>().join("  ")
         };
@@ -1309,7 +1309,7 @@ impl RepoView {
                     muted,
                     div().into_any_element(),
                 ),
-                Load::Empty => (tr("还没有任何提交").into(), muted, div().into_any_element()),
+                Load::Empty => (tr("暂无提交").into(), muted, div().into_any_element()),
                 Load::Failed(err) => (err.clone(), danger, div().into_any_element()),
                 Load::Ready { data, partial } => {
                     let (build, rows) = self.history.last_rows_build;
@@ -1323,16 +1323,16 @@ impl RepoView {
                         .into(),
                     );
                     let mut text = if *partial {
-                        tf!("先显示前 {n} 个提交，其余的还在读…", n = data.commits.len())
+                        tf!("已显示前 {n} 个提交，正在加载其余提交…", n = data.commits.len())
                     } else {
                         tf!("{n} 个提交", n = data.commits.len())
                     };
                     if self.history.reloading && !partial {
-                        text.push_str(tr(" · 正在重读…"));
+                        text.push_str(tr(" · 正在刷新…"));
                     }
                     if data.graph.max_lanes > graph_paint::MAX_LANES {
                         text = tf!(
-                            "提交图有 {lanes} 条线，只画前 {max} 条（带 ··· 的行没画全） · {text}",
+                            "提交图共 {lanes} 条线，仅绘制前 {max} 条（带 ··· 的行未完整绘制） · {text}",
                             lanes = data.graph.max_lanes,
                             max = graph_paint::MAX_LANES,
                             text = text
@@ -1364,7 +1364,7 @@ impl RepoView {
             "".into()
         } else if self.history.matches.is_empty() {
             if still_reading {
-                tr("提交还没读完，读到的里面还没有匹配的").into()
+                tr("提交尚未加载完，已加载的提交中没有匹配项").into()
             } else {
                 tr("没有匹配的提交").into()
             }
@@ -1372,7 +1372,7 @@ impl RepoView {
             match self.history.match_pos {
                 Some(pos) => format!("{} / {}", pos + 1, self.history.matches.len()).into(),
                 None => tf!(
-                    "{matches} 个匹配，回车跳到第一个",
+                    "{matches} 个匹配项，按 Enter 跳转到第一个",
                     matches = self.history.matches.len()
                 )
                 .into(),
@@ -1405,7 +1405,7 @@ impl RepoView {
                         .child(
                             Button::new("close-file-history")
                                 .xsmall()
-                                .label(tr("回到所有提交"))
+                                .label(tr("返回所有提交"))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.close_file_history(window, cx)
                                 })),
@@ -1438,7 +1438,7 @@ impl RepoView {
                                 .xsmall()
                                 .ghost()
                                 .icon(ui::icon(IconName::ChevronUp))
-                                .tooltip(tr("上一个匹配的提交（Shift+回车）"))
+                                .tooltip(tr("上一个匹配的提交（Shift+Enter）"))
                                 .on_click(cx.listener(|this, _, _, cx| this.next_match(-1, cx))),
                         )
                         .child(
@@ -1446,7 +1446,7 @@ impl RepoView {
                                 .xsmall()
                                 .ghost()
                                 .icon(ui::icon(IconName::ChevronDown))
-                                .tooltip(tr("下一个匹配的提交（回车）"))
+                                .tooltip(tr("下一个匹配的提交（Enter）"))
                                 .on_click(cx.listener(|this, _, _, cx| this.next_match(1, cx))),
                         )
                     })
@@ -1460,7 +1460,7 @@ impl RepoView {
                             .ghost()
                             .icon(ui::icon(IconName::FileClock))
                             .label(tr("文件历史…"))
-                            .tooltip(tr("选一个文件，看它的历史或逐行追溯"))
+                            .tooltip(tr("选择文件以查看其历史或逐行追溯"))
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.pick_file(window, cx)),
                             ),
@@ -1616,7 +1616,7 @@ impl RepoView {
                                                 .ghost()
                                                 .icon(ui::icon(IconName::Columns2))
                                                 .selected(split)
-                                                .tooltip(tr("并排着看：左边是旧的，右边是新的"))
+                                                .tooltip(tr("并排显示：左侧为旧版本，右侧为新版本"))
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.toggle_split(cx)
                                                 })),
@@ -1770,7 +1770,7 @@ fn build_loaded(
             t1 = (t2 - t1).as_millis()
         ),
         None => tf!(
-            "先显示前 {commits} 个提交（{fetch_time} ms 读到），其余的还在读…",
+            "已显示前 {commits} 个提交（读取耗时 {fetch_time} ms），正在加载其余提交…",
             commits = commits.len(),
             fetch_time = fetch_time.as_millis()
         ),
@@ -1806,7 +1806,7 @@ fn format_time(ts: i64) -> SharedString {
 
 fn not_found_text(id: &str) -> SharedString {
     tf!(
-        "提交历史里没有找到 {id}（它可能不在任何分支上）",
+        "提交历史中未找到 {id}（可能不在任何分支上）",
         id = &id[..id.len().min(10)]
     )
     .into()
@@ -1967,7 +1967,7 @@ fn ref_badges(
     if shown < labels.len() {
         // 收起来的那些：鼠标停在「+N」上能看到名字
         let hidden: SharedString = tf!(
-            "还有：{join}",
+            "另有：{join}",
             join = labels[shown..]
                 .iter()
                 .map(|l| l.name.as_str())
@@ -2027,7 +2027,7 @@ fn diff_file_header(file: &DiffFile, width: Pixels, muted: Hsla) -> AnyElement {
     let status = match file.status() {
         DiffFileStatus::Added => tr("新增"),
         DiffFileStatus::Deleted => tr("已删除"),
-        DiffFileStatus::Renamed => tr("已改名"),
+        DiffFileStatus::Renamed => tr("已重命名"),
         DiffFileStatus::Copied => tr("已复制"),
         DiffFileStatus::Conflicted => tr("有冲突"),
         _ => "",

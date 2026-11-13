@@ -37,19 +37,19 @@ pub fn title_pill(updater: &Entity<Updater>, cx: &App) -> Option<AnyElement> {
         Stage::Available(release) => button
             .custom(accent)
             .icon(ui::icon(IconName::CircleArrowUp))
-            .label(tf!("{version} 可以升级", version = release.version)),
+            .label(tf!("新版本 {version}", version = release.version)),
         Stage::Downloading { release, got, .. } => button.custom(accent).label(tf!(
-            "下载 {percent}%",
+            "正在下载 {percent}%",
             percent = percent(got.load(Ordering::Relaxed), release.asset.size)
         )),
         Stage::Ready(_) => button
             .primary()
             .icon(ui::icon(IconName::RotateCw))
-            .label(tr("重启完成升级")),
+            .label(tr("重启以完成更新")),
         Stage::Failed { .. } => button
             .custom(tint(theme.danger, theme.danger))
             .icon(ui::icon(IconName::TriangleAlert))
-            .label(tr("升级没成功")),
+            .label(tr("更新失败")),
         Stage::Idle => return None,
     };
     let updater = updater.clone();
@@ -99,7 +99,7 @@ fn popover_body(
                         div()
                             .text_xs()
                             .text_color(muted)
-                            .child(tr("升级要重启 Kuai，服务器上的终端不受影响。")),
+                            .child(tr("更新需要重启 Kuai，服务器上的终端不受影响。")),
                     ),
             )
             .child(
@@ -109,7 +109,7 @@ fn popover_body(
                         Button::new("update-skip")
                             .ghost()
                             .small()
-                            .label(tr("跳过这一版"))
+                            .label(tr("跳过此版本"))
                             .on_click(closing(popover, act(updater, |u, cx| u.skip(cx)))),
                     )
                     .child(download_button(updater)),
@@ -142,15 +142,15 @@ fn popover_body(
             .child(header(
                 IconName::ShieldCheck,
                 success,
-                tf!("{version} 下好了", version = release.version),
-                Some(tr("和 GitHub 上记的校验值对过了").into()),
+                tf!("{version} 已下载", version = release.version),
+                Some(tr("已通过 SHA-256 校验").into()),
                 cx,
             ))
             .child(
                 div()
                     .text_xs()
                     .text_color(muted)
-                    .child(tr("不重启也行，下次打开 Kuai 就是新版。")),
+                    .child(tr("也可稍后重启，下次启动 Kuai 时将使用新版本。")),
             )
             .child(
                 h_flex()
@@ -204,20 +204,20 @@ pub fn about_version(updater: &Entity<Updater>, cx: &App) -> AnyElement {
     };
     let right = h_flex().flex_none().gap_2().items_center();
     let right = match &this.stage {
-        _ if this.checking => right.child(status(tr("正在问 GitHub…").into())),
+        _ if this.checking => right.child(status(tr("正在检查更新…").into())),
         Stage::Idle => {
             let text = match (this.checked_at, &this.updated_from) {
-                (Some(at), _) => tf!("已是最新 · {when}检查过", when = ago(at)),
-                (None, Some(from)) => tf!("刚从 {from} 升上来", from = from.as_str()),
+                (Some(at), _) => tf!("已是最新版本 · {when}检查", when = ago(at)),
+                (None, Some(from)) => tf!("已从 {from} 更新", from = from.as_str()),
                 (None, None) => String::new(),
             };
             right.child(status(text.into())).child(check_button())
         }
         Stage::Available(release) => {
             let text = if this.skipped(release, cx) {
-                tf!("有新版本 {version}（跳过了）", version = release.version)
+                tf!("发现新版本 {version}（已跳过）", version = release.version)
             } else {
-                tf!("有新版本 {version}", version = release.version)
+                tf!("发现新版本 {version}", version = release.version)
             };
             right
                 .child(
@@ -240,7 +240,7 @@ pub fn about_version(updater: &Entity<Updater>, cx: &App) -> AnyElement {
         }
         Stage::Ready(release) => right
             .child(status(
-                tf!("{version} 下好了", version = release.version).into(),
+                tf!("{version} 已下载", version = release.version).into(),
             ))
             .child(restart_button(updater, None)),
         Stage::Failed { release, problem } => {
@@ -305,7 +305,7 @@ pub fn about_version(updater: &Entity<Updater>, cx: &App) -> AnyElement {
                                 .child(tf!("版本 {version}", version = env!("CARGO_PKG_VERSION"))),
                         )
                         .child(div().text_xs().text_color(muted).child(tr(
-                            "能打开服务器上仓库的 Git 客户端：本机和服务器上的仓库用同一套界面。",
+                            "可打开服务器上仓库的 Git 客户端，本机和服务器上的仓库使用同一界面。",
                         ))),
                 )
                 .child(right),
@@ -342,7 +342,7 @@ fn download_button(updater: &Entity<Updater>) -> Button {
         .primary()
         .small()
         .icon(ui::icon(IconName::Download))
-        .label(tr("升级"))
+        .label(tr("更新"))
         .on_click(act(updater, |u, cx| u.download(cx)))
 }
 
@@ -360,7 +360,7 @@ fn restart_button(updater: &Entity<Updater>, popover: Option<&Entity<PopoverStat
         .primary()
         .small()
         .icon(ui::icon(IconName::RotateCw))
-        .label(tr("重启完成升级"));
+        .label(tr("重启以完成更新"));
     match popover {
         Some(popover) => button.on_click(closing(popover, restart)),
         None => button.on_click(restart),
@@ -373,7 +373,7 @@ fn page_link(release: &Release) -> Button {
     Button::new("update-page")
         .link()
         .small()
-        .label(tr("完整的更新说明"))
+        .label(tr("完整更新说明"))
         .on_click(move |_, window, cx| {
             crate::shell::report(crate::shell::open_url(&page), window, cx)
         })
@@ -385,7 +385,7 @@ fn downloads_link(release: Option<&Release>) -> Button {
     Button::new("update-downloads")
         .link()
         .small()
-        .label(tr("去下载页"))
+        .label(tr("前往下载页"))
         .on_click(move |_, window, cx| {
             crate::shell::report(crate::shell::open_url(&page), window, cx)
         })
@@ -458,18 +458,18 @@ fn release_meta(release: &Release) -> SharedString {
 
 fn problem_text(problem: &Problem) -> (SharedString, SharedString) {
     let (title, detail): (&str, String) = match problem {
-        Problem::Check(err) => (tr("没问成"), err.clone()),
-        Problem::Download(err) => (tr("没下完"), err.clone()),
+        Problem::Check(err) => (tr("检查更新失败"), err.clone()),
+        Problem::Download(err) => (tr("下载失败"), err.clone()),
         Problem::Digest => (
-            tr("没装"),
-            tr("下载的文件和 GitHub 上记的校验值对不上").into(),
+            tr("校验失败"),
+            tr("下载文件的校验值与 GitHub 记录的不一致").into(),
         ),
-        Problem::NotWritable(_) => (tr("装不上"), tr("Kuai 所在的文件夹不能写").into()),
+        Problem::NotWritable(_) => (tr("无法安装"), tr("Kuai 所在的文件夹没有写入权限").into()),
         Problem::DevBuild => (
-            tr("开发版不自己升级"),
-            tr("打好的包（kuai.exe）才会换程序").into(),
+            tr("开发版不支持自动更新"),
+            tr("当前程序不是发布版的 kuai.exe").into(),
         ),
-        Problem::Install(err) => (tr("没换成"), err.clone()),
+        Problem::Install(err) => (tr("安装失败"), err.clone()),
     };
     (title.into(), detail.into())
 }
@@ -492,7 +492,7 @@ fn problem_hint(problem: &Problem, muted: Hsla) -> Option<Div> {
             .child(
                 div()
                     .whitespace_normal()
-                    .child(tr("到下载页手动下载，或者把 Kuai 挪到自己的文件夹再升级。")),
+                    .child(tr("请前往下载页手动下载，或将 Kuai 移至有写入权限的文件夹后重试。")),
             ),
     )
 }
@@ -547,7 +547,7 @@ fn mb(bytes: u64) -> String {
 fn ago(at: Instant) -> String {
     let minutes = at.elapsed().as_secs() / 60;
     match minutes {
-        0 => tr("刚才").into(),
+        0 => tr("刚刚").into(),
         1..60 => tf!("{n} 分钟前", n = minutes),
         _ => tf!("{n} 小时前", n = minutes / 60),
     }

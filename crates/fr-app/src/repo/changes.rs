@@ -88,7 +88,7 @@ impl Changes {
     ) -> (Self, Vec<Subscription>) {
         let message = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder(tr("提交说明，第一行是标题。Ctrl+Enter 提交"))
+                .placeholder(tr("提交说明（首行为标题），按 Ctrl+Enter 提交"))
         });
         let subscription = cx.subscribe_in(
             &message,
@@ -233,7 +233,7 @@ fn nul_paths<'a>(paths: impl Iterator<Item = &'a str>) -> Vec<u8> {
 fn name_list(entries: &[Entry]) -> String {
     let mut names: Vec<&str> = entries.iter().take(8).map(|e| e.path.as_str()).collect();
     let more = entries.len().saturating_sub(names.len());
-    let tail = tf!("……等 {entries} 个文件", entries = entries.len());
+    let tail = tf!("……共 {entries} 个文件", entries = entries.len());
     if more > 0 {
         names.push(&tail);
     }
@@ -620,7 +620,7 @@ impl RepoView {
         let note = move |window: &mut Window, cx: &mut App| {
             if skipped > 0 {
                 let text = tf!(
-                    "{skipped} 个文件有冲突，没有暂存。解决后右键「标记为已解决」。",
+                    "{skipped} 个文件存在冲突，未暂存。解决后请右键选择「标记为已解决」。",
                     skipped
                 );
                 window.push_notification(Notification::warning(text), cx);
@@ -701,7 +701,7 @@ impl RepoView {
             .cloned()
             .partition(|e| e.unstaged == Some(Kind::Untracked));
         let description = tf!(
-            "{entries} 个文件没暂存的改动会被丢弃，其中 {untracked} 个未跟踪的会被删除。不能撤销。\n\n{entries2}",
+            "{entries} 个文件未暂存的改动将被丢弃，其中 {untracked} 个未跟踪的文件将被删除。此操作无法撤销。\n\n{entries2}",
             entries = entries.len(),
             untracked = untracked.len(),
             entries2 = name_list(&entries)
@@ -915,7 +915,7 @@ impl RepoView {
             )
         } else {
             tf!(
-                "{path} 在工作区里没暂存的改动会被丢弃，不能撤销。",
+                "{path} 在工作区中未暂存的改动将被丢弃，此操作无法撤销。",
                 path = entry.path
             )
         };
@@ -1017,7 +1017,7 @@ impl RepoView {
             None => diff.selected_count(),
         };
         let description = tf!(
-            "{path} 里的 {count} 行改动会从工作区丢弃，不能撤销。",
+            "{path} 中的 {count} 行改动将从工作区丢弃，此操作无法撤销。",
             path = diff.entry.path,
             count
         );
@@ -1133,7 +1133,7 @@ impl RepoView {
         let sent = self.changes.message.read(cx).value().to_string();
         let message = sent.trim().to_string();
         if message.is_empty() {
-            window.push_notification(Notification::warning(tr("先写提交说明")), cx);
+            window.push_notification(Notification::warning(tr("请先填写提交说明")), cx);
             return;
         }
         let amend = self.changes.amend;
@@ -1170,7 +1170,7 @@ impl RepoView {
                     // 说明在提交期间又改过：留着，只把「修改上次提交」取消掉
                     this.changes.amend = false;
                     this.changes.amend_message = None;
-                    let text = tr("已提交。说明框里的内容在提交期间改过，留着没清。");
+                    let text = tr("已提交。提交期间说明已被修改，因此未清空。");
                     window.push_notification(Notification::info(text), cx);
                 }
                 // 到这里提交这个操作已经结束了，可以接着做下一个
@@ -1214,7 +1214,7 @@ impl RepoView {
     /// 换了界面语言：提交说明框里的提示文字要重新设一遍。
     pub(super) fn retranslate_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.changes.message.update(cx, |state, cx| {
-            state.set_placeholder(tr("提交说明，第一行是标题。Ctrl+Enter 提交"), window, cx)
+            state.set_placeholder(tr("提交说明（首行为标题），按 Ctrl+Enter 提交"), window, cx)
         });
     }
 
@@ -1255,13 +1255,13 @@ impl RepoView {
             Area::Unstaged => (
                 tr("未暂存"),
                 tr("全部暂存"),
-                tr("工作区没有改动"),
+                tr("工作区无改动"),
                 "unstaged",
             ),
             Area::Staged => (
                 tr("已暂存"),
                 tr("全部取消暂存"),
-                tr("还没有暂存的改动"),
+                tr("暂无已暂存的改动"),
                 "staged",
             ),
         };
@@ -1313,8 +1313,8 @@ impl RepoView {
                     .child(div().flex_1())
                     .when(picked > 1, |bar| {
                         let label = match area {
-                            Area::Unstaged => tf!("暂存选中的 {picked} 个", picked),
-                            Area::Staged => tf!("取消暂存选中的 {picked} 个", picked),
+                            Area::Unstaged => tf!("暂存选中的 {picked} 项", picked),
+                            Area::Staged => tf!("取消暂存选中的 {picked} 项", picked),
                         };
                         bar.child(
                             Button::new(SharedString::from(format!("{id}-picked")))
@@ -1532,11 +1532,11 @@ impl RepoView {
                             .xsmall()
                             .ghost()
                             .icon(crate::ui::icon_small(IconName::Clock))
-                            .label(tr("最近用过的"))
+                            .label(tr("最近使用"))
                             .dropdown_menu(move |mut menu, _, _| {
                                 if recent.is_empty() {
                                     return menu.item(
-                                        PopupMenuItem::new(tr("还没有；提交过的说明会记在这里"))
+                                        PopupMenuItem::new(tr("暂无；提交后，说明将记录在此处"))
                                             .disabled(true),
                                     );
                                 }
@@ -1621,11 +1621,11 @@ impl RepoView {
         }
         let Some(diff) = &self.changes.diff else {
             let text = if self.changes.unstaged.is_empty() && self.changes.staged.is_empty() {
-                tr("工作区和暂存区都没有改动")
+                tr("工作区和暂存区均无改动")
             } else if self.changes.selected.is_some() {
                 tr("正在读取改动…")
             } else {
-                tr("选一个文件查看改动")
+                tr("选择文件以查看改动")
             };
             return div()
                 .size_full()
@@ -1676,7 +1676,7 @@ impl RepoView {
                     .ghost()
                     .icon(crate::ui::icon(IconName::Columns2))
                     .selected(self.split_mode(cx))
-                    .tooltip(tr("并排着看：左边是旧的，右边是新的"))
+                    .tooltip(tr("并排显示：左侧为旧版本，右侧为新版本"))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_split(cx))),
             );
 
@@ -1726,11 +1726,11 @@ impl RepoView {
             if count == 0 {
                 let hint = match (area, split) {
                     (Area::Unstaged, false) => {
-                        tr("点改动的行选中，Shift 连选；空格暂存，Delete 丢弃")
+                        tr("点击改动行以选中，按住 Shift 可连续选择；按空格键暂存，按 Delete 丢弃")
                     }
-                    (Area::Staged, false) => tr("点改动的行选中，Shift 连选；空格取消暂存"),
-                    (Area::Unstaged, true) => tr("在行号上按住拖动选中几行；空格暂存，Delete 丢弃"),
-                    (Area::Staged, true) => tr("在行号上按住拖动选中几行；空格取消暂存"),
+                    (Area::Staged, false) => tr("点击改动行以选中，按住 Shift 可连续选择；按空格键取消暂存"),
+                    (Area::Unstaged, true) => tr("在行号上拖动以选择多行；按空格键暂存，按 Delete 丢弃"),
+                    (Area::Staged, true) => tr("在行号上拖动以选择多行；按空格键取消暂存"),
                 };
                 return bar
                     .child(crate::ui::clipped("select-hint", hint).flex_1())
@@ -1741,14 +1741,14 @@ impl RepoView {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .child(tf!("选中了 {count} 行", count)),
+                    .child(tf!("已选中 {count} 行", count)),
             );
             let bar = match area {
                 Area::Unstaged => bar
                     .child(
                         Button::new("stage-lines")
                             .xsmall()
-                            .label(tr("暂存这几行"))
+                            .label(tr("暂存所选行"))
                             .disabled(!line_ops)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.apply_selection(None, window, cx)
@@ -1758,7 +1758,7 @@ impl RepoView {
                         Button::new("discard-lines")
                             .xsmall()
                             .ghost()
-                            .label(tr("丢弃这几行…"))
+                            .label(tr("丢弃所选行…"))
                             .disabled(!line_ops)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.discard_selection(None, window, cx)
@@ -1767,7 +1767,7 @@ impl RepoView {
                 Area::Staged => bar.child(
                     Button::new("unstage-lines")
                         .xsmall()
-                        .label(tr("取消暂存这几行"))
+                        .label(tr("取消暂存所选行"))
                         .disabled(!line_ops)
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.apply_selection(None, window, cx)

@@ -214,7 +214,7 @@ impl RepoView {
                         div()
                             .text_xs()
                             .text_color(muted)
-                            .child(tr("点一行跳到改它的提交；上下键选行，回车跳转")),
+                            .child(tr("点击一行跳转到修改该行的提交；使用上下方向键选择，按 Enter 跳转")),
                     )
                     .child(
                         Button::new("close-blame")
@@ -256,7 +256,7 @@ impl RepoView {
                 let (who, what): (SharedString, SharedString) = if !line.first {
                     ("".into(), "".into())
                 } else if commit.uncommitted() {
-                    ("".into(), tr("还没提交").into())
+                    ("".into(), tr("未提交").into())
                 } else {
                     (
                         format!(

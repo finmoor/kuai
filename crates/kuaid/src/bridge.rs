@@ -36,7 +36,7 @@ pub fn connect() -> Result<()> {
     let paths = Paths::new()?;
     paths.create()?;
     let mine = crate::build();
-    let exe = std::env::current_exe().context("不知道自己装在哪")?;
+    let exe = std::env::current_exe().context("无法确定 kuaid 的安装位置")?;
     let deadline = Instant::now() + WAIT;
     let mut started: Option<Child> = None;
     let mut asked_upgrade = false;
@@ -44,11 +44,11 @@ pub fn connect() -> Result<()> {
         let mut stream = connect_or_start(&paths, &mut started, deadline)?;
         // 常驻进程刚好在退出、或者正在换程序时，问不到：重来
         let Ok(info) = call(&mut stream, "info", json!({})) else {
-            ensure_time(deadline, "常驻进程没有回应")?;
+            ensure_time(deadline, "常驻进程无响应")?;
             std::thread::sleep(Duration::from_millis(30));
             continue;
         };
-        let info: DaemonInfo = serde_json::from_value(info).context("常驻进程的回答看不懂")?;
+        let info: DaemonInfo = serde_json::from_value(info).context("无法解析常驻进程的响应")?;
         if info.build == mine || mine.is_empty() || asked_upgrade || !should_replace(&info.build, &mine)
         {
             break stream;
@@ -105,7 +105,7 @@ fn connect_or_start(
         if need_start {
             *started = Some(start_daemon(paths)?);
         }
-        ensure_time(deadline, "常驻进程起不来，看看 ~/.kuai/run/kuaid.log")?;
+        ensure_time(deadline, "常驻进程启动失败，详见 ~/.kuai/run/kuaid.log")?;
         std::thread::sleep(Duration::from_millis(25));
     }
 }
@@ -120,7 +120,7 @@ fn start_daemon(paths: &Paths) -> Result<Child> {
         .write(true)
         .truncate(too_big)
         .open(&log_path)
-        .with_context(|| format!("写不了 {}", log_path.display()))?;
+        .with_context(|| format!("无法写入 {}", log_path.display()))?;
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("--daemon")
         .stdin(Stdio::null())
@@ -134,7 +134,7 @@ fn start_daemon(paths: &Paths) -> Result<Child> {
             Ok(())
         });
     }
-    cmd.spawn().context("拉不起常驻进程")
+    cmd.spawn().context("无法启动常驻进程")
 }
 
 fn send(stream: &mut UnixStream, method: &str, params: Value) -> Result<()> {
@@ -144,7 +144,7 @@ fn send(stream: &mut UnixStream, method: &str, params: Value) -> Result<()> {
         params,
         bytes: 0,
     };
-    protocol::write_message(stream, &request, &[]).context("和常驻进程的连接断了")
+    protocol::write_message(stream, &request, &[]).context("与常驻进程的连接已断开")
 }
 
 /// 发一个请求，等它的响应。只在开始搬字节之前用：这时连接上没有别的消息。
@@ -153,7 +153,7 @@ fn call(stream: &mut UnixStream, method: &str, params: Value) -> Result<Value> {
     // 一个字节一个字节地读：不能多读，后面的字节是客户端的
     let mut reader = BufReader::with_capacity(1, &*stream);
     let (response, _) = protocol::read_message::<_, Response>(&mut reader)?
-        .context("常驻进程断开了连接")?;
+        .context("常驻进程已断开连接")?;
     match response.error {
         Some(err) => bail!("{err}"),
         None => Ok(response.result.unwrap_or(Value::Null)),
@@ -170,7 +170,7 @@ fn pump(stream: UnixStream) -> Result<()> {
             ManuallyDrop::new(File::from_raw_fd(1)),
         )
     };
-    let mut to_daemon = stream.try_clone().context("套接字用不了")?;
+    let mut to_daemon = stream.try_clone().context("套接字不可用")?;
     std::thread::Builder::new()
         .name("kuaid-bridge-in".into())
         .spawn(move || {
@@ -200,7 +200,7 @@ fn copy(from: &mut impl Read, to: &mut impl Write) -> std::io::Result<()> {
 /// 连上正在跑的常驻进程；没在跑就报错（不拉起）。
 fn existing() -> Result<UnixStream> {
     let paths = Paths::new()?;
-    UnixStream::connect(paths.socket()).context("常驻进程没在跑")
+    UnixStream::connect(paths.socket()).context("常驻进程未运行")
 }
 
 /// `kuaid --status`：常驻进程和终端会话的情况。
@@ -208,7 +208,7 @@ pub fn status() -> Result<()> {
     let mut stream = existing()?;
     let info: DaemonInfo = serde_json::from_value(call(&mut stream, "info", json!({}))?)?;
     println!(
-        "kuaid {} {}，进程号 {}，连着 {} 个客户端",
+        "kuaid {} {}，进程号 {}，已连接 {} 个客户端",
         info.version,
         info.build,
         info.pid,
@@ -218,16 +218,16 @@ pub fn status() -> Result<()> {
     let listed = call(&mut stream, "term_list", json!({}))?;
     let terms: Vec<TermInfo> = serde_json::from_value(listed["terms"].clone()).unwrap_or_default();
     if terms.is_empty() {
-        println!("没有终端会话");
+        println!("暂无终端会话");
     }
     for term in terms {
         println!(
-            "{}  {}  {}×{}  {}  接着 {} 个客户端  开了 {} 分钟{}",
+            "{}  {}  {}×{}  {}  已连接 {} 个客户端  已运行 {} 分钟{}",
             term.term,
             term.cwd,
             term.cols,
             term.rows,
-            if term.alive { "在跑" } else { "已结束" },
+            if term.alive { "运行中" } else { "已结束" },
             term.attached,
             term.age / 60,
             term.title.map(|t| format!("  {t}")).unwrap_or_default(),

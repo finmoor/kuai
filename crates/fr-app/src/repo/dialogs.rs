@@ -79,7 +79,7 @@ pub(super) fn ref_name_error(name: &str) -> Option<String> {
         || name.contains("@{")
         || name == "@";
     (bad_char || bad_shape).then(|| {
-        tr("名字不合规则：不能有空格、~ ^ : ? * [ \\、连着的两个点或斜杠，不能以 - / . 开头，不能以 / . 结尾。").to_string()
+        tr("名称无效：不能包含空格、~ ^ : ? * [ \\、连续的两个点或斜杠，不能以 - / . 开头，也不能以 / . 结尾。").to_string()
     })
 }
 
@@ -90,7 +90,7 @@ impl RepoView {
             .branches
             .iter()
             .any(|b| b.name == name)
-            .then(|| tf!("已经有叫 {name} 的分支了", name))
+            .then(|| tf!("分支 {name} 已存在", name))
     }
 
     /// 弹出通用对话框。点确定（或在输入框里按回车）并且通过校验时关掉对话框、调用 `on_ok`。
@@ -140,7 +140,7 @@ impl RepoView {
                     checks: states.iter().map(Cell::get).collect(),
                 };
                 let found = if answer.text.is_empty() && !allow_empty {
-                    Some(tr("还没有填内容").to_string())
+                    Some(tr("请填写内容").to_string())
                 } else {
                     validate.as_ref().and_then(|validate| {
                         view.upgrade()
@@ -340,10 +340,10 @@ impl RepoView {
         };
         let ask = Ask {
             title: tr("新建分支").into(),
-            placeholder: tr("分支名，比如 feature/login").into(),
+            placeholder: tr("分支名称，例如 feature/login").into(),
             hint: hint.into(),
             ok: tr("创建"),
-            checks: vec![(tr("创建后切换过去"), true)],
+            checks: vec![(tr("创建后切换"), true)],
             validate: Some(Box::new(|this, answer| {
                 ref_name_error(&answer.text).or_else(|| this.branch_exists_error(&answer.text))
             })),
@@ -382,7 +382,7 @@ impl RepoView {
             // 从别的提交新建并切换过去，工作区要换内容：有改动时先问怎么处理。
             // 从当前 HEAD 新建不用问，改动原样留着
             if switch && start.is_some() {
-                this.with_local_changes(what, tr("带着改动切过去"), window, cx, create);
+                this.with_local_changes(what, tr("保留改动并切换"), window, cx, create);
             } else {
                 create(this, false, window, cx);
             }
@@ -393,22 +393,22 @@ impl RepoView {
     pub(super) fn stash_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ask = Ask {
             title: tr("贮藏改动").into(),
-            placeholder: tr("说明，可以不填").into(),
-            hint: tr("把改动收起来，工作区恢复干净；以后从侧栏的「贮藏」里恢复。").into(),
+            placeholder: tr("说明（可选）").into(),
+            hint: tr("将改动贮藏，使工作区恢复干净；之后可在侧栏的「贮藏」中恢复。").into(),
             ok: tr("贮藏"),
-            checks: vec![(tr("包括未跟踪的文件"), false)],
+            checks: vec![(tr("包含未跟踪的文件"), false)],
             allow_empty: true,
             validate: Some(Box::new(|this, answer| {
                 let entries = this.status.as_ref().map(|s| s.entries.as_slice())?;
                 let untracked = answer.checks.first().copied().unwrap_or(false);
                 if entries.is_empty() {
-                    Some(tr("没有可以贮藏的改动").into())
+                    Some(tr("没有可贮藏的改动").into())
                 } else if !untracked
                     && entries
                         .iter()
                         .all(|e| e.unstaged == Some(Kind::Untracked) && e.staged.is_none())
                 {
-                    Some(tr("只有未跟踪的文件：勾上「包括未跟踪的文件」才能贮藏").into())
+                    Some(tr("只有未跟踪的文件，需勾选「包含未跟踪的文件」才能贮藏").into())
                 } else {
                     None
                 }
@@ -428,9 +428,9 @@ impl RepoView {
                     // 没有改动时 git 也是成功退出，只在输出里说一句
                     let said = String::from_utf8_lossy(&out.stdout);
                     let note = if said.contains("No local changes") {
-                        Notification::warning(tr("没有可以贮藏的改动"))
+                        Notification::warning(tr("没有可贮藏的改动"))
                     } else {
-                        Notification::success(tr("改动已经贮藏，工作区恢复干净了"))
+                        Notification::success(tr("改动已贮藏，工作区已恢复干净"))
                     };
                     window.push_notification(note, cx);
                 },

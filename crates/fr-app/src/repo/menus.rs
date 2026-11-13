@@ -55,22 +55,22 @@ struct MergeMode {
 const MERGE_MODES: [MergeMode; 4] = [
     MergeMode {
         label: tr_key("默认"),
-        detail: tr_key("能快进就快进，不能就生成合并提交。"),
+        detail: tr_key("可以快进时快进，否则生成合并提交。"),
         flag: None,
     },
     MergeMode {
-        label: tr_key("总是生成合并提交（--no-ff）"),
-        detail: tr_key("总是生成合并提交，历史里看得出合并过。"),
+        label: tr_key("始终生成合并提交（--no-ff）"),
+        detail: tr_key("始终生成合并提交，在历史中保留合并记录。"),
         flag: Some("--no-ff"),
     },
     MergeMode {
-        label: tr_key("只快进（--ff-only）"),
-        detail: tr_key("不能快进就什么都不做。"),
+        label: tr_key("仅快进（--ff-only）"),
+        detail: tr_key("无法快进时不执行任何操作。"),
         flag: Some("--ff-only"),
     },
     MergeMode {
-        label: tr_key("压缩成一份改动（--squash）"),
-        detail: tr_key("对方的改动合成一份放进暂存区，不记录合并关系，自己写说明提交。"),
+        label: tr_key("压缩合并（--squash）"),
+        detail: tr_key("将要合并的改动压缩后放入暂存区，不记录合并关系，需自行填写说明并提交。"),
         flag: Some("--squash"),
     },
 ];
@@ -138,14 +138,14 @@ fn scope_items(
         }
     };
     let menu = menu.item(
-        item(view, tr("提交列表里只看它"), move |this, w, cx| {
+        item(view, tr("在提交列表中仅显示此项"), move |this, w, cx| {
             this.set_scope(to.clone(), w, cx)
         })
         .checked(only),
     );
     match hidden {
         Some(hidden) => menu.item(
-            item(view, tr("在提交列表里隐藏"), move |this, _, cx| {
+            item(view, tr("在提交列表中隐藏"), move |this, _, cx| {
                 this.toggle_hidden(full.clone(), cx)
             })
             .checked(hidden),
@@ -178,10 +178,10 @@ impl RepoView {
     /// theirs 才是自己分支上正在重放的那个提交。
     pub(super) fn side_labels(&self) -> (&'static str, &'static str) {
         match self.in_progress {
-            Some(InProgress::Merge) => (tr("当前分支的版本"), tr("合并进来的版本")),
-            Some(InProgress::Rebase) => (tr("变基目标上的版本"), tr("正在重放的那个提交的版本")),
+            Some(InProgress::Merge) => (tr("当前分支的版本"), tr("被合并分支的版本")),
+            Some(InProgress::Rebase) => (tr("变基目标的版本"), tr("正在重放的提交的版本")),
             Some(InProgress::CherryPick) => (tr("当前分支的版本"), tr("被挑拣的提交的版本")),
-            Some(InProgress::Revert) => (tr("当前分支的版本"), tr("还原之后的版本")),
+            Some(InProgress::Revert) => (tr("当前分支的版本"), tr("还原后的版本")),
             None => (tr("当前分支的版本"), tr("传入的版本")),
         }
     }
@@ -217,7 +217,7 @@ impl RepoView {
             menu = menu
                 .item(item(
                     &view,
-                    tr("检出这个提交（分离 HEAD）"),
+                    tr("检出此提交（分离 HEAD）"),
                     move |this, w, cx| this.checkout_detached(target.clone(), w, cx),
                 ))
                 .separator()
@@ -242,13 +242,13 @@ impl RepoView {
             let revert = id.clone();
             menu = menu.item(item(
                 &view,
-                tr("还原这个提交（revert）"),
+                tr("还原此提交（revert）"),
                 move |this, w, cx| this.revert_commit(revert.clone(), is_merge, w, cx),
             ));
             {
                 let (view2, id2) = (view.clone(), id.clone());
                 menu = menu.submenu(
-                    tf!("把 {cur} 重置到这里", cur),
+                    tf!("将 {cur} 重置到此提交", cur),
                     window,
                     cx,
                     move |sub, _, _| {
@@ -261,11 +261,11 @@ impl RepoView {
                         // 在 HEAD 上 soft 什么都不改，不列
                         let sub = if is_head {
                             sub.item(mode(
-                                tr("取消全部暂存，改动留在工作区（mixed）…"),
+                                tr("取消全部暂存，改动保留在工作区（mixed）…"),
                                 "--mixed",
                             ))
                         } else {
-                            sub.item(mode(tr("保留改动，并且留在暂存区（soft）…"), "--soft"))
+                            sub.item(mode(tr("保留改动并暂存（soft）…"), "--soft"))
                                 .item(mode(tr("保留改动，不暂存（mixed）…"), "--mixed"))
                         };
                         sub.separator()
@@ -277,7 +277,7 @@ impl RepoView {
                 let onto = id.clone();
                 menu = menu.item(item(
                     &view,
-                    tf!("把 {cur} 变基到这里…", cur),
+                    tf!("将 {cur} 变基到此提交…", cur),
                     move |this, w, cx| {
                         this.rebase_onto(onto.clone(), short(&onto).to_string(), w, cx)
                     },
@@ -285,7 +285,7 @@ impl RepoView {
                 let base = id.clone();
                 menu = menu.item(item(
                     &view,
-                    tr("交互式变基：整理这之后的提交…"),
+                    tr("交互式变基：整理此后的提交…"),
                     move |this, w, cx| this.interactive_rebase(base.clone(), w, cx),
                 ));
             }
@@ -335,7 +335,7 @@ impl RepoView {
                             ))
                             .item(item(
                                 &view,
-                                tf!("把 {cur} 变基到 {name}…", cur, name),
+                                tf!("将 {cur} 变基到 {name}…", cur, name),
                                 move |this, w, cx| this.rebase_onto(c.clone(), c.clone(), w, cx),
                             ))
                             .separator();
@@ -351,7 +351,7 @@ impl RepoView {
                         let branch = name.clone();
                         menu = menu.item(item(
                             &view,
-                            tf!("拉取 {name}（只快进，不用切换）", name),
+                            tf!("拉取 {name}（仅快进，无需切换）", name),
                             move |this, w, cx| {
                                 this.fast_forward_branch(branch.clone(), upstream.clone(), w, cx)
                             },
@@ -370,7 +370,7 @@ impl RepoView {
                             move |this, w, cx| this.push_branch(&b, true, w, cx),
                         ))
                         .separator()
-                        .item(item(&view, tr("改名…"), move |this, w, cx| {
+                        .item(item(&view, tr("重命名…"), move |this, w, cx| {
                             this.rename_branch_dialog(c.clone(), w, cx)
                         }));
                     if !branch.current {
@@ -416,7 +416,7 @@ impl RepoView {
                         ))
                         .item(item(
                             &view,
-                            tf!("把 {cur} 变基到 {name}…", cur, name),
+                            tf!("将 {cur} 变基到 {name}…", cur, name),
                             move |this, w, cx| this.rebase_onto(c.clone(), c.clone(), w, cx),
                         ))
                         .separator()
@@ -447,7 +447,7 @@ impl RepoView {
                     let menu = menu
                         .item(item(
                             &view,
-                            tr("检出这个标签（分离 HEAD）"),
+                            tr("检出此标签（分离 HEAD）"),
                             move |this, w, cx| this.checkout_detached(a.clone(), w, cx),
                         ))
                         .separator()
@@ -501,7 +501,7 @@ impl RepoView {
                         ))
                         .item(item(
                             &view,
-                            tf!("改 {remote} 的地址…", remote),
+                            tf!("修改 {remote} 的地址…", remote),
                             move |this, w, cx| this.set_remote_url_dialog(a.clone(), w, cx),
                         ))
                         .item(item(
@@ -513,7 +513,7 @@ impl RepoView {
                     } else {
                         menu
                     };
-                    menu.item(copy_item(tr("复制远程的名字"), remote.clone()))
+                    menu.item(copy_item(tr("复制远程名称"), remote.clone()))
                 }))
             }
             SideItem::Header(SideSection::Submodules) => Some(Box::new(move |menu, _, _| {
@@ -527,12 +527,12 @@ impl RepoView {
                     let (a, b) = (path.clone(), path.clone());
                     menu.item(item(
                         &view,
-                        tr("在新标签页里打开"),
+                        tr("在新标签页中打开"),
                         move |this, _, cx| this.open_submodule(i, cx),
                     ))
                     .item(item(
                         &view,
-                        tr("更新这个子模块"),
+                        tr("更新此子模块"),
                         move |this, w, cx| this.update_submodules(Some(a.clone()), w, cx),
                     ))
                     .separator()
@@ -546,7 +546,7 @@ impl RepoView {
                     let c = (stash.selector.clone(), stash.message.clone());
                     menu.item(item(
                         &view,
-                        tr("应用（贮藏留着）"),
+                        tr("应用（保留贮藏）"),
                         move |this, w, cx| this.stash_apply(a.clone(), w, cx),
                     ))
                     .item(item(
@@ -587,19 +587,19 @@ impl RepoView {
                         menu = menu
                             .item(item(
                                 &view,
-                                tr("在合并编辑器里解决…"),
+                                tr("在合并编辑器中解决…"),
                                 move |this, w, cx| this.open_merge_editor(path.clone(), w, cx),
                             ))
                             .separator();
                         menu = menu
                             .item(item(
                                 &view,
-                                tf!("整个文件用{ours}（ours）…", ours),
+                                tf!("整个文件采用{ours}（ours）…", ours),
                                 move |this, w, cx| this.resolve_with(a.clone(), "--ours", w, cx),
                             ))
                             .item(item(
                                 &view,
-                                tf!("整个文件用{theirs}（theirs）…", theirs),
+                                tf!("整个文件采用{theirs}（theirs）…", theirs),
                                 move |this, w, cx| this.resolve_with(b.clone(), "--theirs", w, cx),
                             ))
                             .separator();
@@ -623,7 +623,7 @@ impl RepoView {
                     if entry.unstaged == Some(Kind::Untracked) {
                         let path = entry.path.clone();
                         menu =
-                            menu.item(item(&view, tr("加到 .gitignore"), move |this, w, cx| {
+                            menu.item(item(&view, tr("添加到 .gitignore"), move |this, w, cx| {
                                 this.ignore_path(path.clone(), w, cx)
                             }));
                     }
@@ -643,7 +643,7 @@ impl RepoView {
                     Some(dest) => {
                         let (dest, file) = (dest.clone(), format!("{full_path}/{}", entry.path));
                         menu = menu.item(
-                            PopupMenuItem::new(tr("在 VS Code 里打开（Remote-SSH）")).on_click(
+                            PopupMenuItem::new(tr("在 VS Code 中打开（Remote-SSH）")).on_click(
                                 move |_, window, cx| {
                                     let result = crate::shell::open_vscode_remote(&dest, &file);
                                     crate::shell::report(result, window, cx);
@@ -660,7 +660,7 @@ impl RepoView {
                                     crate::shell::report(crate::shell::open_file(&file), window, cx)
                                 },
                             ))
-                            .item(PopupMenuItem::new(tr("在 VS Code 里打开")).on_click(
+                            .item(PopupMenuItem::new(tr("在 VS Code 中打开")).on_click(
                                 move |_, window, cx| {
                                     let result = crate::shell::open_vscode(&file2);
                                     crate::shell::report(result, window, cx);
@@ -686,7 +686,7 @@ impl RepoView {
             }
             if local {
                 let file = format!("{full_path}/{}", entry.path);
-                menu = menu.item(PopupMenuItem::new(tr("在资源管理器里显示")).on_click(
+                menu = menu.item(PopupMenuItem::new(tr("在资源管理器中显示")).on_click(
                     move |_, window, cx| {
                         crate::shell::report(crate::shell::reveal_in_explorer(&file), window, cx)
                     },
@@ -762,7 +762,7 @@ impl RepoView {
         Box::new(move |menu, _, _| {
             menu.item(item(
                 &view,
-                tr("拉取，用变基代替合并（--rebase）"),
+                tr("拉取，以变基代替合并（--rebase）"),
                 |this, w, cx| this.pull(true, w, cx),
             ))
         })
@@ -779,7 +779,7 @@ impl RepoView {
                     match current {
                         Some(branch) => this.push_branch(&branch, true, w, cx),
                         None => w.push_notification(
-                            Notification::warning(tr("现在是分离的 HEAD，先切换到一个分支再推送")),
+                            Notification::warning(tr("当前处于分离的 HEAD 状态，请先切换到分支再推送")),
                             cx,
                         ),
                     }
@@ -809,7 +809,7 @@ impl RepoView {
     ) {
         self.with_local_changes(
             tf!("检出 {rev}", rev = short(&rev)),
-            tr("带着改动切过去"),
+            tr("保留改动并切换"),
             window,
             cx,
             move |this, stash, window, cx| {
@@ -827,7 +827,7 @@ impl RepoView {
                     window,
                     cx,
                     move |_, _, w, cx| {
-                        let text = tf!("已检出 {rev}，现在是分离的 HEAD", rev = short(&rev));
+                        let text = tf!("已检出 {rev}，当前处于分离的 HEAD 状态", rev = short(&rev));
                         w.push_notification(Notification::success(text), cx);
                     },
                 );
@@ -875,7 +875,7 @@ impl RepoView {
             window,
             cx,
             move |_, _, w, cx| {
-                let text = tf!("已新建一个提交，还原了 {id}", id = short(&id));
+                let text = tf!("已新建提交以还原 {id}", id = short(&id));
                 w.push_notification(Notification::success(text), cx);
             },
         );
@@ -894,7 +894,7 @@ impl RepoView {
             String::new()
         } else {
             tf!(
-                "{cur} 会指向 {id}，它后面的提交从这个分支上消失（还能从 reflog 找回）。",
+                "{cur} 将指向 {id}，之后的提交将从此分支上移除（仍可通过 reflog 找回）。",
                 cur,
                 id = short(&id)
             )
@@ -916,7 +916,7 @@ impl RepoView {
         };
         match flag {
             "--hard" => {
-                let description = tf!("{moved}工作区和暂存区里的改动全部丢弃，不能撤销。", moved);
+                let description = tf!("{moved}工作区和暂存区中的所有改动将被丢弃，此操作无法撤销。", moved);
                 self.confirm(
                     tr("重置并丢弃所有改动？"),
                     description,
@@ -927,7 +927,7 @@ impl RepoView {
                 );
             }
             "--soft" => {
-                let description = tf!("{moved}这些提交的改动留在暂存区，工作区不动。", moved);
+                let description = tf!("{moved}这些提交的改动将保留在暂存区，工作区不变。", moved);
                 self.confirm_plain(
                     tr("重置（soft）？"),
                     description,
@@ -938,7 +938,7 @@ impl RepoView {
                 );
             }
             _ => {
-                let description = tf!("{moved}改动留在工作区，暂存区清空。", moved);
+                let description = tf!("{moved}改动将保留在工作区，暂存区将被清空。", moved);
                 self.confirm_plain(
                     tr("重置（mixed）？"),
                     description,
@@ -962,7 +962,7 @@ impl RepoView {
                 .map(|mode| (tr(mode.label).into(), tr(mode.detail).into()))
                 .collect(),
             selected: 0,
-            checks: vec![(tr("先不提交，合并好停下来检查（--no-commit）"), false)],
+            checks: vec![(tr("合并后暂不提交，以便检查（--no-commit）"), false)],
             ok: tr("合并"),
         };
         self.choose(
@@ -986,15 +986,15 @@ impl RepoView {
                         let note = if squash {
                             this.show_changes(cx);
                             Notification::success(tr(
-                                "对方的改动已合成一份放进暂存区。在「本地修改」里写说明后提交。",
+                                "改动已压缩并放入暂存区。请在「本地修改」中填写说明后提交。",
                             ))
-                            .title(tf!("已把 {name} 的改动压缩进来", name))
+                            .title(tf!("已压缩合并 {name} 的改动", name))
                         } else if no_commit && !stdout.contains("Fast-forward") {
                             this.show_changes(cx);
                             Notification::success(tr(
-                                "还没提交：检查后点上面的「提交合并」，不要了点「中止」。",
+                                "尚未提交：请检查后点击上方的「提交合并」，如需放弃，请点击「中止」。",
                             ))
-                            .title(tf!("{name} 合并好了，等你检查", name))
+                            .title(tf!("{name} 已合并，尚未提交", name))
                         } else {
                             Notification::success(first.to_string())
                                 .title(tf!("已合并 {name}", name))
@@ -1016,12 +1016,12 @@ impl RepoView {
     ) {
         let cur = self.current_label();
         let description = tf!(
-            "{cur} 独有的提交会接到 {shown} 后面重新生成（哈希会变）。已推送的分支变基后要强制推送。",
+            "{cur} 独有的提交将在 {shown} 之后重新生成（哈希会改变）。已推送的分支变基后需要强制推送。",
             cur,
             shown
         );
         self.confirm_plain(
-            tf!("把 {cur} 变基到 {shown}？", cur, shown),
+            tf!("将 {cur} 变基到 {shown}？", cur, shown),
             description,
             tr("变基"),
             window,
@@ -1076,7 +1076,7 @@ impl RepoView {
                 }
                 Err(text) if text.contains("non-fast-forward") => {
                     let text = tf!(
-                        "{name} 上有 {upstream} 没有的提交，快进不了。切换到 {name} 再拉取。",
+                        "{name} 包含 {upstream} 中没有的提交，无法快进。请切换到 {name} 后再拉取。",
                         name,
                         upstream
                     );
@@ -1113,7 +1113,7 @@ impl RepoView {
             }
         };
         let description = tf!(
-            "{to} 上的提交会被本地 {name} 覆盖。{to} 在上次获取后有新提交时不会推送（--force-with-lease）。",
+            "{to} 上的提交将被本地的 {name} 覆盖。如果 {to} 在上次获取后有新提交，则不会推送（--force-with-lease）。",
             to,
             name
         );
@@ -1145,11 +1145,11 @@ impl RepoView {
 
     fn rename_branch_dialog(&mut self, old: String, window: &mut Window, cx: &mut Context<Self>) {
         let ask = Ask {
-            title: tf!("给 {old} 改名", old).into(),
-            placeholder: tr("新的分支名").into(),
+            title: tf!("重命名 {old}", old).into(),
+            placeholder: tr("新分支名称").into(),
             value: old.clone(),
-            hint: tr("只改本地分支的名字，远程上的分支不变。").into(),
-            ok: tr("改名"),
+            hint: tr("仅重命名本地分支，远程分支不变。").into(),
+            ok: tr("重命名"),
             validate: Some(Box::new({
                 let old = old.clone();
                 move |this, answer| {
@@ -1168,13 +1168,13 @@ impl RepoView {
             }
             let rename = vec!["branch".into(), "-m".into(), old.clone(), new.clone()];
             this.run_op(
-                tr("改名"),
+                tr("重命名"),
                 rename,
                 None,
                 window,
                 cx,
                 move |_, _, w, cx| {
-                    w.push_notification(Notification::success(tf!("已改名为 {new}", new)), cx);
+                    w.push_notification(Notification::success(tf!("已重命名为 {new}", new)), cx);
                 },
             );
         });
@@ -1192,7 +1192,7 @@ impl RepoView {
             branch.into(),
         ];
         let description = tf!(
-            "{remote} 上的分支 {branch} 会被删除，其他人也看不到了。本地分支不受影响。",
+            "将删除 {remote} 上的分支 {branch}，其他协作者也将无法访问。本地分支不受影响。",
             remote,
             branch
         );
@@ -1227,9 +1227,9 @@ impl RepoView {
         let remote = self.default_remote();
         let ask = Ask {
             title: tr("新建标签").into(),
-            placeholder: tr("标签名，比如 v1.0.0").into(),
+            placeholder: tr("标签名称，例如 v1.0.0").into(),
             value: String::new(),
-            hint: tf!("打在提交 {id} {subject} 上", id = short(&id), subject).into(),
+            hint: tf!("目标提交：{id} {subject}", id = short(&id), subject).into(),
             ok: tr("创建"),
             checks: vec![(tr("创建后推送到远程"), false)],
             validate: Some(Box::new(|this, answer| {
@@ -1238,7 +1238,7 @@ impl RepoView {
                         .tags
                         .iter()
                         .any(|t| t.name == answer.text)
-                        .then(|| tf!("已经有叫 {text} 的标签了", text = answer.text))
+                        .then(|| tf!("标签 {text} 已存在", text = answer.text))
                 })
             })),
             ..Default::default()
@@ -1293,7 +1293,7 @@ impl RepoView {
             (
                 tr("从远程删除标签？"),
                 tf!(
-                    "{remote} 上的标签 {name} 会被删除，本地的留着。",
+                    "将删除 {remote} 上的标签 {name}，本地标签保留。",
                     remote,
                     name
                 ),
@@ -1301,7 +1301,7 @@ impl RepoView {
         } else {
             (
                 tr("删除本地标签？"),
-                tf!("本地的标签 {name} 会被删除，远程上的不受影响。", name),
+                tf!("将删除本地标签 {name}，远程标签不受影响。", name),
             )
         };
         self.confirm(
@@ -1356,7 +1356,7 @@ impl RepoView {
         let fetch = args(&["fetch", "--all", "--prune", "--progress"]);
         self.run_net_op(tr("获取"), fetch, window, cx, |_, _, w, cx| {
             w.push_notification(
-                Notification::success(tr("获取完成，已清理远程删除的分支")),
+                Notification::success(tr("获取完成，已清理远程已删除的分支")),
                 cx,
             );
         });
@@ -1373,7 +1373,7 @@ impl RepoView {
     fn set_upstream(&mut self, remote: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(branch) = self.status.as_ref().and_then(|s| s.branch.clone()) else {
             window.push_notification(
-                Notification::warning(tr("现在是分离的 HEAD，先切换到一个分支")),
+                Notification::warning(tr("当前处于分离的 HEAD 状态，请先切换到分支")),
                 cx,
             );
             return;
@@ -1403,11 +1403,11 @@ impl RepoView {
         let (ours, theirs) = self.side_labels();
         let which = if side == "--ours" { ours } else { theirs };
         let description = tf!(
-            "{path} 的每处冲突都取这一边，文件标记为已解决。另一边的改动和你手工改过的内容会被覆盖。",
+            "{path} 中的所有冲突都将采用此版本，文件将标记为已解决。另一方的改动和手动编辑的内容将被覆盖。",
             path
         );
         self.confirm(
-            tf!("整个文件用{which}？", which),
+            tf!("整个文件采用{which}？", which),
             description,
             tr("覆盖并标记为已解决"),
             window,
@@ -1424,7 +1424,7 @@ impl RepoView {
                     Step::local(vec!["add".into(), "--".into(), path.clone()]),
                 ];
                 this.run_seq(tr("解决冲突"), steps, window, cx, move |_, _, w, cx| {
-                    let text = tf!("{path} 已用{which}，并标记为已解决", path, which);
+                    let text = tf!("{path} 已采用{which}，并标记为已解决", path, which);
                     w.push_notification(Notification::success(text), cx);
                 });
             },
@@ -1441,7 +1441,7 @@ impl RepoView {
             cx,
             move |_, _, w, cx| {
                 w.push_notification(
-                    Notification::success(tf!("{path} 已加到 .gitignore", path)),
+                    Notification::success(tf!("{path} 已添加到 .gitignore", path)),
                     cx,
                 );
             },
@@ -1453,21 +1453,21 @@ impl RepoView {
     fn add_remote_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ask = Ask {
             title: tr("添加远程").into(),
-            placeholder: tr("名字，比如 upstream").into(),
-            second: Some(tr("地址，比如 https://example.com/team/project.git").into()),
-            hint: tr("添加后会获取一次。获取失败时远程已经加上，可在右键菜单里改地址或删除。")
+            placeholder: tr("名称，例如 upstream").into(),
+            second: Some(tr("地址，例如 https://example.com/team/project.git").into()),
+            hint: tr("添加后将执行一次获取。即使获取失败，远程也已添加，可在右键菜单中修改地址或删除。")
                 .into(),
             ok: tr("添加"),
             validate: Some(Box::new(|this, answer| {
                 if answer.second.is_empty() {
-                    return Some(tr("还没有填地址").into());
+                    return Some(tr("请填写地址").into());
                 }
                 if answer.text.contains(char::is_whitespace) || answer.text.contains('/') {
-                    return Some(tr("远程的名字里不能有空格和斜杠").into());
+                    return Some(tr("远程名称不能包含空格和斜杠").into());
                 }
                 this.remote_names
                     .contains(&answer.text)
-                    .then(|| tf!("已经有叫 {text} 的远程了", text = answer.text))
+                    .then(|| tf!("远程 {text} 已存在", text = answer.text))
             })),
             ..Default::default()
         };
@@ -1490,10 +1490,10 @@ impl RepoView {
         cx: &mut Context<Self>,
     ) {
         let ask = Ask {
-            title: tf!("改 {remote} 的地址", remote).into(),
-            placeholder: tr("新的地址").into(),
+            title: tf!("修改 {remote} 的地址", remote).into(),
+            placeholder: tr("新地址").into(),
             value: String::new(),
-            hint: tr("获取和推送都改用这个地址。").into(),
+            hint: tr("获取和推送均使用此地址。").into(),
             ok: tr("修改"),
             ..Default::default()
         };
@@ -1519,7 +1519,7 @@ impl RepoView {
 
     fn remove_remote(&mut self, remote: String, window: &mut Window, cx: &mut Context<Self>) {
         let description = tf!(
-            "只删本地记录的 {remote} 和它的远程分支，远程仓库本身不受影响。",
+            "仅删除本地记录的 {remote} 及其远程分支，远程仓库本身不受影响。",
             remote
         );
         self.confirm(
@@ -1607,7 +1607,7 @@ impl RepoView {
                 if used_message {
                     this.changes.clear_message(window, cx);
                 }
-                let text = tf!("{name}做完了", name = state.name());
+                let text = tf!("{name}已完成", name = state.name());
                 window.push_notification(Notification::success(text), cx);
             },
         );
@@ -1622,12 +1622,12 @@ impl RepoView {
     ) {
         let description = match state {
             InProgress::Rebase => tr(
-                "跳过正在重放的这个提交：它的改动（包括已解决的冲突）会被丢掉，变基接着处理后面的。",
+                "跳过正在重放的提交：其改动（包括已解决的冲突）将被丢弃，变基将继续处理后续提交。",
             ),
-            _ => tr("放弃正在处理的这个提交，已解决的冲突不保留。"),
+            _ => tr("放弃当前正在处理的提交，已解决的冲突将丢失。"),
         };
         self.confirm(
-            tr("跳过这个提交？"),
+            tr("跳过此提交？"),
             description,
             tr("跳过"),
             window,
@@ -1635,7 +1635,7 @@ impl RepoView {
             move |this, window, cx| {
                 let skip = args(&[state.command(), "--skip"]);
                 this.run_op(tr("跳过"), skip, None, window, cx, |_, _, window, cx| {
-                    window.push_notification(Notification::success(tr("已跳过这个提交")), cx);
+                    window.push_notification(Notification::success(tr("已跳过此提交")), cx);
                 });
             },
         );
@@ -1648,7 +1648,7 @@ impl RepoView {
         cx: &mut Context<Self>,
     ) {
         let description = tf!(
-            "回到{name}之前的状态，已解决的冲突不保留。",
+            "恢复到{name}之前的状态，已解决的冲突将丢失。",
             name = state.name()
         );
         self.confirm(
@@ -1666,7 +1666,7 @@ impl RepoView {
                     window,
                     cx,
                     move |_, _, window, cx| {
-                        let text = tf!("已中止{name}，回到了开始之前的状态", name = state.name());
+                        let text = tf!("已中止{name}，已恢复到开始前的状态", name = state.name());
                         window.push_notification(Notification::success(text), cx);
                     },
                 );

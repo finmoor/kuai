@@ -115,5 +115,5 @@ pub(crate) fn list_dir(path: &str) -> BoxFuture<'static, Result<DirListing>> {
     std::thread::spawn(move || {
         let _ = tx.send(fr_core::dir::list_dir(&path));
     });
-    async move { rx.await.map_err(|_| anyhow!(tr("读目录的线程意外退出")))? }.boxed()
+    async move { rx.await.map_err(|_| anyhow!(tr("读取目录的线程意外退出")))? }.boxed()
 }

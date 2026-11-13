@@ -147,7 +147,7 @@ impl RepoView {
         let label: SharedString = label.into();
         if let Some(running) = &self.op {
             window.push_notification(
-                Notification::warning(tf!("等「{running}」做完再试", running)),
+                Notification::warning(tf!("请等待「{running}」完成后重试", running)),
                 cx,
             );
             return;
@@ -281,9 +281,9 @@ impl RepoView {
                     (Some(state), Err(text)) if resuming => {
                         this.in_progress = Some(state);
                         this.show_changes(cx);
-                        let title = tf!("{name}还没做完，又停下了", name = state.name());
+                        let title = tf!("{name}尚未完成，再次暂停", name = state.name());
                         let note = Notification::warning(
-                            tr("有新冲突就在「本地修改」里解决后点「继续」；不要这个提交点「跳过这个提交」。"),
+                            tr("如有新冲突，请在「本地修改」中解决后点击「继续」；如需丢弃此提交，请点击「跳过此提交」。"),
                         )
                         .title(title.clone())
                         .autohide(false);
@@ -300,10 +300,10 @@ impl RepoView {
                             tr("继续")
                         };
                         let note = Notification::warning(tf!(
-                            "在「本地修改」里解决冲突，然后点上面的「{go}」；不做了点「中止」。",
+                            "请在「本地修改」中解决冲突，然后点击上方的「{go}」；如需放弃，请点击「中止」。",
                             go
                         ))
-                        .title(tf!("{name}遇到冲突，停下了", name = state.name()))
+                        .title(tf!("{name}遇到冲突，已暂停", name = state.name()))
                         .id::<StoppedNote>();
                         window.push_notification(note, cx);
                     }
@@ -316,7 +316,7 @@ impl RepoView {
                         // 多步操作：说清楚前面哪几步已经做完了，免得用户以为什么都没做
                         let result = result.map_err(|text| {
                             if total > 1 && !done.is_empty() {
-                                tf!("前面 {done} 步已经做完：{join}\n失败的是：{failed_step}\n\n{text}", done = done.len(), join = done.join(tr("；")), failed_step, text)
+                                tf!("前 {done} 步已完成：{join}\n失败的步骤：{failed_step}\n\n{text}", done = done.len(), join = done.join(tr("；")), failed_step, text)
                             } else {
                                 text
                             }
@@ -448,7 +448,7 @@ impl RepoView {
         // 没有上游：远程上有同名分支就问要不要设成上游，没有就告诉用户该怎么办
         let Some(branch) = status.branch.clone() else {
             window.push_notification(
-                Notification::warning(tr("现在是分离的 HEAD，先切换到一个分支再拉取")),
+                Notification::warning(tr("当前处于分离的 HEAD 状态，请先切换到分支再拉取")),
                 cx,
             );
             return;
@@ -456,7 +456,7 @@ impl RepoView {
         let candidate = format!("{}/{branch}", self.default_remote());
         if self.refs.remotes.iter().any(|b| b.name == candidate) {
             let description = tf!(
-                "{branch} 没有上游。设为 {candidate} 后拉取。",
+                "{branch} 未设置上游，将设为 {candidate} 后拉取。",
                 branch,
                 candidate
             );
@@ -476,7 +476,7 @@ impl RepoView {
             );
         } else {
             let text = tf!(
-                "{branch} 没有上游，远程上也没有同名分支。先推送一次；要跟踪别的分支，在侧栏的远程分支上右键「设为当前分支的上游」。",
+                "{branch} 未设置上游，远程也没有同名分支。请先推送；如需跟踪其他分支，请在侧栏中右键该远程分支，选择「设为 {branch} 的上游」。",
                 branch
             );
             window.push_notification(Notification::warning(text).autohide(false), cx);
@@ -544,7 +544,7 @@ impl RepoView {
         };
         let Some(branch) = status.branch.clone() else {
             window.push_notification(
-                Notification::warning(tr("现在是分离的 HEAD，先切换到一个分支再推送")),
+                Notification::warning(tr("当前处于分离的 HEAD 状态，请先切换到分支再推送")),
                 cx,
             );
             return;
@@ -560,7 +560,7 @@ impl RepoView {
         if self.remote_names.is_empty() {
             window.push_notification(
                 Notification::warning(tr(
-                    "这个仓库还没有远程。先在侧栏「远程」上右键「添加远程…」。",
+                    "此仓库尚无远程。请先在侧栏的「远程」上右键选择「添加远程…」。",
                 ))
                 .autohide(false),
                 cx,
@@ -577,7 +577,7 @@ impl RepoView {
         ];
         self.run_net_op(tr("推送"), push, window, cx, move |_, _, window, cx| {
             let text = tf!(
-                "推送完成，{branch} 的上游设为 {remote}/{branch}",
+                "推送完成，{branch} 的上游已设为 {remote}/{branch}",
                 branch,
                 remote
             );
@@ -597,7 +597,7 @@ impl RepoView {
         let name = name.to_string();
         self.with_local_changes(
             tf!("切换到 {name}", name = &name),
-            tr("带着改动切过去"),
+            tr("保留改动并切换"),
             window,
             cx,
             move |this, stash, window, cx| {
@@ -650,9 +650,9 @@ impl RepoView {
         let what: SharedString = what.into();
         let count = self.status.as_ref().map_or(0, |s| s.entries.len());
         let choose = super::dialogs::Choose {
-            title: tr("工作区有改动还没提交").into(),
+            title: tr("工作区有未提交的改动").into(),
             description: tf!(
-                "{count} 个文件有没提交的改动。「{what}」前怎么处理？",
+                "{count} 个文件有未提交的改动。执行「{what}」前如何处理？",
                 count,
                 what
             )
@@ -660,11 +660,11 @@ impl RepoView {
             options: vec![
                 (
                     keep.into(),
-                    tr("git 的默认做法。改动和要拿到的内容冲突时 git 会拒绝，什么都不变。").into(),
+                    tr("git 的默认方式。改动与要检出的内容冲突时，git 将拒绝执行，不做任何更改。").into(),
                 ),
                 (
-                    tr("先贮藏，做完再放回来").into(),
-                    tr("改动（包括未跟踪的文件）先贮藏，做完自动放回。放回时有冲突，贮藏会留在侧栏里。").into(),
+                    tr("先贮藏，完成后恢复").into(),
+                    tr("先贮藏改动（包括未跟踪的文件），完成后自动恢复。恢复时如有冲突，贮藏将保留在侧栏中。").into(),
                 ),
             ],
             selected: usize::from(self.app.read(cx).settings.stash_before_switch),
@@ -703,7 +703,7 @@ impl RepoView {
             .map_or(0, |d| d.as_millis());
         let marker = format!("kuai-{millis}");
         let message = tf!(
-            "{label}之前自动贮藏的改动（{marker}）",
+            "{label}前自动贮藏的改动（{marker}）",
             label,
             marker = &marker
         );
@@ -755,7 +755,7 @@ impl RepoView {
                 };
                 let pop = vec!["stash".into(), "pop".into(), selector];
                 this.run_op_with(
-                    tr("放回改动"),
+                    tr("恢复改动"),
                     pop,
                     window,
                     cx,
@@ -763,9 +763,9 @@ impl RepoView {
                         (Ok(out), Ok(_)) => on_success(this, &out, window, cx),
                         (Ok(_), Err(text)) => {
                             this.show_changes(cx);
-                            let title = tf!("{label}做完了，但改动放回来时有冲突", label);
+                            let title = tf!("{label}已完成，但恢复改动时发生冲突", label);
                             let note = Notification::warning(tr(
-                                "在「本地修改」里解决冲突后暂存。自动贮藏还留在侧栏里，确认没丢东西再删。",
+                                "请在「本地修改」中解决冲突并暂存。自动贮藏仍保留在侧栏中，确认改动无遗漏后再删除。",
                             ))
                             .title(title.clone())
                             .autohide(false);
@@ -773,12 +773,12 @@ impl RepoView {
                         }
                         (Err(text), Ok(_)) => {
                             let text =
-                                tf!("{text}\n\n改动已经放回工作区。", text);
+                                tf!("{text}\n\n改动已恢复到工作区。", text);
                             failure(window, cx, label, text);
                         }
                         (Err(text), Err(pop)) => {
                             let text = tf!(
-                                "{text}\n\n改动放回时也出错了，还在侧栏的「贮藏」里：\n{pop}",
+                                "{text}\n\n恢复改动时也出现错误，改动仍保留在侧栏的「贮藏」中：\n{pop}",
                                 text,
                                 pop
                             );
@@ -810,14 +810,14 @@ impl RepoView {
             }
             Some(branch) => {
                 let tracking = match &branch.upstream {
-                    Some(upstream) => tf!("跟踪的是 {upstream}", upstream),
-                    None => tr("没有上游").into(),
+                    Some(upstream) => tf!("跟踪 {upstream}", upstream),
+                    None => tr("未设置上游").into(),
                 };
                 let ask = super::dialogs::Ask {
-                    title: tf!("本地已经有分支 {local}", local).into(),
-                    placeholder: tr("新的本地分支名").into(),
+                    title: tf!("本地分支 {local} 已存在", local).into(),
+                    placeholder: tr("新本地分支名称").into(),
                     value: format!("{local}-{remote_name}"),
-                    hint: tf!("本地的 {local} {tracking}，不是 {remote}。换个名字新建；要用原来的，取消后在侧栏双击它。", local, tracking, remote)
+                    hint: tf!("本地分支 {local} {tracking}，而非 {remote}。请输入新名称以新建分支；如需使用现有分支，请取消后在侧栏中双击该分支。", local, tracking, remote)
                     .into(),
                     ok: tr("新建并切换"),
                     validate: Some(Box::new(|this, answer| {
@@ -843,7 +843,7 @@ impl RepoView {
     ) {
         self.with_local_changes(
             tf!("切换到 {local}", local = &local),
-            tr("带着改动切过去"),
+            tr("保留改动并切换"),
             window,
             cx,
             move |this, stash, window, cx| {
@@ -884,7 +884,7 @@ impl RepoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let description = tf!("删除本地分支 {name}。远程上的同名分支不受影响。", name);
+        let description = tf!("删除本地分支 {name}，远程同名分支不受影响。", name);
         self.confirm(
             tr("删除分支？"),
             description,
@@ -917,7 +917,7 @@ impl RepoView {
                 // `-d` 不肯删，一般是分支还没合并。不去认 git 的报错文字（它跟着系统语言变），
                 // 原样给用户看，由用户决定要不要强制删
                 Err(text) if !force => {
-                    let description = tf!("git 没有删除 {name}：\n{text}\n\n强制删除后，只在这个分支上的提交很难找回。", name, text);
+                    let description = tf!("git 未删除 {name}：\n{text}\n\n强制删除后，仅存在于此分支上的提交将难以找回。", name, text);
                     this.confirm(
                         tr("强制删除分支？"),
                         description,
@@ -940,7 +940,7 @@ impl RepoView {
             return;
         };
         let description = tf!(
-            "恢复贮藏「{message}」（{selector}）并把它从列表里删除。只恢复不删除，用侧栏贮藏上的「应用」。",
+            "恢复贮藏「{message}」（{selector}）并将其从列表中删除。如需保留贮藏，请在侧栏中对该贮藏使用「应用」。",
             message = stash.message,
             selector = stash.selector
         );
@@ -972,7 +972,7 @@ impl RepoView {
             |this, _, window, cx| {
                 this.show_changes(cx);
                 window
-                    .push_notification(Notification::success(tr("改动已恢复，这条贮藏已删除")), cx);
+                    .push_notification(Notification::success(tr("改动已恢复，贮藏已删除")), cx);
             },
         );
     }
@@ -993,7 +993,7 @@ impl RepoView {
             |this, _, window, cx| {
                 this.show_changes(cx);
                 window
-                    .push_notification(Notification::success(tr("改动已恢复，这条贮藏还留着")), cx);
+                    .push_notification(Notification::success(tr("改动已恢复，贮藏已保留")), cx);
             },
         );
     }
@@ -1006,7 +1006,7 @@ impl RepoView {
         cx: &mut Context<Self>,
     ) {
         let description = tf!(
-            "{selector}（{message}）会被删除，不能撤销。",
+            "{selector}（{message}）将被删除，此操作无法撤销。",
             selector,
             message
         );
@@ -1025,7 +1025,7 @@ impl RepoView {
                     window,
                     cx,
                     |_, _, window, cx| {
-                        window.push_notification(Notification::success(tr("已删除这条贮藏")), cx);
+                        window.push_notification(Notification::success(tr("已删除此贮藏")), cx);
                     },
                 );
             },
@@ -1045,7 +1045,7 @@ const DETAIL_HEIGHT: f32 = 96.;
 /// 操作失败的通知：常见的情况先用中文说原因和下一步，下面一个小块放 git 的原文（太长只留末尾，
 /// 块里可以滚动），「复制全部」把完整的报错放进剪贴板。通知不会自己消失。
 pub(super) fn failure(window: &mut Window, cx: &mut App, label: &str, detail: String) {
-    let hint = explain(&detail).unwrap_or(tr("git 报的错在下面。"));
+    let hint = explain(&detail).unwrap_or(tr("git 返回的错误信息如下。"));
     let title = tf!("{label}失败", label);
     let note = Notification::error(hint)
         .title(title.clone())
@@ -1100,10 +1100,10 @@ pub(crate) fn explain(detail: &str) -> Option<&'static str> {
     let has = |words: &[&str]| words.iter().any(|w| text.contains(w));
     if has(&["not possible to fast-forward", "can't be fast-forwarded"]) {
         Some(tr(
-            "两边各有新提交，没法快进，什么都没做。要合并请换一种合并方式。",
+            "双方都有新提交，无法快进，未执行任何操作。如需合并，请选择其他合并方式。",
         ))
     } else if has(&["non-fast-forward", "fetch first", "stale info"]) {
-        Some(tr("被拒绝：远程分支上有本地没有的提交。先拉取再推送。"))
+        Some(tr("推送被拒绝：远程分支包含本地没有的提交。请先拉取再推送。"))
     } else if has(&[
         "authentication failed",
         "permission denied",
@@ -1112,7 +1112,7 @@ pub(crate) fn explain(detail: &str) -> Option<&'static str> {
         "terminal prompts disabled",
     ]) {
         Some(tr(
-            "认证没通过。检查用户名、密码或密钥有没有这个仓库的权限。",
+            "认证失败。请检查用户名、密码或密钥是否有该仓库的访问权限。",
         ))
     } else if has(&[
         "could not resolve host",
@@ -1122,35 +1122,35 @@ pub(crate) fn explain(detail: &str) -> Option<&'static str> {
         "unable to access",
         "connection reset",
     ]) {
-        Some(tr("连不上远程。检查网络、代理和远程地址。"))
+        Some(tr("无法连接远程仓库。请检查网络、代理和远程地址。"))
     } else if has(&[
         "would be overwritten",
         "please commit your changes or stash them",
     ]) {
-        Some(tr("本地改动会被覆盖，没有做。先提交或贮藏再试。"))
+        Some(tr("本地改动将被覆盖，操作未执行。请先提交或贮藏改动后重试。"))
     } else if has(&["index.lock", "another git process"]) {
         Some(tr(
-            "仓库被锁住了：有别的 git 进程在用，或者上次操作没正常结束。稍后再试；一直不行就删掉 .git/index.lock。",
+            "仓库已被锁定：其他 git 进程正在使用，或上次操作未正常结束。请稍后重试；如问题持续，请删除 .git/index.lock。",
         ))
     } else if has(&["not fully merged"]) {
-        Some(tr("这个分支还有没合并进来的提交。"))
+        Some(tr("此分支包含尚未合并的提交。"))
     } else if has(&["no upstream", "has no upstream branch"]) {
-        Some(tr("这个分支没有上游，推送一次会自动设好。"))
+        Some(tr("此分支未设置上游，推送后将自动设置。"))
     } else if has(&["unmerged files", "unresolved conflict", "fix conflicts"]) {
-        Some(tr("还有没解决的冲突。到「本地修改」里解决后再试。"))
+        Some(tr("存在未解决的冲突。请在「本地修改」中解决后重试。"))
     } else if has(&["not concluded your merge", "merge_head exists"]) {
-        Some(tr("上一次合并还没提交。先点上面的「提交合并」或「中止」。"))
+        Some(tr("上一次合并尚未提交。请先点击上方的「提交合并」或「中止」。"))
     } else if has(&["nothing to commit", "no changes added to commit"]) {
-        Some(tr("没有可以提交的改动。"))
+        Some(tr("没有可提交的改动。"))
     } else if has(&["already exists"]) {
-        Some(tr("这个名字已经有了，换一个。"))
+        Some(tr("此名称已被使用，请换一个。"))
     } else if has(&[
         "not a valid",
         "invalid refspec",
         "is not a valid branch name",
     ]) {
         Some(tr(
-            "名字不合规则：不能有空格、~ ^ : ? * [ 和连着的两个点，也不能以 / 或 . 结尾。",
+            "名称无效：不能包含空格、~ ^ : ? * [ 或连续的两个点，也不能以 / 或 . 结尾。",
         ))
     } else {
         None
@@ -1173,7 +1173,7 @@ fn tail(text: &str, n: usize) -> String {
         return lines.join("\n");
     }
     tf!(
-        "…（前面还有 {n} 行，点「复制全部」看完整的）\n{n2}",
+        "…（已省略前 {n} 行，点击「复制全部」可查看完整内容）\n{n2}",
         n = lines.len() - n,
         n2 = lines[lines.len() - n..].join("\n")
     )
@@ -1294,7 +1294,7 @@ mod tests {
         assert!(
             explain("fatal: unable to access 'https://example.com/': Could not resolve host")
                 .unwrap()
-                .contains("连不上")
+                .contains("无法连接")
         );
         assert!(
             explain("error: You have not concluded your merge (MERGE_HEAD exists).")
@@ -1311,7 +1311,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let shown = tail(&text, 12);
-        assert!(shown.starts_with("…（前面还有 8 行"));
+        assert!(shown.starts_with("…（已省略前 8 行"));
         assert!(shown.ends_with("第 20 行"));
         assert_eq!(tail("一行", 12), "一行");
     }
