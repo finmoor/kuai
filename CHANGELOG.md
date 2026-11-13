@@ -2,6 +2,11 @@
 
 各版本发布在 [GitHub Releases](https://github.com/finmoor/kuai/releases)，发布说明取自本文件中对应版本的一节（`tools/release-notes.ps1`）。Kuai 的更新提示会列出该节中以 `- ` 开头的条目，因此每条应简短，并面向用户描述变化，写法见 [docs/界面文案规范.md](docs/界面文案规范.md)。1.7 及更早的版本见 README 的「里程碑」。
 
+## 1.8.1
+
+- 界面文案统一改为正式的书面语，提示和报错更简洁，英文界面同步修订
+- 服务器上 kuaid 的报错、安装程序和使用说明的措辞同步修订
+
 ## 1.8.0
 
 - 开源：采用 MIT 或 Apache-2.0 双许可，源代码托管在 GitHub
