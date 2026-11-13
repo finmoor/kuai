@@ -9,7 +9,7 @@
 //!
 //! 快捷键：F5 刷新、Ctrl+W 关标签页、Ctrl+Tab 切标签页、Ctrl+F 搜索提交、Ctrl+P 快速打开仓库、
 //! Ctrl+1 本地修改、Ctrl+2 所有提交、Ctrl+, 设置、Ctrl+Shift+T 重新打开刚关掉的标签页、
-//! Ctrl+` 当前仓库在 Git、终端两页之间切换。
+//! Ctrl+` 当前仓库在 Git、终端两页之间切换、Ctrl+Shift+B 收起、展开侧栏。
 //!
 //! 有新版本时标题栏上齿轮左边多一个小牌（`update_view.rs`），点「重启完成升级」后这里先问一下
 //! 本机终端，再换上新版本、拉起新的 Kuai、自己退出。
@@ -881,6 +881,14 @@ impl Workspace {
         if let Some(tab) = self.active_repo() {
             tab.view
                 .update(cx, |view, cx| view.new_terminal(window, cx));
+        }
+    }
+
+    /// Ctrl+Shift+B：收起、展开仓库页的侧栏（所有标签页一起变）。
+    pub fn toggle_sidebar_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_repo() {
+            tab.view
+                .update(cx, |view, cx| view.toggle_sidebar(window, cx));
         }
     }
 

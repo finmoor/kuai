@@ -17,7 +17,7 @@ use fr_core::i18n::tr;
 use fr_core::tf;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -110,6 +110,37 @@ pub fn end_parked_terminals(entry: &RepoEntry, cx: &mut App) {
 /// 最小的、还没用上的序号。
 fn free_number(used: &[u32]) -> u32 {
     (1..).find(|n| !used.contains(n)).unwrap_or(1)
+}
+
+/// 一个终端的右键菜单：发送文件、重启、结束。侧栏里那一行、图标栏上的序号都用它。
+fn terminal_menu(
+    view: WeakEntity<RepoView>,
+    index: usize,
+) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+    move |menu, _, _| {
+        let (attach, restart, end) = (view.clone(), view.clone(), view.clone());
+        menu.item(
+            PopupMenuItem::new(tr("发送图片或文件…")).on_click(move |_, window, cx| {
+                attach
+                    .update(cx, |this, cx| this.attach_to_terminal(index, window, cx))
+                    .ok();
+            }),
+        )
+        .item(
+            PopupMenuItem::new(tr("重启")).on_click(move |_, window, cx| {
+                restart
+                    .update(cx, |this, cx| this.restart_terminal(index, window, cx))
+                    .ok();
+            }),
+        )
+        .separator()
+        .item(
+            PopupMenuItem::new(tr("结束")).on_click(move |_, window, cx| {
+                end.update(cx, |this, cx| this.end_terminal(index, window, cx))
+                    .ok();
+            }),
+        )
+    }
 }
 
 impl RepoView {
@@ -564,31 +595,70 @@ impl RepoView {
                     .child(ui::clipped(("terminal-title", index), title).flex_1())
                     .child(close),
             )
-            .context_menu(move |menu, _, _| {
-                let (attach, restart, end) = (view.clone(), view.clone(), view.clone());
-                menu.item(
-                    PopupMenuItem::new(tr("发送图片或文件…")).on_click(move |_, window, cx| {
-                        attach
-                            .update(cx, |this, cx| this.attach_to_terminal(index, window, cx))
-                            .ok();
-                    }),
-                )
-                .item(
-                    PopupMenuItem::new(tr("重启")).on_click(move |_, window, cx| {
-                        restart
-                            .update(cx, |this, cx| this.restart_terminal(index, window, cx))
-                            .ok();
-                    }),
-                )
-                .separator()
-                .item(
-                    PopupMenuItem::new(tr("结束")).on_click(move |_, window, cx| {
-                        end.update(cx, |this, cx| this.end_terminal(index, window, cx))
-                            .ok();
-                    }),
-                )
-            })
+            .context_menu(terminal_menu(view, index))
             .into_any_element()
+    }
+
+    /// 侧栏收成图标栏时终端页的那几项：各终端的序号（点一下切过去，右键和侧栏里那一行一样，
+    /// 程序已经结束的变淡），最后是「新终端」。
+    pub(super) fn render_terminal_rail(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let theme = cx.theme();
+        let (fg, muted, selected_bg, hover, border, accent) = (
+            theme.sidebar_foreground,
+            theme.muted_foreground,
+            theme.sidebar_accent,
+            theme.list_hover,
+            theme.input,
+            theme.primary,
+        );
+        let view = cx.entity().downgrade();
+        let mut items: Vec<AnyElement> = self
+            .terminals
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let selected = index == self.terminals.active;
+                let terminal = tab.view.read(cx);
+                let title: SharedString = terminal.title().unwrap_or_else(|| tr("终端").into());
+                let running = terminal.is_running();
+                div()
+                    .id(("rail-term", index))
+                    .flex_none()
+                    .size(px(30.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(if selected {
+                        accent.opacity(0.7)
+                    } else {
+                        border
+                    })
+                    .when(selected, |d| {
+                        d.bg(selected_bg).font_weight(FontWeight::SEMIBOLD)
+                    })
+                    .when(!selected, |d| d.hover(|s| s.bg(hover)))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(12.))
+                    .text_color(if running { fg } else { muted })
+                    .cursor_pointer()
+                    .child(tab.number.to_string())
+                    .tooltip(move |window, cx| ui::tip(title.clone(), window, cx))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_terminal(index, window, cx)
+                    }))
+                    .context_menu(terminal_menu(view.clone(), index))
+                    .into_any_element()
+            })
+            .collect();
+        items.push(
+            super::rail::rail_button("rail-term-new", IconName::Plus, false)
+                .tooltip(tr("新终端（Ctrl+Shift+`）"))
+                .on_click(cx.listener(|this, _, window, cx| this.new_terminal(window, cx)))
+                .into_any_element(),
+        );
+        items
     }
 
     /// 终端页的右边：上面一条工具栏，下面是选中的终端，占满；一个都没有时是空的样子。

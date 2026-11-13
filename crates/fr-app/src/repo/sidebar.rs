@@ -7,6 +7,8 @@
 //! 单击分支、标签：在提交图里跳到它指向的提交；双击本地分支：切换过去；
 //! 双击远程分支：切到同名本地分支，没有就新建一个跟踪它的。
 //! 过滤框里输几个字，只留名字里有这几个字的分支、标签、贮藏，文件夹全部展开。
+//!
+//! 仓库名一行的右边是收起按钮：侧栏收成图标栏，见 [`super::rail`]。
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashSet};
@@ -16,7 +18,7 @@ use std::ops::Range;
 use fr_core::i18n::{tr, trc};
 use fr_core::refs::Refs;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
@@ -41,7 +43,7 @@ pub(super) enum SideSection {
 }
 
 impl SideSection {
-    fn title(self) -> &'static str {
+    pub(super) fn title(self) -> &'static str {
         match self {
             // 分组的标题在英文里是复数（Branches），和按钮上的同一个词（Branch）分开翻
             SideSection::Branches => trc("分组", "分支"),
@@ -52,7 +54,7 @@ impl SideSection {
         }
     }
 
-    fn icon(self) -> IconName {
+    pub(super) fn icon(self) -> IconName {
         match self {
             SideSection::Branches => IconName::GitBranch,
             SideSection::Remotes => IconName::Cloud,
@@ -194,7 +196,8 @@ pub(super) struct Sidebar {
     folded: HashSet<String>,
     filter: Entity<InputState>,
     scroll: UniformListScrollHandle,
-    selected: SideItem,
+    /// 选中的项；收成图标栏时，它所在的那一项（或那一组）的图标是选中的样子
+    pub(super) selected: SideItem,
     /// 侧栏的键盘焦点：上下键换选中的项，回车等于双击
     focus: FocusHandle,
 }
@@ -461,6 +464,7 @@ impl RepoView {
                 )
                 .child(
                     v_flex()
+                        .flex_1()
                         .min_w_0()
                         .child(
                             ui::clipped("repo-name", name)
@@ -476,6 +480,17 @@ impl RepoView {
                             )
                             .text_size(px(11.))
                             .text_color(muted),
+                        ),
+                )
+                .child(
+                    Button::new("side-collapse")
+                        .ghost()
+                        .xsmall()
+                        .flex_none()
+                        .icon(ui::icon(IconName::PanelLeftClose).text_color(muted))
+                        .tooltip(tr("收起侧栏（Ctrl+Shift+B）"))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx)),
                         ),
                 )
                 .context_menu(move |menu, _, _| {
@@ -574,6 +589,9 @@ impl RepoView {
     }
 
     pub(super) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.sidebar_collapsed(cx) {
+            return self.render_rail(cx);
+        }
         let theme = cx.theme();
         let (bg, muted) = (theme.sidebar, theme.muted_foreground);
         let width = self.sizes(cx).sidebar;
@@ -1070,6 +1088,33 @@ impl RepoView {
         }
     }
 
+    /// 键盘焦点在侧栏的列表或过滤框里。
+    pub(super) fn sidebar_has_focus(&self, window: &Window, cx: &App) -> bool {
+        self.sidebar.focus.is_focused(window)
+            || self.sidebar.filter.focus_handle(cx).is_focused(window)
+    }
+
+    /// 展开这一组，清掉过滤，把它滚到侧栏最上面（图标栏的列表放不下时，展开侧栏看全部）。
+    pub(super) fn reveal_section(
+        &mut self,
+        section: SideSection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar.collapsed.remove(&section);
+        self.sidebar
+            .filter
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        let at = self
+            .sidebar_rows(cx)
+            .iter()
+            .position(|row| row.item == SideItem::Header(section));
+        if let Some(at) = at {
+            self.sidebar.scroll.scroll_to_item(at, ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+
     /// 切到 Git 页的本地修改，并把键盘焦点放到文件列表上（Ctrl+1）。
     pub fn show_changes_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_page(Page::Git, window, cx);
@@ -1088,7 +1133,7 @@ impl RepoView {
         }
     }
 
-    fn click_sidebar(
+    pub(super) fn click_sidebar(
         &mut self,
         item: SideItem,
         clicks: usize,
@@ -1184,7 +1229,7 @@ impl RepoView {
 }
 
 /// 贮藏的说明去掉 git 加的前缀：`On main: 说明` → `说明`，`WIP on main: abc 说明` → `abc 说明`。
-fn stash_label(message: &str) -> String {
+pub(super) fn stash_label(message: &str) -> String {
     match message.split_once(": ") {
         Some((prefix, rest)) if prefix.starts_with("On ") || prefix.starts_with("WIP on ") => {
             rest.to_string()

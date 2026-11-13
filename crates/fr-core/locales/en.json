@@ -907,5 +907,18 @@
   "初始化仓库失败：{err}": "Failed to initialize the repository: {err}",
   "未找到目录 {dir}": "Directory not found: {dir}",
   "Kuai 已在运行，但未响应。请稍后重试，或在任务管理器中结束 Kuai。": "Kuai is already running but is not responding. Try again later, or end Kuai in Task Manager.",
-  "此仓库有 {n} 个终端正在后台运行，将一并结束。": "{n} {n|terminal is|terminals are} running in the background for this repository and will be ended."
+  "此仓库有 {n} 个终端正在后台运行，将一并结束。": "{n} {n|terminal is|terminals are} running in the background for this repository and will be ended.",
+  "收起侧栏（Ctrl+Shift+B）": "Collapse sidebar (Ctrl+Shift+B)",
+  "展开侧栏（Ctrl+Shift+B）": "Expand sidebar (Ctrl+Shift+B)",
+  "Git（Ctrl+`）": "Git (Ctrl+`)",
+  "终端（Ctrl+`）": "Terminal (Ctrl+`)",
+  "本地修改（Ctrl+1）": "Local changes (Ctrl+1)",
+  "所有提交（Ctrl+2）": "All commits (Ctrl+2)",
+  "新终端（Ctrl+Shift+`）": "New terminal (Ctrl+Shift+`)",
+  "暂无分支": "No branches",
+  "暂无远程分支": "No remote branches",
+  "暂无标签": "No tags",
+  "暂无贮藏": "No stashes",
+  "暂无子模块": "No submodules",
+  "展开侧栏以查看全部 {n} 项": "Expand the sidebar to see all {n} {n|item|items}"
 }

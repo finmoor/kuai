@@ -36,6 +36,9 @@ pub struct Layout {
     /// 仓库页侧栏的宽度
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidebar: Option<f32>,
+    /// 仓库页的侧栏收成了图标栏（所有标签页、Git 页和终端页共用）；展开时还是上面的宽度
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sidebar_collapsed: bool,
     /// 本地修改里文件列表的宽度
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changes_list: Option<f32>,
