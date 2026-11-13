@@ -78,8 +78,9 @@ Windows 上的 Git 客户端，界面和操作方式接近 Fork，目标是完�
 # （先 rustup target add x86_64-unknown-linux-musl）
 cargo build-kuaid
 
-# 客户端；给了仓库路径就加进仓库列表并打开
-cargo run --release -p fr-app -- [仓库路径]
+# 客户端；给了目录就打开（不是仓库先问是否初始化）。同一个设置文件只运行一个 Kuai，
+# 已经在运行时交给运行着的那个，测试时用 FR_SETTINGS 换一个设置文件
+cargo run --release -p fr-app -- [目录]
 
 # 测通道：本机仓库，或者服务器上的仓库（需要时自动上传 kuaid）
 cargo run --release -p fr-channel --bin fr-probe -- --repo .testdata/big-repo local

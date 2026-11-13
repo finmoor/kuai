@@ -853,12 +853,19 @@ fn copy_tree(root: &Path, from: &Path, to: &Path) -> Result<()> {
 }
 
 /// 拉起新的 Kuai，参数照旧（开机自启带的「收进托盘」不带：人正看着呢）。
+/// 只运行一个 Kuai（`instance.rs`）：新的先等这个进程退出再启动，不然会把自己交给正在退出的这个。
 fn relaunch(exe: &Path) -> Result<()> {
-    let args = std::env::args_os()
-        .skip(1)
-        .filter(|arg| arg != crate::autostart::MINIMIZED_FLAG);
+    let args = std::env::args_os().skip(1).filter(|arg| {
+        let arg = arg.to_string_lossy();
+        arg != crate::autostart::MINIMIZED_FLAG && !arg.starts_with(crate::instance::WAIT_PID_FLAG)
+    });
     std::process::Command::new(exe)
         .args(args)
+        .arg(format!(
+            "{}{}",
+            crate::instance::WAIT_PID_FLAG,
+            std::process::id()
+        ))
         .spawn()
         .context(tr("无法启动新版本"))?;
     Ok(())

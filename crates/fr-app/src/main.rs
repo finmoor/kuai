@@ -7,7 +7,9 @@ mod autostart;
 mod browser;
 mod clone;
 mod graph_paint;
+mod instance;
 mod manager;
+mod open_dir;
 mod palette;
 mod prompt;
 mod repo;
@@ -26,10 +28,10 @@ mod workspace;
 
 use std::path::PathBuf;
 
+use futures::StreamExt as _;
 use gpui_kit::*;
 
 use crate::app_state::AppState;
-use crate::settings::RepoEntry;
 use crate::workspace::Workspace;
 
 gpui_kit::actions!(
@@ -145,41 +147,36 @@ fn main() {
     if std::env::var_os("FR_LOG").is_some() {
         let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Info));
     }
+    // 开机自启带的参数：有托盘就直接收进托盘
+    let start_minimized = std::env::args().any(|arg| arg == autostart::MINIMIZED_FLAG);
+    // 命令行给了目录：打开它（不是仓库先问是否初始化），和 Fork 的 `fork <路径>` 一样。
+    // 相对路径按这个进程的当前目录算，交给已经运行的 Kuai 之前先换成绝对路径
+    let open_arg = std::env::args_os()
+        .skip(1)
+        .find(|arg| !arg.to_string_lossy().starts_with("--"))
+        .map(|arg| {
+            let path = PathBuf::from(arg);
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            let path = path.to_string_lossy();
+            path.strip_prefix(r"\\?\").unwrap_or(&path).to_string()
+        });
+    // 只运行一个 Kuai：已经有一个在运行，就把显示窗口、打开目录交给它，这个进程退出
+    let request = instance::Request {
+        open: open_arg.clone(),
+        show: !start_minimized,
+    };
+    let (_instance, incoming) = match instance::claim(&request) {
+        instance::Claim::First(guard, incoming) => (guard, incoming),
+        instance::Claim::Forwarded => return,
+    };
     // 上次下好了新版本、没点重启就退出了：先换上，拉起新版本，这个进程就不开窗口了
     if update::apply_staged_at_startup() {
         return;
     }
 
-    let mut settings = settings::load();
+    let settings = settings::load();
     // 语言在画任何界面之前就定下来
     fr_core::i18n::set_lang(settings.language.resolve());
-    // 开机自启带的参数：有托盘就直接收进托盘
-    let start_minimized = std::env::args().any(|arg| arg == autostart::MINIMIZED_FLAG);
-    // 命令行给了仓库路径：加进本机仓库列表并打开，和 Fork 的 `fork <路径>` 一样
-    let repo_arg = std::env::args_os()
-        .skip(1)
-        .find(|arg| !arg.to_string_lossy().starts_with("--"));
-    if let Some(arg) = repo_arg {
-        let path = PathBuf::from(arg);
-        let path = std::fs::canonicalize(&path).unwrap_or(path);
-        let path = path.to_string_lossy();
-        let entry = RepoEntry {
-            server: None,
-            path: path.strip_prefix(r"\\?\").unwrap_or(&path).to_string(),
-        };
-        if !settings.repos.contains(&entry) {
-            settings.repos.push(entry.clone());
-        }
-        let group = settings.workspace_mut();
-        let ix = match group.tabs.iter().position(|e| *e == entry) {
-            Some(ix) => ix,
-            None => {
-                group.tabs.push(entry);
-                group.tabs.len() - 1
-            }
-        };
-        group.active = ix + 1;
-    }
 
     // git、ssh 要密码时交给界面弹窗
     let prompts = prompt::init();
@@ -265,9 +262,35 @@ fn main() {
                 if start_minimized {
                     workspace.update(cx, |ws, _| ws.start_in_tray());
                 }
+                if let Some(dir) = open_arg {
+                    workspace.update(cx, |ws, cx| ws.open_local_dir(dir, window, cx));
+                }
                 workspace
             })
             .expect("打开窗口失败");
             cx.activate(true);
+            // 再次启动 Kuai 时交过来的请求：显示窗口、打开目录
+            let mut incoming = incoming;
+            cx.spawn(async move |cx| {
+                while let Some(instance::Incoming { request, done }) = incoming.next().await {
+                    let handled = cx.update(|cx| {
+                        let Some(MainWorkspace(workspace, handle)) =
+                            cx.try_global::<MainWorkspace>()
+                        else {
+                            return false;
+                        };
+                        let (workspace, handle) = (workspace.clone(), *handle);
+                        handle
+                            .update(cx, |_, window, cx| {
+                                workspace.update(cx, |ws, cx| ws.on_launch_again(request, window, cx))
+                            })
+                            .is_ok_and(|updated| updated.is_ok())
+                    });
+                    if handled {
+                        let _ = done.send(());
+                    }
+                }
+            })
+            .detach();
         });
 }

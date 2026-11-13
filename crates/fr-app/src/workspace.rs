@@ -14,6 +14,10 @@
 //! 有新版本时标题栏上齿轮左边多一个小牌（`update_view.rs`），点「重启完成升级」后这里先问一下
 //! 本机终端，再换上新版本、拉起新的 Kuai、自己退出。
 //!
+//! 本机终端活在 Kuai 进程里，关标签页不结束（留到再打开这个仓库时接回，见 `repo/terminals.rs`），
+//! 退出 Kuai 才结束：关窗口真要退出、托盘菜单的「退出」、重启以完成更新，都先数一下还有几个
+//! 本机终端在运行，有就问一下；有托盘时可以改为最小化到托盘，终端接着运行。
+//!
 //! 关标签页时：有写操作在做就先拦一下；提交说明框里没提交的内容记下来，再打开这个仓库时放回去。
 //! 关掉的标签页每个工作区记最近 10 个（存在设置里），手滑关错了能找回来；
 //! 设置里还可以把标签页上的关闭按钮藏起来。
@@ -144,6 +148,11 @@ impl Workspace {
             cx.subscribe_in(&updater, window, |this, _, event, window, cx| match event {
                 UpdateEvent::Restart => this.restart_for_update(window, cx),
             }),
+            // 退出时先撤掉托盘图标：进程退出前没撤的话，托盘里会留一个点不开的图标，鼠标移过去才消失
+            cx.on_app_quit(|this, _| {
+                this.tray = None;
+                async {}
+            }),
         ];
         // 关闭到托盘：点关闭按钮时不退出，把窗口藏起来
         {
@@ -159,43 +168,14 @@ impl Workspace {
                     win::hide(hwnd);
                     return false;
                 }
-                // 真要退出：终端里还有程序在跑就先问一下
-                let terminals = this
-                    .read_with(cx, |this, cx| this.live_terminals(cx))
-                    .unwrap_or(0);
-                if terminals == 0 || quitting.get() {
+                // 真要退出：本机终端里还有程序在运行就先问一下
+                if quitting.get() {
                     return true;
                 }
-                let quitting = quitting.clone();
-                window.open_alert_dialog(cx, move |alert, _, _| {
-                    let quitting = quitting.clone();
-                    alert
-                        .title(tr("退出？"))
-                        .description(tf!(
-                            "有 {n} 个终端正在运行，退出将结束其中的程序。",
-                            n = terminals
-                        ))
-                        .on_ok(|_, _, _| false)
-                        .footer(
-                            DialogFooter::new()
-                                .child(
-                                    Button::new("cancel")
-                                        .label(tr("取消"))
-                                        .on_click(|_, window, cx| window.close_dialog(cx)),
-                                )
-                                .child(
-                                    Button::new("ok")
-                                        .label(tr("结束并退出"))
-                                        .with_variant(ButtonVariant::Danger)
-                                        .on_click(move |_, window, cx| {
-                                            window.close_dialog(cx);
-                                            quitting.set(true);
-                                            cx.quit();
-                                        }),
-                                ),
-                        )
-                });
-                false
+                let asked = this
+                    .update(cx, |this, cx| this.confirm_quit(window, cx))
+                    .unwrap_or(false);
+                !asked
             });
         }
         let count = app.read(cx).settings.workspaces.len();
@@ -346,18 +326,92 @@ impl Workspace {
         });
     }
 
+    /// 把藏到托盘、最小化或者被挡住的窗口叫到最前面。
+    ///
+    /// 放到这一轮更新之后再做：`ShowWindow` 会同步调用窗口过程，GPUI 在那里还要借用整个 App，
+    /// 在更新里直接调会撞上正借着的 App（日志里的 `RefCell already borrowed`，这一帧可能不重画）。
+    fn show_window(&self, cx: &mut Context<Self>) {
+        if let Some(hwnd) = self.hwnd {
+            cx.spawn(async move |_, _| win::show(hwnd)).detach();
+        }
+    }
+
+    /// 把窗口藏到托盘。和 [`Self::show_window`] 一样放到这一轮更新之后再做。
+    fn hide_window(&self, cx: &mut Context<Self>) {
+        if let Some(hwnd) = self.hwnd {
+            cx.spawn(async move |_, _| win::hide(hwnd)).detach();
+        }
+    }
+
     fn on_tray(&mut self, action: TrayAction, cx: &mut Context<Self>) {
         match action {
-            TrayAction::Show => {
-                if let Some(hwnd) = self.hwnd {
-                    win::show(hwnd);
-                }
-            }
-            TrayAction::Quit => {
-                self.quitting.set(true);
-                cx.quit();
-            }
+            TrayAction::Show => self.show_window(cx),
+            TrayAction::Quit => self.quit_from_tray(cx),
         }
+    }
+
+    /// 托盘菜单的「退出」：本机终端里没有程序在运行就直接退出；有就把窗口叫出来，问一下。
+    fn quit_from_tray(&mut self, cx: &mut Context<Self>) {
+        if self.live_terminals(cx) == 0 {
+            self.quitting.set(true);
+            cx.quit();
+            return;
+        }
+        self.show_window(cx);
+        let this = cx.entity().downgrade();
+        crate::with_main_window(cx, move |window, cx| {
+            this.update(cx, |this, cx| this.confirm_quit(window, cx))
+                .ok();
+        });
+    }
+
+    /// 退出前问一下：本机终端里还有程序在运行，退出将结束它们（服务器上的终端不受影响）。
+    /// 有托盘时多一个「最小化到托盘」，窗口藏起来，终端接着运行。返回问了没有：一个都没有时
+    /// 不问，由调用的地方直接退出。
+    fn confirm_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let terminals = self.live_terminals(cx);
+        if terminals == 0 {
+            return false;
+        }
+        let quitting = self.quitting.clone();
+        let to_tray = self.tray.is_some().then(|| cx.entity().downgrade());
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (quitting, to_tray) = (quitting.clone(), to_tray.clone());
+            alert
+                .title(tr("退出 Kuai？"))
+                .description(tf!(
+                    "有 {n} 个本机终端正在运行，退出将结束其中的程序。服务器上的终端不受影响。",
+                    n = terminals
+                ))
+                .on_ok(|_, _, _| false)
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("cancel")
+                                .label(tr("取消"))
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .when_some(to_tray, |footer, this| {
+                            footer.child(Button::new("tray").label(tr("最小化到托盘")).on_click(
+                                move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    this.update(cx, |this, cx| this.hide_window(cx)).ok();
+                                },
+                            ))
+                        })
+                        .child(
+                            Button::new("ok")
+                                .label(tr("结束并退出"))
+                                .with_variant(ButtonVariant::Danger)
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    quitting.set(true);
+                                    cx.quit();
+                                }),
+                        ),
+                )
+        });
+        true
     }
 
     /// 最小化到托盘：窗口最小化了、设置里开着、托盘图标也在，就把窗口藏起来。
@@ -381,9 +435,43 @@ impl Workspace {
         }
     }
 
-    /// 各个工作区里一共有几个终端还跑着程序。
+    /// 打开本机的目录（命令行给的、再次启动时交过来的）：在仓库中就打开仓库，不是仓库先问是否初始化。
+    pub fn open_local_dir(&mut self, dir: String, window: &mut Window, cx: &mut Context<Self>) {
+        let app = self.app.clone();
+        crate::open_dir::open_dir(
+            &app,
+            None,
+            dir,
+            window,
+            cx,
+            |this: &mut Self, entry, window, cx| {
+                this.app
+                    .update(cx, |app, cx| app.add_repo(entry.clone(), cx));
+                this.open(entry, window, cx);
+            },
+        );
+    }
+
+    /// 已经运行时又启动了一次 Kuai（开始菜单、命令行带目录）：显示窗口，带了目录就打开。
+    pub fn on_launch_again(
+        &mut self,
+        request: crate::instance::Request,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if request.show {
+            self.show_window(cx);
+        }
+        if let Some(dir) = request.open {
+            self.open_local_dir(dir, window, cx);
+        }
+    }
+
+    /// 一共有几个本机终端的程序正在运行（退出 Kuai 时将结束）：各个工作区里打开的标签页中的，
+    /// 加上关掉的标签页留下的。
     fn live_terminals(&self, cx: &App) -> usize {
-        self.tabs
+        let open: usize = self
+            .tabs
             .iter()
             .chain(
                 self.parked
@@ -391,8 +479,9 @@ impl Workspace {
                     .flatten()
                     .flat_map(|(tabs, _)| tabs.iter()),
             )
-            .map(|tab| tab.view.read(cx).terminals_alive(cx))
-            .sum()
+            .map(|tab| tab.view.read(cx).local_terminals_running(cx))
+            .sum();
+        open + crate::repo::parked_terminals_running(cx)
     }
 
     /// 服务器被移除了：它上面的仓库的标签页跟着关掉（各个工作区里的都关）。
@@ -527,6 +616,7 @@ impl Workspace {
 
     /// 关标签页。固定着的不关。这一页有写操作在做时不直接关：联网的操作问一下要不要取消，
     /// 改工作区、暂存区的操作（提交、变基）等它做完，中途杀掉会把仓库留在半截状态。
+    /// 终端里的程序不用管：关掉以后接着运行，再打开这个仓库时接回来。
     fn close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(ix) else {
             return;
@@ -536,18 +626,13 @@ impl Workspace {
             window.push_notification(Notification::info(text), cx);
             return;
         }
-        let (busy, cancellable, terminal) = {
+        let (busy, cancellable) = {
             let view = tab.view.read(cx);
-            (view.busy(), view.cancellable(), view.terminal_alive(cx))
+            (view.busy(), view.cancellable())
         };
         let entry = tab.entry.clone();
         let Some(op) = busy else {
-            if terminal {
-                let text = tr("终端中的程序仍在运行，关闭标签页将结束该程序。").to_string();
-                self.confirm_close(entry, text, tr("结束并关闭"), window, cx);
-            } else {
-                self.close_now(ix, cx);
-            }
+            self.close_now(ix, cx);
             return;
         };
         if !cancellable {
@@ -664,13 +749,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let tab = self.tabs.iter().find(|tab| tab.entry == entry);
-        if let Some(tab) = tab {
-            let view = tab.view.read(cx);
-            if view.busy().is_some() || view.terminal_alive(cx) {
-                let text = tr("此仓库正在执行操作或有运行中的终端，请处理完毕后再移除。");
-                window.push_notification(Notification::warning(text), cx);
-                return;
-            }
+        if let Some(op) = tab.and_then(|tab| tab.view.read(cx).busy()) {
+            let text = tf!("此仓库正在{op}，请等待完成后再移除。", op);
+            window.push_notification(Notification::warning(text), cx);
+            return;
         }
         let open = tab.is_some();
         let (name, workspace) = {
@@ -706,7 +788,7 @@ impl Workspace {
     }
 
     /// 关掉除了第 `keep` 个以外的标签页（`None` 是全关）。固定的不关；
-    /// 正在做操作的、终端里还跑着程序的也留着，并说一声。
+    /// 正在做操作的也留着，并说一声。
     fn close_others(&mut self, keep: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
         let keep_entry = keep
             .and_then(|ix| self.tabs.get(ix))
@@ -719,8 +801,7 @@ impl Workspace {
             .filter(|tab| Some(&tab.entry) != keep_entry.as_ref())
             .filter(|tab| !pinned.contains(&tab.entry))
             .filter(|tab| {
-                let view = tab.view.read(cx);
-                let busy = view.busy().is_some() || view.terminal_alive(cx);
+                let busy = tab.view.read(cx).busy().is_some();
                 skipped += busy as usize;
                 !busy
             })
@@ -740,10 +821,7 @@ impl Workspace {
             self.persist(cx);
         }
         if skipped > 0 {
-            let text = tf!(
-                "{n} 个标签页正在执行操作或有运行中的终端，未关闭。",
-                n = skipped
-            );
+            let text = tf!("{n} 个标签页正在执行操作，未关闭。", n = skipped);
             window.push_notification(Notification::warning(text), cx);
         }
         cx.notify();
@@ -972,11 +1050,12 @@ impl Workspace {
             window.push_notification(Notification::warning(text), cx);
             return;
         }
-        if self.tabs.iter().any(|tab| {
-            let view = tab.view.read(cx);
-            view.busy().is_some() || view.terminal_alive(cx)
-        }) {
-            let text = tr("此工作区中有标签页正在执行操作或有运行中的终端，请处理完毕后再删除。");
+        if self
+            .tabs
+            .iter()
+            .any(|tab| tab.view.read(cx).busy().is_some())
+        {
+            let text = tr("此工作区中有标签页正在执行操作，请等待完成后再删除。");
             window.push_notification(Notification::warning(text), cx);
             return;
         }
@@ -1039,12 +1118,7 @@ impl Workspace {
             window.push_notification(Notification::warning(text), cx);
             return;
         }
-        // 移过去是在那边重新打开，终端带不过去
-        if tab.view.read(cx).terminal_alive(cx) {
-            let text = tr("此仓库的终端仍在运行，请先结束终端再移动。");
-            window.push_notification(Notification::warning(text), cx);
-            return;
-        }
+        // 移过去是在那边重新打开；本机终端跟着关标签页留下来，到那边的终端页时接回
         let entry = tab.entry.clone();
         self.close_now(ix, cx);
         self.app.update(cx, |app, cx| {

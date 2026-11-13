@@ -2,8 +2,8 @@
 //!
 //! 终端仿真交给 `alacritty_terminal`：解析转义序列、维护字符格子。程序在哪跑有两种：
 //!
-//! - 本机仓库：这个库在 Windows 上用 ConPTY 开伪终端，它的后台线程读程序的输出。关掉标签页，
-//!   里面的程序就结束。
+//! - 本机仓库：这个库在 Windows 上用 ConPTY 开伪终端，它的后台线程读程序的输出。程序活在
+//!   Kuai 进程里：关掉标签页时视图交给仓库页留着（见 `repo/terminals.rs`），退出 Kuai 才结束。
 //! - 服务器上的仓库：终端开在服务器上常驻的 kuaid 里，输出经仓库通道那条 ssh 连接送过来
 //!   （[`Session::attach`]），我们只管喂给仿真器。关掉标签页、退出、断线都只是断开，里面的程序
 //!   接着跑；再打开时接上原来的，kuaid 把屏幕还原出来。
@@ -484,12 +484,6 @@ impl TerminalView {
     /// 里面的进程还在跑，而且连着（敲的字它收得到）。
     pub fn is_alive(&self) -> bool {
         self.session.is_some() && self.exited.is_none() && !self.lost
-    }
-
-    /// 丢弃这个视图（关标签页、退出）会结束里面还在跑的程序：只有本机的终端会，
-    /// 服务器上的开在 kuaid 里，接着跑。
-    pub fn dies_with_view(&self) -> bool {
-        self.is_alive() && self.session.as_ref().is_some_and(|session| !session.is_remote())
     }
 
     /// 有东西在跑：本机的进程，或者服务器上的终端（连接断了它也在跑；上次留下、

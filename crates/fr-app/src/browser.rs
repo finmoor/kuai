@@ -14,6 +14,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::app_state::{AppState, ConnStatus};
+use crate::open_dir::{self, Found};
 use crate::settings::RepoEntry;
 
 pub enum BrowserEvent {
@@ -152,7 +153,7 @@ impl RemoteBrowser {
         cx.notify();
     }
 
-    /// 用 git 确认当前目录在仓库里，取仓库根目录，再通知打开。
+    /// 用 git 确认当前目录在仓库中，取仓库根目录，再通知打开；不是仓库先问是否初始化。
     fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(listing) = &self.listing else {
             return;
@@ -166,29 +167,32 @@ impl RemoteBrowser {
         self.status = Some((tr("正在检查…").into(), false));
         self.task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = match channel.await {
-                Ok(channel) => channel
-                    .git(&path, vec!["rev-parse".into(), "--show-toplevel".into()])
+                Ok(channel) => open_dir::find(&channel, &path)
                     .await
-                    .and_then(|out| out.ok())
-                    .map_err(|err| {
-                        SharedString::from(tf!(
-                            "{path} 不是 git 仓库，请选择标有「仓库」的目录。\n{err}",
-                            path,
-                            err = format!("{:#}", err)
-                        ))
-                    }),
+                    .map(|found| (channel, found))
+                    .map_err(SharedString::from),
                 Err(err) => Err(err),
             };
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 match result {
-                    Ok(out) => {
+                    Ok((_, Found::Repo(root))) => {
                         this.status = None;
-                        let path = String::from_utf8_lossy(&out).trim().to_string();
                         cx.emit(BrowserEvent::Open(RepoEntry {
                             server: Some(server),
-                            path,
+                            path: root,
                         }));
+                    }
+                    Ok((channel, Found::NotRepo)) => {
+                        this.status = None;
+                        open_dir::ask_init(
+                            channel,
+                            Some(server),
+                            path,
+                            |_: &mut Self, entry, _, cx| cx.emit(BrowserEvent::Open(entry)),
+                            window,
+                            cx,
+                        );
                     }
                     Err(err) => this.status = Some((err, true)),
                 }

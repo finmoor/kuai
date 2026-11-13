@@ -5,9 +5,12 @@
 //! 终端叫什么、开在哪，右边是发文件、重开；下面是选中的终端，占满。只画选中的那个，没选中的
 //! 照样收输出，只是不画、不跟着改大小。
 //!
-//! 本机仓库的终端跟着仓库的标签页走，关了就结束。服务器上的终端开在 kuaid 里，各有各的会话
-//! （名字见 [`crate::terminal::session_key`]）：关标签页、退出 Kuai 以后接着跑；再打开这个仓库时
-//! 问一遍 kuaid，原来留着几个就接回几个。
+//! 终端不跟着标签页结束：
+//!
+//! - 本机仓库的终端在 Kuai 进程里。关标签页时，程序还在运行的终端交给 [`Parked`] 保管，
+//!   再打开这个仓库、到终端页时接回来；退出 Kuai（包括重启以完成更新）时才结束。
+//! - 服务器上的终端开在 kuaid 里，各有各的会话（名字见 [`crate::terminal::session_key`]）：
+//!   关标签页、退出 Kuai 以后接着跑；再打开这个仓库时问一遍 kuaid，原来留着几个就接回几个。
 
 use fr_channel::Channel;
 use fr_core::i18n::tr;
@@ -20,6 +23,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::{Page, RepoView, TOOLBAR_HEIGHT, tool_button};
+use crate::settings::RepoEntry;
 use crate::terminal::{self, TerminalView};
 use crate::ui;
 
@@ -46,20 +50,84 @@ pub(super) struct Terminals {
     waiting: Vec<(u32, bool)>,
 }
 
+/// 关掉的本机仓库标签页留下的终端，里面的程序接着运行。再打开这个仓库、到终端页时接回去
+/// （[`RepoView::adopt_parked`]）；同一个仓库在别的工作区里也开着的话，先到终端页的那个接走。
+#[derive(Default)]
+struct Parked(Vec<ParkedTerminal>);
+
+impl Global for Parked {}
+
+struct ParkedTerminal {
+    entry: RepoEntry,
+    number: u32,
+    view: Entity<TerminalView>,
+}
+
+/// 关掉的标签页留下的本机终端中，程序还在运行的有几个（退出 Kuai、重启以完成更新前要问）。
+pub fn parked_terminals_running(cx: &App) -> usize {
+    parked_running(None, cx)
+}
+
+/// 留下的本机终端中，程序还在运行的有几个；给了 `entry` 就只数这个仓库的。
+fn parked_running(entry: Option<&RepoEntry>, cx: &App) -> usize {
+    let Some(parked) = cx.try_global::<Parked>() else {
+        return 0;
+    };
+    parked
+        .0
+        .iter()
+        .filter(|t| entry.is_none_or(|entry| t.entry == *entry))
+        .filter(|t| t.view.read(cx).is_running())
+        .count()
+}
+
+/// 这个仓库留下了几个本机终端（程序还在运行的）。
+pub fn parked_terminals_of(entry: &RepoEntry, cx: &App) -> usize {
+    parked_running(Some(entry), cx)
+}
+
+/// 仓库从列表中移除了：它留下的本机终端一起结束，不然再也没有地方能看到它们。
+pub fn end_parked_terminals(entry: &RepoEntry, cx: &mut App) {
+    let mine = |t: &ParkedTerminal| t.entry == *entry;
+    // 先只读地看一眼：改动会通知所有盯着的仓库页重画
+    if !cx
+        .try_global::<Parked>()
+        .is_some_and(|parked| parked.0.iter().any(mine))
+    {
+        return;
+    }
+    let ended: Vec<ParkedTerminal> = {
+        let parked = &mut cx.global_mut::<Parked>().0;
+        let (ended, rest) = std::mem::take(parked).into_iter().partition(mine);
+        *parked = rest;
+        ended
+    };
+    for terminal in ended {
+        terminal.view.update(cx, |view, cx| view.kill(cx));
+    }
+}
+
+/// 最小的、还没用上的序号。
+fn free_number(used: &[u32]) -> u32 {
+    (1..).find(|n| !used.contains(n)).unwrap_or(1)
+}
+
 impl RepoView {
-    /// 关掉这个标签页会不会结束终端里还在跑的程序（会的话关之前要问一下）。只有本机的终端会：
-    /// 服务器上的终端开在 kuaid 里，标签页关了它接着跑，再打开这个仓库时接上。
-    pub fn terminal_alive(&self, cx: &App) -> bool {
-        self.terminals_alive(cx) > 0
+    /// 这个标签页里有几个本机终端的程序正在运行（退出 Kuai、重启以完成更新时将结束）。
+    /// 服务器上的终端开在 kuaid 里，不算。
+    pub fn local_terminals_running(&self, cx: &App) -> usize {
+        if self.entry.server.is_some() {
+            return 0;
+        }
+        self.terminals
+            .tabs
+            .iter()
+            .filter(|tab| tab.view.read(cx).is_running())
+            .count()
     }
 
-    /// 关掉这个标签页会结束几个终端里还在跑的程序。
-    pub fn terminals_alive(&self, cx: &App) -> usize {
-        let dies = |tab: &&TermTab| tab.view.read(cx).dies_with_view();
-        self.terminals.tabs.iter().filter(dies).count()
-    }
-
-    /// 这个仓库有几个终端里有东西在跑：这次打开的，加上服务器上留着、还没接上的。
+    /// 这个仓库有几个终端里有东西在跑：这次打开的，加上服务器上留着、还没接上的，
+    /// 和关掉的标签页留下、还没接回来的本机终端。
     pub(super) fn terminals_running(&self, cx: &App) -> usize {
         let opened = self
             .terminals
@@ -68,7 +136,71 @@ impl RepoView {
             .filter(|tab| tab.view.read(cx).is_running())
             .count();
         let waiting = self.terminals.waiting.iter().filter(|(_, alive)| *alive);
-        opened + waiting.count()
+        opened + waiting.count() + parked_running(Some(&self.entry), cx)
+    }
+
+    /// 本机仓库的终端不跟着标签页结束：这个视图释放（标签页关掉）时，程序还在运行的终端交给
+    /// [`Parked`] 保管；这个仓库有终端留下时，侧栏切换上的个数跟着变，到终端页时接回来。
+    /// 建视图时调用。
+    pub(super) fn keep_local_terminals(&mut self, cx: &mut Context<Self>) {
+        if self.entry.server.is_some() {
+            return;
+        }
+        cx.on_release(|this, cx| this.park_terminals(cx)).detach();
+        let observe = cx.observe_global::<Parked>(|_, cx| cx.notify());
+        self._subscriptions.push(observe);
+    }
+
+    /// 标签页关掉了：程序还在运行的终端交给 [`Parked`]。已经结束的不留，用户看到过了
+    /// （kuaid 里的会话也是这样）。
+    fn park_terminals(&mut self, cx: &mut App) {
+        let tabs = std::mem::take(&mut self.terminals.tabs);
+        let running: Vec<ParkedTerminal> = tabs
+            .into_iter()
+            .filter(|tab| tab.view.read(cx).is_running())
+            .map(|tab| ParkedTerminal {
+                entry: self.entry.clone(),
+                number: tab.number,
+                view: tab.view,
+            })
+            .collect();
+        if !running.is_empty() {
+            log::info!(
+                "标签页已关闭，保留 {} 个本机终端：{}",
+                running.len(),
+                self.entry.path
+            );
+            cx.default_global::<Parked>().0.extend(running);
+        }
+    }
+
+    /// 接回关掉的标签页留下的、这个仓库的本机终端。序号和已经打开的重了（同一个仓库在别的
+    /// 工作区里也开着）就换成最小的空号。
+    fn adopt_parked(&mut self, cx: &mut Context<Self>) {
+        let entry = self.entry.clone();
+        let mine = |t: &ParkedTerminal| t.entry == entry;
+        // 先只读地看一眼：取出来会通知所有盯着的仓库页重画，每帧都取就停不下来了
+        if !cx
+            .try_global::<Parked>()
+            .is_some_and(|parked| parked.0.iter().any(mine))
+        {
+            return;
+        }
+        let taken: Vec<ParkedTerminal> = {
+            let parked = &mut cx.global_mut::<Parked>().0;
+            let (taken, rest) = std::mem::take(parked).into_iter().partition(mine);
+            *parked = rest;
+            taken
+        };
+        log::info!("接回 {} 个本机终端：{}", taken.len(), entry.path);
+        for terminal in taken {
+            let used: Vec<u32> = self.terminals.tabs.iter().map(|tab| tab.number).collect();
+            let number = match used.contains(&terminal.number) {
+                true => free_number(&used),
+                false => terminal.number,
+            };
+            self.insert_terminal(number, terminal.view, cx);
+        }
     }
 
     /// 连上服务器以后问一下：kuaid 里留着这个仓库的哪几个终端（侧栏的切换上标出个数，
@@ -121,13 +253,22 @@ impl RepoView {
             }
             view
         });
+        self.insert_terminal(number, view, cx)
+    }
+
+    /// 把终端按序号排进去，返回它在第几个。
+    fn insert_terminal(
+        &mut self,
+        number: u32,
+        view: Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) -> usize {
         let observe = cx.observe(&view, |_, _, cx| cx.notify());
         let tab = TermTab {
             number,
             view,
             _observe: observe,
         };
-        // 按序号排着放
         let at = self
             .terminals
             .tabs
@@ -138,19 +279,21 @@ impl RepoView {
         at
     }
 
-    /// 服务器上留着、还没接上的终端都加进来（选中哪个才去接哪个）。显示的还是原来那个。
+    /// 留着、还没接上的终端都加进来：关掉的标签页留下的本机终端，服务器上留着的（选中哪个
+    /// 才去接哪个）。显示的还是原来那个。
     fn adopt_waiting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.terminals.waiting.is_empty() {
-            return;
-        }
-        let waiting = std::mem::take(&mut self.terminals.waiting);
         let shown = self
             .terminals
             .tabs
             .get(self.terminals.active)
             .map(|tab| tab.number);
-        for (number, alive) in waiting {
+        let before = self.terminals.tabs.len();
+        self.adopt_parked(cx);
+        for (number, alive) in std::mem::take(&mut self.terminals.waiting) {
             self.add_terminal(number, alive, window, cx);
+        }
+        if self.terminals.tabs.len() == before {
+            return;
         }
         // 新加的可能排在前面，显示的那个的位置跟着变
         let at = |shown| {
@@ -162,16 +305,16 @@ impl RepoView {
         self.terminals.active = shown.and_then(at).unwrap_or(0);
     }
 
-    /// 画之前调用。正在终端页上、这时才知道服务器上还留着别的终端（连得慢，或者断了重连）：
-    /// 补进来。
+    /// 画之前调用。正在终端页上、这时才知道还留着别的终端（服务器连得慢，或者断了重连；
+    /// 同一个本机仓库在别的工作区里的标签页关掉了）：补进来。
     pub(super) fn sync_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.page == Page::Terminal {
             self.adopt_waiting(window, cx);
         }
     }
 
-    /// 切到 Git 页或终端页。到终端页时服务器上留着的都接回来，一个都没有就开第一个，焦点放进
-    /// 终端；回 Git 页不结束里面的程序。
+    /// 切到 Git 页或终端页。到终端页时留着的都接回来，一个都没有就开第一个，焦点放进终端；
+    /// 回 Git 页不结束里面的程序。
     pub(super) fn show_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         match page {
             Page::Terminal => {
@@ -200,10 +343,10 @@ impl RepoView {
 
     /// 再开一个终端（侧栏的「新终端」、Ctrl+Shift+`），切到终端页显示它。
     pub fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // 服务器上留着的先接回来，新的排在它们后面
+        // 留着的先接回来，新的排在它们后面
         self.adopt_waiting(window, cx);
         let used: Vec<u32> = self.terminals.tabs.iter().map(|tab| tab.number).collect();
-        let number = (1..).find(|n| !used.contains(n)).unwrap_or(1);
+        let number = free_number(&used);
         self.terminals.active = self.add_terminal(number, false, window, cx);
         self.page = Page::Terminal;
         self.focus_terminal(window, cx);
@@ -483,7 +626,7 @@ impl RepoView {
                 place = self.place(cx)
             )
             .into(),
-            None => tr("运行在本机的仓库目录中").into(),
+            None => tr("运行在本机，关闭标签页后仍会继续运行").into(),
         };
         let index = self.terminals.active;
         let title = self.active_terminal().map(|view| {

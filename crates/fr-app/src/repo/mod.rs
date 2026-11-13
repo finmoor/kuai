@@ -5,8 +5,8 @@
 //!   从上到下占满；右边上面是工具栏（当前分支、获取、拉取、推送、贮藏……），下面按侧栏选中的项
 //!   显示本地修改（按文件、按块、按行暂存，提交）或提交历史（提交图、详情、改动）。
 //! - 终端页：侧栏里列着这个仓库的几个终端，右边是选中的那个，见 [`terminals`]。在仓库目录里的
-//!   shell，切回 Git 页不结束里面的程序。本机仓库的关标签页才结束；服务器上的仓库的终端开在
-//!   kuaid 里，关了标签页、退出、断线它都接着跑，再到这个仓库的终端页时接上。
+//!   shell，切回 Git 页、关标签页都不结束里面的程序，再到这个仓库的终端页时接上。本机仓库的
+//!   终端在退出 Kuai 时结束；服务器上的仓库的终端开在 kuaid 里，退出、断线它都接着跑。
 //!
 //! 本机仓库和服务器上的仓库共用这一套，经 [`Channel`] 执行 git。
 //!
@@ -32,6 +32,7 @@ mod stage_diff;
 mod terminals;
 
 pub(crate) use ops::explain;
+pub(crate) use terminals::{end_parked_terminals, parked_terminals_of, parked_terminals_running};
 
 use fr_channel::Channel;
 use fr_core::i18n::tr;
@@ -194,6 +195,7 @@ impl RepoView {
         if std::env::var("FR_TEST_VIEW").is_ok_and(|v| v == "changes") {
             this.show_changes(cx);
         }
+        this.keep_local_terminals(cx);
         this.connect(cx);
         this
     }

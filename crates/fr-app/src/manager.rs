@@ -8,7 +8,6 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use fr_channel::Channel;
 use fr_core::i18n::{tr, trc};
 use fr_core::tf;
 use gpui_kit::assets::IconName;
@@ -59,7 +58,7 @@ impl ManagerView {
         cx.emit(ManagerEvent::Open(entry));
     }
 
-    /// 选一个本机目录；用 git 找到仓库根目录再加进列表。
+    /// 选一个本机目录；在仓库中就找到仓库根目录加进列表，不是仓库先问是否初始化。
     fn add_local(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -75,26 +74,20 @@ impl ManagerView {
                 return;
             };
             let dir = dir.to_string_lossy().into_owned();
-            let result = Channel::Local
-                .git(&dir, vec!["rev-parse".into(), "--show-toplevel".into()])
-                .await
-                .and_then(|out| out.ok());
-            this.update_in(cx, |this, window, cx| match result {
-                Ok(out) => {
-                    let path = String::from_utf8_lossy(&out).trim().replace('/', "\\");
-                    let entry = RepoEntry { server: None, path };
-                    this.app
-                        .update(cx, |app, cx| app.add_repo(entry.clone(), cx));
-                    this.open(entry, cx);
-                }
-                Err(err) => window.push_notification(
-                    Notification::error(tf!(
-                        "{dir} 不是 git 仓库：{err}",
-                        dir,
-                        err = format!("{:#}", err)
-                    )),
+            this.update_in(cx, |this, window, cx| {
+                let app = this.app.clone();
+                crate::open_dir::open_dir(
+                    &app,
+                    None,
+                    dir,
+                    window,
                     cx,
-                ),
+                    |this: &mut Self, entry, _, cx| {
+                        this.app
+                            .update(cx, |app, cx| app.add_repo(entry.clone(), cx));
+                        this.open(entry, cx);
+                    },
+                );
             })
             .ok();
         })
@@ -746,14 +739,30 @@ impl ManagerView {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         let (app, entry) = (this.app.clone(), remove.clone());
+                        let mut description = tf!(
+                            "{path}\n仅从列表中移除，仓库本身不受影响。",
+                            path = remove.path
+                        );
+                        // 关掉的标签页留下的本机终端：移除以后再也打不开，一起结束
+                        let terminals = crate::repo::parked_terminals_of(&remove, cx);
+                        if terminals > 0 {
+                            description.push('\n');
+                            description.push_str(&tf!(
+                                "此仓库有 {n} 个终端正在后台运行，将一并结束。",
+                                n = terminals
+                            ));
+                        }
                         confirm(
                             tf!("从列表中移除 {name}？", name = &remove_name),
-                            tf!("{path}\n仅从列表中移除，仓库本身不受影响。", path = remove.path),
+                            description,
                             tr("移除"),
-                            false,
+                            terminals > 0,
                             window,
                             cx,
-                            move |cx| app.update(cx, |app, cx| app.remove_repo(&entry, cx)),
+                            move |cx| {
+                                app.update(cx, |app, cx| app.remove_repo(&entry, cx));
+                                crate::repo::end_parked_terminals(&entry, cx);
+                            },
                         );
                     })),
             )
