@@ -1,11 +1,12 @@
 //! 全局状态：设置和各台服务器的连接。界面各部分共用一个 [`AppState`] 实体。
 
 use fr_core::i18n::tr;
+use fr_core::tf;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fr_channel::{Channel, ConnectOptions, Connection};
+use fr_channel::{Channel, ConnectOptions, Connection, Jump};
 use futures::FutureExt as _;
 use futures::future::{LocalBoxFuture, Shared};
 use gpui_kit::*;
@@ -28,6 +29,8 @@ pub enum ConnStatus {
 pub struct AppState {
     pub settings: Settings,
     conns: HashMap<String, Connecting>,
+    /// 经跳板机连接、还在连的：已经登录上几台了（跳板机按顺序算）
+    stages: HashMap<String, usize>,
     /// 过一会儿再存设置的任务（拖动窗口时位置一直在变，不每次都写文件）
     save_later: Option<Task<()>>,
 }
@@ -37,12 +40,28 @@ impl AppState {
         Self {
             settings,
             conns: HashMap::new(),
+            stages: HashMap::new(),
             save_later: None,
         }
     }
 
     pub fn server(&self, id: &str) -> Option<&Server> {
-        self.settings.servers.iter().find(|s| s.id == id)
+        self.settings.server(id)
+    }
+
+    /// 正在连接时显示的那句话：经跳板机的写明走到哪一台了。
+    pub fn connecting_text(&self, id: &str) -> SharedString {
+        let route = self.settings.route(id);
+        let done = self.stages.get(id).copied().unwrap_or(0);
+        match (route.get(done), route.last()) {
+            (Some(jump), _) => tf!("正在连接跳板机 {name}…", name = jump.name).into(),
+            // 跳板机都登录上了：在连目标服务器；它也登录上以后是启动 kuaid
+            (None, Some(last)) if done == route.len() => {
+                tf!("正在经由 {name} 连接…", name = last.name).into()
+            }
+            (None, Some(_)) => tr("正在启动 kuaid…").into(),
+            (None, None) => tr("正在连接…").into(),
+        }
     }
 
     pub fn status(&self, id: &str) -> ConnStatus {
@@ -65,12 +84,36 @@ impl AppState {
             }
         }
         let server = self.server(id).cloned();
+        let route: Vec<Server> = self.settings.route(id).into_iter().cloned().collect();
+        // 经跳板机的：后台线程每登录上一台报一次，这边记下来、刷新列表上的那句话
+        self.stages.remove(id);
+        let (stage_tx, mut stage_rx) = futures::channel::mpsc::unbounded::<usize>();
+        let on_stage = (!route.is_empty()).then(|| {
+            Arc::new(move |done: usize| drop(stage_tx.unbounded_send(done)))
+                as fr_channel::StageHandler
+        });
+        let stage_id = id.to_string();
+        cx.spawn(async move |this, cx| {
+            use futures::StreamExt as _;
+            while let Some(done) = stage_rx.next().await {
+                let updated = this.update(cx, |this, cx| {
+                    this.stages.insert(stage_id.clone(), done);
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
         let connecting = cx
             .background_executor()
             .spawn(async move {
                 let server =
                     server.ok_or_else(|| SharedString::from(tr("未找到该服务器的设置")))?;
-                let options = connect_options(&server);
+                let mut options = connect_options(&server);
+                options.jumps = route.iter().map(jump_options).collect();
+                options.on_stage = on_stage;
                 Connection::connect(&server.destination, &options)
                     .map(Arc::new)
                     .map_err(|err| SharedString::from(format!("{err:#}")))
@@ -146,7 +189,8 @@ impl AppState {
             || old.destination != server.destination
             || old.forward_agent != server.forward_agent
             || old.auth != server.auth
-            || old.identity_file != server.identity_file;
+            || old.identity_file != server.identity_file
+            || old.jump != server.jump;
         let id = server.id.clone();
         *old = server;
         if reconnect {
@@ -160,6 +204,12 @@ impl AppState {
     /// 从列表里去掉服务器和它的仓库；服务器上的东西不动。
     pub fn remove_server(&mut self, id: &str, cx: &mut Context<Self>) {
         self.settings.servers.retain(|s| s.id != id);
+        // 经它连接的服务器改为直接连接（已经连着的不受影响，下次连接时才按新的来）
+        for server in &mut self.settings.servers {
+            if server.jump.as_deref() == Some(id) {
+                server.jump = None;
+            }
+        }
         self.settings
             .repos
             .retain(|r| r.server.as_deref() != Some(id));
@@ -240,6 +290,8 @@ impl AppState {
     pub fn update_settings(&mut self, cx: &mut Context<Self>, edit: impl FnOnce(&mut Settings)) {
         edit(&mut self.settings);
         self.settings.normalize();
+        // 终端的设置：开着的终端马上跟着变
+        crate::terminal::set_prefs(&self.settings.terminal, cx);
         self.save();
         cx.notify();
     }
@@ -382,10 +434,22 @@ impl AppState {
     }
 }
 
-/// 登录这台服务器用的选项：私钥、密码登录、存着的密码或口令。
+/// 登录这台服务器用的选项：私钥、密码登录、存着的密码或口令。不含跳板机（见 [`AppState::connect`]）。
 pub(crate) fn connect_options(server: &Server) -> ConnectOptions {
     ConnectOptions {
         forward_agent: server.forward_agent,
+        identity_file: server.key_file().map(str::to_string),
+        password_auth: server.auth == Auth::Password,
+        secret: crate::secrets::get(&server.id),
+        ..ConnectOptions::default()
+    }
+}
+
+/// 把这台服务器当跳板机时怎么登录它：沿用它自己的设置。ssh-agent 不往跳板机上转发。
+fn jump_options(server: &Server) -> Jump {
+    Jump {
+        name: server.name.clone(),
+        destination: server.destination.clone(),
         identity_file: server.key_file().map(str::to_string),
         password_auth: server.auth == Auth::Password,
         secret: crate::secrets::get(&server.id),

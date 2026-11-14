@@ -517,7 +517,7 @@ impl RepoView {
         )
     }
 
-    /// Git、终端两页的切换：仓库名下面、过滤框上面，两页里都在这个位置。终端那一半标出
+    /// Git、终端、文件三页的切换：仓库名下面、过滤框上面，三页里都在这个位置。终端那一格标出
     /// 有几个终端在跑（服务器上留着、还没接上的也算）。
     fn render_page_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
@@ -530,14 +530,19 @@ impl RepoView {
             theme.background
         };
         let running = self.terminals_running(cx);
-        let half = |id: &'static str, page: Page, icon: IconName, label: &'static str| {
+        let (unsaved, accent) = (self.unsaved_files(), theme.primary);
+        let half = |id: &'static str,
+                    page: Page,
+                    icon: IconName,
+                    label: &'static str,
+                    tip: &'static str| {
             let on = self.page == page;
             h_flex()
                 .id(id)
                 .flex_1()
                 .min_w_0()
                 .h(px(26.))
-                .gap(px(6.))
+                .gap(px(5.))
                 .justify_center()
                 .rounded(px(5.))
                 .text_size(px(13.))
@@ -552,7 +557,7 @@ impl RepoView {
                 })
                 .child(ui::icon(icon).flex_none())
                 .child(label)
-                .tooltip(|window, cx| ui::tip(tr("在 Git 和终端页面之间切换（Ctrl+`）"), window, cx))
+                .tooltip(move |window, cx| ui::tip(tip, window, cx))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if this.page != page {
                         this.show_page(page, window, cx);
@@ -567,13 +572,20 @@ impl RepoView {
             .gap(px(2.))
             .rounded(px(7.))
             .bg(track)
-            .child(half("page-git", Page::Git, IconName::GitBranch, "Git"))
+            .child(half(
+                "page-git",
+                Page::Git,
+                IconName::GitBranch,
+                "Git",
+                tr("提交历史和本地修改（Ctrl+1、Ctrl+2）"),
+            ))
             .child(
                 half(
                     "page-terminal",
                     Page::Terminal,
                     IconName::SquareTerminal,
                     tr("终端"),
+                    tr("此仓库的终端（Ctrl+`）"),
                 )
                 .when(running > 0, |half| {
                     half.child(
@@ -584,6 +596,18 @@ impl RepoView {
                             .text_color(muted)
                             .child(running.to_string()),
                     )
+                }),
+            )
+            .child(
+                half(
+                    "page-files",
+                    Page::Files,
+                    IconName::Files,
+                    tr("文件"),
+                    tr("浏览和编辑仓库中的文件（Ctrl+Shift+E）"),
+                )
+                .when(unsaved > 0, |half| {
+                    half.child(div().flex_none().size(px(6.)).rounded_full().bg(accent))
                 }),
             )
     }
@@ -605,6 +629,7 @@ impl RepoView {
             .child(self.render_page_switch(cx));
         let side = match self.page {
             Page::Terminal => side.child(self.render_terminal_side(cx)),
+            Page::Files => side.child(self.render_files_side(cx)),
             Page::Git => {
                 let count = self.sidebar_rows(cx).len();
                 let actions = self.render_side_actions(cx);

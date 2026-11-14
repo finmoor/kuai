@@ -21,12 +21,20 @@
 //! 在 kuaid 里有自己的会话，名字见 [`session_key`]。
 //!
 //! 往终端里发图片、文件（粘贴、拖进来、点按钮选）见 [`attach`]：发过去的是文件的路径。
+//!
+//! 字体、字号、行高、光标、往回翻多少行、选中即复制、右键做什么都可以在设置里改（见 [`prefs`]），
+//! 所有终端共用，改了马上生效。
 
 mod attach;
 mod colors;
+mod glyphs;
 mod keys;
+mod prefs;
+mod preview;
 
 pub use attach::Attachment;
+pub use prefs::{font_choices, set_prefs, set_prefs_writer};
+pub use preview::preview;
 
 use std::any::Any;
 use std::borrow::Cow;
@@ -36,7 +44,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
@@ -47,7 +55,7 @@ use alacritty_terminal::index::{
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::tty::{self, Options, Shell};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor};
 use fr_channel::{Connection, TermItem, TermStream, UploadItem, UploadSource};
@@ -57,15 +65,12 @@ use futures::channel::mpsc;
 use futures::future::LocalBoxFuture;
 use futures::{FutureExt as _, StreamExt as _};
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use colors::Palette;
 
-/// 终端用的等宽字体和字号；行高取字号的 1.25 倍（制表符画的线上下接得上）。
-const FONT: &str = "Consolas";
-const FONT_SIZE: f32 = 13.;
-const LINE_HEIGHT: f32 = 16.;
 /// 字和面板边缘之间留的空
 const PADDING: f32 = 8.;
 
@@ -214,7 +219,7 @@ impl Session {
     ) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::unbounded();
         let proxy = Proxy(tx);
-        let term = Term::new(Config::default(), &grid, proxy.clone());
+        let term = Term::new(prefs::config(&prefs::get(cx)), &grid, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
         let mut env: HashMap<String, String> = launch.env.into_iter().collect();
         env.entry("TERM".into())
@@ -256,7 +261,7 @@ impl Session {
         cx: &mut Context<TerminalView>,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded();
-        let term = Term::new(Config::default(), &grid, Proxy(tx.clone()));
+        let term = Term::new(prefs::config(&prefs::get(cx)), &grid, Proxy(tx.clone()));
         let term = Arc::new(FairMutex::new(term));
         let stream = conn.term_open(key, cwd, grid.cols as u16, grid.rows as u16);
         let executor = cx.background_executor().clone();
@@ -440,6 +445,13 @@ pub struct TerminalView {
     scroll_rest: f32,
     /// 程序自己设的标题（OSC 0、2）
     title: Option<SharedString>,
+    /// 光标该不该闪（设置里开了，或者终端里的程序要它闪；焦点得在这里）：每帧画的时候记下来
+    blinking: Rc<Cell<bool>>,
+    /// 光标正闪到「灭」的那半拍
+    blink_hidden: bool,
+    /// 上一次敲键盘的时刻：正打着字的时候光标不闪
+    typed_at: Instant,
+    _blink: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -459,7 +471,18 @@ impl TerminalView {
         let subscriptions = vec![
             cx.on_focus(&focus, window, |this, _, cx| this.focus_changed(true, cx)),
             cx.on_blur(&focus, window, |this, _, cx| this.focus_changed(false, cx)),
+            // 终端的设置变了：往回翻的行数、光标的样子交给仿真器，字体、字号重画时就用上了
+            cx.observe_global::<prefs::Prefs>(|this, cx| this.prefs_changed(cx)),
         ];
+        // 光标闪烁的节拍。不该闪的时候只是空转，不重画
+        let blink = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(BLINK_INTERVAL).await;
+                if this.update(cx, |this, cx| this.blink_tick(cx)).is_err() {
+                    break;
+                }
+            }
+        });
         Self {
             launcher: Box::new(launcher),
             session: None,
@@ -477,8 +500,49 @@ impl TerminalView {
             selecting: false,
             scroll_rest: 0.,
             title: None,
+            blinking: Rc::default(),
+            blink_hidden: false,
+            typed_at: Instant::now(),
+            _blink: blink,
             _subscriptions: subscriptions,
         }
+    }
+
+    fn prefs_changed(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = &self.session {
+            session
+                .term
+                .lock()
+                .set_options(prefs::config(&prefs::get(cx)));
+        }
+        cx.notify();
+    }
+
+    /// 每半拍来一次：该闪就把光标亮灭换一下。
+    fn blink_tick(&mut self, cx: &mut Context<Self>) {
+        let blink = self.blinking.get() && self.typed_at.elapsed() >= BLINK_INTERVAL;
+        let hidden = blink && !self.blink_hidden;
+        if hidden != self.blink_hidden {
+            self.blink_hidden = hidden;
+            cx.notify();
+        }
+    }
+
+    /// 调字号：`step` 是加几号，0 是回到默认。存进设置，所有终端一起变。
+    fn zoom(&mut self, step: f32, cx: &mut Context<Self>) {
+        use crate::settings::TerminalSettings;
+        let mut prefs = prefs::get(cx);
+        let size = if step == 0. {
+            TerminalSettings::DEFAULT_SIZE
+        } else {
+            (prefs.font_size + step).clamp(TerminalSettings::MIN_SIZE, TerminalSettings::MAX_SIZE)
+        };
+        self.flash = Some(tf!("字号 {size}", size = size as u32).into());
+        if size != prefs.font_size {
+            prefs.font_size = size;
+            prefs::write(prefs, cx);
+        }
+        cx.notify();
     }
 
     /// 里面的进程还在跑，而且连着（敲的字它收得到）。
@@ -705,6 +769,7 @@ impl TerminalView {
     }
 
     fn focus_changed(&mut self, focused: bool, cx: &mut Context<Self>) {
+        self.blink_hidden = false;
         if self.mode().contains(TermMode::FOCUS_IN_OUT) {
             self.write(if focused { &b"\x1b[I"[..] } else { &b"\x1b[O"[..] });
         }
@@ -936,6 +1001,26 @@ impl TerminalView {
         if self.flash.take().is_some() {
             cx.notify();
         }
+        // 正打着字的时候光标不闪
+        self.typed_at = Instant::now();
+        if std::mem::take(&mut self.blink_hidden) {
+            cx.notify();
+        }
+        // Ctrl+加号、Ctrl+减号调字号，Ctrl+0 回到默认（和 Windows 终端一样）；不交给程序。
+        // Ctrl+Shift+减号（Ctrl+_，有的程序用它撤销）照旧交给程序
+        if mods.control && !mods.alt && !mods.platform {
+            let step = match key {
+                "=" | "+" => Some(1.),
+                "-" if !mods.shift => Some(-1.),
+                "0" if !mods.shift => Some(0.),
+                _ => None,
+            };
+            if let Some(step) = step {
+                self.zoom(step, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
         // 正在传文件时 Esc 是不传了（不交给程序）
         if key == "escape" && self.sending.take().is_some() {
             self.flash = Some(tr("已取消上传。").into());
@@ -1042,13 +1127,17 @@ impl TerminalView {
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.selecting = false;
+        let was_selecting = std::mem::take(&mut self.selecting);
         // 只点了一下没拖：不算选了东西
         if let Some(session) = &self.session {
             let mut term = session.term.lock();
             if term.selection.as_ref().is_some_and(Selection::is_empty) {
                 term.selection = None;
             }
+        }
+        // 设置里开了「选中即复制」：松开鼠标时选着字就复制
+        if was_selecting && prefs::get(cx).copy_on_select && self.selected_text().is_some() {
+            self.copy(cx);
         }
         cx.notify();
     }
@@ -1228,7 +1317,11 @@ impl Render for TerminalView {
         let theme = cx.theme();
         let (background, muted, bar) = (theme.background, theme.muted_foreground, theme.secondary);
         let (for_prepaint, for_paint) = (cx.entity(), cx.entity());
-        div()
+        // 右键：默认是「选着字就复制，否则粘贴」；设置里改成菜单的，弹出复制、粘贴
+        let menu = prefs::get(cx).right_click == crate::settings::RightClick::Menu;
+        let (has_selection, alive) = (self.selected_text().is_some(), self.is_alive());
+        let view = cx.entity().downgrade();
+        let panel = div()
             .id("terminal")
             .relative()
             .size_full()
@@ -1237,10 +1330,12 @@ impl Render for TerminalView {
             .bg(background)
             .cursor_text()
             .track_focus(&self.focus)
-            .key_context("Terminal")
+            .key_context(KEY_CONTEXT)
             .on_key_down(cx.listener(Self::on_key))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_click))
+            .when(!menu, |panel| {
+                panel.on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_click))
+            })
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll(cx.listener(Self::on_scroll))
@@ -1270,9 +1365,38 @@ impl Render for TerminalView {
                         .text_color(muted)
                         .child(notice),
                 )
-            })
+            });
+        if !menu {
+            return panel.into_any_element();
+        }
+        div()
+            .size_full()
+            .child(panel.context_menu(move |menu, _, _| {
+                let (copy, paste) = (view.clone(), view.clone());
+                menu.item(
+                    PopupMenuItem::new(tr("复制"))
+                        .disabled(!has_selection)
+                        .on_click(move |_, _, cx| {
+                            copy.update(cx, |this, cx| this.copy(cx)).ok();
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(tr("粘贴"))
+                        .disabled(!alive)
+                        .on_click(move |_, _, cx| {
+                            paste.update(cx, |this, cx| this.paste(cx)).ok();
+                        }),
+                )
+            }))
+            .into_any_element()
     }
 }
+
+/// 光标闪烁：亮、灭各这么久
+const BLINK_INTERVAL: Duration = Duration::from_millis(530);
+
+/// 终端面板的按键上下文：焦点在终端里时哪些快捷键让给里面的程序，按它来定（见 main.rs）。
+pub const KEY_CONTEXT: &str = "Terminal";
 
 /// 一段样式相同、挨在一起的字。
 struct Run {
@@ -1313,12 +1437,17 @@ struct Frame {
     cell: Size<Pixels>,
     /// 背景和默认不一样的格子：第几行、从第几列起、几列、什么颜色
     rects: Vec<(usize, usize, usize, Hsla)>,
+    /// 自己画的字（方块、制表线，见 [`glyphs`]）：第几行、第几列、哪个字、什么颜色
+    shapes: Vec<(usize, usize, char, Hsla)>,
     runs: Vec<Run>,
     cursor: Option<CursorDraw>,
     foreground: Hsla,
     background: Hsla,
     focused: bool,
     marked: Option<String>,
+    /// 画字用的字体（不带粗体、斜体）和字号
+    font: Font,
+    font_size: Pixels,
 }
 
 fn prepaint(
@@ -1327,14 +1456,16 @@ fn prepaint(
     window: &mut Window,
     cx: &mut App,
 ) -> Option<Frame> {
-    let font_size = px(FONT_SIZE);
-    let font_id = window.text_system().resolve_font(&font(FONT));
+    let prefs = prefs::get(cx);
+    let font_size = px(prefs.font_size);
+    let base_font = prefs::base_font(&prefs);
+    let font_id = window.text_system().resolve_font(&base_font);
     let cell_width = window
         .text_system()
         .advance(font_id, font_size, 'm')
         .map(|advance| advance.width)
         .unwrap_or(font_size * 0.55);
-    let cell = size(cell_width, px(LINE_HEIGHT));
+    let cell = size(cell_width, px(prefs.cell_height()));
     let grid = Grid {
         cols: ((bounds.size.width / cell.width).floor() as usize).max(2),
         rows: ((bounds.size.height / cell.height).floor() as usize).max(1),
@@ -1350,12 +1481,17 @@ fn prepaint(
     let selection = theme.selection;
     let this = view.read(cx);
     let session = this.session.as_ref()?;
-    let (rects, runs, cursor) = snapshot(&session.term.lock(), &palette, selection);
     let focused = this.focus.is_focused(window);
-    let frame = Frame {
+    let (rects, shapes, runs, cursor) = {
+        let term = session.term.lock();
+        this.blinking.set(focused && term.cursor_style().blinking);
+        snapshot(&term, &palette, selection)
+    };
+    let mut frame = Frame {
         origin: bounds.origin,
         cell,
         rects,
+        shapes,
         runs,
         // 进程结束了、够不着了就不画光标
         cursor: cursor.filter(|_| this.is_alive()),
@@ -1363,8 +1499,14 @@ fn prepaint(
         background: palette.background,
         focused,
         marked: this.marked.clone(),
+        font: base_font,
+        font_size,
     };
     let cursor_bounds = frame.cursor.as_ref().map(|cursor| frame.cell_bounds(cursor.row, cursor.col, 1));
+    // 闪到「灭」的那半拍不画光标；它的位置照记（输入法的候选框跟着它）
+    if this.blink_hidden && focused && this.marked.is_none() {
+        frame.cursor = None;
+    }
     this.geometry.set(Geometry {
         origin: bounds.origin,
         cell,
@@ -1374,9 +1516,14 @@ fn prepaint(
     Some(frame)
 }
 
-type Snapshot = (Vec<(usize, usize, usize, Hsla)>, Vec<Run>, Option<CursorDraw>);
+type Snapshot = (
+    Vec<(usize, usize, usize, Hsla)>,
+    Vec<(usize, usize, char, Hsla)>,
+    Vec<Run>,
+    Option<CursorDraw>,
+);
 
-/// 把现在看得见的格子拍成要画的背景块、文字段和光标。
+/// 把现在看得见的格子拍成要画的背景块、自己画的字、文字段和光标。
 fn snapshot(term: &Term<Proxy>, palette: &Palette, selection_color: Hsla) -> Snapshot {
     let content = term.renderable_content();
     let offset = content.display_offset as i32;
@@ -1385,6 +1532,7 @@ fn snapshot(term: &Term<Proxy>, palette: &Palette, selection_color: Hsla) -> Sna
     let cursor_at = content.cursor.point;
     let cursor_shape = content.cursor.shape;
     let mut rects: Vec<(usize, usize, usize, Hsla)> = Vec::new();
+    let mut shapes: Vec<(usize, usize, char, Hsla)> = Vec::new();
     let mut runs: Vec<Run> = Vec::new();
     let mut current: Option<Run> = None;
     let mut cursor = None;
@@ -1445,7 +1593,13 @@ fn snapshot(term: &Term<Proxy>, palette: &Palette, selection_color: Hsla) -> Sna
         }
         let underline = flags.intersects(Flags::ALL_UNDERLINES);
         let strike = flags.contains(Flags::STRIKEOUT);
-        let blank = cell.c == ' ' || cell.c == '\t' || flags.contains(Flags::HIDDEN);
+        let hidden = flags.contains(Flags::HIDDEN);
+        // 方块、制表线不交给字体：按格子画，一格接一格没有缝。在文字段里它算一个空格
+        let drawn = !hidden && glyphs::is_drawn(cell.c);
+        if drawn {
+            shapes.push((row, col, cell.c, fg));
+        }
+        let blank = drawn || hidden || cell.c == ' ' || cell.c == '\t';
         if blank {
             // 空格接在前一段后面（省得一个词一段），划线不一样时才断开；开头的空格不用画
             match &mut current {
@@ -1499,7 +1653,7 @@ fn snapshot(term: &Term<Proxy>, palette: &Palette, selection_color: Hsla) -> Sna
         }
     }
     flush(&mut current, &mut runs);
-    (rects, runs, cursor)
+    (rects, shapes, runs, cursor)
 }
 
 impl Frame {
@@ -1514,8 +1668,8 @@ impl Frame {
     }
 }
 
-fn text_run(len: usize, style: Style) -> TextRun {
-    let mut font = font(FONT);
+fn text_run(len: usize, style: Style, base: &Font) -> TextRun {
+    let mut font = base.clone();
     if style.bold {
         font = font.bold();
     }
@@ -1549,13 +1703,20 @@ fn paint(
     let focus = view.read(cx).focus.clone();
     // 不管里面有没有东西，焦点在这里时打的字都归它
     window.handle_input(&focus, ElementInputHandler::new(bounds, view.clone()), cx);
-    let Some(frame) = frame else {
-        return;
-    };
-    let font_size = px(FONT_SIZE);
+    if let Some(frame) = frame {
+        paint_frame(&frame, bounds, window, cx);
+    }
+}
+
+/// 把一帧画出来：背景块、自己画的字、文字、光标、输入法正在组的字。设置页的预览也用它。
+fn paint_frame(frame: &Frame, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+    let font_size = frame.font_size;
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
         for &(row, col, cols, color) in &frame.rects {
             window.paint_quad(fill(frame.cell_bounds(row, col, cols), color));
+        }
+        for &(row, col, ch, color) in &frame.shapes {
+            glyphs::paint(ch, frame.cell_bounds(row, col, 1), color, window);
         }
         for run in &frame.runs {
             let force = match (run.single, run.wide) {
@@ -1567,7 +1728,7 @@ fn paint(
             let line = window.text_system().shape_line(
                 text,
                 font_size,
-                &[text_run(run.text.len(), run.style)],
+                &[text_run(run.text.len(), run.style, &frame.font)],
                 force,
             );
             let origin = frame.cell_bounds(run.row, run.col, 1).origin;
@@ -1585,7 +1746,9 @@ fn paint(
             match shape {
                 CursorShape::Block => {
                     window.paint_quad(fill(area, color));
-                    if cursor.ch != ' ' {
+                    if glyphs::is_drawn(cursor.ch) {
+                        glyphs::paint(cursor.ch, area, frame.background, window);
+                    } else if cursor.ch != ' ' {
                         let text: SharedString = cursor.ch.to_string().into();
                         let style = Style {
                             color: frame.background,
@@ -1597,7 +1760,7 @@ fn paint(
                         let line = window.text_system().shape_line(
                             text.clone(),
                             font_size,
-                            &[text_run(text.len(), style)],
+                            &[text_run(text.len(), style, &frame.font)],
                             None,
                         );
                         let _ = line.paint(
@@ -1640,7 +1803,7 @@ fn paint(
             let line = window.text_system().shape_line(
                 text.clone(),
                 font_size,
-                &[text_run(text.len(), style)],
+                &[text_run(text.len(), style, &frame.font)],
                 None,
             );
             let origin = frame.cell_bounds(cursor.row, cursor.col, 1).origin;

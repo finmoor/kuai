@@ -1,10 +1,11 @@
-//! 侧栏收起后的图标栏：48 宽，从上到下是仓库的图标、Git 和终端两页的切换、这一页的几项，
+//! 侧栏收起后的图标栏：48 宽，从上到下是仓库的图标、Git、终端、文件三页的切换、这一页的几项，
 //! 最下面是展开侧栏的按钮。
 //!
 //! - Git 页：本地修改（带改动的文件数）、所有提交，和分支、远程、标签、贮藏、子模块。后几个
 //!   点一下在右边弹出列表，点列表里的一项和在侧栏里单击那一行一样（在提交图里跳过去；贮藏是
 //!   显示里面的改动；子模块是在新标签页里打开）。切换分支、删除这些操作要展开侧栏。
 //! - 终端页：各终端的序号，点一下切过去，右键和侧栏里那一行一样；最后是「新终端」。
+//! - 文件页：展开侧栏看目录树、新建文件、上传。目录树要展开侧栏才看得到。
 //!
 //! 收起、展开见 [`super::layout`]：所有标签页、两页共用一个状态，存在设置里。
 
@@ -128,6 +129,7 @@ impl RepoView {
         let items = match self.page {
             Page::Git => self.render_git_rail(cx),
             Page::Terminal => self.render_terminal_rail(cx),
+            Page::Files => self.render_files_rail(cx),
         };
         v_flex()
             .w(px(RAIL_WIDTH))
@@ -217,7 +219,8 @@ impl RepoView {
             })
     }
 
-    /// Git、终端两页的切换，竖着放，样子和侧栏里横着的那个一样；终端上标出有几个在跑。
+    /// Git、终端、文件三页的切换，竖着放，样子和侧栏里横着的那个一样；终端上标出有几个在跑，
+    /// 文件上标出有几个没保存。
     fn render_rail_pages(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (track, fg, muted) = (theme.secondary, theme.foreground, theme.muted_foreground);
@@ -228,6 +231,7 @@ impl RepoView {
             theme.background
         };
         let running = self.terminals_running(cx);
+        let unsaved = self.unsaved_files();
         let half = |id: &'static str, page: Page, icon: IconName, tip: &'static str| {
             let on = self.page == page;
             div()
@@ -259,12 +263,7 @@ impl RepoView {
             .gap(px(2.))
             .rounded(px(7.))
             .bg(track)
-            .child(half(
-                "rail-git",
-                Page::Git,
-                IconName::GitBranch,
-                tr("Git（Ctrl+`）"),
-            ))
+            .child(half("rail-git", Page::Git, IconName::GitBranch, "Git"))
             .child(
                 half(
                     "rail-terminal",
@@ -273,6 +272,15 @@ impl RepoView {
                     tr("终端（Ctrl+`）"),
                 )
                 .when(running > 0, |half| half.child(badge(running, false, cx))),
+            )
+            .child(
+                half(
+                    "rail-files",
+                    Page::Files,
+                    IconName::Files,
+                    tr("文件（Ctrl+Shift+E）"),
+                )
+                .when(unsaved > 0, |half| half.child(badge(unsaved, true, cx))),
             )
     }
 

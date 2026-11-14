@@ -19,6 +19,8 @@ use gpui_kit::*;
 /// 一个密码请求：提示文字，和把回答送回去的口子（None 表示取消）。
 pub struct Request {
     prompt: String,
+    /// 是跳板机在问时，它的名字
+    jump: Option<String>,
     reply: Sender<Option<String>>,
 }
 
@@ -49,7 +51,7 @@ impl Drop for Quiet {
 /// 程序启动时调用：登记密码请求的处理函数，返回界面这头接收请求的口子。
 pub fn init() -> Prompts {
     let (tx, rx) = mpsc::unbounded();
-    let started = fr_channel::init_prompts(move |prompt| {
+    let started = fr_channel::init_prompts(move |prompt, jump| {
         if QUIET.load(Ordering::SeqCst) > 0 {
             log::info!("自动获取要密码，这一次不问：{}", prompt.trim());
             return None;
@@ -57,6 +59,7 @@ pub fn init() -> Prompts {
         let (reply, answer) = std::sync::mpsc::channel();
         tx.unbounded_send(Request {
             prompt: prompt.to_string(),
+            jump: jump.map(str::to_string),
             reply,
         })
         .ok()?;
@@ -90,7 +93,19 @@ pub fn show_in<T: 'static>(
 }
 
 fn open(request: Request, window: &mut Window, cx: &mut App) {
-    let Request { prompt, reply } = request;
+    let Request {
+        prompt,
+        jump,
+        reply,
+    } = request;
+    // 跳板机在问：写明是哪一台，不然用户会当成是目标服务器的密码
+    let jump: Option<SharedString> = jump.map(|name| {
+        fr_core::tf!(
+            "此为跳板机 {name} 的登录提示。连接目标服务器前需先登录跳板机。",
+            name
+        )
+        .into()
+    });
     let secret = fr_core::askpass::is_secret(&prompt);
     let input = cx.new(|cx| InputState::new(window, cx).masked(secret));
     let prompt: SharedString = prompt.trim().to_string().into();
@@ -130,6 +145,9 @@ fn open(request: Request, window: &mut Window, cx: &mut App) {
             .child(
                 v_flex()
                     .gap_3()
+                    .when_some(jump.clone(), |body, jump| {
+                        body.child(div().text_sm().child(jump))
+                    })
                     .child(div().text_sm().child(prompt.clone()))
                     .child(Input::new(&input))
                     .child(

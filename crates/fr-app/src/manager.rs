@@ -140,6 +140,38 @@ impl ManagerView {
         let passphrase = input("", secret_hint(Auth::Key), true);
         let password = input("", secret_hint(Auth::Password), true);
         let name = input(&old.name, tr("默认使用主机名"), false);
+        // 能选作跳板机的：别的已配置的服务器，而且不经这台连接（不然绕圈）。
+        // 每项是 id、名字、ssh 目标、从本机到它要经过的跳板机的名字
+        let candidates: Rc<Vec<JumpChoice>> = {
+            let settings = &self.app.read(cx).settings;
+            Rc::new(
+                settings
+                    .servers
+                    .iter()
+                    .filter(|server| settings.can_jump(&old.id, &server.id))
+                    .map(|server| JumpChoice {
+                        id: server.id.clone(),
+                        name: server.name.clone().into(),
+                        destination: server.destination.clone().into(),
+                        via: settings
+                            .route(&server.id)
+                            .iter()
+                            .map(|jump| jump.name.clone().into())
+                            .collect(),
+                    })
+                    .collect(),
+            )
+        };
+        let jump: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(
+            old.jump
+                .clone()
+                .filter(|id| candidates.iter().any(|choice| choice.id == *id)),
+        ));
+        if jump.borrow().is_some() {
+            host.update(cx, |state, cx| {
+                state.set_placeholder(tr(HOST_VIA_JUMP), window, cx)
+            });
+        }
 
         let app = self.app.clone();
         let view = cx.entity().downgrade();
@@ -163,6 +195,7 @@ impl ManagerView {
                 let (app, auth, forward_agent) =
                     (app.clone(), auth.clone(), forward_agent.clone());
                 let (forget, problem, old) = (forget.clone(), problem.clone(), old.clone());
+                let jump = jump.clone();
                 move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                     let read = |input: &Entity<InputState>| input.read(cx).value().to_string();
                     let (host, user, port) = (read(&host), read(&user), read(&port));
@@ -213,6 +246,7 @@ impl ManagerView {
                         auth,
                         // 换成密码登录时填过的私钥文件留着，换回来还在
                         identity_file: (!key.is_empty()).then(|| key.to_string()),
+                        jump: jump.borrow().clone(),
                     };
                     // 存着的密码、口令：填了新的就换；没填、登录方式没变、也没点清除，就留着
                     let keep = had_secret && auth == old.auth && !forget.get();
@@ -286,6 +320,134 @@ impl ManagerView {
                 });
                 field_with(label, clear, Input::new(input).mask_toggle())
             };
+            let jump_now = jump.borrow().clone();
+            let chosen = jump_now
+                .as_deref()
+                .and_then(|id| candidates.iter().find(|choice| choice.id == id))
+                .cloned();
+            // 选一台：记下来，主机那一格的提示跟着换
+            let pick_jump = {
+                let (jump, host) = (jump.clone(), host.clone());
+                move |to: Option<String>| {
+                    let (jump, host) = (jump.clone(), host.clone());
+                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    let hint = if to.is_some() {
+                        tr(HOST_VIA_JUMP)
+                    } else {
+                        tr("主机名、IP 或 ~/.ssh/config 中的别名")
+                    };
+                        host.update(cx, |state, cx| state.set_placeholder(hint, window, cx));
+                        *jump.borrow_mut() = to.clone();
+                        window.refresh();
+                    }
+                }
+            };
+            let jump_field = {
+                let candidates = candidates.clone();
+                let pick_jump = pick_jump.clone();
+                let jump_now = jump_now.clone();
+                let shown = match &chosen {
+                    Some(choice) => h_flex()
+                        .gap_2()
+                        .min_w_0()
+                        .child(div().flex_none().child(choice.name.clone()))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .font_family("Consolas")
+                                .text_xs()
+                                .text_color(muted)
+                                .child(choice.destination.clone()),
+                        ),
+                    None => h_flex()
+                        .gap_2()
+                        .child(tr("不使用"))
+                        .child(div().text_xs().text_color(muted).child(tr("直接连接"))),
+                };
+                field(
+                    tr("跳板机"),
+                    Button::new("jump")
+                        .outline()
+                        .w_full()
+                        .child(shown)
+                        .dropdown_caret(true)
+                        .dropdown_menu(move |menu, _, cx| {
+                            let muted = cx.theme().muted_foreground;
+                            let mut menu = menu.min_w(px(512.)).item(
+                                PopupMenuItem::new(tr("不使用（直接连接）"))
+                                    .checked(jump_now.is_none())
+                                    .on_click(pick_jump(None)),
+                            );
+                            if candidates.is_empty() {
+                                return menu.separator().label(tr("暂无其他已配置的服务器"));
+                            }
+                            menu = menu.separator().label(tr("经由已配置的服务器"));
+                            for choice in candidates.iter() {
+                                let (name, destination) =
+                                    (choice.name.clone(), choice.destination.clone());
+                                menu = menu.item(
+                                    PopupMenuItem::element(move |_, _| {
+                                        h_flex()
+                                            .gap_3()
+                                            .child(name.clone())
+                                            .child(
+                                                div()
+                                                    .font_family("Consolas")
+                                                    .text_xs()
+                                                    .text_color(muted)
+                                                    .child(destination.clone()),
+                                            )
+                                    })
+                                    .checked(jump_now.as_deref() == Some(&choice.id))
+                                    .on_click(pick_jump(Some(choice.id.clone()))),
+                                );
+                            }
+                            menu
+                        }),
+                )
+            };
+            // 选了跳板机：把从本机到目标要经过的几台画出来
+            let route_line = chosen.as_ref().map(|choice| {
+                let typed = Target::parse(host.read(cx).value().as_ref()).host;
+                let target: SharedString = if typed.is_empty() {
+                    tr("目标服务器").into()
+                } else {
+                    typed.into()
+                };
+                let mut stops: Vec<(SharedString, bool)> = vec![(tr("本机").into(), false)];
+                stops.extend(choice.via.iter().cloned().map(|name| (name, false)));
+                stops.push((choice.name.clone(), false));
+                stops.push((target, true));
+                let accent = cx.theme().primary;
+                let chip_bg = cx.theme().secondary;
+                let mut line = h_flex()
+                    .flex_wrap()
+                    .gap(px(6.))
+                    .child(div().text_xs().text_color(muted).child(tr("连接路径")));
+                for (index, (name, last)) in stops.into_iter().enumerate() {
+                    if index > 0 {
+                        line = line.child(ui::icon_small(IconName::ArrowRight).text_color(muted));
+                    }
+                    line = line.child(
+                        div()
+                            .px(px(8.))
+                            .h(px(22.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(11.))
+                            .text_xs()
+                            .max_w(px(200.))
+                            .truncate()
+                            .map(|chip| match last {
+                                true => chip.bg(accent.opacity(0.16)).text_color(accent),
+                                false => chip.bg(chip_bg),
+                            })
+                            .child(name),
+                    );
+                }
+                line
+            });
             dialog
                 .title(if editing {
                     tr("编辑服务器")
@@ -321,6 +483,7 @@ impl ManagerView {
                                         .child(field(tr("端口"), Input::new(&port))),
                                 ),
                         )
+                        .child(v_flex().gap_2().child(jump_field).children(route_line))
                         .child(field(tr("用户名"), Input::new(&user)))
                         .child(
                             h_flex()
@@ -372,9 +535,15 @@ impl ManagerView {
                         .when_some(problem.borrow().clone(), |body, found| {
                             body.child(div().text_sm().text_color(danger).child(found))
                         })
-                        .child(div().text_xs().text_color(muted).child(tr(
-                            "密码和私钥口令保存在 Windows 凭据管理器中。首次连接时将在服务器的 ~/.kuai/ 中安装 kuaid。",
-                        ))),
+                        .child(div().text_xs().text_color(muted).child(if jump_now.is_some() {
+                            tr(
+                                "密码和私钥口令保存在 Windows 凭据管理器中。首次连接时将在服务器的 ~/.kuai/ 中安装 kuaid，跳板机上不安装任何程序。",
+                            )
+                        } else {
+                            tr(
+                                "密码和私钥口令保存在 Windows 凭据管理器中。首次连接时将在服务器的 ~/.kuai/ 中安装 kuaid。",
+                            )
+                        })),
                 )
                 .footer(
                     DialogFooter::new()
@@ -642,6 +811,7 @@ impl ManagerView {
                 "workspace",
                 IconName::Layers,
                 group.name.clone().into(),
+                Vec::new(),
                 Some(tr("当前工作区").into()),
                 status_line(
                     "workspace",
@@ -843,8 +1013,49 @@ pub(crate) fn confirm(
     });
 }
 
-fn field(label: &'static str, input: Input) -> impl IntoElement {
+fn field(label: &'static str, input: impl IntoElement) -> impl IntoElement {
     field_with(label, None, input)
+}
+
+/// 选了跳板机以后，主机那一格的提示
+const HOST_VIA_JUMP: &str = "跳板机能访问到的地址，例如内网 IP";
+
+/// 「跳板机」下拉里的一项。
+#[derive(Clone)]
+struct JumpChoice {
+    id: String,
+    name: SharedString,
+    destination: SharedString,
+    /// 从本机到这台要先经过的跳板机的名字（它自己也经跳板机连接时才有）
+    via: Vec<SharedString>,
+}
+
+/// 名字后面的小标签：`accent` 时用强调色（「经由 …」），否则是灰的（「跳板机」）。
+fn name_tag(
+    key: String,
+    icon: Option<IconName>,
+    text: SharedString,
+    tip: SharedString,
+    accent: bool,
+    colors: Colors,
+) -> AnyElement {
+    let color = if accent { colors.accent } else { colors.muted };
+    h_flex()
+        .id(ElementId::Name(key.into()))
+        .flex_none()
+        .h(px(18.))
+        .px(px(6.))
+        .gap(px(3.))
+        .rounded(px(9.))
+        .text_xs()
+        .text_color(color)
+        .bg(color.opacity(if accent { 0.14 } else { 0.12 }))
+        .when_some(icon, |tag, icon| {
+            tag.child(Icon::new(icon).size_3().text_color(color))
+        })
+        .child(text)
+        .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
+        .into_any_element()
 }
 
 /// 一格：上面是名字（右边可以带个小按钮），下面是填的地方。
@@ -891,6 +1102,7 @@ impl Render for ManagerView {
                 "local",
                 IconName::Monitor,
                 tr("本机").into(),
+                Vec::new(),
                 None,
                 status_line(
                     "local",
@@ -935,7 +1147,11 @@ impl Render for ManagerView {
             let mut failure: Option<SharedString> = None;
             let (dot, status_text, retry): (Option<Hsla>, SharedString, bool) = match &status {
                 ConnStatus::Idle => (Some(colors.muted.opacity(0.6)), tr("未连接").into(), true),
-                ConnStatus::Connecting => (Some(colors.accent), tr("正在连接…").into(), false),
+                ConnStatus::Connecting => (
+                    Some(colors.accent),
+                    self.app.read(cx).connecting_text(&server.id),
+                    false,
+                ),
                 ConnStatus::Ready(conn) => (
                     Some(colors.success),
                     tf!(
@@ -956,8 +1172,49 @@ impl Render for ManagerView {
                     (Some(colors.danger), tr("连接失败").into(), true)
                 }
             };
+            // 名字后面的标签：它经哪几台连接；有没有别的服务器经它连接
+            let route: Vec<String> = settings
+                .route(&server.id)
+                .iter()
+                .map(|jump| jump.name.clone())
+                .collect();
+            let users: Vec<String> = settings
+                .jump_users(&server.id)
+                .iter()
+                .map(|user| user.name.clone())
+                .collect();
+            let mut tags: Vec<AnyElement> = Vec::new();
+            if !users.is_empty() {
+                tags.push(name_tag(
+                    format!("tag-jump:{}", server.id),
+                    None,
+                    tr("跳板机").into(),
+                    tf!("经此服务器连接：{names}", names = users.join("、")).into(),
+                    false,
+                    colors,
+                ));
+            }
+            if !route.is_empty() {
+                let path = route.join(" → ");
+                tags.push(name_tag(
+                    format!("tag-via:{}", server.id),
+                    Some(IconName::CornerDownRight),
+                    tf!("经由 {path}", path = &path).into(),
+                    tf!("连接时依次经过：{path}", path = &path).into(),
+                    true,
+                    colors,
+                ));
+            }
             let (id_open, id_retry) = (server.id.clone(), server.id.clone());
             let id_clone = server.id.clone();
+            let removal_note = if users.is_empty() {
+                String::new()
+            } else {
+                tf!(
+                    "{names} 经此服务器连接，移除后将改为直接连接，需重新选择跳板机。\n",
+                    names = users.join("、")
+                )
+            };
             let (menu_view, menu_server, menu_app) =
                 (cx.entity().downgrade(), server.clone(), self.app.clone());
             let mut actions: Vec<AnyElement> = Vec::new();
@@ -1005,6 +1262,7 @@ impl Render for ManagerView {
                     .dropdown_menu(move |menu, _, _| {
                         let (view, edit) = (menu_view.clone(), menu_server.clone());
                         let (app, remove) = (menu_app.clone(), menu_server.clone());
+                        let removal_note = removal_note.clone();
                         menu.item(
                             PopupMenuItem::new(tr("编辑…")).on_click(move |_, window, cx| {
                                 view.update(cx, |this, cx| {
@@ -1028,8 +1286,9 @@ impl Render for ManagerView {
                                 confirm(
                                     tf!("移除服务器 {name}？", name = remove.name),
                                     tf!(
-                                        "{destination}\n{repos}服务器上的内容不受影响。",
+                                        "{destination}\n{jump}{repos}服务器上的内容不受影响。",
                                         destination = remove.destination,
+                                        jump = &removal_note,
                                         repos = repos
                                     ),
                                     tr("移除服务器"),
@@ -1048,6 +1307,7 @@ impl Render for ManagerView {
                     &server.id,
                     IconName::Server,
                     server.name.clone().into(),
+                    tags,
                     Some(server.destination.clone().into()),
                     status_line(&server.id, dot, status_text, colors),
                     actions,
@@ -1055,7 +1315,11 @@ impl Render for ManagerView {
                 ),
                 failure,
                 repos,
-                tr("暂无此服务器上的仓库。请点击「打开仓库…」选择。"),
+                if users.is_empty() {
+                    tr("暂无此服务器上的仓库。请点击「打开仓库…」选择。")
+                } else {
+                    tr("仅用作跳板机，暂无此服务器上的仓库。")
+                },
                 colors,
             ));
         }
@@ -1185,11 +1449,12 @@ fn status_line(key: &str, dot: Option<Hsla>, text: SharedString, colors: Colors)
         .into_any_element()
 }
 
-/// 卡片顶上的一条：图标、名字（后面跟一句小字），下面一行是状态；右边是按钮。
+/// 卡片顶上的一条：图标、名字（后面跟小标签和一句小字），下面一行是状态；右边是按钮。
 fn card_header(
     key: &str,
     icon: IconName,
     name: SharedString,
+    tags: Vec<AnyElement>,
     aside: Option<SharedString>,
     status: AnyElement,
     actions: Vec<AnyElement>,
@@ -1229,6 +1494,7 @@ fn card_header(
                                 .text_sm()
                                 .font_weight(FontWeight::SEMIBOLD),
                         )
+                        .children(tags)
                         .when_some(aside, |row, aside| {
                             row.child(
                                 ui::clipped(

@@ -5,13 +5,13 @@ param(
     # 截图里的坐标（窗口矩形左上角为原点的物理像素，和 capture-printwindow.ps1 的图一致）
     [int]$X, [int]$Y, [int]$X2, [int]$Y2,
     [string]$Text,
-    # 按住的修饰键：ctrl、shift 或 ctrl+shift。对 click、dblclick、key 有效。
+    # 按住的修饰键：ctrl、shift、alt，可以用加号连起来（ctrl+shift）。对 click、dblclick、key 有效。
     [string]$Mods = ''
 )
 # 直接往测试窗口投递鼠标、字符消息，不移动真实鼠标、不抢焦点，不打扰正在用电脑的人。
-# 修饰键（Shift、Ctrl）gpui 用 GetKeyState 读，读的是窗口线程自己的那份按键状态，不是真实键盘。
+# 修饰键（Shift、Ctrl、Alt）gpui 用 GetKeyState 读，读的是窗口线程自己的那份按键状态，不是真实键盘。
 # 所以带修饰键时：把本线程的输入状态和窗口线程接到一起（AttachThreadInput），把那份状态里的
-# Ctrl、Shift 改成按下，投递消息，等窗口处理完再改回去。真实键盘不受影响；这期间如果有人正好在
+# 修饰键改成按下，投递消息，等窗口处理完再改回去。真实键盘不受影响；这期间如果有人正好在
 # 按键盘，那份状态会被真实按键冲掉，结果可能不对，重跑一次。
 Add-Type @"
 using System;
@@ -28,7 +28,7 @@ public static class PostIn {
   [DllImport("user32.dll")] static extern bool GetKeyboardState(byte[] s);
   [DllImport("user32.dll")] static extern bool SetKeyboardState(byte[] s);
   // 按住修饰键投递一串消息。整个过程在一次调用里做完，保证都在同一个线程上。
-  public static bool PostWithMods(IntPtr h, bool ctrl, bool shift, uint[] msg, long[] w, long[] l) {
+  public static bool PostWithMods(IntPtr h, bool ctrl, bool shift, bool alt, uint[] msg, long[] w, long[] l) {
     uint pid; uint target = GetWindowThreadProcessId(h, out pid); uint me = GetCurrentThreadId();
     if (!AttachThreadInput(me, target, true)) return false;
     try {
@@ -36,6 +36,7 @@ public static class PostIn {
       byte[] now = (byte[])old.Clone();
       if (ctrl) { now[0x11] = 0x80; now[0xA2] = 0x80; }
       if (shift) { now[0x10] = 0x80; now[0xA0] = 0x80; }
+      if (alt) { now[0x12] = 0x80; now[0xA4] = 0x80; }
       SetKeyboardState(now);
       for (int i = 0; i < msg.Length; i++) { PostMessageW(h, msg[i], (IntPtr)w[i], (IntPtr)l[i]); System.Threading.Thread.Sleep(40); }
       System.Threading.Thread.Sleep(250);
@@ -64,11 +65,11 @@ function LParam([int]$x, [int]$y) {
 $WM_MOUSEMOVE = 0x0200; $WM_LBUTTONDOWN = 0x0201; $WM_LBUTTONUP = 0x0202; $WM_CHAR = 0x0102
 $MK_LBUTTON = [IntPtr]1
 
-$ctrl = $Mods -match 'ctrl'; $shift = $Mods -match 'shift'
+$ctrl = $Mods -match 'ctrl'; $shift = $Mods -match 'shift'; $alt = $Mods -match 'alt'
 # 带修饰键时先把消息攒起来，最后一次投递
 $script:batch = @()
 function Post([uint32]$msg, [IntPtr]$w, [IntPtr]$l) {
-    if ($ctrl -or $shift) { $script:batch += , @($msg, [long]$w, [long]$l); return }
+    if ($ctrl -or $shift -or $alt) { $script:batch += , @($msg, [long]$w, [long]$l); return }
     [PostIn]::PostMessageW($h, $msg, $w, $l) | Out-Null
     Start-Sleep -Milliseconds 40
 }
@@ -97,14 +98,21 @@ switch ($Action) {
         Post 0x0205 ([IntPtr]0) (LParam $X $Y)
     }
     'key' {
-        # 按键：-Text 给名字（enter、esc、f5、up、down、tab、delete、space、left、right、pageup、pagedown、home、end、comma、backtick），
-        # 或者一个字母、数字（配 -Mods ctrl 用，比如 Ctrl+P）
+        # 按键：-Text 给名字（enter、esc、f1 到 f12、up、down、left、right、tab、backspace、insert、delete、space、pageup、pagedown、
+        # home、end、comma、backtick、equal、minus），或者一个字母、数字（配 -Mods ctrl 用，比如 Ctrl+P）
         $name = $Text.ToLower()
-        $vk = @{ enter = 0x0D; esc = 0x1B; f5 = 0x74; up = 0x26; down = 0x28; tab = 0x09; delete = 0x2E; space = 0x20; left = 0x25; right = 0x27; pageup = 0x21; pagedown = 0x22; end = 0x23; home = 0x24; comma = 0xBC; backtick = 0xC0 }[$name]
+        $vk = @{ enter = 0x0D; esc = 0x1B; backspace = 0x08; insert = 0x2D; up = 0x26; down = 0x28; tab = 0x09; delete = 0x2E; space = 0x20; left = 0x25; right = 0x27; pageup = 0x21; pagedown = 0x22; end = 0x23; home = 0x24; comma = 0xBC; backtick = 0xC0; equal = 0xBB; minus = 0xBD }[$name]
+        if (-not $vk -and $name -match '^f([1-9]|1[0-2])$') { $vk = 0x6F + [int]$Matches[1] }
         if (-not $vk -and $name -match '^[a-z0-9]$') { $vk = [int][char]$name.ToUpper() }
         if (-not $vk) { throw "不认识的按键 $Text" }
-        Post 0x0100 ([IntPtr]$vk) ([IntPtr]1)
-        Post 0x0101 ([IntPtr]$vk) ([IntPtr]0xC0000001)
+        if ($alt) {
+            # 按着 Alt 时系统发的是 WM_SYSKEYDOWN、WM_SYSKEYUP，lParam 第 29 位是「Alt 按着」
+            Post 0x0104 ([IntPtr]$vk) ([IntPtr]0x20000001)
+            Post 0x0105 ([IntPtr]$vk) ([IntPtr]0xE0000001)
+        } else {
+            Post 0x0100 ([IntPtr]$vk) ([IntPtr]1)
+            Post 0x0101 ([IntPtr]$vk) ([IntPtr]0xC0000001)
+        }
     }
     'drag' {
         Post $WM_MOUSEMOVE ([IntPtr]0) (LParam $X $Y)
@@ -162,7 +170,7 @@ switch ($Action) {
     default { throw "不认识的动作 $Action" }
 }
 if ($script:batch.Count -gt 0) {
-    $ok = [PostIn]::PostWithMods($h, $ctrl, $shift,
+    $ok = [PostIn]::PostWithMods($h, $ctrl, $shift, $alt,
         [uint32[]]($script:batch | ForEach-Object { $_[0] }),
         [long[]]($script:batch | ForEach-Object { $_[1] }),
         [long[]]($script:batch | ForEach-Object { $_[2] }))

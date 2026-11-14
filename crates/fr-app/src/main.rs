@@ -50,9 +50,73 @@ gpui_kit::actions!(
         ReopenTab,
         OpenTerminal,
         NewTerminal,
-        ToggleSidebar
+        ToggleSidebar,
+        ShowFiles,
+        SaveFile
     ]
 );
+
+/// 焦点在终端里时仍然归 Kuai 的快捷键，其余的键全部交给终端里的程序。
+///
+/// 留下的都是终端里的程序本来就收不到、或者收到了也和不按 Shift 时没有区别的组合键。
+/// F5、Ctrl+W、Ctrl+F、Ctrl+P、Ctrl+S 不在里面：它们是 shell 和程序要用的
+/// （删一个词、往前搜、上一条命令……）。新加的全局快捷键要在终端里也生效，得加到这里。
+const TERMINAL_KEEPS: [&str; 12] = [
+    // 切仓库标签页、重新打开刚关的
+    "ctrl-tab",
+    "ctrl-shift-tab",
+    "ctrl-shift-t",
+    // 切页面：改动、历史、文件、终端，新开一个终端
+    "ctrl-1",
+    "ctrl-2",
+    "ctrl-shift-e",
+    "ctrl-`",
+    "ctrl-shift-`",
+    "ctrl-~",
+    // 设置、侧栏、帧耗时浮层
+    "ctrl-,",
+    "ctrl-shift-b",
+    "ctrl-shift-f",
+];
+
+/// 焦点在终端里时，键位表里出现过的键除了 [`TERMINAL_KEEPS`] 一律不当快捷键。
+///
+/// GPUI 收到按键先查键位表，查不到才轮到终端自己的按键处理。所以别处绑过的键终端收不到：
+/// 界面库在最外层绑了 Tab、Shift+Tab（切焦点）和 Ctrl+C（复制界面上选中的文字），补全、
+/// Claude Code 切模式、中断程序都会被它拦下。这里不一个个列「哪些键要让给终端」——漏一个就是
+/// 一个用不了的键，界面库升级多绑一个也发现不了——而是反过来只列留给 Kuai 的，其余的每一个
+/// 都在终端这一层绑成「什么都不做」，盖住外层的绑定。
+///
+/// 要在所有快捷键都登记完以后调用：同一层里后登记的优先。
+fn release_keys_to_terminal(cx: &mut App) {
+    let os = cx.platform_info().os;
+    let unparse = |binding: &KeyBinding| {
+        let keys: Vec<String> = binding
+            .keystrokes()
+            .iter()
+            .map(|keystroke| keystroke.inner().unparse(os))
+            .collect();
+        keys.join(" ")
+    };
+    let keeps = TERMINAL_KEEPS.map(|key| unparse(&KeyBinding::new(key, NoAction, None)));
+    let mut taken: Vec<String> = cx.key_bindings().borrow().bindings().map(unparse).collect();
+    taken.sort();
+    taken.dedup();
+    let terminal = std::rc::Rc::new(
+        KeyBindingContextPredicate::parse(terminal::KEY_CONTEXT).expect("合法的上下文名"),
+    );
+    let masks: Vec<KeyBinding> = taken
+        .iter()
+        .filter(|keys| !keeps.contains(keys))
+        .filter_map(|keys| {
+            let context = Some(terminal.clone());
+            KeyBinding::load(keys, Box::new(NoAction), context, false, None, cx)
+                .inspect_err(|error| eprintln!("终端让不出这个键 {keys}：{error}"))
+                .ok()
+        })
+        .collect();
+    cx.bind_keys(masks);
+}
 
 /// 主窗口里的工作区，全局的快捷键靠它找到要操作的对象。
 struct MainWorkspace(WeakEntity<Workspace>, AnyWindowHandle);
@@ -142,6 +206,10 @@ fn main() {
     if let Some(code) = fr_core::askpass::run_helper() {
         std::process::exit(code);
     }
+    // 被 ssh 当作 ProxyCommand 启动时：把连接转到跳板机上，直到连接结束
+    if let Some(code) = fr_channel::run_ssh_hop() {
+        std::process::exit(code);
+    }
     if let Some(code) = uninstall_command() {
         std::process::exit(code);
     }
@@ -207,13 +275,11 @@ fn main() {
                 KeyBinding::new("ctrl-~", NewTerminal, None),
                 // 不用 Ctrl+B：焦点在终端里时它归里面的程序（Claude Code 把命令转到后台、tmux 的前缀键）
                 KeyBinding::new("ctrl-shift-b", ToggleSidebar, None),
+                // 和 VS Code 的资源管理器一样
+                KeyBinding::new("ctrl-shift-e", ShowFiles, None),
+                KeyBinding::new("ctrl-s", SaveFile, None),
             ]);
-            // 焦点在终端里时，这几个键是 shell 和里面的程序要用的（删一个词、往前搜、上一条命令……），
-            // 不当成上面的快捷键。切标签页、设置、Ctrl+` 这些终端用不到的照常
-            cx.bind_keys(
-                ["f5", "ctrl-w", "ctrl-f", "ctrl-p"]
-                    .map(|key| KeyBinding::new(key, NoAction, Some("Terminal"))),
-            );
+            release_keys_to_terminal(cx);
             workspace_action::<OpenSettings>(cx, |ws, _, cx| ws.toggle_settings(cx));
             workspace_action::<Refresh>(cx, |ws, _, cx| ws.refresh_active(cx));
             workspace_action::<CloseTab>(cx, |ws, window, cx| ws.close_active(window, cx));
@@ -237,6 +303,8 @@ fn main() {
             workspace_action::<ToggleSidebar>(cx, |ws, window, cx| {
                 ws.toggle_sidebar_in_active(window, cx)
             });
+            workspace_action::<ShowFiles>(cx, |ws, window, cx| ws.files_in_active(window, cx));
+            workspace_action::<SaveFile>(cx, |ws, window, cx| ws.save_in_active(window, cx));
             cx.on_action(|_: &ToggleFrameOverlay, cx: &mut App| {
                 for handle in cx.windows() {
                     handle
@@ -246,7 +314,17 @@ fn main() {
             });
 
             let saved_window = settings.window;
+            terminal::set_prefs(&settings.terminal, cx);
             let app = cx.new(|_| AppState::new(settings));
+            // 在终端里按 Ctrl+加号、减号调了字号：存进设置
+            terminal::set_prefs_writer(cx, {
+                let app = app.clone();
+                move |prefs, cx| {
+                    app.update(cx, |app, cx| {
+                        app.update_settings(cx, |s| s.terminal = prefs)
+                    });
+                }
+            });
             let updater = cx.new(|cx| update::Updater::new(app.clone(), cx));
             // 标题栏自己画（标签页放在里面），所以用组件库配套的窗口选项
             let options = WindowOptions {

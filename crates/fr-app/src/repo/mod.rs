@@ -1,15 +1,16 @@
 //! 仓库标签页。
 //!
-//! 分 Git、终端两页，侧栏里仓库名下面的切换（或者 Ctrl+`）来回切，每个标签页各记各的：
+//! 分 Git、终端、文件三页，侧栏里仓库名下面的切换（或者 Ctrl+`、Ctrl+Shift+E）来回切，每个标签页各记各的：
 //! - Git 页：左边是侧栏（仓库的名字、本地修改、所有提交、分支、远程分支、标签、贮藏），
 //!   从上到下占满；右边上面是工具栏（当前分支、获取、拉取、推送、贮藏……），下面按侧栏选中的项
 //!   显示本地修改（按文件、按块、按行暂存，提交）或提交历史（提交图、详情、改动）。
 //! - 终端页：侧栏里列着这个仓库的几个终端，右边是选中的那个，见 [`terminals`]。在仓库目录里的
 //!   shell，切回 Git 页、关标签页都不结束里面的程序，再到这个仓库的终端页时接上。本机仓库的
 //!   终端在退出 Kuai 时结束；服务器上的仓库的终端开在 kuaid 里，退出、断线它都接着跑。
+//! - 文件页：侧栏里是仓库目录的树，右边是打开的文件，能看、能小改、能上传下载，见 [`files`]。
 //!
 //! 侧栏可以收成 48 宽的图标栏（侧栏右上角的按钮、Ctrl+Shift+B，或者把分隔条往左拖到头），
-//! 两页都一样，见 [`rail`]。
+//! 三页都一样，见 [`rail`]。
 //!
 //! 本机仓库和服务器上的仓库共用这一套，经 [`Channel`] 执行 git。
 //!
@@ -23,6 +24,9 @@ mod blame;
 mod changes;
 mod dialogs;
 mod file_picker;
+mod files;
+mod files_ops;
+mod files_view;
 mod history;
 mod inline_diff;
 mod layout;
@@ -78,6 +82,8 @@ enum Page {
     Git,
     /// 这个仓库的终端们
     Terminal,
+    /// 仓库目录里的文件
+    Files,
 }
 
 /// 仓库页发给工作区的事件。
@@ -139,6 +145,10 @@ pub struct RepoView {
     page: Page,
     /// 终端页上的终端们
     terminals: terminals::Terminals,
+    /// 文件页：目录树和打开的文件
+    files: files::Files,
+    /// 从终端页按 Ctrl+` 回到哪一页（Git 或者文件）
+    back_page: Page,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -160,6 +170,8 @@ impl RepoView {
         subscriptions.extend(history_subscriptions);
         let (sidebar, sidebar_subscription) = sidebar::Sidebar::new(window, cx);
         subscriptions.push(sidebar_subscription);
+        let (files, files_subscription) = files::Files::new(window, cx);
+        subscriptions.push(files_subscription);
         let mut this = Self {
             entry,
             app,
@@ -193,6 +205,8 @@ impl RepoView {
             viewport: window.viewport_size(),
             page: Page::Git,
             terminals: terminals::Terminals::default(),
+            files,
+            back_page: Page::Git,
             _subscriptions: subscriptions,
         };
         // 测试开关：FR_TEST_VIEW=changes 打开仓库时直接显示本地修改
@@ -340,6 +354,7 @@ impl RepoView {
                     .unwrap_or_default();
                 let head = parsed.head.clone().unwrap_or_default();
                 this.apply_status(parsed, cx);
+                this.files_status_changed(cx);
                 let refs_out = rf.and_then(|out| out.ok()).unwrap_or_default();
                 let stash_out = sh.map(|out| out.stdout).unwrap_or_default();
                 let old_refs =
@@ -946,9 +961,11 @@ impl Render for RepoView {
         self.history.set_layout(self.viewport, sizes);
         self.focus_blame_if_new(window, cx);
         self.sync_terminals(window, cx);
+        self.sync_files(window, cx);
         let right = match self.page {
             Page::Git => self.render_git_page(cx),
             Page::Terminal => self.render_terminal_page(cx),
+            Page::Files => self.render_files_page(cx),
         };
         h_flex()
             .size_full()

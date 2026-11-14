@@ -41,6 +41,17 @@
 //!   `done` 的那一块写完后文件才放到位（`~/.kuai/drop/` 下，重名的换个名字），响应里带它的完整路径。
 //!   `abort` 是不传了。客户端断开时没传完的自动删掉；传好的文件过几天由 kuaid 清掉。
 //!
+//! 仓库里的文件（协议 6 起，文件页用）。路径都相对仓库根、用 `/` 分隔，不能带 `..`，见 [`crate::files`]：
+//! - `fs_list`：参数 `{repo, path}`，返回 `{entries: [FsEntry]}`：这一层的文件和目录，不含 `.git`。
+//! - `fs_stat`：参数 `{repo, path}`，返回 [`FsStat`]；文件不在了不算出错，`exists` 为假。
+//! - `fs_read`：参数 `{repo, path, offset, len}`，返回 [`FsStat`]，后面跟从 `offset` 起最多 `len` 字节
+//!   （一次不超过 [`crate::files::READ_MAX`]）。下载大文件就是一段段读。
+//! - `fs_write`：参数 [`FsWrite`]，请求带的字节是文件的全部内容，返回 [`FsWritten`]。先写临时文件再改名。
+//!   `expect` 是打开时的修改时间和大小：磁盘上的已经不是这样了就不写，`conflict` 为真。
+//! - `fs_mkdir`、`fs_remove`（目录连里面的一起，永久删除）：参数 `{repo, path}`。
+//! - `fs_rename`：参数 `{repo, path, to}`，`to` 已经有了就失败。
+//! - `file_put` 带上 `repo`、`path` 就是往仓库里传文件：没传完的放在目标旁边，传完才改成正式的名字。
+//!
 //! 给 ssh 转接程序（`kuaid --connect`）和运维用的：
 //! - `info`：返回 [`DaemonInfo`]。
 //! - `bridge`：参数 `{auth_sock}`，转接程序报告这条 ssh 连接转发过来的 ssh-agent 套接字。不回响应。
@@ -57,7 +68,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// 协议版本，握手时交换。服务器上的 kuaid 不能比客户端旧（连接时会原地升级），可以比客户端新。
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// 一条消息后面跟多少字节的原始数据。
 pub trait Frame {
@@ -216,6 +227,15 @@ pub struct FilePut {
     /// 不传了，删掉已经收到的
     #[serde(default, skip_serializing_if = "is_false")]
     pub abort: bool,
+    /// 第一块：传到这个仓库里（协议 6 起）。为空就是放到 `~/.kuai/drop/` 下
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub repo: String,
+    /// 第一块：传到仓库里的哪个路径（相对仓库根，含文件名），此时不看 `name`
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    /// 第一块：`path` 已经有文件时换掉它；为假就失败
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub overwrite: bool,
 }
 
 /// `file_put` 每一块的响应。
@@ -228,6 +248,81 @@ pub struct FilePutReply {
     /// 传完了：文件在服务器上的完整路径
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+}
+
+/// `fs_list` 里的一项。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FsEntry {
+    pub name: String,
+    /// 是目录（符号链接看它指向的）
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dir: bool,
+    /// 是符号链接
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub link: bool,
+    /// 文件大小（字节）；目录为 0
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub size: u64,
+    /// 修改时间：1970 年起的毫秒数
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub mtime: u64,
+}
+
+/// 一个文件现在的情况。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsStat {
+    /// 为假：这个路径上什么都没有，其余几项没有意义
+    #[serde(default)]
+    pub exists: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dir: bool,
+    #[serde(default)]
+    pub size: u64,
+    /// 修改时间：1970 年起的毫秒数
+    #[serde(default)]
+    pub mtime: u64,
+    /// 只读（没有写权限）
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub readonly: bool,
+}
+
+/// `fs_write` 的参数。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FsWrite {
+    pub repo: String,
+    pub path: String,
+    /// 新建：已经有这个文件就失败；路径上缺的目录一起建
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub create: bool,
+    /// 打开时文件的样子：磁盘上的已经不是这样了就不写。为空是不管，直接换掉
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<FsExpect>,
+}
+
+/// 打开文件时记下的修改时间和大小，保存时拿来看别人有没有动过。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsExpect {
+    pub mtime: u64,
+    pub size: u64,
+}
+
+impl From<FsStat> for FsExpect {
+    fn from(stat: FsStat) -> FsExpect {
+        FsExpect {
+            mtime: stat.mtime,
+            size: stat.size,
+        }
+    }
+}
+
+/// `fs_write` 的结果。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct FsWritten {
+    /// 没写：磁盘上的文件和 `expect` 对不上（别的程序改过，或者删了）
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub conflict: bool,
+    /// 文件现在的情况（写成了是写完以后的，冲突了是磁盘上的）
+    pub stat: FsStat,
 }
 
 /// `git` 方法的结果。

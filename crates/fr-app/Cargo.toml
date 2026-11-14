@@ -29,8 +29,8 @@ similar = "2"
 raw-window-handle = "0.6"
 # 内置终端：伪终端（Windows 上是 ConPTY）和终端仿真，画由 terminal/ 自己来
 alacritty_terminal = "0.26"
-# 往终端里发剪贴板里的图片：位图转成 PNG（GPUI 也用它，不多带一个库）
-image = { version = "0.25", default-features = false, features = ["png", "bmp", "tiff", "ico", "pnm"] }
+# 往终端里发剪贴板里的图片：位图转成 PNG；文件页读图片的宽高（GPUI 也用它，不多带一个库）
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "tiff", "ico", "pnm", "jpeg", "gif", "webp"] }
 # 检查更新、点一下升级（update.rs）：问 GitHub Releases、下载发布包（ureq，rustls），
 # 核对 SHA-256，解压 zip，换掉正在运行的 kuai.exe（Windows 上只能改名、不能删，self-replace 处理）
 ureq = { version = "3.5.2", features = ["json"] }

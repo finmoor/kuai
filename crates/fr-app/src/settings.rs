@@ -210,6 +210,9 @@ pub struct Settings {
     /// 本机仓库的终端用哪个程序（`shell::local_shells` 里的 id）；空着自动挑
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub terminal_shell: String,
+    /// 终端的字体、光标、滚动和复制（所有终端共用）
+    #[serde(default, skip_serializing_if = "TerminalSettings::is_default")]
+    pub terminal: TerminalSettings,
     #[serde(default)]
     pub layout: Layout,
     /// 各个仓库自己记的东西
@@ -224,6 +227,136 @@ pub struct Settings {
     /// 点过「跳过这一版」的版本号：标题栏上不再提示它
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped_version: Option<String>,
+}
+
+/// 终端的外观和操作习惯：所有终端共用，改了马上生效。默认值就是 1.9 以前写死的那一套，
+/// 升上来以后看不出变化。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerminalSettings {
+    /// 等宽字体
+    pub font: String,
+    /// 中文这些 `font` 里没有的字用哪个字体；空着由系统挑。字宽由格子定，换它不影响对齐
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub cjk_font: String,
+    /// 字号（[`TerminalSettings::MIN_SIZE`]～[`TerminalSettings::MAX_SIZE`] 的整数）
+    pub font_size: f32,
+    /// 行高是字号的几倍（[`TerminalSettings::LINE_HEIGHTS`] 里的一档）
+    pub line_height: f32,
+    /// 光标的样子；终端里的程序可以临时改成别的
+    pub cursor: TerminalCursor,
+    pub cursor_blink: bool,
+    /// 每个终端留多少行往回翻（[`TerminalSettings::SCROLLBACKS`] 里的一档）
+    pub scrollback: usize,
+    /// 用鼠标选中文字就复制到剪贴板
+    pub copy_on_select: bool,
+    pub right_click: RightClick,
+}
+
+/// 光标的样子。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TerminalCursor {
+    #[default]
+    Block,
+    Beam,
+    Underline,
+}
+
+impl TerminalCursor {
+    pub const ALL: [TerminalCursor; 3] = [
+        TerminalCursor::Block,
+        TerminalCursor::Beam,
+        TerminalCursor::Underline,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TerminalCursor::Block => tr("方块"),
+            TerminalCursor::Beam => tr("竖线"),
+            TerminalCursor::Underline => tr("下划线"),
+        }
+    }
+}
+
+/// 在终端里点右键做什么。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RightClick {
+    /// 选着字就复制，没选就粘贴（和 Windows 终端一样）
+    #[default]
+    Paste,
+    /// 弹出菜单
+    Menu,
+}
+
+impl RightClick {
+    pub const ALL: [RightClick; 2] = [RightClick::Paste, RightClick::Menu];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RightClick::Paste => tr("有选中时复制，否则粘贴"),
+            RightClick::Menu => tr("显示菜单"),
+        }
+    }
+}
+
+impl TerminalSettings {
+    pub const DEFAULT_FONT: &str = "Consolas";
+    pub const DEFAULT_SIZE: f32 = 13.;
+    pub const MIN_SIZE: f32 = 9.;
+    pub const MAX_SIZE: f32 = 24.;
+    pub const LINE_HEIGHTS: [f32; 5] = [1., 1.1, 1.25, 1.4, 1.6];
+    pub const SCROLLBACKS: [usize; 5] = [1_000, 5_000, 10_000, 50_000, 100_000];
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// 手改设置文件写了别的数：收到范围里、最近的一档。
+    pub fn normalize(&mut self) {
+        if self.font.trim().is_empty() {
+            self.font = Self::DEFAULT_FONT.to_string();
+        }
+        self.font_size = if self.font_size.is_finite() {
+            self.font_size.round().clamp(Self::MIN_SIZE, Self::MAX_SIZE)
+        } else {
+            Self::DEFAULT_SIZE
+        };
+        let wanted = self.line_height;
+        self.line_height = Self::LINE_HEIGHTS
+            .into_iter()
+            .min_by(|a, b| (a - wanted).abs().total_cmp(&(b - wanted).abs()))
+            .unwrap_or(1.25);
+        if !self.line_height.is_finite() || !wanted.is_finite() {
+            self.line_height = 1.25;
+        }
+        self.scrollback = Self::SCROLLBACKS
+            .into_iter()
+            .min_by_key(|choice| choice.abs_diff(self.scrollback))
+            .unwrap_or(10_000);
+    }
+
+    /// 一格有多高（像素）：字号乘行高，取整，画出来的线上下才接得上。
+    pub fn cell_height(&self) -> f32 {
+        (self.font_size * self.line_height).round()
+    }
+}
+
+impl Default for TerminalSettings {
+    fn default() -> Self {
+        Self {
+            font: Self::DEFAULT_FONT.to_string(),
+            cjk_font: String::new(),
+            font_size: Self::DEFAULT_SIZE,
+            line_height: 1.25,
+            cursor: TerminalCursor::Block,
+            cursor_blink: false,
+            scrollback: 10_000,
+            copy_on_select: false,
+            right_click: RightClick::Paste,
+        }
+    }
 }
 
 /// 用哪套主题。
@@ -259,7 +392,9 @@ impl Default for Settings {
             workspaces: Vec::new(),
             active_workspace: 0,
             language: Language::default(),
-            theme: ThemeChoice::default(),
+            // 新装的默认深色（2026-11-13 Feng 定）。设置文件里没有这一项（1.1 以前的）
+            // 时取 ThemeChoice 的默认值，照旧跟随系统，见 parse 的测试
+            theme: ThemeChoice::Dark,
             light_theme: default_light_theme(),
             dark_theme: default_dark_theme(),
             minimize_to_tray: false,
@@ -269,6 +404,7 @@ impl Default for Settings {
             stash_before_switch: false,
             tab_close_button: true,
             terminal_shell: String::new(),
+            terminal: TerminalSettings::default(),
             layout: Layout::default(),
             repo_memos: Vec::new(),
             window: None,
@@ -324,6 +460,17 @@ impl Settings {
                 .min_by_key(|choice| choice.abs_diff(self.auto_fetch_minutes))
                 .unwrap_or(0);
         }
+        self.terminal.normalize();
+        // 跳板机：指向不存在的服务器、绕回自己的（手改设置文件才会有）都去掉
+        for index in 0..self.servers.len() {
+            let Some(jump) = self.servers[index].jump.clone() else {
+                continue;
+            };
+            let id = self.servers[index].id.clone();
+            if !self.can_jump(&id, &jump) {
+                self.servers[index].jump = None;
+            }
+        }
         // 仓库已经不在列表里、也没开着了，它记的东西就不留
         let (repos, groups) = (&self.repos, &self.workspaces);
         self.repo_memos.retain(|memo| {
@@ -331,6 +478,46 @@ impl Settings {
                 && (repos.contains(&memo.repo)
                     || groups.iter().any(|group| group.tabs.contains(&memo.repo)))
         });
+    }
+
+    pub fn server(&self, id: &str) -> Option<&Server> {
+        self.servers.iter().find(|server| server.id == id)
+    }
+
+    /// 连接这台服务器要依次经过的跳板机：第一台从本机直接连，最后一台连到这台服务器。
+    /// 不经跳板机的是空的。
+    pub fn route(&self, id: &str) -> Vec<&Server> {
+        let mut route: Vec<&Server> = Vec::new();
+        let mut at = self.server(id);
+        while let Some(jump) = at
+            .and_then(|server| server.jump.as_deref())
+            .and_then(|jump| self.server(jump))
+        {
+            // 绕回来了（normalize 会去掉，这里只是不死循环）
+            if jump.id == id || route.iter().any(|seen| seen.id == jump.id) {
+                break;
+            }
+            route.push(jump);
+            at = Some(jump);
+        }
+        route.reverse();
+        route
+    }
+
+    /// `id` 这台服务器能不能把 `jump` 当跳板机：得是另一台已配置的服务器，而且它不经 `id` 连接
+    /// （不然绕圈）。`id` 是还没加进来的新服务器时传空串。
+    pub fn can_jump(&self, id: &str, jump: &str) -> bool {
+        jump != id
+            && self.server(jump).is_some()
+            && !self.route(jump).iter().any(|server| server.id == id)
+    }
+
+    /// 经这台服务器连接的服务器（直接把它选作跳板机的）。
+    pub fn jump_users(&self, id: &str) -> Vec<&Server> {
+        self.servers
+            .iter()
+            .filter(|server| server.jump.as_deref() == Some(id))
+            .collect()
     }
 
     /// 这个仓库记的东西。
@@ -427,6 +614,10 @@ pub struct Server {
     /// 私钥文件（只在用密钥登录时有用）；空着用 ssh 默认的密钥
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_file: Option<String>,
+    /// 跳板机：另一台已配置的服务器的 id。连接时先登录它，再从它连到这台；
+    /// 它自己也可以有跳板机，见 [`Settings::route`]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jump: Option<String>,
 }
 
 impl Server {
@@ -833,6 +1024,98 @@ mod tests {
     }
 
     #[test]
+    fn 跳板机按顺序排成一条路_不能绕圈() {
+        let server = |id: &str, jump: Option<&str>| Server {
+            id: id.into(),
+            name: id.into(),
+            destination: id.into(),
+            jump: jump.map(str::to_string),
+            ..Server::default()
+        };
+        let mut settings = Settings {
+            servers: vec![
+                server("bastion", None),
+                server("inner", Some("bastion")),
+                server("dev", Some("inner")),
+                server("alone", None),
+            ],
+            ..Settings::default()
+        };
+        let ids = |settings: &Settings, id: &str| -> Vec<String> {
+            settings.route(id).iter().map(|s| s.id.clone()).collect()
+        };
+        // 从本机出发先到的排前面
+        assert_eq!(ids(&settings, "dev"), ["bastion", "inner"]);
+        assert_eq!(ids(&settings, "inner"), ["bastion"]);
+        assert!(ids(&settings, "bastion").is_empty());
+        let users: Vec<&str> = settings
+            .jump_users("bastion")
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(users, ["inner"]);
+        // 不能选自己、不存在的、经自己连接的；新服务器（还没有 id）谁都可以选
+        assert!(!settings.can_jump("bastion", "bastion"));
+        assert!(!settings.can_jump("bastion", "nope"));
+        assert!(!settings.can_jump("bastion", "dev"));
+        assert!(!settings.can_jump("inner", "dev"));
+        assert!(settings.can_jump("alone", "dev"));
+        assert!(settings.can_jump("dev", "alone"));
+        assert!(settings.can_jump("", "dev"));
+        // 手改出来的圈、指向不存在的服务器：normalize 去掉
+        settings.servers[0].jump = Some("dev".into());
+        settings.servers[3].jump = Some("gone".into());
+        assert!(settings.route("dev").len() <= 3);
+        settings.normalize();
+        assert_eq!(settings.servers[0].jump, None);
+        assert_eq!(settings.servers[3].jump, None);
+        assert_eq!(ids(&settings, "dev"), ["bastion", "inner"]);
+        // 没有跳板机的不写进文件
+        let text = serde_json::to_string(&settings.servers[0]).unwrap();
+        assert!(!text.contains("jump"), "{text}");
+    }
+
+    #[test]
+    fn 终端设置的默认值和以前写死的一样_不写进文件() {
+        use super::{RightClick, TerminalCursor, TerminalSettings};
+        let settings = Settings::default();
+        let terminal = &settings.terminal;
+        assert_eq!(terminal.font, "Consolas");
+        assert_eq!(terminal.font_size, 13.);
+        // 1.9 以前行高写死 16 像素
+        assert_eq!(terminal.cell_height(), 16.);
+        assert_eq!(terminal.cursor, TerminalCursor::Block);
+        assert!(!terminal.cursor_blink && !terminal.copy_on_select);
+        assert_eq!(terminal.scrollback, 10_000);
+        assert_eq!(terminal.right_click, RightClick::Paste);
+        let text = serde_json::to_string(&settings).unwrap();
+        assert!(!text.contains("\"terminal\":"), "{text}");
+        // 旧设置文件没有这一项：取默认值
+        let old = super::parse(r#"{"servers":[],"repos":[]}"#).unwrap();
+        assert_eq!(old.terminal, TerminalSettings::default());
+        // 只写了几项的：别的取默认值；写了别的数的收到范围里、最近的一档
+        let partial = super::parse(
+            r#"{"terminal":{"font":"Cascadia Mono","font_size":40,"line_height":1.3,"scrollback":7000,"cursor":"beam","right_click":"menu"}}"#,
+        )
+        .unwrap();
+        let terminal = &partial.terminal;
+        assert_eq!(terminal.font, "Cascadia Mono");
+        assert_eq!(terminal.font_size, 24.);
+        assert_eq!(terminal.line_height, 1.25);
+        assert_eq!(terminal.scrollback, 5_000);
+        assert_eq!(terminal.cursor, TerminalCursor::Beam);
+        assert_eq!(terminal.right_click, RightClick::Menu);
+        assert!(
+            serde_json::to_string(&partial)
+                .unwrap()
+                .contains("\"terminal\":")
+        );
+        let empty = super::parse(r#"{"terminal":{"font":" ","font_size":2}}"#).unwrap();
+        assert_eq!(empty.terminal.font, "Consolas");
+        assert_eq!(empty.terminal.font_size, 9.);
+    }
+
+    #[test]
     fn 仓库可以另起名字() {
         let repo = RepoEntry {
             server: None,
@@ -888,5 +1171,16 @@ mod tests {
         assert_eq!(english.language, Language::English);
         // 新装的（没有设置文件）跟随系统
         assert_eq!(super::Settings::default().language, Language::System);
+    }
+
+    #[test]
+    fn 新装的默认深色_旧设置文件不变() {
+        use super::ThemeChoice;
+        assert_eq!(super::Settings::default().theme, ThemeChoice::Dark);
+        // 没存过颜色模式的旧设置文件照旧跟随系统，存过的照存的来
+        let old = super::parse(r#"{"servers":[],"repos":[]}"#).unwrap();
+        assert_eq!(old.theme, ThemeChoice::System);
+        let light = super::parse(r#"{"theme":"light"}"#).unwrap();
+        assert_eq!(light.theme, ThemeChoice::Light);
     }
 }

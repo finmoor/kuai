@@ -15,6 +15,11 @@
 //!     --secret-env <环境变量名>   密码（带 --password 时）或私钥口令放在这个环境变量里，ssh 问的时候自动回答；
 //!                                没给、或者答过一次 ssh 还问，就打出它问的话并当作取消
 //!     --connect-only             连上就退出，不测速
+//!     --jump <ssh 目标>           经这台跳板机连接（用 ssh 默认的密钥登录它）；打出登录上了几台
+//!     --jump-key <私钥文件>       跳板机用这把私钥
+//!     --jump-password            跳板机用密码登录
+//!     --jump-secret-env <环境变量名>  跳板机的密码或私钥口令放在这个环境变量里
+//!     --jump2 <ssh 目标>          第二台跳板机：经第一台连它，再经它连目标
 //!
 //! 连服务器时测终端（开在 kuaid 里，名字用 `--repo` 给的路径，和客户端里那个仓库的终端是同一个）：
 //!     --term <命令>              开（或者接上）终端，敲这条命令，把之后几秒的输出打出来，然后断开；
@@ -25,6 +30,11 @@
 //!
 //! 连服务器时测传文件（往终端里发图片、文件走的那条路）：
 //!     --put <本机文件>           传到服务器的 ~/.kuai/drop/ 下，打出它在服务器上的路径和速度
+//!
+//! 测仓库里的文件（文件页走的那条路，本机、服务器都能测）：
+//!     --fs                       在仓库里建一个 `.kuai-probe-<进程号>` 目录，把新建、保存、冲突、列目录、
+//!                                上传、下载、改名、删除走一遍，核对内容，最后删掉这个目录
+//!     --fs-size <MB>             `--fs` 里上传、下载的那个文件多大，默认 9（大于一次读写的上限，要分段）
 
 use std::process::Command;
 use std::sync::Arc;
@@ -32,7 +42,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use fr_channel::{
-    Channel, ConnectOptions, Connection, StreamItem, TermItem, UploadItem, UploadSource,
+    Channel, ConnectOptions, Connection, FsWrite, StreamItem, TermItem, UploadItem, UploadSource,
+    UploadStream,
 };
 use futures::StreamExt as _;
 use futures::executor::block_on;
@@ -42,6 +53,10 @@ fn main() -> Result<()> {
     if let Some(code) = fr_core::askpass::run_helper() {
         std::process::exit(code);
     }
+    // 被 ssh 当作 ProxyCommand 启动时：把连接转到跳板机上
+    if let Some(code) = fr_channel::run_ssh_hop() {
+        std::process::exit(code);
+    }
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut flag = |name: &str| {
         let found = args.iter().any(|a| a == name);
@@ -49,15 +64,31 @@ fn main() -> Result<()> {
         found
     };
     let (password_auth, connect_only) = (flag("--password"), flag("--connect-only"));
+    let jump_password = flag("--jump-password");
     let (term_list, term_close) = (flag("--term-list"), flag("--term-close"));
+    let fs = flag("--fs");
     let value = |name: &str| args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone());
     let options = ConnectOptions {
         forward_agent: false,
         identity_file: value("--key"),
         password_auth,
         secret: value("--secret-env").and_then(|name| std::env::var(name).ok()),
+        jumps: [value("--jump"), value("--jump2")]
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, destination)| fr_channel::Jump {
+                name: format!("跳板机{}", index + 1),
+                destination,
+                identity_file: value("--jump-key"),
+                password_auth: jump_password,
+                secret: value("--jump-secret-env").and_then(|name| std::env::var(name).ok()),
+                ..Default::default()
+            })
+            .collect(),
+        on_stage: Some(Arc::new(|n| println!("已登录 {n} 台"))),
     };
-    let ask = password_auth || options.secret.is_some();
+    let ask = password_auth || options.secret.is_some() || jump_password;
     let usage = "用法：fr-probe --repo <仓库路径> (local | <ssh 目标> | --kuaid <kuaid 程序>)";
     let repo = args
         .windows(2)
@@ -70,11 +101,27 @@ fn main() -> Result<()> {
         .and_then(|w| w[1].parse().ok());
     let term_command = value("--term");
     let put = value("--put");
-    let term_secs: u64 = value("--secs").and_then(|secs| secs.parse().ok()).unwrap_or(3);
+    let fs_size: u64 = value("--fs-size")
+        .and_then(|mb| mb.parse().ok())
+        .unwrap_or(9);
+    let term_secs: u64 = value("--secs")
+        .and_then(|secs| secs.parse().ok())
+        .unwrap_or(3);
     let is_option = |a: &str| {
         matches!(
             a,
-            "--repo" | "--watch" | "--key" | "--secret-env" | "--term" | "--secs" | "--put"
+            "--repo"
+                | "--watch"
+                | "--key"
+                | "--secret-env"
+                | "--term"
+                | "--secs"
+                | "--put"
+                | "--fs-size"
+                | "--jump"
+                | "--jump-key"
+                | "--jump-secret-env"
+                | "--jump2"
         )
     };
     let rest: Vec<&String> = args
@@ -100,8 +147,9 @@ fn main() -> Result<()> {
         [destination] => {
             if ask {
                 // 没有界面：存着的答不了的提问，打出来并当作取消
-                fr_channel::init_prompts(|prompt| {
-                    println!("ssh 问了没有存着答案的：{}", prompt.trim());
+                fr_channel::init_prompts(|prompt, jump| {
+                    let who = jump.map(|name| format!("（{name}）")).unwrap_or_default();
+                    println!("ssh 问了没有存着答案的{who}：{}", prompt.trim());
                     None
                 })?;
             }
@@ -123,6 +171,10 @@ fn main() -> Result<()> {
         }
         _ => anyhow::bail!(usage),
     };
+
+    if fs {
+        return block_on(files(&channel, &repo, fs_size << 20));
+    }
 
     if let Some(file) = &put {
         let Channel::Remote(conn) = &channel else {
@@ -254,6 +306,161 @@ fn upload(conn: &Connection, file: &str) -> Result<()> {
         }
         anyhow::bail!("上传中断")
     })
+}
+
+/// 等一次上传或下载结束，返回传了几块、多少字节。
+async fn transfer(mut stream: UploadStream) -> Result<(u32, u64)> {
+    let (mut chunks, mut size) = (0, 0);
+    while let Some(item) = stream.next().await {
+        match item? {
+            UploadItem::Progress { sent, .. } => {
+                chunks += 1;
+                size = sent;
+            }
+            UploadItem::Done(_) => return Ok((chunks, size)),
+        }
+    }
+    anyhow::bail!("传输中断")
+}
+
+/// 把文件页用的那些操作在仓库里走一遍，每一步核对结果。
+async fn files(channel: &Channel, repo: &str, size: u64) -> Result<()> {
+    let dir = format!(".kuai-probe-{}", std::process::id());
+    let at = |name: &str| format!("{dir}/{name}");
+    let write = |path: String, create: bool, expect| FsWrite {
+        repo: repo.to_string(),
+        path,
+        create,
+        expect,
+    };
+    let started = Instant::now();
+    let step = |what: &str, since: Instant| println!("  {what}：{:.1} ms", ms(since.elapsed()));
+
+    // 新建、读回来、按打开时的样子保存、拿旧的样子保存（冲突）
+    let now = Instant::now();
+    let text = "第一行\r\nsecond line\r\n".as_bytes().to_vec();
+    let created = channel
+        .fs_write(write(at("说明 1.txt"), true, None), text.clone())
+        .await?;
+    anyhow::ensure!(
+        !created.conflict && created.stat.size == text.len() as u64,
+        "新建的结果不对"
+    );
+    anyhow::ensure!(
+        channel
+            .fs_write(write(at("说明 1.txt"), true, None), text.clone())
+            .await
+            .is_err(),
+        "已经有的文件又新建成功了"
+    );
+    step("新建", now);
+    let now = Instant::now();
+    let (stat, bytes) = channel.fs_open(repo, &at("说明 1.txt"), 1 << 20).await?;
+    anyhow::ensure!(bytes == text && stat == created.stat, "读回来的内容不对");
+    step("读", now);
+    let now = Instant::now();
+    let saved = channel
+        .fs_write(
+            write(at("说明 1.txt"), false, Some(stat.into())),
+            b"changed".to_vec(),
+        )
+        .await?;
+    anyhow::ensure!(!saved.conflict && saved.stat.size == 7, "保存的结果不对");
+    let stale = channel
+        .fs_write(
+            write(at("说明 1.txt"), false, Some(stat.into())),
+            b"stale!!!".to_vec(),
+        )
+        .await?;
+    anyhow::ensure!(
+        stale.conflict && stale.stat.size == 7,
+        "别人改过的文件被盖掉了"
+    );
+    step("保存和冲突", now);
+
+    // 上传一个大文件再下载回来，核对内容
+    let local = std::env::temp_dir().join(format!("kuai-probe-{}.bin", std::process::id()));
+    let back = local.with_extension("back");
+    let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
+    std::fs::write(&local, &content)?;
+    let now = Instant::now();
+    let (chunks, sent) =
+        transfer(channel.fs_upload(repo, &at("大 文件.bin"), local.clone(), false)).await?;
+    anyhow::ensure!(sent == size, "上传的大小不对：{sent}");
+    let secs = now.elapsed().as_secs_f64().max(1e-6);
+    println!(
+        "  上传 {:.1} MB：{chunks} 块，{:.0} ms，{:.1} MB/s",
+        size as f64 / 1e6,
+        secs * 1e3,
+        size as f64 / 1e6 / secs
+    );
+    anyhow::ensure!(
+        transfer(channel.fs_upload(repo, &at("大 文件.bin"), local.clone(), false))
+            .await
+            .is_err(),
+        "已经有的文件被上传盖掉了"
+    );
+    transfer(channel.fs_upload(repo, &at("大 文件.bin"), local.clone(), true)).await?;
+    let now = Instant::now();
+    let (chunks, got) =
+        transfer(channel.fs_download(repo, &at("大 文件.bin"), back.clone())).await?;
+    let secs = now.elapsed().as_secs_f64().max(1e-6);
+    println!(
+        "  下载 {:.1} MB：{chunks} 块，{:.0} ms，{:.1} MB/s",
+        got as f64 / 1e6,
+        secs * 1e3,
+        got as f64 / 1e6 / secs
+    );
+    anyhow::ensure!(
+        std::fs::read(&back)? == content,
+        "下载回来的内容和传上去的不一样"
+    );
+    let _ = std::fs::remove_file(&local);
+    let _ = std::fs::remove_file(&back);
+    // 比上限大的不读完
+    let (stat, part) = channel.fs_open(repo, &at("大 文件.bin"), 1 << 20).await?;
+    anyhow::ensure!(
+        stat.size == size && (part.len() as u64) < size.max(1),
+        "超过上限的文件被读完了"
+    );
+
+    // 建目录、列目录、改名、删除
+    let now = Instant::now();
+    channel.fs_mkdir(repo, &at("子目录/深一层")).await?;
+    channel
+        .fs_rename(repo, &at("说明 1.txt"), &at("子目录/改名.txt"))
+        .await?;
+    let mut listed = channel.fs_list(repo, &dir).await?;
+    listed.sort_by(|a, b| a.name.cmp(&b.name));
+    let names: Vec<_> = listed
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry.dir))
+        .collect();
+    anyhow::ensure!(
+        names == [("大 文件.bin", false), ("子目录", true)],
+        "列出来的不对：{names:?}"
+    );
+    let inner = channel.fs_list(repo, &at("子目录")).await?;
+    anyhow::ensure!(inner.len() == 2, "子目录里的不对：{inner:?}");
+    anyhow::ensure!(
+        !channel.fs_stat(repo, &at("说明 1.txt")).await?.exists,
+        "改名以后原来的还在"
+    );
+    step("建目录、改名、列目录", now);
+    anyhow::ensure!(
+        channel.fs_list(repo, "../").await.is_err(),
+        "能列仓库外面的目录"
+    );
+    let root = channel.fs_list(repo, "").await?;
+    anyhow::ensure!(root.iter().all(|entry| entry.name != ".git"), "列出了 .git");
+    println!("  仓库根：{} 项", root.len());
+
+    let now = Instant::now();
+    channel.fs_remove(repo, &dir).await?;
+    anyhow::ensure!(!channel.fs_stat(repo, &dir).await?.exists, "删除以后还在");
+    step("删除", now);
+    println!("文件操作全部通过，共 {:.0} ms", ms(started.elapsed()));
+    Ok(())
 }
 
 /// 监听仓库一段时间，每收到一次变化通知打一行。

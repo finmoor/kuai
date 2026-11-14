@@ -51,12 +51,14 @@ Windows 上的 Git 客户端，界面和操作方式接近 Fork，目标是完�
 | Ctrl+F | 搜索提交 |
 | Ctrl+P | 快速打开仓库（上下方向键选择，Enter 打开） |
 | Ctrl+, | 打开或关闭设置页 |
-| Ctrl+W | 关闭当前标签页（有操作正在执行时会先提示） |
+| Ctrl+W | 关闭当前标签页（有操作正在执行时会先提示）；在文件页中先关闭当前打开的文件 |
 | Ctrl+Tab、Ctrl+Shift+Tab | 切换到下一个、上一个标签页 |
 | Ctrl+Shift+T | 重新打开最近关闭的标签页 |
-| Ctrl+` | 在当前仓库的 Git 页和终端页之间切换 |
+| Ctrl+` | 切换到当前仓库的终端页；已在终端页时回到之前的那一页（Git 页或文件页） |
 | Ctrl+Shift+` | 为当前仓库新建终端，并切换到终端页 |
 | Ctrl+Shift+B | 收起或展开左侧栏（收起后显示为一列图标，所有标签页共用此状态） |
+| Ctrl+Shift+E | 切换到当前仓库的文件页 |
+| Ctrl+S | 保存文件页中当前打开的文件 |
 
 列表中的按键（先点击列表，或用 Ctrl+1、Ctrl+2 将焦点移到列表）：
 
@@ -67,8 +69,9 @@ Windows 上的 Git 客户端，界面和操作方式接近 Fork，目标是完�
 | 提交列表 | 上下键、PageUp、PageDown、Home、End |
 | 侧栏 | 上下方向键切换选中项，Enter 相当于双击（切换分支）；选中文件夹时左方向键折叠、右方向键展开 |
 | 逐行追溯 | 上下方向键、PageUp、PageDown、Home、End 选择行，Enter 跳转到修改该行的提交，Esc 关闭 |
+| 文件页的目录树 | 上下方向键切换，左右方向键折叠、展开目录，Enter 打开文件并保留，空格键预览；F2 重命名，Delete 删除（会先确认） |
 
-焦点位于终端中时，F5、Ctrl+W、Ctrl+F、Ctrl+P 交由终端中的程序处理（在 shell 中分别用于删除一个词、向前搜索、调出上一条命令），其他快捷键不变。终端中：Ctrl+C 中断（选中文字时为复制），Ctrl+Shift+C 复制，Ctrl+V、Shift+Insert 粘贴（剪贴板中为图片或文件时，粘贴的是其路径）；右键在有选中文字时复制，否则粘贴；Shift+PageUp、Shift+PageDown 和鼠标滚轮可查看之前的输出。
+焦点位于终端中时，只有以下快捷键仍由 Kuai 处理：Ctrl+Tab、Ctrl+Shift+Tab、Ctrl+Shift+T、Ctrl+1、Ctrl+2、Ctrl+Shift+E、Ctrl+\`、Ctrl+Shift+\`、Ctrl+,、Ctrl+Shift+B。其余按键（Tab、Shift+Tab、Esc、F5、Ctrl+W、Ctrl+F、Ctrl+P、Ctrl+S、功能键、Alt 组合键等）全部交给终端中的程序。终端中：Ctrl+C 中断（选中文字时为复制），Ctrl+Shift+C 复制，Ctrl+V、Shift+Insert 粘贴（剪贴板中为图片或文件时，粘贴的是其路径）；右键在有选中文字时复制，否则粘贴；Shift+PageUp、Shift+PageDown 和鼠标滚轮可查看之前的输出。
 
 ## 构建与运行
 

@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 use fr_core::exec::{self, Killer, OnStderr};
 use fr_core::protocol::{
-    self, DaemonInfo, FilePut, GitResult, Hello, PROTOCOL_VERSION, Request, Response, TermOpen,
+    self, DaemonInfo, FilePut, FsWrite, GitResult, Hello, PROTOCOL_VERSION, Request, Response,
+    TermOpen,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -350,6 +351,22 @@ fn handle(
                 .and_then(|reply| Ok(serde_json::to_value(reply)?));
             conn.reply(id, reply);
         }
+        method if method.starts_with("fs_") => {
+            // 读写文件可能慢（大文件、网络盘）：放到自己的线程里，这边接着读下一个请求
+            let conn = conn.clone();
+            std::thread::spawn(move || match fs_request(request, &payload) {
+                Ok((result, bytes)) => {
+                    let response = Response {
+                        id,
+                        result: Some(result),
+                        bytes: bytes.len() as u64,
+                        ..Default::default()
+                    };
+                    conn.send(&response, &bytes);
+                }
+                Err(err) => conn.reply(id, Err(err)),
+            });
+        }
         "upgrade" => {
             let exe = param("exe").and_then(Value::as_str).unwrap_or_default();
             let failed = match &shared.control {
@@ -395,6 +412,39 @@ fn simple(shared: &Shared, request: &Request) -> Result<Value> {
             let closed = shared.terms.close(param("term").unwrap_or_default());
             Ok(json!({ "closed": closed }))
         }
+        other => bail!("未知方法：{other}"),
+    }
+}
+
+/// 仓库里的文件（文件页用）：返回结果和跟在后面的原始字节。
+fn fs_request(request: Request, payload: &[u8]) -> Result<(Value, Vec<u8>)> {
+    use fr_core::files;
+    let text = |name: &str| {
+        request
+            .params
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    };
+    let number = |name: &str| request.params.get(name).and_then(Value::as_u64);
+    let (repo, path) = (text("repo"), text("path"));
+    let done = |result: Value| Ok((result, Vec::new()));
+    match request.method.as_str() {
+        "fs_list" => done(json!({ "entries": files::list(repo, path)? })),
+        "fs_stat" => done(serde_json::to_value(files::stat(repo, path)?)?),
+        "fs_read" => {
+            let (offset, len) = (number("offset").unwrap_or(0), number("len"));
+            let (stat, bytes) = files::read(repo, path, offset, len.unwrap_or(files::READ_MAX))?;
+            Ok((serde_json::to_value(stat)?, bytes))
+        }
+        "fs_write" => {
+            let params: FsWrite =
+                serde_json::from_value(request.params.clone()).context("fs_write 参数无效")?;
+            done(serde_json::to_value(files::write(&params, payload)?)?)
+        }
+        "fs_mkdir" => files::make_dir(repo, path).and_then(|()| done(json!({}))),
+        "fs_remove" => files::remove(repo, path).and_then(|()| done(json!({}))),
+        "fs_rename" => files::rename(repo, path, text("to")).and_then(|()| done(json!({}))),
         other => bail!("未知方法：{other}"),
     }
 }
@@ -688,6 +738,91 @@ mod tests {
         drop(client);
         wait_until("没传完的删掉", || std::fs::read_dir(&dir.0).unwrap().count() == 1);
         assert!(path.exists());
+    }
+
+    #[test]
+    fn 仓库里的文件_列_读_写_改名_删除_往里传() {
+        let repo = files::tests::TempDir::new();
+        std::fs::create_dir_all(repo.0.join(".git")).unwrap();
+        let root = repo.0.to_str().unwrap().to_string();
+        let (terms, _) = fake_registry();
+        let shared = Shared::new(terms, None, String::new());
+        let mut client = connect(&shared);
+        let at = |path: &str| json!({ "repo": root, "path": path });
+
+        // 新建，再按打开时的样子保存；拿旧的样子保存就是冲突
+        let create = json!({ "repo": root, "path": "src/a.txt", "create": true });
+        let id = client.send("fs_write", create, b"one");
+        let (response, _) = client.next();
+        assert_eq!(response.id, id);
+        let opened = response.result.unwrap()["stat"].clone();
+        assert_eq!(opened["size"], 3);
+        let save = json!({ "repo": root, "path": "src/a.txt", "expect": opened });
+        client.send("fs_write", save.clone(), b"two!");
+        assert!(client.next().0.result.unwrap().get("conflict").is_none());
+        client.send("fs_write", save, b"three");
+        assert_eq!(client.next().0.result.unwrap()["conflict"], true);
+
+        // 列目录没有 .git；读带着文件现在的情况，可以只读一段
+        let listed = client.call("fs_list", at(""));
+        assert_eq!(listed["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["entries"][0]["name"], "src");
+        assert_eq!(listed["entries"][0]["dir"], true);
+        let id = client.send(
+            "fs_read",
+            json!({ "repo": root, "path": "src/a.txt", "offset": 1, "len": 2 }),
+            &[],
+        );
+        let (response, payload) = client.next();
+        assert_eq!(response.id, id);
+        assert_eq!(response.result.unwrap()["size"], 4);
+        assert_eq!(payload, b"wo");
+        // 出仓库的路径、不存在的文件：回错误
+        client.send("fs_read", at("../x"), &[]);
+        assert!(client.next().0.error.is_some());
+        assert_eq!(client.call("fs_stat", at("nope"))["exists"], false);
+
+        // 往仓库里传：传完才出现正式的名字；已经有了、又没说要换，就不传
+        let first = json!({ "repo": root, "path": "up/大 文件.bin" });
+        client.send("file_put", first.clone(), b"12");
+        let upload = client.next().0.result.unwrap()["upload"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!repo.0.join("up/大 文件.bin").exists());
+        client.send("file_put", json!({ "upload": upload, "done": true }), b"34");
+        let last = client.next().0.result.unwrap();
+        assert_eq!(
+            PathBuf::from(last["path"].as_str().unwrap()),
+            repo.0.join("up/大 文件.bin")
+        );
+        assert_eq!(
+            std::fs::read(repo.0.join("up/大 文件.bin")).unwrap(),
+            b"1234"
+        );
+        assert_eq!(std::fs::read_dir(repo.0.join("up")).unwrap().count(), 1);
+        client.send("file_put", first, b"x");
+        assert!(client.next().0.error.unwrap().contains("已存在"));
+        let replace =
+            json!({ "repo": root, "path": "up/大 文件.bin", "overwrite": true, "done": true });
+        client.send("file_put", replace, b"new");
+        assert!(client.next().0.result.is_some());
+        assert_eq!(
+            std::fs::read(repo.0.join("up/大 文件.bin")).unwrap(),
+            b"new"
+        );
+
+        // 建目录、改名、删除
+        client.call("fs_mkdir", at("docs/图"));
+        client.call(
+            "fs_rename",
+            json!({ "repo": root, "path": "src/a.txt", "to": "docs/b.txt" }),
+        );
+        assert_eq!(std::fs::read(repo.0.join("docs/b.txt")).unwrap(), b"two!");
+        client.call("fs_remove", at("docs"));
+        assert!(!repo.0.join("docs").exists());
+        client.send("fs_remove", at(""), &[]);
+        assert!(client.next().0.error.is_some());
     }
 
     #[test]

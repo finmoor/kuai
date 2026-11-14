@@ -389,6 +389,20 @@ impl RepoView {
         }
     }
 
+    /// 选中本地修改里的这个文件（从文件页的「改动」过来）：先找未暂存的，再找已暂存的。
+    pub(super) fn select_change(&mut self, path: &str, cx: &mut Context<Self>) {
+        let at = |area: Area| {
+            let list = self.changes.list(area);
+            Some((area, list.iter().position(|entry| entry.path == path)?))
+        };
+        if let Some((area, ix)) = at(Area::Unstaged).or_else(|| at(Area::Staged)) {
+            self.changes
+                .scroll(area)
+                .scroll_to_item(ix, ScrollStrategy::Nearest);
+            self.select_file(area, path.to_string(), ix, cx);
+        }
+    }
+
     fn select_file(&mut self, area: Area, path: String, ix: usize, cx: &mut Context<Self>) {
         let same = self.changes.selected.as_ref() == Some(&(area, path.clone()));
         self.changes.selected = Some((area, path));

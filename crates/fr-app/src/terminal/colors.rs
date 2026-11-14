@@ -48,6 +48,11 @@ impl Palette {
         }
     }
 
+    /// 16 个基本色里的第几个（设置页的预览用）。
+    pub fn ansi(&self, index: u8) -> Hsla {
+        self.indexed(index.min(15))
+    }
+
     fn named(&self, name: NamedColor) -> Hsla {
         use NamedColor::*;
         match name {

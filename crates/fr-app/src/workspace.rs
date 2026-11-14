@@ -352,7 +352,7 @@ impl Workspace {
 
     /// 托盘菜单的「退出」：本机终端里没有程序在运行就直接退出；有就把窗口叫出来，问一下。
     fn quit_from_tray(&mut self, cx: &mut Context<Self>) {
-        if self.live_terminals(cx) == 0 {
+        if self.live_terminals(cx) == 0 && self.unsaved_files(cx) == 0 {
             self.quitting.set(true);
             cx.quit();
             return;
@@ -370,19 +370,33 @@ impl Workspace {
     /// 不问，由调用的地方直接退出。
     fn confirm_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let terminals = self.live_terminals(cx);
-        if terminals == 0 {
+        let unsaved = self.unsaved_files(cx);
+        if terminals == 0 && unsaved == 0 {
             return false;
         }
+        let description = match (terminals, unsaved) {
+            (_, 0) => tf!(
+                "有 {n} 个本机终端正在运行，退出将结束其中的程序。服务器上的终端不受影响。",
+                n = terminals
+            ),
+            (0, _) => tf!("有 {n} 个文件尚未保存，退出后修改将丢失。", n = unsaved),
+            _ => tf!(
+                "有 {n} 个文件尚未保存，退出后修改将丢失。另有 {m} 个本机终端正在运行，退出将结束其中的程序。",
+                n = unsaved,
+                m = terminals
+            ),
+        };
+        let ok = match terminals {
+            0 => tr("放弃修改并退出"),
+            _ => tr("结束并退出"),
+        };
         let quitting = self.quitting.clone();
         let to_tray = self.tray.is_some().then(|| cx.entity().downgrade());
         window.open_alert_dialog(cx, move |alert, _, _| {
             let (quitting, to_tray) = (quitting.clone(), to_tray.clone());
             alert
                 .title(tr("退出 Kuai？"))
-                .description(tf!(
-                    "有 {n} 个本机终端正在运行，退出将结束其中的程序。服务器上的终端不受影响。",
-                    n = terminals
-                ))
+                .description(description.clone())
                 .on_ok(|_, _, _| false)
                 .footer(
                     DialogFooter::new()
@@ -401,7 +415,7 @@ impl Workspace {
                         })
                         .child(
                             Button::new("ok")
-                                .label(tr("结束并退出"))
+                                .label(ok)
                                 .with_variant(ButtonVariant::Danger)
                                 .on_click(move |_, window, cx| {
                                     window.close_dialog(cx);
@@ -465,6 +479,20 @@ impl Workspace {
         if let Some(dir) = request.open {
             self.open_local_dir(dir, window, cx);
         }
+    }
+
+    /// 各个工作区里打开的标签页中，一共有几个文件没保存（退出 Kuai 前要问）。
+    fn unsaved_files(&self, cx: &App) -> usize {
+        self.tabs
+            .iter()
+            .chain(
+                self.parked
+                    .iter()
+                    .flatten()
+                    .flat_map(|(tabs, _)| tabs.iter()),
+            )
+            .map(|tab| tab.view.read(cx).unsaved_files())
+            .sum()
     }
 
     /// 一共有几个本机终端的程序正在运行（退出 Kuai 时将结束）：各个工作区里打开的标签页中的，
@@ -631,6 +659,12 @@ impl Workspace {
             (view.busy(), view.cancellable())
         };
         let entry = tab.entry.clone();
+        let unsaved = tab.view.read(cx).unsaved_files();
+        if busy.is_none() && unsaved > 0 {
+            let text = tf!("有 {n} 个文件尚未保存，关闭后修改将丢失。", n = unsaved);
+            self.confirm_close(entry, text, tr("放弃修改并关闭"), window, cx);
+            return;
+        }
         let Some(op) = busy else {
             self.close_now(ix, cx);
             return;
@@ -861,7 +895,29 @@ impl Workspace {
         if self.showing_settings {
             self.toggle_settings(cx);
         } else if let Some(ix) = self.active.checked_sub(1) {
-            self.close(ix, window, cx);
+            // 在文件页上、有打开的文件：Ctrl+W 关的是那个文件，不是整个仓库标签页
+            let closed_file = self.tabs.get(ix).is_some_and(|tab| {
+                tab.view
+                    .update(cx, |view, cx| view.close_active_file(window, cx))
+            });
+            if !closed_file {
+                self.close(ix, window, cx);
+            }
+        }
+    }
+
+    /// Ctrl+Shift+E：当前仓库切到文件页。
+    pub fn files_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_repo() {
+            tab.view.update(cx, |view, cx| view.show_files(window, cx));
+        }
+    }
+
+    /// Ctrl+S：保存当前仓库文件页上显示着的文件。
+    pub fn save_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_repo() {
+            tab.view
+                .update(cx, |view, cx| view.save_active_file(window, cx));
         }
     }
 

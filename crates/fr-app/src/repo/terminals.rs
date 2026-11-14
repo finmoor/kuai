@@ -272,10 +272,22 @@ impl RepoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
+        self.add_terminal_in(number, restored, String::new(), window, cx)
+    }
+
+    /// 同 [`Self::add_terminal`]，开在仓库里的 `dir` 目录（相对仓库根）。
+    fn add_terminal_in(
+        &mut self,
+        number: u32,
+        restored: bool,
+        dir: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
         let (entry, app) = (self.entry.clone(), self.app.clone());
         let view = cx.new(|cx| {
             let mut view = TerminalView::new(
-                move |cx| crate::shell::terminal_launch(&entry, &app, number, cx),
+                move |cx| crate::shell::terminal_launch(&entry, &app, number, &dir, cx),
                 window,
                 cx,
             );
@@ -344,32 +356,71 @@ impl RepoView {
         }
     }
 
-    /// 切到 Git 页或终端页。到终端页时留着的都接回来，一个都没有就开第一个，焦点放进终端；
-    /// 回 Git 页不结束里面的程序。
+    /// 切到 Git、终端或文件页。到终端页时留着的都接回来，一个都没有就开第一个，焦点放进终端；
+    /// 离开终端页不结束里面的程序。到文件页时焦点放到打开的文件（没有就是目录树）上。
     pub(super) fn show_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        // 焦点还留在看不见的那一页上的话，键盘就没反应了（或者改到看不见的文件里去）
+        let stray = match self.page {
+            Page::Terminal => page != Page::Terminal && self.terminal_focused(window, cx),
+            Page::Files => page != Page::Files && self.files_focused(window, cx),
+            Page::Git => false,
+        };
+        if stray {
+            window.blur(cx);
+        }
+        let from = std::mem::replace(&mut self.page, page);
         match page {
             Page::Terminal => {
+                if from != Page::Terminal {
+                    self.back_page = from;
+                }
                 self.adopt_waiting(window, cx);
                 if self.terminals.tabs.is_empty() {
                     self.terminals.active = self.add_terminal(1, false, window, cx);
                 }
                 self.focus_terminal(window, cx);
             }
-            // 焦点还留在看不见的终端上的话，键盘就没反应了
-            Page::Git if self.terminal_focused(window, cx) => window.blur(cx),
+            Page::Files => {
+                self.focus_files(window, cx);
+                if from != Page::Files {
+                    self.refresh_files(cx);
+                }
+            }
             Page::Git => {}
         }
-        self.page = page;
         cx.notify();
     }
 
-    /// Ctrl+`：在 Git、终端两页之间来回切。
+    /// Ctrl+`：在终端页和刚才那一页（Git 或者文件）之间来回切。
     pub fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let page = match self.page {
-            Page::Git => Page::Terminal,
-            Page::Terminal => Page::Git,
+            Page::Terminal => self.back_page,
+            Page::Git | Page::Files => Page::Terminal,
         };
         self.show_page(page, window, cx);
+    }
+
+    /// Ctrl+Shift+E：切到文件页；已经在文件页就把焦点放到目录树上。
+    pub fn show_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page == Page::Files {
+            self.files.focus.focus(window, cx);
+            return;
+        }
+        self.show_page(Page::Files, window, cx);
+    }
+
+    /// 再开一个终端，开在仓库里的 `dir` 目录（文件页的「终端」），切到终端页显示它。
+    pub(super) fn new_terminal_in(
+        &mut self,
+        dir: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adopt_waiting(window, cx);
+        let used: Vec<u32> = self.terminals.tabs.iter().map(|tab| tab.number).collect();
+        let number = free_number(&used);
+        self.terminals.active = self.add_terminal_in(number, false, dir, window, cx);
+        self.show_page(Page::Terminal, window, cx);
     }
 
     /// 再开一个终端（侧栏的「新终端」、Ctrl+Shift+`），切到终端页显示它。
@@ -379,9 +430,7 @@ impl RepoView {
         let used: Vec<u32> = self.terminals.tabs.iter().map(|tab| tab.number).collect();
         let number = free_number(&used);
         self.terminals.active = self.add_terminal(number, false, window, cx);
-        self.page = Page::Terminal;
-        self.focus_terminal(window, cx);
-        cx.notify();
+        self.show_page(Page::Terminal, window, cx);
     }
 
     fn select_terminal(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {

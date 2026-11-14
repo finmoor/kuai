@@ -95,13 +95,19 @@ pub fn local_shells() -> Vec<LocalShell> {
 /// 服务器上的仓库是开在 kuaid 里的终端，经这台服务器的连接接上（没连着就先连）。
 ///
 /// `number`：这个仓库的第几个终端（从 1 起）。服务器上的终端靠它起名字，下次打开这个仓库时
-/// 接上的还是原来那个。
+/// 接上的还是原来那个。`dir`：开在仓库里的哪个目录（相对仓库根，空的是仓库根）。
 pub fn terminal_launch(
     entry: &RepoEntry,
     app: &Entity<AppState>,
     number: u32,
+    dir: &str,
     cx: &mut App,
 ) -> Result<Launch, String> {
+    let root = entry.path.trim_end_matches(['/', '\\']);
+    let cwd = match dir.is_empty() {
+        true => entry.path.clone(),
+        false => format!("{root}/{dir}"),
+    };
     let Some(server) = &entry.server else {
         let preferred = app.read(cx).settings.terminal_shell.clone();
         let mut shells = local_shells();
@@ -116,7 +122,7 @@ pub fn terminal_launch(
         return Ok(Launch::Local(LocalLaunch {
             program: shell.program.to_string_lossy().into_owned(),
             args: shell.args,
-            cwd: Some(PathBuf::from(windows_path(&entry.path))),
+            cwd: Some(PathBuf::from(windows_path(&cwd))),
             env: Vec::new(),
             keep: None,
         }));
@@ -128,7 +134,7 @@ pub fn terminal_launch(
     Ok(Launch::Remote(RemoteLaunch {
         connect: connecting.boxed_local(),
         key: crate::terminal::session_key(&entry.path, number),
-        cwd: entry.path.clone(),
+        cwd,
     }))
 }
 

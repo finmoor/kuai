@@ -3,6 +3,9 @@
 //! 终端那条路只能过文字。要把图片、文件交给终端里的程序（Claude Code、Codex 这些），
 //! 客户端先把文件传到这里，拿到它在服务器上的路径，再把路径贴进终端，程序自己去读。
 //! 放在仓库外面：不弄脏仓库的状态。
+//!
+//! 文件页往仓库里传文件走的也是这里（`file_put` 带着 `repo`、`path`）：没传完的放在目标旁边，
+//! 传完才改成正式的名字，传到一半断了不会留下半个文件顶着正式的名字。
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -40,6 +43,8 @@ struct Upload {
     part: PathBuf,
     name: String,
     received: u64,
+    /// 传到仓库里的：传完放到哪、那里已经有文件时换不换
+    dest: Option<(PathBuf, bool)>,
 }
 
 impl Drop for Upload {
@@ -68,7 +73,7 @@ impl Uploads {
             });
         }
         let id = match params.upload.is_empty() {
-            true => self.begin(&params.name)?,
+            true => self.begin(&params)?,
             false => params.upload,
         };
         let upload = self
@@ -97,24 +102,42 @@ impl Uploads {
     }
 
     /// 开一个新文件，返回这次上传的编号。
-    fn begin(&mut self, name: &str) -> Result<String> {
-        create_private_dir(&self.dir)?;
+    fn begin(&mut self, params: &FilePut) -> Result<String> {
         let id = format!("u{}", self.next);
         self.next += 1;
-        let part = self.dir.join(format!(
+        let part_name = format!(
             "{PARTIAL_PREFIX}{}-{id}{PARTIAL_SUFFIX}",
             std::process::id()
-        ));
-        // 上一个同进程号的进程剩下的：换掉
-        let _ = std::fs::remove_file(&part);
+        );
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            // 可能是截图、日志这类东西，只有本人能读
-            options.mode(0o600);
-        }
+        let (part, dest) = match params.repo.is_empty() {
+            true => {
+                create_private_dir(&self.dir)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    // 可能是截图、日志这类东西，只有本人能读
+                    options.mode(0o600);
+                }
+                (self.dir.join(part_name), None)
+            }
+            false => {
+                let target = fr_core::files::resolve_inside(&params.repo, &params.path)?;
+                if target.is_dir() {
+                    bail!("{} 是目录", params.path);
+                }
+                if !params.overwrite && std::fs::symlink_metadata(&target).is_ok() {
+                    bail!("{} 已存在", params.path);
+                }
+                let dir = target.parent().context("路径无效")?;
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("无法创建 {}", dir.display()))?;
+                (dir.join(part_name), Some((target, params.overwrite)))
+            }
+        };
+        // 上一个同进程号的进程剩下的：换掉
+        let _ = std::fs::remove_file(&part);
         let file = options
             .open(&part)
             .with_context(|| format!("无法创建 {}", part.display()))?;
@@ -123,8 +146,9 @@ impl Uploads {
             Upload {
                 file,
                 part,
-                name: safe_name(name),
+                name: safe_name(&params.name),
                 received: 0,
+                dest,
             },
         );
         Ok(id)
@@ -135,6 +159,23 @@ impl Upload {
     /// 传完了：给它起正式的名字，返回完整路径。重名的在后面加 -2、-3……
     fn finish(self, dir: &Path) -> Result<String> {
         self.file.sync_all().context("写入文件失败")?;
+        if let Some((target, overwrite)) = &self.dest {
+            let shown = target.to_string_lossy().into_owned();
+            let placed = match overwrite {
+                true => std::fs::rename(&self.part, target),
+                // 再起一个名字指向同一个文件：传的这段时间里别人建了同名的，不盖掉它
+                false => std::fs::hard_link(&self.part, target).or_else(|err| match err.kind() {
+                    ErrorKind::AlreadyExists => Err(err),
+                    // 这个文件系统不支持硬链接：改名
+                    _ if std::fs::symlink_metadata(target).is_err() => {
+                        std::fs::rename(&self.part, target)
+                    }
+                    _ => Err(err),
+                }),
+            };
+            placed.with_context(|| format!("无法保存到 {shown}"))?;
+            return Ok(shown);
+        }
         let (stem, ext) = match self.name.rfind('.') {
             Some(dot) if dot > 0 => self.name.split_at(dot),
             _ => (self.name.as_str(), ""),

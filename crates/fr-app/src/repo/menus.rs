@@ -639,6 +639,12 @@ impl RepoView {
             // 交给编辑器：解决冲突、细改都在那边做
             let exists = entry.unstaged != Some(Kind::Deleted);
             if exists {
+                let path = entry.path.clone();
+                menu = menu.item(item(
+                    &view,
+                    tr("在文件页中打开"),
+                    move |this, w, cx| this.show_file(path.clone(), w, cx),
+                ));
                 match &destination {
                     Some(dest) => {
                         let (dest, file) = (dest.clone(), format!("{full_path}/{}", entry.path));
@@ -700,8 +706,13 @@ impl RepoView {
     pub(super) fn tracked_file_menu(&self, path: String, cx: &mut Context<Self>) -> MenuFn {
         let view = cx.entity().downgrade();
         Box::new(move |menu, _, _| {
-            let (a, b) = (path.clone(), path.clone());
-            menu.item(item(&view, tr("文件历史"), move |this, w, cx| {
+            let (a, b, open) = (path.clone(), path.clone(), path.clone());
+            menu.item(item(
+                &view,
+                tr("在文件页中打开"),
+                move |this, w, cx| this.show_file(open.clone(), w, cx),
+            ))
+            .item(item(&view, tr("文件历史"), move |this, w, cx| {
                 this.show_file_history(a.clone(), w, cx)
             }))
             .item(item(
