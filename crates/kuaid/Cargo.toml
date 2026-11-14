@@ -20,3 +20,20 @@ alacritty_terminal = "0.26"
 [target.'cfg(unix)'.dependencies]
 # 伪终端、套接字的锁、给进程发信号
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Windows 版：伪终端（ConPTY）、作业对象、拉起脱离 ssh 会话的进程、读 sshd 的默认 shell。
+# 版本和 alacritty_terminal 用的一致，不多编一份
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Environment",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+] }

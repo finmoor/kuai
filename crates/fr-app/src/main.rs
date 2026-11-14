@@ -233,6 +233,7 @@ fn main() {
     let request = instance::Request {
         open: open_arg.clone(),
         show: !start_minimized,
+        ..Default::default()
     };
     let (_instance, incoming) = match instance::claim(&request) {
         instance::Claim::First(guard, incoming) => (guard, incoming),

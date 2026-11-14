@@ -1,32 +1,60 @@
 //! 转接程序（`kuaid --connect`）：客户端每次经 ssh 启动它，它把 ssh 的标准输入输出接到常驻进程的
 //! 套接字上。接之前先办三件事：
 //!
-//! 1. 常驻进程没在跑就把它拉起来。
+//! 1. 常驻进程没在跑就把它拉起来（Windows 上运行着 Kuai 的话请它来拉，常驻进程落在桌面上）。
 //! 2. 常驻进程不是自己这一版、而且不比自己新，就让它原地换成自己这一版（终端会话留着）。
 //!    比自己新就不动它：别的电脑上有更新的客户端，新的 kuaid 认得旧客户端。
 //! 3. 告诉常驻进程这条 ssh 连接转发过来的 ssh-agent 在哪。
 //!
 //! 之后只是原样搬字节，协议由客户端和常驻进程自己说。
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufReader, ErrorKind, Read, Write};
 use std::mem::ManuallyDrop;
 use std::net::Shutdown;
-use std::os::fd::FromRawFd;
-use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use fr_core::protocol::{self, DaemonInfo, Request, Response, TermInfo};
 use serde_json::{Value, json};
 
-use crate::daemon::Paths;
+use crate::daemon::{Paths, Stream, dial};
+
+/// 我们拉起的那个常驻进程：只用来看它退出了没有。
+#[cfg(unix)]
+type Child = std::process::Child;
+#[cfg(windows)]
+type Child = Started;
+
+/// Windows 上常驻进程是谁拉起的。
+#[cfg(windows)]
+enum Started {
+    /// 我们自己
+    Own(crate::win::Detached),
+    /// 请运行着的 Kuai 拉起的（它说办了的时刻）：手里没有那个进程
+    ByKuai(Instant),
+}
+
+#[cfg(windows)]
+impl Started {
+    /// 照着标准库的 `Child::try_wait`：`Some` 是它退出了（该再拉一次）。Kuai 拉起的看不到进程，
+    /// 过了 [`KUAI_WAIT`] 还连不上就当它没起来。
+    fn try_wait(&mut self) -> std::io::Result<Option<()>> {
+        match self {
+            Started::Own(child) => child.try_wait(),
+            Started::ByKuai(at) => Ok((at.elapsed() >= KUAI_WAIT).then_some(())),
+        }
+    }
+}
+
+/// Kuai 说常驻进程拉起来了，等它听上端口最多这么久
+#[cfg(windows)]
+const KUAI_WAIT: Duration = Duration::from_secs(3);
 
 /// 拉起常驻进程、等它换完程序，最多等这么久
 const WAIT: Duration = Duration::from_secs(8);
 /// 日志文件超过这么大就从头写
+#[cfg(unix)]
 const LOG_LIMIT: u64 = 1 << 20;
 /// 转接程序自己发的请求用的编号：和客户端的编号不相干（响应在开始搬字节前就收完了）
 const OWN_ID: u64 = u64::MAX;
@@ -35,6 +63,9 @@ const OWN_ID: u64 = u64::MAX;
 pub fn connect() -> Result<()> {
     let paths = Paths::new()?;
     paths.create()?;
+    // Windows 上被进程占着的目录删不掉：不占着启动时所在的版本目录
+    #[cfg(windows)]
+    let _ = std::env::set_current_dir(crate::dirs::home_dir());
     let mine = crate::build();
     let exe = std::env::current_exe().context("无法确定 kuaid 的安装位置")?;
     let deadline = Instant::now() + WAIT;
@@ -49,13 +80,25 @@ pub fn connect() -> Result<()> {
             continue;
         };
         let info: DaemonInfo = serde_json::from_value(info).context("无法解析常驻进程的响应")?;
-        if info.build == mine || mine.is_empty() || asked_upgrade || !should_replace(&info.build, &mine)
-        {
+        if asked_upgrade {
             break stream;
         }
-        // 让它换成我们这一版。成功的话它不回答，连接直接断；回答了就是没换成，照旧用它
+        let replace = info.build != mine && !mine.is_empty() && should_replace(&info.build, &mine);
+        let request = if replace {
+            // 让它换成我们这一版
+            Some(("upgrade", json!({ "exe": exe })))
+        } else if misplaced(&paths, &info) {
+            // 版本不用换，只是该搬到桌面上：让它用自己那一版重新起一遍
+            Some(("move", json!({})))
+        } else {
+            None
+        };
+        let Some((method, params)) = request else {
+            break stream;
+        };
+        // 成功的话它不回答，连接直接断；回答了就是没办成，照旧用它
         asked_upgrade = true;
-        match call(&mut stream, "upgrade", json!({ "exe": exe })) {
+        match call(&mut stream, method, params) {
             Err(_) => continue,
             Ok(_) => break stream,
         }
@@ -63,6 +106,8 @@ pub fn connect() -> Result<()> {
     let mut stream = stream;
     let auth_sock = std::env::var("SSH_AUTH_SOCK").ok().filter(|s| !s.is_empty());
     send(&mut stream, "bridge", json!({ "auth_sock": auth_sock }))?;
+    // 开头这几步可能设了读超时（Windows），之后客户端多久不说话都行
+    let _ = stream.set_read_timeout(None);
     pump(stream)
 }
 
@@ -80,6 +125,21 @@ fn should_replace(theirs: &str, mine: &str) -> bool {
     version(theirs) <= version(mine)
 }
 
+/// 常驻进程该不该搬个地方：它在会话 0（经 ssh 拉起的，没有桌面），我们在桌面上，这台电脑上还
+/// 运行着 Kuai（能替它在桌面上重新起一遍）。搬过去以后新开的终端才开得了带窗口的程序；已经开着的
+/// 终端留在原来的会话里，照常用。
+#[cfg(windows)]
+fn misplaced(paths: &Paths, info: &DaemonInfo) -> bool {
+    info.session == Some(0)
+        && crate::win::session_id() != 0
+        && crate::win::kuai_pipe_file(&paths.run).is_file()
+}
+
+#[cfg(unix)]
+fn misplaced(_paths: &Paths, _info: &DaemonInfo) -> bool {
+    false
+}
+
 fn ensure_time(deadline: Instant, what: &str) -> Result<()> {
     if Instant::now() >= deadline {
         bail!("{what}");
@@ -92,9 +152,9 @@ fn connect_or_start(
     paths: &Paths,
     started: &mut Option<Child>,
     deadline: Instant,
-) -> Result<UnixStream> {
+) -> Result<Stream> {
     loop {
-        if let Ok(stream) = UnixStream::connect(paths.socket()) {
+        if let Ok(stream) = dial(paths) {
             return Ok(stream);
         }
         // 没拉起过，或者拉起的那个已经退出了（比如另一个转接程序抢先拉起了一个）：再拉
@@ -103,7 +163,8 @@ fn connect_or_start(
             Some(child) => matches!(child.try_wait(), Ok(Some(_)) | Err(_)),
         };
         if need_start {
-            *started = Some(start_daemon(paths)?);
+            let first = started.is_none();
+            *started = Some(start_daemon(paths, first)?);
         }
         ensure_time(deadline, "常驻进程启动失败，详见 ~/.kuai/run/kuaid.log")?;
         std::thread::sleep(Duration::from_millis(25));
@@ -111,7 +172,11 @@ fn connect_or_start(
 }
 
 /// 拉起常驻进程：自己一个会话，标准输入输出都不接在这条 ssh 连接上（不然 ssh 断不开）。
-fn start_daemon(paths: &Paths) -> Result<Child> {
+#[cfg(unix)]
+fn start_daemon(paths: &Paths, _first: bool) -> Result<Child> {
+    use std::fs::OpenOptions;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
     let log_path = paths.log();
     let too_big = std::fs::metadata(&log_path).is_ok_and(|meta| meta.len() > LOG_LIMIT);
     let log = OpenOptions::new()
@@ -137,7 +202,21 @@ fn start_daemon(paths: &Paths) -> Result<Child> {
     cmd.spawn().context("无法启动常驻进程")
 }
 
-fn send(stream: &mut UnixStream, method: &str, params: Value) -> Result<()> {
+/// 拉起常驻进程。这台电脑上运行着 Kuai 就先请它来拉（常驻进程落在桌面上，见
+/// [`crate::win::ask_kuai`]），只问头一次；不然自己拉：脱离这条 ssh 连接的作业（不然连接一断就被
+/// sshd 杀掉），不带着我们的标准输入输出（它自己把输出接到日志文件上）。
+#[cfg(windows)]
+fn start_daemon(paths: &Paths, first: bool) -> Result<Child> {
+    let exe = std::env::current_exe()?;
+    if first && crate::win::ask_kuai(&paths.run, &exe, None) {
+        return Ok(Started::ByKuai(Instant::now()));
+    }
+    crate::win::spawn_detached(&exe, &["--daemon"])
+        .map(Started::Own)
+        .context("无法启动常驻进程")
+}
+
+fn send(stream: &mut Stream, method: &str, params: Value) -> Result<()> {
     let request = Request {
         id: OWN_ID,
         method: method.into(),
@@ -148,7 +227,7 @@ fn send(stream: &mut UnixStream, method: &str, params: Value) -> Result<()> {
 }
 
 /// 发一个请求，等它的响应。只在开始搬字节之前用：这时连接上没有别的消息。
-fn call(stream: &mut UnixStream, method: &str, params: Value) -> Result<Value> {
+fn call(stream: &mut Stream, method: &str, params: Value) -> Result<Value> {
     send(stream, method, params)?;
     // 一个字节一个字节地读：不能多读，后面的字节是客户端的
     let mut reader = BufReader::with_capacity(1, &*stream);
@@ -161,15 +240,9 @@ fn call(stream: &mut UnixStream, method: &str, params: Value) -> Result<Value> {
 }
 
 /// 两头原样搬字节，直到一头关了。
-fn pump(stream: UnixStream) -> Result<()> {
-    // 直接用文件描述符 0 和 1：标准库的标准输出会按行攒着，这里要来多少马上写多少
-    // SAFETY: 0 和 1 是进程的标准输入输出，放在 ManuallyDrop 里不会被关掉
-    let (mut stdin, mut stdout) = unsafe {
-        (
-            ManuallyDrop::new(File::from_raw_fd(0)),
-            ManuallyDrop::new(File::from_raw_fd(1)),
-        )
-    };
+fn pump(stream: Stream) -> Result<()> {
+    // 直接用标准输入输出底下的文件：标准库的标准输出会按行攒着，这里要来多少马上写多少
+    let (mut stdin, mut stdout) = raw_stdio();
     let mut to_daemon = stream.try_clone().context("套接字不可用")?;
     std::thread::Builder::new()
         .name("kuaid-bridge-in".into())
@@ -185,6 +258,30 @@ fn pump(stream: UnixStream) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn raw_stdio() -> (ManuallyDrop<File>, ManuallyDrop<File>) {
+    use std::os::fd::FromRawFd;
+    // SAFETY: 0 和 1 是进程的标准输入输出，放在 ManuallyDrop 里不会被关掉
+    unsafe {
+        (
+            ManuallyDrop::new(File::from_raw_fd(0)),
+            ManuallyDrop::new(File::from_raw_fd(1)),
+        )
+    }
+}
+
+#[cfg(windows)]
+fn raw_stdio() -> (ManuallyDrop<File>, ManuallyDrop<File>) {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    // SAFETY: 这两个句柄是进程的标准输入输出，放在 ManuallyDrop 里不会被关掉
+    unsafe {
+        (
+            ManuallyDrop::new(File::from_raw_handle(std::io::stdin().as_raw_handle())),
+            ManuallyDrop::new(File::from_raw_handle(std::io::stdout().as_raw_handle())),
+        )
+    }
+}
+
 fn copy(from: &mut impl Read, to: &mut impl Write) -> std::io::Result<()> {
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -198,9 +295,9 @@ fn copy(from: &mut impl Read, to: &mut impl Write) -> std::io::Result<()> {
 }
 
 /// 连上正在跑的常驻进程；没在跑就报错（不拉起）。
-fn existing() -> Result<UnixStream> {
+fn existing() -> Result<Stream> {
     let paths = Paths::new()?;
-    UnixStream::connect(paths.socket()).context("常驻进程未运行")
+    dial(&paths).context("常驻进程未运行")
 }
 
 /// `kuaid --status`：常驻进程和终端会话的情况。

@@ -2,11 +2,15 @@
 //!
 //! 一个会话 = 一个伪终端里的登录 shell + 记着屏幕的仿真器（[`screen`]）+ 现在接着的客户端。
 //! 程序的输出喂给仿真器，同时转给接着的每个客户端；客户端接上来时先收到还原屏幕的那一段。
-//! 伪终端那一层在 [`pty`]（只有 Linux 上有），这里不碰系统调用，测试里换成假的。
+//! 伪终端那一层：Linux 上在 [`pty`]；Windows 上终端开在托管进程里（[`host`]），常驻进程这边是
+//! [`hosted`]。这里不碰系统调用，测试里换成假的。
 
-// Windows 上的 kuaid 只拿来测协议，开不了终端，下面有些东西用不上
-#![cfg_attr(not(unix), allow(dead_code))]
-
+#[cfg(windows)]
+pub mod conpty;
+#[cfg(windows)]
+pub mod host;
+#[cfg(windows)]
+pub mod hosted;
 #[cfg(unix)]
 pub mod pty;
 pub mod screen;
@@ -41,10 +45,16 @@ pub trait Backend: Send + Sync {
     fn resize(&self, size: Size);
     /// 结束里面的程序。
     fn kill(&self);
-    /// 伪终端的文件描述符和 shell 的进程号：升级换程序时带过去。
+    /// 升级换程序时带过去的两个数。Linux：伪终端的文件描述符和 shell 的进程号；
+    /// Windows：托管进程听的端口和 shell 的进程号。
     fn handle(&self) -> Option<(i32, i32)> {
         None
     }
+    /// 升级换程序前：不再收程序的输出，返回时已经收到的都交给了 [`Session::output`]。
+    /// Linux 上用不着（整个进程一把锁，见 `pty::freeze`）。
+    fn pause(&self) {}
+    /// 升级没换成：接着收。
+    fn resume(&self) {}
 }
 
 /// 开一个新会话要的东西。
@@ -55,6 +65,9 @@ pub struct Spawn {
     pub size: Size,
     /// 除了继承来的，shell 再多带的环境变量
     pub env: Vec<(String, String)>,
+    /// 客户端点名要开的 shell（程序和参数）；空着由伪终端那一层自己定。只有 Windows 上认
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub shell: Vec<String>,
 }
 
 pub type Spawner = Box<dyn Fn(&Spawn) -> Result<Box<dyn Backend>> + Send + Sync>;
@@ -252,6 +265,15 @@ impl Session {
     }
 }
 
+/// 会话的名字记成什么：Windows 上同一个目录有几种写法，统一成一种（见
+/// [`fr_core::dir::windows_key`]），本机的 Kuai 和别的电脑上的 Kuai 接上的才是同一个。
+fn session_key(key: &str) -> String {
+    match cfg!(windows) {
+        true => fr_core::dir::windows_key(key),
+        false => key.to_string(),
+    }
+}
+
 fn exit_message(request: u64, code: Option<i32>) -> Response {
     Response {
         id: request,
@@ -273,7 +295,7 @@ pub struct Frozen {
     pub cwd: String,
     pub created: u64,
     pub size: Size,
-    /// 伪终端的文件描述符和 shell 的进程号；程序已经结束的没有
+    /// [`Backend::handle`] 给的那两个数；程序已经结束的没有
     pub handle: Option<(i32, i32)>,
     /// 程序已经结束、还没人看过：退出码
     pub exit: Option<Option<i32>>,
@@ -300,8 +322,8 @@ impl Registry {
         }))
     }
 
-    /// 这个系统上开不了终端（Windows 上的 kuaid 只拿来测协议）。
-    #[cfg(any(test, not(unix)))]
+    /// 开不了终端的登记表（测试用）。
+    #[cfg(test)]
     pub fn unsupported() -> Registry {
         Registry::new(Box::new(|_| anyhow::bail!("当前系统上的 kuaid 不支持终端")))
     }
@@ -316,11 +338,12 @@ impl Registry {
         out: &Outbox,
     ) -> Result<()> {
         let size = Size::new(params.cols, params.rows);
+        let key = session_key(&params.key);
         // 整个过程拿着登记表的锁：两个客户端同时开同一个名字，只会开出一个
         let mut sessions = self.0.sessions.lock().unwrap();
         let existing = sessions
             .values()
-            .find(|session| !params.key.is_empty() && session.key == params.key)
+            .find(|session| !key.is_empty() && session.key == key)
             .cloned();
         if let Some(session) = existing {
             drop(sessions);
@@ -333,11 +356,12 @@ impl Registry {
             cwd: params.cwd.clone(),
             size,
             env,
+            shell: params.shell.clone(),
         })
         .with_context(|| format!("无法在 {} 中打开终端", params.cwd))?;
         let session = Arc::new(Session {
             id: id.clone(),
-            key: params.key.clone(),
+            key,
             cwd: params.cwd.clone(),
             created: now_secs(),
             backend,
@@ -422,6 +446,26 @@ impl Registry {
             let state = session.state.lock().unwrap();
             state.ended.is_none_or(|at| at.elapsed() < KEEP_ENDED)
         });
+    }
+
+    /// 升级换程序前：让每个还在跑的会话停止收输出（见 [`Backend::pause`]）。
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn pause_all(&self) {
+        for session in self.all() {
+            if session.is_alive() {
+                session.backend.pause();
+            }
+        }
+    }
+
+    /// 升级没换成：接着收。
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn resume_all(&self) {
+        for session in self.all() {
+            if session.is_alive() {
+                session.backend.resume();
+            }
+        }
     }
 
     /// 升级换程序前：把每个会话拍下来。调用前要先让伪终端那一层停止读输出。
@@ -573,6 +617,7 @@ pub(crate) mod tests {
             cwd: "/repo".into(),
             cols: 20,
             rows: 4,
+            shell: Vec::new(),
         };
         registry
             .open(&params, Vec::new(), conn, request, out)

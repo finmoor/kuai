@@ -6,21 +6,28 @@
 //!   套接字上；常驻进程没在跑就先把它拉起来，比自己旧就让它原地换成自己这一版（见 `bridge`）。
 //! - `kuaid --daemon`：常驻进程，由转接程序拉起来，听 `~/.kuai/run/kuaid.sock`。
 //!   客户端都断开、终端会话也都结束了，过一阵自己退出（见 `daemon`）。
-//! - `kuaid --stdio`：不常驻，只服务标准输入输出这一个客户端，读到头就退出。测试协议用，
-//!   Windows 上也能跑（开不了终端）。
+//! - `kuaid --stdio`：不常驻，只服务标准输入输出这一个客户端，读到头就退出。测试协议用。
 //! - `kuaid --status`、`kuaid --stop`：在服务器上看常驻进程的情况、让它结束。
+//!
+//! Linux 和 Windows 都能跑。Windows 上多两种：`kuaid --pty-host` 是终端托管进程，一个终端一个，
+//! 由常驻进程启动（见 `term::host`）；`kuaid --installed` 在刚装好这一版时清掉旧版本的目录。
 //!
 //! kuaid 尽量少做事：`git` 方法执行客户端给的任意 git 参数，原样回传输出，解析和布局都在
 //! 客户端做。协议见 `fr_core::protocol`。
 
-#[cfg(unix)]
 mod bridge;
 mod conn;
 #[cfg(unix)]
 mod daemon;
+#[cfg(windows)]
+#[path = "daemon_win.rs"]
+mod daemon;
+mod dirs;
 mod files;
 mod out;
 mod term;
+#[cfg(windows)]
+mod win;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -42,16 +49,24 @@ fn main() {
             stdio();
             Ok(())
         }
-        #[cfg(unix)]
         ["--connect"] => bridge::connect(),
-        #[cfg(unix)]
         ["--daemon"] => daemon::run(None),
-        #[cfg(unix)]
         ["--daemon", "--resume", state] => daemon::run(Some(state)),
-        #[cfg(unix)]
         ["--status"] => bridge::status(),
-        #[cfg(unix)]
         ["--stop"] => bridge::stop(),
+        #[cfg(windows)]
+        ["--pty-host", launch] => term::host::run(launch),
+        #[cfg(windows)]
+        ["--installed"] => {
+            daemon::clean_old_versions();
+            Ok(())
+        }
+        // Kuai 替转接程序拉起常驻进程时跑的是这个：由我们用「什么句柄都不继承」的办法起，
+        // Kuai 那边就不用操心自己手里的管道被常驻进程带走
+        #[cfg(windows)]
+        ["--spawn-daemon"] => daemon::spawn(&["--daemon"]),
+        #[cfg(windows)]
+        ["--spawn-daemon", "--resume", state] => daemon::spawn(&["--daemon", "--resume", state]),
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
@@ -67,8 +82,8 @@ fn main() {
 fn stdio() {
     #[cfg(unix)]
     let terms = term::Registry::new(term::pty::spawner());
-    #[cfg(not(unix))]
-    let terms = term::Registry::unsupported();
+    #[cfg(windows)]
+    let terms = term::Registry::new(term::hosted::spawner(fr_core::askpass::random_token()));
     let shared = conn::Shared::new(terms, None, build());
     // 以前传上来、已经过期的文件
     files::sweep(&shared.drop_dir);

@@ -1,5 +1,7 @@
 # 推到 main、提 PR 时跑测试。
-# kuaid 常驻那一套（拉起、终端断开后还在、原地升级）只能在 Linux 上测，单独一个 ubuntu 的任务。
+# kuaid 常驻那一套（拉起、终端断开后还在、升级不断终端）两个系统各有一份实现、各测各的：
+# Windows 版（crates/kuaid/tests/windows.rs）跟着 windows 任务的全部测试一起跑，
+# Linux 版（tests/linux.rs）单独一个 ubuntu 的任务。
 name: CI
 
 on:

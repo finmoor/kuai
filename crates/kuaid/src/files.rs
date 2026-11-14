@@ -28,7 +28,7 @@ const PARTIAL_SUFFIX: &str = ".part";
 
 /// 默认放在哪：主目录下的 `.kuai/drop`。
 pub fn default_dir() -> PathBuf {
-    Path::new(&fr_core::dir::home()).join(".kuai").join("drop")
+    crate::dirs::kuai_root().join("drop")
 }
 
 /// 一个客户端正在传的文件。客户端断开时丢弃，没传完的跟着删掉。

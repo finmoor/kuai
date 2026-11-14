@@ -40,7 +40,7 @@ pub use fr_core::protocol::{
     DirEntry, DirListing, FsEntry, FsExpect, FsStat, FsWrite, FsWritten, Hello, TermInfo,
 };
 pub use hop::run_helper as run_ssh_hop;
-pub use remote::{ConnectOptions, Connection, Jump, StageHandler};
+pub use remote::{ConnectOptions, Connection, Jump, StageHandler, local_kuai_root};
 
 /// 一次 git 调用的结果。
 #[derive(Debug, Clone, Default)]

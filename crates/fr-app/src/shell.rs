@@ -14,7 +14,7 @@ use gpui_kit::{App, Entity, Window};
 
 use crate::app_state::AppState;
 use crate::settings::{RepoEntry, Server, Target};
-use crate::terminal::{Launch, LocalLaunch, RemoteLaunch};
+use crate::terminal::{Launch, LocalLaunch};
 
 /// CREATE_NO_WINDOW：不弹出控制台窗口
 const NO_WINDOW: u32 = 0x0800_0000;
@@ -91,8 +91,9 @@ pub fn local_shells() -> Vec<LocalShell> {
     shells
 }
 
-/// 内置终端要跑什么：本机仓库是设置里选的 shell（没选、选的找不到了就用第一个找得到的）；
-/// 服务器上的仓库是开在 kuaid 里的终端，经这台服务器的连接接上（没连着就先连）。
+/// 内置终端要跑什么：本机仓库是设置里选的 shell（没选、选的找不到了就用第一个找得到的），开在这台
+/// 电脑的 kuaid 里，kuaid 用不了时开在 Kuai 进程里；服务器上的仓库是开在服务器的 kuaid 里的终端，
+/// 经这台服务器的连接接上（没连着就先连）。
 ///
 /// `number`：这个仓库的第几个终端（从 1 起）。服务器上的终端靠它起名字，下次打开这个仓库时
 /// 接上的还是原来那个。`dir`：开在仓库里的哪个目录（相对仓库根，空的是仓库根）。
@@ -119,23 +120,37 @@ pub fn terminal_launch(
             return Err(tr("未找到可用的 shell（PowerShell、cmd）。").into());
         }
         let shell = shells.swap_remove(at);
-        return Ok(Launch::Local(LocalLaunch {
-            program: shell.program.to_string_lossy().into_owned(),
+        let program = shell.program.to_string_lossy().into_owned();
+        let mut command = vec![program.clone()];
+        command.extend(shell.args.iter().cloned());
+        let local = LocalLaunch {
+            program,
             args: shell.args,
             cwd: Some(PathBuf::from(windows_path(&cwd))),
             env: Vec::new(),
             keep: None,
-        }));
+        };
+        // 开在这台电脑的 kuaid 里：Kuai 退出、更新以后终端还在，从别的电脑连上来看到的也是它
+        let connecting = app.update(cx, |app, cx| app.connect_local(cx));
+        return Ok(Launch {
+            connect: connecting.boxed_local(),
+            key: crate::terminal::session_key(&entry.path, number),
+            cwd: windows_path(&cwd),
+            shell: command,
+            fallback: Some(local),
+        });
     };
     if app.read(cx).server(server).is_none() {
         return Err(tr("未找到该服务器的设置").into());
     }
     let connecting = app.update(cx, |app, cx| app.connect(server, cx));
-    Ok(Launch::Remote(RemoteLaunch {
+    Ok(Launch {
         connect: connecting.boxed_local(),
         key: crate::terminal::session_key(&entry.path, number),
         cwd,
-    }))
+        shell: Vec::new(),
+        fallback: None,
+    })
 }
 
 /// 在资源管理器里打开所在目录并选中这个文件。

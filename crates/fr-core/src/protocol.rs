@@ -68,7 +68,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// 协议版本，握手时交换。服务器上的 kuaid 不能比客户端旧（连接时会原地升级），可以比客户端新。
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// 7：kuaid 有了 Windows 版；`term_open` 可以带 `shell`。
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// 一条消息后面跟多少字节的原始数据。
 pub trait Frame {
@@ -155,6 +157,9 @@ pub struct DaemonInfo {
     /// 现在连着几个客户端（含发这个请求的）
     #[serde(default)]
     pub clients: usize,
+    /// 常驻进程在哪个登录会话里（只有 Windows 上报）：0 是没有桌面的那个，经 ssh 拉起的在这里
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<u32>,
 }
 
 /// `term_open` 的参数。
@@ -167,6 +172,11 @@ pub struct TermOpen {
     pub cwd: String,
     pub cols: u16,
     pub rows: u16,
+    /// 开哪个 shell：程序和参数（协议 7 起）。空着由 kuaid 定：Linux 上是登录 shell，
+    /// Windows 上是 sshd 配的默认 shell。只在新开会话时用，接上已有的会话时不管。
+    /// 现在只有 Windows 上的 kuaid 认：本机的 Kuai 经它开终端时带上设置里选的 shell
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shell: Vec<String>,
 }
 
 /// 终端流的第一条消息。

@@ -198,7 +198,12 @@ fn main() -> Result<()> {
         }
         if term_close {
             let terms = block_on(conn.term_list())?;
-            match terms.iter().find(|term| term.key == repo) {
+            // Windows 上的 kuaid 把名字统一成正斜杠、小写
+            let key = match conn.hello.os == "windows" {
+                true => fr_core::dir::windows_key(&repo),
+                false => repo.clone(),
+            };
+            match terms.iter().find(|term| term.key == key) {
                 Some(term) => {
                     block_on(conn.term_close(&term.term))?;
                     println!("结束了终端 {}", term.term);
@@ -236,7 +241,7 @@ fn main() -> Result<()> {
 /// 开（或者接上）这个仓库的终端，敲一条命令，把 `duration` 这么久里收到的输出原样打出来，然后断开。
 fn terminal(conn: &Connection, repo: &str, command: &str, duration: Duration) -> Result<()> {
     use std::io::Write as _;
-    let mut stream = conn.term_open(repo, repo, 100, 30);
+    let mut stream = conn.term_open(repo, repo, &[], 100, 30);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         block_on(async {

@@ -29,7 +29,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::future::{self, BoxFuture};
 use serde_json::{Value, json};
 
-use crate::binaries::Binaries;
+use crate::binaries::{Binaries, Os};
 use crate::{
     ChangeStream, GitOutput, GitStream, StreamItem, TermItem, TermStream, UploadItem,
     UploadSource, UploadStream,
@@ -37,7 +37,7 @@ use crate::{
 
 /// 启动脚本找到 kuaid 时先打这一行；前面的输出（比如 `.bashrc` 打印的东西）都跳过
 const START_MARKER: &str = "KUAID-START";
-/// 没装 kuaid 时打这一行，后面跟 `uname -s` 和 `uname -m`
+/// 没装 kuaid 时打这一行，后面跟系统和 CPU 架构（Linux 上是 `uname -s` 和 `uname -m`）
 const MISSING_MARKER: &str = "KUAID-MISSING";
 /// ssh 的标准错误留最后这么多，连接失败时拿来提示
 const STDERR_TAIL: usize = 4096;
@@ -53,6 +53,8 @@ pub struct Connection {
     pub connect_time: Duration,
     /// 这次连接时上传了 kuaid
     pub installed: bool,
+    /// 连的是这台电脑上的 kuaid（[`Connection::connect_local`]），不经 ssh
+    pub local: bool,
     inner: Arc<Inner>,
 }
 
@@ -79,6 +81,28 @@ enum Pending {
 enum Started {
     Ready(Arc<Inner>, Hello),
     Missing { os: String, arch: String },
+    /// 登录上了，但服务器跑不了启动脚本（比如拿 Linux 的写法去问 Windows）。里面是报错
+    Refused(String),
+}
+
+/// 已经知道是 Windows 的服务器（按 ssh 目标记，只在这次运行期间）：再连时直接用 Windows 的写法，
+/// 不先按 Linux 试一次。
+static WINDOWS_SERVERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn known_windows(destination: &str) -> bool {
+    WINDOWS_SERVERS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|known| known == destination)
+}
+
+fn remember_windows(destination: &str, windows: bool) {
+    let mut known = WINDOWS_SERVERS.lock().unwrap();
+    known.retain(|item| item != destination);
+    if windows {
+        known.push(destination.to_string());
+    }
 }
 
 /// 连接选项。
@@ -144,32 +168,65 @@ impl Connection {
         let binaries = Binaries::find()?;
         let dir = binaries.dir_name();
         let mut installed = false;
+        // 服务器是 Linux 还是 Windows 事先不知道：先按 Linux 的写法问（上次是 Windows 的先按
+        // Windows），服务器跑不了这种写法再换另一种。两种都不行，报头一次的错
+        let mut windows = known_windows(destination);
+        let (mut tried_sh, mut tried_cmd) = (false, false);
+        let mut refused: Option<String> = None;
         loop {
+            let script = match windows {
+                true => windows_bootstrap_script(&dir),
+                false => bootstrap_script(&dir),
+            };
             // _saved 留到握手完：登录阶段 ssh 要密码时用得上
-            let (cmd, _saved) = ssh(
-                destination,
-                &bootstrap_script(&dir),
-                options,
-                options.forward_agent,
-            );
+            let (cmd, _saved) = ssh(destination, &script, options, options.forward_agent);
             match start(cmd, true, destination, Some(options))? {
                 Started::Ready(inner, hello) => {
+                    remember_windows(destination, windows);
                     return Ok(Connection {
                         destination: destination.to_string(),
                         hello,
                         connect_time: started.elapsed(),
                         installed,
+                        local: false,
                         inner,
                     });
+                }
+                Started::Refused(message) => {
+                    match windows {
+                        true => tried_cmd = true,
+                        false => tried_sh = true,
+                    }
+                    let first = refused.get_or_insert(message).clone();
+                    if tried_sh && tried_cmd {
+                        bail!("{first}");
+                    }
+                    windows = !windows;
                 }
                 Started::Missing { os, arch } => {
                     if installed {
                         bail!(tr("上传 kuaid 后仍无法启动"));
                     }
-                    if os != "Linux" {
-                        bail!("{}", tf!("目前仅支持 Linux 服务器，该服务器为 {os}", os));
+                    match server_os(&os) {
+                        Some(Os::Linux) => {
+                            let binary = binaries.binary_for(Os::Linux, &arch)?;
+                            install(destination, options, &install_script(&dir), binary)?;
+                        }
+                        Some(Os::Windows) if windows => {
+                            let binary = binaries.binary_for(Os::Windows, &arch)?;
+                            let archive = tar_single("kuaid.exe", &binary);
+                            install(destination, options, &windows_install_script(&dir), archive)?;
+                        }
+                        // Windows 上 PATH 里有 Git 带的 sh，头一种写法跑得了：按 Windows 的写法再问一次
+                        Some(Os::Windows) => {
+                            windows = true;
+                            continue;
+                        }
+                        None => bail!(
+                            "{}",
+                            tf!("目前仅支持 Linux 和 Windows 服务器，该服务器为 {os}", os)
+                        ),
                     }
-                    install(destination, options, &dir, &binaries.binary_for(&arch)?)?;
                     installed = true;
                 }
             }
@@ -185,10 +242,50 @@ impl Connection {
                 hello,
                 connect_time: started.elapsed(),
                 installed: false,
+                local: true,
                 inner,
             }),
-            Started::Missing { .. } => bail!(tr("kuaid 未启动")),
+            Started::Missing { .. } | Started::Refused(_) => bail!(tr("kuaid 未启动")),
         }
+    }
+
+    /// 连这台电脑上的 kuaid：本机仓库的终端开在它里面，Kuai 退出、更新以后终端还在，从别的电脑经
+    /// ssh 连上来看到的也是同一批终端。没装（或者不是这一版）就先从 Kuai 带的那份装到 `~/.kuai`
+    /// 下；常驻进程没在跑由转接程序拉起。会阻塞，放在后台线程里调用。
+    pub fn connect_local() -> Result<Connection> {
+        let started = Instant::now();
+        let binaries = Binaries::find()?;
+        let (exe, installed) = binaries.install_local(&local_home())?;
+        if installed {
+            // 清掉没人用的旧版本
+            let mut clean = Command::new(&exe);
+            clean
+                .arg("--installed")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            no_window(&mut clean);
+            let _ = clean.status();
+        }
+        let mut cmd = Command::new(&exe);
+        cmd.arg("--connect");
+        match start(cmd, false, tr("本机 kuaid"), None)? {
+            Started::Ready(inner, hello) => Ok(Connection {
+                destination: tr("本机 kuaid").into(),
+                hello,
+                connect_time: started.elapsed(),
+                installed,
+                local: true,
+                inner,
+            }),
+            Started::Missing { .. } | Started::Refused(_) => bail!(tr("kuaid 未启动")),
+        }
+    }
+
+    /// 这台电脑上的 kuaid 常驻进程多半在跑（它在跑的时候留着这个文件）：里面可能有留着的终端。
+    /// 只是看一眼，不拉起它。
+    pub fn local_daemon_running() -> bool {
+        local_kuai_root().join("run").join("kuaid.port").is_file()
     }
 
     /// 连接还在不在。断开后所有调用都会失败，要重新连接。
@@ -292,12 +389,21 @@ impl Connection {
     /// 开（或者接上）一个终端：kuaid 里有名字是 `key` 的终端会话就接上它，没有就在 `cwd` 里开一个
     /// 登录 shell。返回的流先给会话的编号，再是程序的输出（接上已有会话时，开头是还原屏幕的那一段），
     /// 程序结束时给退出码。丢弃这个流只是断开，里面的程序接着跑；要结束它用 [`Self::term_close`]。
-    pub fn term_open(&self, key: &str, cwd: &str, cols: u16, rows: u16) -> TermStream {
+    /// `shell`：新开时用哪个 shell（程序和参数），空着由 kuaid 定。
+    pub fn term_open(
+        &self,
+        key: &str,
+        cwd: &str,
+        shell: &[String],
+        cols: u16,
+        rows: u16,
+    ) -> TermStream {
         let params = TermOpen {
             key: key.to_string(),
             cwd: cwd.to_string(),
             cols,
             rows,
+            shell: shell.to_vec(),
         };
         self.term_stream("term_open", json!(params))
     }
@@ -594,10 +700,27 @@ impl Drop for Connection {
         // 关掉标准输入，kuaid 读到结尾就退出；再杀掉 ssh，免得服务器那边卡住时它不退
         self.inner.outgoing.lock().unwrap().take();
         if let Ok(mut child) = self.inner.child.lock() {
-            kill_tree(&mut child);
+            match self.local {
+                // 本机的转接程序下面挂着它拉起的常驻进程和终端：只结束它自己
+                true => drop(child.kill()),
+                false => kill_tree(&mut child),
+            }
             let _ = child.wait();
         }
     }
+}
+
+/// 本机的 kuaid 把 `.kuai` 放在谁的主目录下：和 kuaid 自己认的一样（`FR_KUAID_HOME` 测试时用）。
+fn local_home() -> PathBuf {
+    match std::env::var_os("FR_KUAID_HOME").filter(|dir| !dir.is_empty()) {
+        Some(dir) if cfg!(windows) => PathBuf::from(dir),
+        _ => PathBuf::from(fr_core::dir::home()),
+    }
+}
+
+/// 这台电脑上的 kuaid 的目录（`~/.kuai`）：各个版本的程序在它下面，`run` 里是常驻进程用的文件。
+pub fn local_kuai_root() -> PathBuf {
+    local_home().join(".kuai")
 }
 
 /// 结束 ssh 和它启动的进程。经跳板机连接时，ssh 下面还挂着转接用的那几层（见 `hop`）：正常情况下
@@ -852,7 +975,20 @@ fn start(
         loop {
             let mut line = String::new();
             if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                bail!("{}", give_up(&noise));
+                let code = child
+                    .lock()
+                    .unwrap()
+                    .wait()
+                    .ok()
+                    .and_then(|status| status.code());
+                let timed_out = watchdog.as_ref().is_some_and(Watchdog::timed_out);
+                let message = give_up(&noise);
+                // ssh 自己出的错（连不上、登录不了）退出码是 255；别的退出码是服务器上那条命令的：
+                // 登录上了，只是这种写法它跑不了
+                if code.is_some_and(|code| code != 255) && !timed_out {
+                    return Ok(Started::Refused(message));
+                }
+                bail!("{message}");
             }
             let line = line.trim_end();
             if line == START_MARKER {
@@ -1341,6 +1477,71 @@ fn bootstrap_script(dir: &str) -> String {
     )
 }
 
+/// 服务器报的系统名是哪种系统。Windows 上经 Git 带的 sh 问到的是 `MINGW64_NT-10.0-…` 这类。
+fn server_os(name: &str) -> Option<Os> {
+    let upper = name.to_uppercase();
+    if upper == "LINUX" {
+        Some(Os::Linux)
+    } else if upper == "WINDOWS"
+        || ["MINGW", "MSYS", "CYGWIN"]
+            .iter()
+            .any(|p| upper.starts_with(p))
+    {
+        Some(Os::Windows)
+    } else {
+        None
+    }
+}
+
+/// Windows 服务器上的启动脚本，做的事和 [`bootstrap_script`] 一样。
+///
+/// 包一层 `cmd /c`：sshd 的默认 shell 是命令提示符、Windows PowerShell 还是 PowerShell 7，这一行
+/// 都能原样交给 cmd（里面没有 `$`、反引号和双引号），而且经 cmd 启动的程序直接拿到 ssh 的标准输入
+/// 输出，字节原样过。先进到版本目录再按名字启动：主目录带空格时路径不用加引号。
+/// `if` 外面那层括号不能省：`if 条件 (…) & 后面的` 在条件不成立时连「后面的」也不执行。
+fn windows_bootstrap_script(dir: &str) -> String {
+    format!(
+        r#"cmd /c "2>nul cd /d %USERPROFILE%\.kuai\{dir} || (echo {MISSING_MARKER} Windows %PROCESSOR_ARCHITECTURE%& exit /b 0) & (if not exist kuaid.exe (echo {MISSING_MARKER} Windows %PROCESSOR_ARCHITECTURE%& exit /b 0)) & echo {START_MARKER}& kuaid.exe --connect""#
+    )
+}
+
+/// Windows 服务器上的安装脚本：标准输入进来的是一个 tar 包，里面只有 `kuaid.exe`，用系统自带的
+/// `tar.exe` 解开（Windows 10 1803 起就有；PowerShell 从标准输入收二进制会卡住，不用它）。
+/// 先解到临时目录再改名，免得留下半个文件。清掉旧版本的事交给刚装好的 kuaid 自己做
+/// （`kuaid --installed`）：正在用的那一版、还有程序占着的目录它会留着。
+fn windows_install_script(dir: &str) -> String {
+    format!(
+        r#"cmd /c "cd /d %USERPROFILE% && (if not exist .kuai mkdir .kuai) && cd .kuai && (if exist {dir}.tmp rmdir /s /q {dir}.tmp) && mkdir {dir}.tmp && tar -xf - -C {dir}.tmp && (if exist {dir} rmdir /s /q {dir}) && ren {dir}.tmp {dir} && {dir}\kuaid.exe --installed""#
+    )
+}
+
+/// 只有一个文件的 tar 包（ustar 格式）。
+fn tar_single(name: &str, data: &[u8]) -> Vec<u8> {
+    let mut header = [0u8; 512];
+    header[..name.len()].copy_from_slice(name.as_bytes());
+    let mut field =
+        |at: usize, text: &str| header[at..at + text.len()].copy_from_slice(text.as_bytes());
+    field(100, "0000755\0");
+    field(108, "0000000\0");
+    field(116, "0000000\0");
+    field(124, &format!("{:011o}\0", data.len()));
+    field(136, "00000000000\0");
+    // 校验和算的时候这一格当成 8 个空格
+    field(148, "        ");
+    // 普通文件
+    field(156, "0");
+    field(257, "ustar\0");
+    field(263, "00");
+    let sum: u32 = header.iter().map(|b| u32::from(*b)).sum();
+    header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    let mut archive = Vec::with_capacity(512 + data.len() + 2048);
+    archive.extend_from_slice(&header);
+    archive.extend_from_slice(data);
+    // 内容补齐到 512 的整数倍，最后是两块全零
+    archive.resize(archive.len().div_ceil(512) * 512 + 1024, 0);
+    archive
+}
+
 /// 远程执行的安装脚本，kuaid 程序从标准输入进来。
 fn install_script(dir: &str) -> String {
     format!(
@@ -1352,16 +1553,15 @@ fn install_script(dir: &str) -> String {
 /// 然后删掉 `~/.kuai/` 下其他版本的目录（名字以数字开头的），只留刚装的这一版和常驻进程正在用的
 /// 那一版（它记在 `run/current` 里：下次连接时才换成新的，换之前它的程序不能没）；
 /// 还有 1.2.2 以前产品叫 fork-remote 时装在 `~/.fork-remote` 的旧程序。
-fn install(destination: &str, options: &ConnectOptions, dir: &str, binary: &[u8]) -> Result<()> {
-    let script = install_script(dir);
-    let (mut cmd, _saved) = ssh(destination, &script, options, false);
+/// `script` 是服务器上执行的安装脚本，`data` 是喂给它标准输入的内容。
+fn install(destination: &str, options: &ConnectOptions, script: &str, data: Vec<u8>) -> Result<()> {
+    let (mut cmd, _saved) = ssh(destination, script, options, false);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     no_window(&mut cmd);
     let mut child = cmd.spawn().context(tr("无法启动 ssh"))?;
     let mut stdin = child.stdin.take().context(tr("无法获取 ssh 的标准输入"))?;
-    let data = binary.to_vec();
     let writer = std::thread::spawn(move || stdin.write_all(&data));
     let out = child.wait_with_output().context(tr("上传 kuaid 失败"))?;
     let written = writer.join();
@@ -1443,6 +1643,67 @@ mod tests {
         for script in [&boot, &install] {
             assert_eq!(script.matches('\'').count(), 2, "{script}");
         }
+    }
+
+    #[test]
+    fn windows_的脚本交给_cmd_里面没有会被_powershell_改掉的字符() {
+        let boot = windows_bootstrap_script("1.11.0-abc");
+        assert!(boot.contains(r"%USERPROFILE%\.kuai\1.11.0-abc"), "{boot}");
+        assert!(
+            boot.ends_with(r#"echo KUAID-START& kuaid.exe --connect""#),
+            "{boot}"
+        );
+        let install = windows_install_script("1.11.0-abc");
+        assert!(install.contains("tar -xf - -C 1.11.0-abc.tmp"), "{install}");
+        assert!(
+            install.ends_with(r#"1.11.0-abc\kuaid.exe --installed""#),
+            "{install}"
+        );
+        for script in [&boot, &install] {
+            // 整个脚本包在一对双引号里，PowerShell 原样交给 cmd
+            assert!(script.starts_with("cmd /c \""));
+            assert_eq!(script.matches('"').count(), 2, "{script}");
+            assert!(!script.contains(['$', '`', '\'']), "{script}");
+        }
+    }
+
+    #[test]
+    fn 认得出服务器是哪种系统() {
+        assert_eq!(server_os("Linux"), Some(Os::Linux));
+        assert_eq!(server_os("Windows"), Some(Os::Windows));
+        assert_eq!(server_os("MINGW64_NT-10.0-26300"), Some(Os::Windows));
+        assert_eq!(server_os("Darwin"), None);
+    }
+
+    #[test]
+    fn tar_包系统的_tar_解得开() {
+        let data: Vec<u8> = (0..70_001u32).map(|i| (i % 251) as u8).collect();
+        let archive = tar_single("kuaid.exe", &data);
+        assert_eq!(archive.len() % 512, 0);
+        assert_eq!(&archive[..9], b"kuaid.exe");
+        assert_eq!(&archive[124..136], b"00000210561\0");
+        assert_eq!(&archive[512..512 + data.len()], &data[..]);
+        // 校验和对得上：按 tar 的算法重算一遍
+        let mut header = archive[..512].to_vec();
+        let stored = std::str::from_utf8(&header[148..154]).unwrap().to_string();
+        header[148..156].copy_from_slice(b"        ");
+        let sum: u32 = header.iter().map(|b| u32::from(*b)).sum();
+        assert_eq!(stored, format!("{sum:06o}"));
+        // 有 tar 的话真的解一遍（Windows 10 1803 起自带）
+        let dir = std::env::temp_dir().join(format!("fr-tar-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spawned = Command::new("tar")
+            .args(["-xf", "-", "-C"])
+            .arg(&dir)
+            .stdin(Stdio::piped())
+            .spawn();
+        if let Ok(mut child) = spawned {
+            child.stdin.take().unwrap().write_all(&archive).unwrap();
+            assert!(child.wait().unwrap().success());
+            assert_eq!(std::fs::read(dir.join("kuaid.exe")).unwrap(), data);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -18,6 +18,9 @@ use crate::settings::{
 /// 正在进行或已经结束的连接；多处等同一个连接时共用。
 type Connecting = Shared<Task<Result<Arc<Connection>, SharedString>>>;
 
+/// 这台电脑上的 kuaid 的连接在 `conns` 里用的名字（服务器的 id 不会是空的）。
+const LOCAL: &str = "";
+
 /// 一台服务器的连接状态。
 pub enum ConnStatus {
     Idle,
@@ -72,6 +75,41 @@ impl AppState {
             Some(Some(Ok(_))) => ConnStatus::Failed(tr("连接已断开").into()),
             Some(Some(Err(err))) => ConnStatus::Failed(err.clone()),
         }
+    }
+
+    /// 连这台电脑上的 kuaid（本机仓库的终端开在它里面）；已经连上或正在连就沿用。
+    pub fn connect_local(&mut self, cx: &mut Context<Self>) -> Connecting {
+        if let Some(existing) = self.conns.get(LOCAL) {
+            match existing.peek() {
+                None => return existing.clone(),
+                Some(Ok(conn)) if conn.is_alive() => return existing.clone(),
+                _ => {}
+            }
+        }
+        let connecting = cx
+            .background_executor()
+            .spawn(async move {
+                Connection::connect_local()
+                    .map(Arc::new)
+                    .map_err(|err| SharedString::from(format!("{err:#}")))
+            })
+            .shared();
+        self.conns.insert(LOCAL.to_string(), connecting.clone());
+        let done = connecting.clone();
+        cx.background_executor()
+            .spawn(async move {
+                match done.await {
+                    Ok(conn) => log::info!(
+                        "连接本机的 kuaid：{} ms，{}{}",
+                        conn.connect_time.as_millis(),
+                        conn.hello.version,
+                        if conn.installed { "，已安装" } else { "" },
+                    ),
+                    Err(err) => log::warn!("连接本机的 kuaid 失败：{err}"),
+                }
+            })
+            .detach();
+        connecting
     }
 
     /// 连接服务器；已经连上或正在连就沿用。返回等连接结果的 future。

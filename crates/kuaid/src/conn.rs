@@ -80,7 +80,6 @@ impl Shared {
     }
 
     /// 没有客户端连着、也没有终端会话，已经这样多久了。还有的话是 0。
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn idle_for(&self) -> Duration {
         let mut last_busy = self.last_busy.lock().unwrap();
         if self.clients() > 0 || self.terms.count() > 0 {
@@ -91,7 +90,6 @@ impl Shared {
     }
 
     /// 杀掉所有客户端正在跑的 git（升级换程序前）。
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn kill_git(&self) {
         for conn in self.conns.lock().unwrap().values() {
             conn.kill_git();
@@ -106,6 +104,10 @@ impl Shared {
             pid: std::process::id(),
             terms: self.terms.count(),
             clients: self.clients(),
+            #[cfg(windows)]
+            session: Some(crate::win::session_id()),
+            #[cfg(not(windows))]
+            session: None,
         }
     }
 
@@ -273,8 +275,12 @@ fn handle(
         "git" => start_git(conn, request, payload),
         "cancel" => {
             if let Some(target) = param("id").and_then(Value::as_u64) {
-                if let Some(killer) = conn.running.lock().unwrap().get(&target) {
-                    killer.kill();
+                if let Some(killer) = conn.running.lock().unwrap().get(&target).cloned() {
+                    // Windows 上杀进程树要启动 taskkill，近一秒：不能卡住读下一个请求
+                    match cfg!(windows) {
+                        true => drop(std::thread::spawn(move || killer.kill())),
+                        false => killer.kill(),
+                    }
                 }
                 watchers.remove(&target);
                 shared.terms.detach(conn.id, Some(target));
@@ -348,7 +354,10 @@ fn handle(
             let reply = serde_json::from_value::<FilePut>(request.params)
                 .context("file_put 参数无效")
                 .and_then(|params| conn.uploads.lock().unwrap().put(params, &payload))
-                .and_then(|reply| Ok(serde_json::to_value(reply)?));
+                .and_then(|mut reply| {
+                    reply.path = reply.path.map(|path| crate::dirs::shown(&path));
+                    Ok(serde_json::to_value(reply)?)
+                });
             conn.reply(id, reply);
         }
         method if method.starts_with("fs_") => {
@@ -372,6 +381,15 @@ fn handle(
             let failed = match &shared.control {
                 Some(control) => control.upgrade(shared, exe),
                 None => anyhow::anyhow!("非常驻进程，无法升级"),
+            };
+            conn.reply(id, Err(failed));
+        }
+        // 用自己这一版重新起一遍（Windows 上从会话 0 搬到桌面上用）。办成了不回答，连接直接断
+        "move" => {
+            let failed = match (&shared.control, std::env::current_exe()) {
+                (Some(control), Ok(exe)) => control.upgrade(shared, &exe.to_string_lossy()),
+                (Some(_), Err(err)) => anyhow::anyhow!("无法确定 kuaid 的安装位置：{err}"),
+                (None, _) => anyhow::anyhow!("非常驻进程"),
             };
             conn.reply(id, Err(failed));
         }
@@ -399,12 +417,12 @@ fn simple(shared: &Shared, request: &Request) -> Result<Value> {
             os: std::env::consts::OS.into(),
             arch: std::env::consts::ARCH.into(),
             git: git_version().into(),
-            home: fr_core::dir::home(),
+            home: crate::dirs::home(),
             build: shared.build.clone(),
             daemon: shared.control.is_some(),
         })?),
         "info" => Ok(serde_json::to_value(shared.info())?),
-        "list_dir" => Ok(serde_json::to_value(fr_core::dir::list_dir(
+        "list_dir" => Ok(serde_json::to_value(crate::dirs::list_dir(
             param("path").unwrap_or(""),
         )?)?),
         "term_list" => Ok(json!({ "terms": shared.terms.list() })),

@@ -1,12 +1,13 @@
 //! 内置终端：仓库页底下的一块，在仓库目录里开一个 shell。
 //!
-//! 终端仿真交给 `alacritty_terminal`：解析转义序列、维护字符格子。程序在哪跑有两种：
+//! 终端仿真交给 `alacritty_terminal`：解析转义序列、维护字符格子。程序在哪跑：
 //!
-//! - 本机仓库：这个库在 Windows 上用 ConPTY 开伪终端，它的后台线程读程序的输出。程序活在
-//!   Kuai 进程里：关掉标签页时视图交给仓库页留着（见 `repo/terminals.rs`），退出 Kuai 才结束。
-//! - 服务器上的仓库：终端开在服务器上常驻的 kuaid 里，输出经仓库通道那条 ssh 连接送过来
-//!   （[`Session::attach`]），我们只管喂给仿真器。关掉标签页、退出、断线都只是断开，里面的程序
-//!   接着跑；再打开时接上原来的，kuaid 把屏幕还原出来。
+//! - 开在常驻的 kuaid 里（[`Session::attach`]）：服务器上的仓库是服务器的 kuaid，输出经仓库通道
+//!   那条 ssh 连接送过来；本机仓库是这台电脑自己的 kuaid（1.11 起）。我们只管把输出喂给仿真器。
+//!   关掉标签页、退出、断线都只是断开，里面的程序接着跑；再打开时接上原来的，kuaid 把屏幕还原出来。
+//! - 本机的 kuaid 用不了时的退路（[`Session::spawn`]）：这个库在 Windows 上用 ConPTY 开伪终端，
+//!   它的后台线程读程序的输出。程序活在 Kuai 进程里：关掉标签页时视图交给仓库页留着
+//!   （见 `repo/terminals.rs`），退出 Kuai 才结束。
 //!
 //! 这里做三件事：
 //!
@@ -15,9 +16,9 @@
 //! - 输入：功能键和 Ctrl、Alt 组合在 `keys` 里编码；普通的字和输入法上屏的字由系统经
 //!   [`EntityInputHandler`] 送进来。
 //! - 生命周期：面板第一次画出来、知道能放几行几列时才启动进程；进程结束后画面留着，
-//!   按回车重新启动；这个视图丢弃时，本机的进程跟着结束，服务器上的只是断开。
+//!   按回车重新启动；这个视图丢弃时，开在 Kuai 进程里的跟着结束，开在 kuaid 里的只是断开。
 //!
-//! 一个仓库可以开几个终端（仓库页的面板上一个标签一个），各是各的视图。服务器上的每个终端
+//! 一个仓库可以开几个终端（仓库页的面板上一个标签一个），各是各的视图。每个终端
 //! 在 kuaid 里有自己的会话，名字见 [`session_key`]。
 //!
 //! 往终端里发图片、文件（粘贴、拖进来、点按钮选）见 [`attach`]：发过去的是文件的路径。
@@ -87,8 +88,16 @@ pub fn session_key(repo: &str, number: u32) -> String {
 }
 
 /// 反过来：这个会话是不是这个仓库的终端，是第几个。
+///
+/// Windows 上的 kuaid 把名字统一成正斜杠、小写（同一个目录有几种写法，见
+/// [`fr_core::dir::windows_key`]），所以带盘符的路径按那种写法比。
 pub fn session_number(repo: &str, key: &str) -> Option<u32> {
-    let rest = key.strip_prefix(repo)?;
+    let windows = repo.as_bytes().get(1) == Some(&b':');
+    let normalized = windows.then(|| fr_core::dir::windows_key(repo));
+    let rest = normalized
+        .as_deref()
+        .and_then(|repo| key.strip_prefix(repo))
+        .or_else(|| key.strip_prefix(repo))?;
     if rest.is_empty() {
         return Some(1);
     }
@@ -96,14 +105,7 @@ pub fn session_number(repo: &str, key: &str) -> Option<u32> {
     (number >= 2).then_some(number)
 }
 
-/// 终端里要跑什么。
-pub enum Launch {
-    /// 本机的程序
-    Local(LocalLaunch),
-    /// 服务器上的终端，开在 kuaid 里
-    Remote(RemoteLaunch),
-}
-
+/// 开在 Kuai 进程里的本机程序：这台电脑上的 kuaid 用不了时才用。
 pub struct LocalLaunch {
     pub program: String,
     pub args: Vec<String>,
@@ -115,13 +117,18 @@ pub struct LocalLaunch {
     pub keep: Option<Box<dyn Any>>,
 }
 
-pub struct RemoteLaunch {
-    /// 等这台服务器的连接
+/// 终端里要跑什么：开在 kuaid 里的终端，服务器上的或者这台电脑上的。
+pub struct Launch {
+    /// 等这台服务器（或者这台电脑上的 kuaid）的连接
     pub connect: LocalBoxFuture<'static, Result<Arc<Connection>, SharedString>>,
     /// 终端会话的名字：kuaid 里有同名的就接上，不另开。见 [`session_key`]
     pub key: String,
     /// 在哪个目录里开 shell
     pub cwd: String,
+    /// 开哪个 shell（程序和参数）；空着由 kuaid 定。只有 Windows 上的 kuaid 认
+    pub shell: Vec<String>,
+    /// 这是这台电脑上的终端：kuaid 用不了（找不到、被安全软件拦下）时改为开在 Kuai 进程里
+    pub fallback: Option<LocalLaunch>,
 }
 
 /// 送回界面线程的事。
@@ -203,6 +210,8 @@ enum Link {
     },
     Remote {
         conn: Arc<Connection>,
+        /// 连的是这台电脑上的 kuaid：文件不用传，路径就是本机的
+        local: bool,
         /// kuaid 给这个会话的编号；刚发出请求、还没回来时是空的
         term: RefCell<Option<String>>,
         /// 收输出、喂给仿真器的任务；丢弃就从会话上断开
@@ -251,11 +260,13 @@ impl Session {
         })
     }
 
-    /// 接上服务器上的终端：请 kuaid 接上（或者新开）名字是 `key` 的会话，它的输出喂给这里的仿真器。
+    /// 接上开在 kuaid 里的终端：请 kuaid 接上（或者新开）名字是 `key` 的会话，它的输出喂给这里的
+    /// 仿真器。
     fn attach(
         conn: Arc<Connection>,
         key: &str,
         cwd: &str,
+        shell: &[String],
         grid: Grid,
         cell: Size<Pixels>,
         cx: &mut Context<TerminalView>,
@@ -263,7 +274,7 @@ impl Session {
         let (tx, rx) = mpsc::unbounded();
         let term = Term::new(prefs::config(&prefs::get(cx)), &grid, Proxy(tx.clone()));
         let term = Arc::new(FairMutex::new(term));
-        let stream = conn.term_open(key, cwd, grid.cols as u16, grid.rows as u16);
+        let stream = conn.term_open(key, cwd, shell, grid.cols as u16, grid.rows as u16);
         let executor = cx.background_executor().clone();
         // 解析输出放在后台：大段输出不卡界面
         let pump = cx
@@ -274,6 +285,7 @@ impl Session {
             grid,
             cell,
             link: Link::Remote {
+                local: conn.local,
                 conn,
                 term: RefCell::new(None),
                 _pump: pump,
@@ -324,8 +336,22 @@ impl Session {
         }
     }
 
+    /// 开在别的电脑（服务器）上。
     fn is_remote(&self) -> bool {
-        matches!(self.link, Link::Remote { .. })
+        matches!(self.link, Link::Remote { local: false, .. })
+    }
+
+    /// 开在 Kuai 进程里：Kuai 退出它就结束。
+    fn in_process(&self) -> bool {
+        matches!(self.link, Link::Local { .. })
+    }
+
+    /// 里面的 shell 是 Windows 上的（路径加引号的规则不一样）。
+    fn on_windows(&self) -> bool {
+        match &self.link {
+            Link::Local { .. } => true,
+            Link::Remote { conn, local, .. } => *local || conn.hello.os == "windows",
+        }
     }
 }
 
@@ -429,8 +455,13 @@ pub struct TerminalView {
     exited: Option<Option<i32>>,
     /// 和服务器的连接断了，画面留着；终端里的程序还在服务器上跑
     lost: bool,
-    /// 这是服务器上留着的终端（上次没结束），还没接上：也算有东西在跑
+    /// 这是 kuaid 里留着的终端（上次没结束），还没接上：也算有东西在跑
     restored: bool,
+    /// 这是这台电脑上的终端（开在本机的 kuaid 里，或者退回到 Kuai 进程里）：提示里不说「服务器」
+    local: bool,
+    /// 在本机的 kuaid 里开过（或者本来就是留在那里的）：之后 kuaid 连不上时不能改开在 Kuai 进程里，
+    /// 那是另一个新的 shell，原来的还在 kuaid 里跑着
+    hosted: bool,
     /// 正在往里发文件
     sending: Option<Sending>,
     /// 要提示一下的话（发不了的原因之类）；再敲键盘就消失
@@ -492,6 +523,8 @@ impl TerminalView {
             exited: None,
             lost: false,
             restored: false,
+            local: false,
+            hosted: false,
             sending: None,
             flash: None,
             focus,
@@ -559,9 +592,15 @@ impl TerminalView {
         }
     }
 
-    /// 这是服务器上留着的终端，里面的程序还在跑：没接上之前 [`Self::is_running`] 也为真。
+    /// 这是 kuaid 里留着的终端，里面的程序还在跑：没接上之前 [`Self::is_running`] 也为真。
     pub fn mark_restored(&mut self) {
         self.restored = true;
+        self.hosted = true;
+    }
+
+    /// 里面的程序开在 Kuai 进程里：关掉标签页要另外保管，退出 Kuai 它就结束。
+    pub fn in_process(&self) -> bool {
+        self.session.as_ref().is_some_and(Session::in_process)
     }
 
     /// 程序自己设的标题。Windows 上 shell 刚启动时标题是它自己的完整路径，只留程序名
@@ -583,7 +622,7 @@ impl TerminalView {
         self.reopen(cx);
     }
 
-    /// 结束里面的进程。本机的丢掉会话就结束了；服务器上的要告诉 kuaid，不然它接着跑。
+    /// 结束里面的进程。开在 Kuai 进程里的丢掉会话就结束了；开在 kuaid 里的要告诉它，不然接着跑。
     pub fn kill(&mut self, cx: &mut Context<Self>) {
         if let Some(Session {
             link: Link::Remote { conn, term, .. },
@@ -600,10 +639,11 @@ impl TerminalView {
         }
         self.session = None;
         self.restored = false;
+        self.hosted = false;
         self.sending = None;
     }
 
-    /// 丢掉现在的会话，下一帧重新开：本机是新的进程；服务器上有同名的会话就接上它
+    /// 丢掉现在的会话，下一帧重新开：开在 Kuai 进程里的是新的进程；kuaid 里有同名的会话就接上它
     /// （连接断了以后重新接上用的就是这个）。
     fn reopen(&mut self, cx: &mut Context<Self>) {
         self.session = None;
@@ -646,35 +686,48 @@ impl TerminalView {
                 return;
             }
         };
-        match launch {
-            Launch::Local(launch) => match Session::spawn(launch, grid, cell, cx) {
-                Ok(session) => self.session = Some(session),
-                Err(err) => self.error = Some(tf!("终端启动失败：{err}", err).into()),
-            },
-            // 服务器上的：先等连接（多半已经连着，马上就好）
-            Launch::Remote(launch) => {
-                let RemoteLaunch { connect, key, cwd } = launch;
-                self.connecting = Some(cx.spawn(async move |this, cx| {
-                    let connected = connect.await;
-                    this.update(cx, |this, cx| {
-                        this.connecting = None;
-                        // 等的这一会儿面板的大小可能变了，用现在的
-                        let (grid, cell) = this.fitted.unwrap_or((grid, cell));
-                        match connected {
-                            Ok(conn) => {
-                                let session = Session::attach(conn, &key, &cwd, grid, cell, cx);
-                                this.session = Some(session);
-                            }
+        // 先等连接（多半已经连着，马上就好）
+        let Launch {
+            connect,
+            key,
+            cwd,
+            shell,
+            fallback,
+        } = launch;
+        self.local = fallback.is_some();
+        self.connecting = Some(cx.spawn(async move |this, cx| {
+            let connected = connect.await;
+            this.update(cx, |this, cx| {
+                this.connecting = None;
+                // 等的这一会儿面板的大小可能变了，用现在的
+                let (grid, cell) = this.fitted.unwrap_or((grid, cell));
+                match (connected, fallback) {
+                    (Ok(conn), _) => {
+                        this.hosted |= conn.local;
+                        let session = Session::attach(conn, &key, &cwd, &shell, grid, cell, cx);
+                        this.session = Some(session);
+                    }
+                    // 本机的 kuaid 用不了：这个终端还没在它里面开过，就开在 Kuai 进程里
+                    (Err(err), Some(fallback)) if !this.hosted => {
+                        log::warn!("本机的 kuaid 用不了，终端开在 Kuai 进程里：{err}");
+                        match Session::spawn(fallback, grid, cell, cx) {
+                            Ok(session) => this.session = Some(session),
                             Err(err) => {
-                                this.error = Some(tf!("无法连接服务器：{err}", err).into());
+                                this.error = Some(tf!("终端启动失败：{err}", err).into());
                             }
                         }
-                        cx.notify();
-                    })
-                    .ok();
-                }));
-            }
-        }
+                    }
+                    (Err(err), Some(_)) => {
+                        this.error = Some(tf!("无法连接 kuaid：{err}", err).into());
+                    }
+                    (Err(err), None) => {
+                        this.error = Some(tf!("无法连接服务器：{err}", err).into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn on_feed(&mut self, feed: Feed, cx: &mut Context<Self>) {
@@ -695,7 +748,7 @@ impl TerminalView {
             Feed::Exited(code) => self.exited = Some(code),
             Feed::Lost(reason) => {
                 if !reason.is_empty() {
-                    log::warn!("终端和服务器断开了：{reason}");
+                    log::warn!("终端和 kuaid 断开了：{reason}");
                 }
                 self.lost = true;
             }
@@ -878,21 +931,23 @@ impl TerminalView {
         };
         let (name, count) = (SharedString::from(items[0].name()), items.len());
         let task = match &session.link {
-            Link::Local { .. } => cx.spawn(async move |this, cx| {
-                // 存图片要写文件，放到后台
-                let prepared = cx
-                    .background_spawn(async move { attach::local_paths(items) })
-                    .await;
-                this.update(cx, |this, cx| {
-                    this.sending = None;
-                    match prepared {
-                        Ok(paths) => this.paste_paths(&paths, cx),
-                        Err(err) => this.flash = Some(err.into()),
-                    }
-                    cx.notify();
+            Link::Local { .. } | Link::Remote { local: true, .. } => {
+                cx.spawn(async move |this, cx| {
+                    // 存图片要写文件，放到后台
+                    let prepared = cx
+                        .background_spawn(async move { attach::local_paths(items) })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        this.sending = None;
+                        match prepared {
+                            Ok(paths) => this.paste_paths(&paths, cx),
+                            Err(err) => this.flash = Some(err.into()),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
                 })
-                .ok();
-            }),
+            }
             Link::Remote { conn, .. } => {
                 let conn = conn.clone();
                 cx.spawn(async move |this, cx| {
@@ -979,7 +1034,7 @@ impl TerminalView {
             return;
         }
         let bracketed = self.mode().contains(TermMode::BRACKETED_PASTE);
-        let windows = self.session.as_ref().is_some_and(|s| !s.is_remote());
+        let windows = self.session.as_ref().is_some_and(Session::on_windows);
         self.input(attach::paste_paths(paths, bracketed, windows), cx);
     }
 
@@ -1187,10 +1242,20 @@ impl TerminalView {
             return Some(tf!("{error} 按 Enter 重试。", error).into());
         }
         if self.connecting.is_some() {
-            return Some(tr("正在连接服务器…").into());
+            return Some(match self.local {
+                true => tr("正在启动终端…").into(),
+                false => tr("正在连接服务器…").into(),
+            });
         }
         if self.lost && self.exited.is_none() {
-            return Some(tr("与服务器的连接已断开，终端中的程序仍在运行。按 Enter 重新连接。").into());
+            return Some(match self.local {
+                true => {
+                    tr("与 kuaid 的连接已断开，终端中的程序仍在运行。按 Enter 重新连接。").into()
+                }
+                false => {
+                    tr("与服务器的连接已断开，终端中的程序仍在运行。按 Enter 重新连接。").into()
+                }
+            });
         }
         match self.exited {
             Some(Some(0) | None) => return Some(tr("进程已结束。按回车重新启动。").into()),
@@ -1845,5 +1910,16 @@ mod tests {
         assert_eq!(session_number(repo, "/data/workspaces/kuai\u{1f}0"), None);
         // 不是仓库页开的（名字是空的）
         assert_eq!(session_number(repo, ""), None);
+        // Windows 上的仓库：kuaid 记的名字是正斜杠、小写的
+        let repo = r"C:\Users\Feng\Repo";
+        assert_eq!(session_number(repo, "c:/users/feng/repo"), Some(1));
+        assert_eq!(session_number(repo, "c:/users/feng/repo\u{1f}3"), Some(3));
+        assert_eq!(
+            session_number("C:/Users/Feng/Repo", "c:/users/feng/repo"),
+            Some(1)
+        );
+        assert_eq!(session_number(repo, "c:/users/feng/repo2"), None);
+        // Linux 上分大小写
+        assert_eq!(session_number("/Data/Repo", "/data/repo"), None);
     }
 }

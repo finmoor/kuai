@@ -10,7 +10,13 @@
 //!   连接，默认的权限只允许本人和管理员写入。
 //! - 键取设置文件路径的哈希：测试时用 FR_SETTINGS 指向别的文件，和平时用的 Kuai 互不影响。
 //! - 更新时旧的 Kuai 先启动新的再退出，新的带着 `--wait-pid=<旧进程号>`，先等旧的退出（`update.rs`）。
+//!
+//! 这根管道还替这台电脑上的 kuaid 办一件事：把它的常驻进程拉起来（[`start_daemon`]）。从别的电脑
+//! 经 ssh 连上来时，kuaid 的转接程序在会话 0（没有桌面），它自己拉起的常驻进程也在那里，里面的终端
+//! 用的是管理员权限，开不了带窗口的程序；由运行在桌面上的 Kuai 来拉，常驻进程就和本机开的一样。
+//! 管道叫什么写在 `~/.kuai/run/kuai.pipe` 里（kuaid 不知道设置文件在哪，算不出名字）。
 
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
@@ -30,6 +36,12 @@ pub struct Request {
     /// 显示窗口（开机自启带 `--minimized` 时不显示）
     #[serde(default)]
     pub show: bool,
+    /// kuaid 的转接程序发来的：拉起这个 kuaid 程序的常驻进程。带着它的请求不交给界面
+    #[serde(default)]
+    pub daemon: Option<String>,
+    /// 和 `daemon` 一起：常驻进程升级换新时的交接文件
+    #[serde(default)]
+    pub resume: Option<String>,
 }
 
 /// 别的进程交过来的请求。处理完往 `done` 里发一个 `()`，那个进程才退出。
@@ -48,6 +60,91 @@ pub enum Claim {
 /// 占着「只运行一个」的位置；丢掉就让出去。
 pub struct Guard {
     _imp: imp::Guard,
+    /// 写给 kuaid 看的那个文件和里面的内容：退出时还是我们写的那份就删掉
+    announced: Option<(PathBuf, String)>,
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if let Some((file, name)) = &self.announced
+            && std::fs::read_to_string(file).is_ok_and(|text| text.trim() == name)
+        {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+}
+
+/// 把管道的名字写到 `~/.kuai/run/kuai.pipe`，kuaid 的转接程序照着它找过来。写不了就算了：
+/// 转接程序找不到我们就自己拉起常驻进程。
+fn announce(name: String) -> Option<(PathBuf, String)> {
+    let run = fr_channel::local_kuai_root().join("run");
+    std::fs::create_dir_all(&run).ok()?;
+    let file = run.join("kuai.pipe");
+    std::fs::write(&file, &name).ok()?;
+    Some((file, name))
+}
+
+/// 替 kuaid 的转接程序拉起常驻进程，办成了返回 true。只认装在 `~/.kuai/<版本>/` 下的 `kuaid.exe`
+/// 和 `~/.kuai/run/handoff` 这一个交接文件：管道本人和管理员都能写，不能叫我们启动别的程序。
+///
+/// 跑的是 `kuaid.exe --spawn-daemon`：它用「什么句柄都不继承」的办法起常驻进程，自己马上退出。
+/// 直接从这里起的话，我们手里正开着的管道（和 ssh、git 之间的）可能被常驻进程带走，那些连接就断不开了。
+fn start_daemon(exe: &str, resume: Option<&str>) -> bool {
+    let root = fr_channel::local_kuai_root();
+    let exe = Path::new(exe);
+    let version_dir = exe.parent();
+    let ours = exe
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("kuaid.exe"))
+        && version_dir
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(|c: char| c.is_ascii_digit()))
+        && version_dir
+            .and_then(Path::parent)
+            .is_some_and(|dir| same_path(dir, &root))
+        && exe.is_file();
+    let handoff = root.join("run").join("handoff");
+    if !ours || resume.is_some_and(|state| !same_path(Path::new(state), &handoff)) {
+        log::warn!(
+            "没有照办：不是 kuaid 自己的程序或交接文件（{}）",
+            exe.display()
+        );
+        return false;
+    }
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--spawn-daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(state) = resume {
+        cmd.args(["--resume", state]);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // CREATE_NO_WINDOW：不弹出控制台窗口
+        cmd.creation_flags(0x0800_0000);
+    }
+    let started = cmd.status().is_ok_and(|status| status.success());
+    log::info!(
+        "替 kuaid 拉起常驻进程（{}）：{}",
+        exe.display(),
+        if started { "已启动" } else { "失败" }
+    );
+    started
+}
+
+/// 两个路径是不是同一个：Windows 上不分大小写、两种斜杠都行。只比写法，不去解析 `..`
+/// （带 `..` 的一律算不同）。
+fn same_path(a: &Path, b: &Path) -> bool {
+    let plain = |path: &Path| {
+        let text = path.to_string_lossy().replace('/', "\\").to_lowercase();
+        let text = text.strip_prefix(r"\\?\").unwrap_or(&text).to_string();
+        text.trim_end_matches('\\').to_string()
+    };
+    let (a, b) = (plain(a), plain(b));
+    a == b && !a.split('\\').any(|part| part == "..")
 }
 
 /// 启动时调用（在打开任何窗口之前）。
@@ -62,7 +159,11 @@ pub fn claim(request: &Request) -> Claim {
         if let Some(guard) = imp::take(&key) {
             let (tx, rx) = mpsc::unbounded();
             imp::listen(&key, tx);
-            return Claim::First(Guard { _imp: guard }, rx);
+            let guard = Guard {
+                _imp: guard,
+                announced: imp::pipe_name(&key).and_then(announce),
+            };
+            return Claim::First(guard, rx);
         }
         if imp::forward(&key, request) {
             return Claim::Forwarded;
@@ -152,11 +253,16 @@ mod imp {
         text.encode_utf16().chain([0]).collect()
     }
 
-    fn pipe_name(key: &str) -> String {
+    fn name_of(key: &str) -> String {
         let mut session = 0;
         // SAFETY：只写进本地变量；失败时会话号按 0 算，只是名字不同
         unsafe { ProcessIdToSessionId(std::process::id(), &mut session) };
         format!(r"\\.\pipe\Kuai-{session}-{key}")
+    }
+
+    /// 我们守的管道叫什么。
+    pub fn pipe_name(key: &str) -> Option<String> {
+        Some(name_of(key))
     }
 
     pub struct Guard(*mut c_void);
@@ -188,7 +294,7 @@ mod imp {
 
     /// 后台线程守着管道，收到的请求送进 `tx`。一个连接一个线程：哪个连上来不说话也挡不住别的。
     pub fn listen(key: &str, tx: UnboundedSender<Incoming>) {
-        let name = wide(&pipe_name(key));
+        let name = wide(&name_of(key));
         let spawned = std::thread::Builder::new()
             .name("kuai-instance".into())
             .spawn(move || {
@@ -244,6 +350,14 @@ mod imp {
         let Ok(request) = serde_json::from_slice::<Request>(line) else {
             return;
         };
+        // kuaid 的转接程序请我们拉起常驻进程：就在这个线程上办，用不着界面
+        if let Some(exe) = &request.daemon {
+            if super::start_daemon(exe, request.resume.as_deref()) {
+                let _ = file.write_all(b"1");
+                let _ = file.sync_all();
+            }
+            return;
+        }
         let (done, handled) = sync_channel(1);
         if tx.unbounded_send(Incoming { request, done }).is_err() {
             return;
@@ -261,7 +375,7 @@ mod imp {
         let Ok(line) = serde_json::to_string(request) else {
             return false;
         };
-        let Ok(mut pipe) = File::options().read(true).write(true).open(pipe_name(key)) else {
+        let Ok(mut pipe) = File::options().read(true).write(true).open(name_of(key)) else {
             return false;
         };
         // 用户刚启动的这个进程有权把前台交出去：让那边能把窗口放到最前面
@@ -316,6 +430,9 @@ mod imp {
     pub fn take(_: &str) -> Option<Guard> {
         Some(Guard)
     }
+    pub fn pipe_name(_: &str) -> Option<String> {
+        None
+    }
     pub fn listen(_: &str, _: UnboundedSender<Incoming>) {}
     pub fn forward(_: &str, _: &Request) -> bool {
         false
@@ -349,6 +466,7 @@ mod tests {
         let request = Request {
             open: Some(r"C:\work\有空格 的目录".into()),
             show: true,
+            ..Default::default()
         };
         let line = serde_json::to_string(&request).unwrap();
         assert!(!line.contains('\n'));
@@ -358,9 +476,44 @@ mod tests {
         assert_eq!(
             old,
             Request {
-                open: None,
-                show: true
+                show: true,
+                ..Default::default()
             }
         );
+        // kuaid 的转接程序发来的
+        let asked: Request =
+            serde_json::from_str(r#"{"daemon":"C:\\k\\kuaid.exe","resume":null}"#).unwrap();
+        assert_eq!(asked.daemon.as_deref(), Some(r"C:\k\kuaid.exe"));
+        assert_eq!(asked.resume, None);
+    }
+
+    #[test]
+    fn 路径只比写法_大小写和斜杠不算() {
+        use super::same_path;
+        use std::path::Path;
+        let same = |a: &str, b: &str| same_path(Path::new(a), Path::new(b));
+        assert!(same(r"C:\Users\Feng\.kuai", "c:/users/feng/.kuai/"));
+        assert!(same(r"\\?\C:\Users\Feng\.kuai", r"C:\Users\Feng\.kuai"));
+        assert!(!same(r"C:\Users\Feng\.kuai", r"C:\Users\Feng\.kuai2"));
+        // 带 .. 的不认：绕出去再绕回来也不行
+        assert!(!same(r"C:\a\..\a", r"C:\a\..\a"));
+    }
+
+    #[test]
+    fn 只替装在_kuai_目录下的_kuaid_拉起常驻进程() {
+        use super::start_daemon;
+        let root = fr_channel::local_kuai_root();
+        // 别处的程序、别的名字、版本目录之外的都不启动（这些文件本来也不存在）
+        assert!(!start_daemon(r"C:\Windows\System32\cmd.exe", None));
+        let other = root.join("1.0.0-abc").join("other.exe");
+        assert!(!start_daemon(&other.to_string_lossy(), None));
+        let outside = root.join("run").join("kuaid.exe");
+        assert!(!start_daemon(&outside.to_string_lossy(), None));
+        let escaped = root
+            .join("1.0.0-abc")
+            .join("..")
+            .join("..")
+            .join("kuaid.exe");
+        assert!(!start_daemon(&escaped.to_string_lossy(), None));
     }
 }

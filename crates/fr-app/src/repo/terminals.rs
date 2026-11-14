@@ -7,10 +7,12 @@
 //!
 //! 终端不跟着标签页结束：
 //!
-//! - 本机仓库的终端在 Kuai 进程里。关标签页时，程序还在运行的终端交给 [`Parked`] 保管，
-//!   再打开这个仓库、到终端页时接回来；退出 Kuai（包括重启以完成更新）时才结束。
-//! - 服务器上的终端开在 kuaid 里，各有各的会话（名字见 [`crate::terminal::session_key`]）：
-//!   关标签页、退出 Kuai 以后接着跑；再打开这个仓库时问一遍 kuaid，原来留着几个就接回几个。
+//! - 终端开在 kuaid 里，各有各的会话（名字见 [`crate::terminal::session_key`]）：服务器上的仓库
+//!   是服务器的 kuaid，本机仓库是这台电脑上的 kuaid。关标签页、退出 Kuai 以后接着跑；再打开这个
+//!   仓库时问一遍 kuaid，原来留着几个就接回几个。
+//! - 这台电脑上的 kuaid 用不了时，本机仓库的终端退回到开在 Kuai 进程里。关标签页时，程序还在
+//!   运行的交给 [`Parked`] 保管，再打开这个仓库、到终端页时接回来；退出 Kuai（包括重启以完成
+//!   更新）时才结束。
 
 use fr_channel::Channel;
 use fr_core::i18n::tr;
@@ -46,11 +48,11 @@ pub(super) struct Terminals {
     tabs: Vec<TermTab>,
     /// 终端页上显示的是哪一个
     active: usize,
-    /// 服务器上留着、这次还没接上的终端：序号，里面的程序还在不在跑
+    /// kuaid 里留着、这次还没接上的终端：序号，里面的程序还在不在跑
     waiting: Vec<(u32, bool)>,
 }
 
-/// 关掉的本机仓库标签页留下的终端，里面的程序接着运行。再打开这个仓库、到终端页时接回去
+/// 关掉的本机仓库标签页留下的、开在 Kuai 进程里的终端，里面的程序接着运行。再打开这个仓库、到终端页时接回去
 /// （[`RepoView::adopt_parked`]）；同一个仓库在别的工作区里也开着的话，先到终端页的那个接走。
 #[derive(Default)]
 struct Parked(Vec<ParkedTerminal>);
@@ -144,8 +146,8 @@ fn terminal_menu(
 }
 
 impl RepoView {
-    /// 这个标签页里有几个本机终端的程序正在运行（退出 Kuai、重启以完成更新时将结束）。
-    /// 服务器上的终端开在 kuaid 里，不算。
+    /// 这个标签页里有几个开在 Kuai 进程里的终端的程序正在运行（退出 Kuai、重启以完成更新时
+    /// 将结束）。开在 kuaid 里的不算。
     pub fn local_terminals_running(&self, cx: &App) -> usize {
         if self.entry.server.is_some() {
             return 0;
@@ -153,7 +155,10 @@ impl RepoView {
         self.terminals
             .tabs
             .iter()
-            .filter(|tab| tab.view.read(cx).is_running())
+            .filter(|tab| {
+                let view = tab.view.read(cx);
+                view.in_process() && view.is_running()
+            })
             .count()
     }
 
@@ -170,9 +175,9 @@ impl RepoView {
         opened + waiting.count() + parked_running(Some(&self.entry), cx)
     }
 
-    /// 本机仓库的终端不跟着标签页结束：这个视图释放（标签页关掉）时，程序还在运行的终端交给
-    /// [`Parked`] 保管；这个仓库有终端留下时，侧栏切换上的个数跟着变，到终端页时接回来。
-    /// 建视图时调用。
+    /// 本机仓库开在 Kuai 进程里的终端不跟着标签页结束：这个视图释放（标签页关掉）时，程序还在
+    /// 运行的终端交给 [`Parked`] 保管；这个仓库有终端留下时，侧栏切换上的个数跟着变，到终端页时
+    /// 接回来。建视图时调用。
     pub(super) fn keep_local_terminals(&mut self, cx: &mut Context<Self>) {
         if self.entry.server.is_some() {
             return;
@@ -180,6 +185,24 @@ impl RepoView {
         cx.on_release(|this, cx| this.park_terminals(cx)).detach();
         let observe = cx.observe_global::<Parked>(|_, cx| cx.notify());
         self._subscriptions.push(observe);
+        self.check_local_terminals(cx);
+    }
+
+    /// 这台电脑的 kuaid 在跑的话，问一下它里面留着这个仓库的哪几个终端。它没在跑就不问：
+    /// 没有留着的终端，用不着为了问这一句把它拉起来。
+    fn check_local_terminals(&mut self, cx: &mut Context<Self>) {
+        if !fr_channel::Connection::local_daemon_running() {
+            return;
+        }
+        let connecting = self.app.update(cx, |app, cx| app.connect_local(cx));
+        cx.spawn(async move |this, cx| {
+            let Ok(conn) = connecting.await else {
+                return;
+            };
+            this.update(cx, |this, cx| this.list_terminals(&conn, cx))
+                .ok();
+        })
+        .detach();
     }
 
     /// 标签页关掉了：程序还在运行的终端交给 [`Parked`]。已经结束的不留，用户看到过了
@@ -188,7 +211,11 @@ impl RepoView {
         let tabs = std::mem::take(&mut self.terminals.tabs);
         let running: Vec<ParkedTerminal> = tabs
             .into_iter()
-            .filter(|tab| tab.view.read(cx).is_running())
+            .filter(|tab| {
+                let view = tab.view.read(cx);
+                // 开在 kuaid 里的不用保管，它们本来就留着
+                view.in_process() && view.is_running()
+            })
             .map(|tab| ParkedTerminal {
                 entry: self.entry.clone(),
                 number: tab.number,
@@ -240,6 +267,11 @@ impl RepoView {
         let Channel::Remote(conn) = channel else {
             return;
         };
+        self.list_terminals(conn, cx);
+    }
+
+    /// 问 kuaid 里留着这个仓库的哪几个终端，记到 `waiting` 里。
+    fn list_terminals(&mut self, conn: &fr_channel::Connection, cx: &mut Context<Self>) {
         let listing = conn.term_list();
         let repo = self.entry.path.clone();
         cx.spawn(async move |this, cx| {
@@ -264,7 +296,7 @@ impl RepoView {
         .detach();
     }
 
-    /// 加一个终端，返回它在第几个。`restored`：它是服务器上留着的、里面的程序还在跑。
+    /// 加一个终端，返回它在第几个。`restored`：它是 kuaid 里留着的、里面的程序还在跑。
     fn add_terminal(
         &mut self,
         number: u32,
@@ -322,7 +354,7 @@ impl RepoView {
         at
     }
 
-    /// 留着、还没接上的终端都加进来：关掉的标签页留下的本机终端，服务器上留着的（选中哪个
+    /// 留着、还没接上的终端都加进来：关掉的标签页留下的本机终端，kuaid 里留着的（选中哪个
     /// 才去接哪个）。显示的还是原来那个。
     fn adopt_waiting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let shown = self
@@ -615,6 +647,8 @@ impl RepoView {
             )
             .child(
                 h_flex()
+                    // 要有 id：悬停样式只有带 id 的元素才会在鼠标进出时重画，不然颜色要等别的事触发重画才变
+                    .id("inner")
                     .h(px(ROW_HEIGHT - 2.))
                     .flex_1()
                     .min_w_0()
@@ -745,7 +779,14 @@ impl RepoView {
                 place = self.place(cx)
             )
             .into(),
-            None => tr("运行在本机，关闭标签页后仍会继续运行").into(),
+            // 退回到开在 Kuai 进程里的：退出 Kuai 就结束
+            None if self
+                .active_terminal()
+                .is_some_and(|view| view.read(cx).in_process()) =>
+            {
+                tr("运行在本机，关闭标签页后仍会继续运行").into()
+            }
+            None => tr("运行在本机，关闭 Kuai 后仍会继续运行").into(),
         };
         let index = self.terminals.active;
         let title = self.active_terminal().map(|view| {

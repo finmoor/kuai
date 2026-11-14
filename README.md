@@ -2,7 +2,7 @@
 
 Windows 上的 Git 客户端，界面和操作方式接近 Fork，目标是完全替代 Fork（本机仓库和服务器上的仓库都能管理）。
 
-与 Fork 相比有两点不同。一是可以打开服务器上的仓库：添加服务器时，会在服务器上安装类似 VS Code Server 的常驻程序 `kuaid`，通过 SSH 的 stdin/stdout 通信；不需要 root 权限，不开放网络端口，服务器也无需联网。服务器上仓库的 git 命令都在服务器上执行，Windows 端只接收结果。二是可以在同一个程序中用终端编程（1.5 起）：每个仓库分为 Git 和终端两页（1.7 起），在终端页中运行 Claude Code、Codex 等工具，再切换到 Git 页查看改动、按行暂存；服务器上的终端运行在 `kuaid` 中，关闭 Kuai 或断线后仍会继续运行。
+与 Fork 相比有两点不同。一是可以打开服务器上的仓库：添加服务器时，会在服务器上安装类似 VS Code Server 的常驻程序 `kuaid`，通过 SSH 的 stdin/stdout 通信；不需要 root 权限，不开放网络端口，服务器也无需联网。服务器上仓库的 git 命令都在服务器上执行，Windows 端只接收结果。二是可以在同一个程序中用终端编程（1.5 起）：每个仓库分为 Git 和终端两页（1.7 起），在终端页中运行 Claude Code、Codex 等工具，再切换到 Git 页查看改动、按行暂存；服务器上的终端运行在 `kuaid` 中，关闭 Kuai 或断线后仍会继续运行；本机的终端也是（1.11 起，运行在本机的 `kuaid` 中）。服务器可以是 Linux，也可以是开启了 OpenSSH 服务的 Windows 电脑（1.11 起）。
 
 > 名字 2026-11-11 定的：不用叉子（Fork）改用筷子，「筷」也谐音「快」。在这之前暂时叫 fork-remote，仓库目录、crate 前缀 `fr-`、环境变量 `FR_*` 还是那时候的，当内部代号留着。
 
@@ -20,8 +20,8 @@ Windows 上的 Git 客户端，界面和操作方式接近 Fork，目标是完�
 ## 技术栈
 
 - 客户端：Rust + GPUI，经 [gpui-kit](https://github.com/longbridge/gpui-kit) 0.9 引入（gpui-pre 快照、gpui-base、gpui-component）。
-- 服务器上的 `kuaid`：Rust；Linux 版用 musl 静态编译，从 Windows 交叉编译。1.5 以前叫 fr-agent，那时不常驻。
-- 本机仓库在进程内直接调用核心代码；服务器上的仓库经 SSH 交给 kuaid。两边用同一套 `fr-core`。
+- 服务器上的 `kuaid`：Rust；Linux 版用 musl 静态编译，从 Windows 交叉编译；Windows 版（1.11 起）和客户端一起编。1.5 以前叫 fr-agent，那时不常驻。
+- 本机仓库在进程内直接调用核心代码；服务器上的仓库经 SSH 交给 kuaid。两边用同一套 `fr-core`。本机仓库的终端（1.11 起）开在这台电脑自己的 kuaid 里。
 - git 操作调用命令行，密码输入走 askpass 助手，和 Fork 的做法一样；高频只读操作以后可以换成 gitoxide。
 - 选这套栈是为了性能。GPUI 还没到 1.0，所以先做了 M0 技术验证，已经通过。
 
@@ -32,13 +32,13 @@ Windows 上的 Git 客户端，界面和操作方式接近 Fork，目标是完�
 | `crates/fr-core` | 调用 git、解析输出、计算提交图布局、通信协议、界面语言（`i18n.rs`，英文译文在 `locales/en.json`）；不依赖界面，客户端和 kuaid 共用 |
 | `crates/fr-channel` | 仓库通道：本机仓库在进程内执行 git，服务器上的仓库经 ssh 交给 kuaid（连接复用、自动安装 kuaid、终端接口）；测试工具 `fr-probe` |
 | `crates/fr-app` | GPUI 客户端 |
-| `crates/kuaid` | 服务器上的常驻程序 `kuaid`：执行 git、托管终端会话 |
+| `crates/kuaid` | 常驻程序 `kuaid`（Linux、Windows）：执行 git、托管终端会话；装在服务器上，Windows 电脑自己也用它开终端 |
 | `tools/gen-test-repo.py` | 生成性能测试用的大仓库 |
 | `tools/ui-test/` | 界面测试脚本：建测试仓库、截窗口、往测试窗口投递点击和输入（不动真实鼠标） |
-| `tools/package.ps1` | 打发布包：客户端加 Linux 版 kuaid，出安装程序和解压版的 zip，输出到 `dist/` |
+| `tools/package.ps1` | 打发布包：客户端加 Linux 版、Windows 版 kuaid，出安装程序和解压版的 zip，输出到 `dist/` |
 | `tools/installer/` | 安装程序的脚本（Inno Setup 6，`kuai.iss`）和简体中文的界面文字 |
 | `tools/release-notes.ps1`、`CHANGELOG.md` | 发版时的发布说明：取 `CHANGELOG.md` 里这个版本的那一节 |
-| `.github/workflows/` | 推代码时跑测试（`ci.yml`，kuaid 的 Linux 测试也在这里跑）；推 `v*` 标签时打包发版（`release.yml`） |
+| `.github/workflows/` | 推代码时跑测试（`ci.yml`，kuaid 常驻那一套在 Windows、Linux 上各跑各的）；推 `v*` 标签时打包发版（`release.yml`） |
 | `tools/make-icon.py` | 画应用图标，输出 `crates/fr-app/assets/icon.ico` |
 
 ## 快捷键
@@ -97,9 +97,14 @@ cargo run --release -p fr-channel --bin fr-probe -- --repo <服务器上的仓�
 # 单元测试
 cargo test --workspace
 
-# kuaid 常驻那一套（拉起、终端断开后还在、原地升级）只能在 Linux 上测：交叉编译出测试程序，
-# 连同 kuaid 拷到 Linux 机器上跑，见 crates/kuaid/tests/linux.rs 开头；GitHub Actions 的 ci.yml 在 ubuntu 上直接跑
+# kuaid 常驻那一套（拉起、终端断开后还在、升级不断终端）两个系统各有一份实现、各测各的。
+# Windows 版：上面的 cargo test --workspace 里就有（crates/kuaid/tests/windows.rs，拿真的 kuaid.exe 测）。
+# Linux 版：交叉编译出测试程序，连同 kuaid 拷到 Linux 机器上跑，见 crates/kuaid/tests/linux.rs 开头；
+# GitHub Actions 的 ci.yml 在 ubuntu 上直接跑
 cargo test --no-run --release -p kuaid --target x86_64-unknown-linux-musl
+
+# Windows 版 kuaid：连 Windows 服务器、开本机终端时，客户端从自己旁边（target/release/kuaid.exe）取它
+cargo build --release -p kuaid
 
 # 打发布包：dist/kuai-<版本>-windows-x64-setup.exe（安装程序）和 dist/kuai-<版本>-windows-x64.zip
 # （解压出来是一个 Kuai 文件夹）。要 Inno Setup 6（winget install JRSoftware.InnoSetup --scope user）；

@@ -325,6 +325,8 @@ impl RepoView {
                 };
                 let tip = row.path.clone();
                 let inner = h_flex()
+                    // 要有 id：悬停样式只有带 id 的元素才会在鼠标进出时重画，不然颜色要等别的事触发重画才变
+                    .id("inner")
                     .h(px(ROW_HEIGHT - 2.))
                     .flex_1()
                     .min_w_0()

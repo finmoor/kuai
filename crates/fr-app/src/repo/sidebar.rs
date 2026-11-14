@@ -786,6 +786,8 @@ impl RepoView {
                 let is_header = matches!(item, SideItem::Header(_));
                 // 行本身占满宽度（好点），里面一块圆角的底显示选中、悬停
                 let inner = h_flex()
+                    // 要有 id：悬停样式只有带 id 的元素才会在鼠标进出时重画，不然颜色要等别的事触发重画才变
+                    .id("inner")
                     .h(px(ROW_HEIGHT - 2.))
                     .flex_1()
                     .min_w_0()
@@ -836,7 +838,7 @@ impl RepoView {
                     let tip = full_name.clone().unwrap_or_else(|| text.clone());
                     ui::clipped_with_tip(("side-name", ix), text, tip).flex_1()
                 };
-                let mark = |row: Div| {
+                let mark = |row: gpui_kit::Stateful<Div>| {
                     row.when(is_hidden, |r| {
                         r.child(
                             ui::icon_small(IconName::EyeOff)

@@ -37,6 +37,14 @@ const SWEEP_EVERY: Duration = Duration::from_secs(3600);
 /// 交接文件的格式版本
 const HANDOFF_FORMAT: u32 = 1;
 
+/// 转接程序和常驻进程之间的连接。
+pub type Stream = std::os::unix::net::UnixStream;
+
+/// 连上常驻进程的套接字。没在跑就连不上。
+pub fn dial(paths: &Paths) -> std::io::Result<Stream> {
+    Stream::connect(paths.socket())
+}
+
 /// `~/.kuai/run` 里的几个文件。
 pub struct Paths {
     pub run: PathBuf,
