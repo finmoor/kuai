@@ -153,13 +153,27 @@ impl AppState {
             return;
         }
         self.mounts.installing = true;
-        // 接着会弹出系统的管理员确认：先说一声是怎么回事
-        cx.emit(Notice::Info(
-            tr("正在安装 WinFsp，请在弹出的窗口中允许。").into(),
-        ));
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = cx.background_executor().spawn(async { run_winget() }).await;
+            let started = cx
+                .background_executor()
+                .spawn(async { start_winget() })
+                .await;
+            let result = match started {
+                Ok(child) => {
+                    // winget 起来了，接着会弹出系统的管理员确认：先说一声是怎么回事。
+                    // 没有 winget 时不说，免得让人等一个不会弹出来的窗口
+                    this.update(cx, |_, cx| {
+                        cx.emit(Notice::Info(
+                            tr("正在安装 WinFsp，请在弹出的窗口中允许。").into(),
+                        ))
+                    })
+                    .ok();
+                    let waiting = async move { wait_winget(child) };
+                    cx.background_executor().spawn(waiting).await
+                }
+                Err(err) => Err(err),
+            };
             this.update(cx, |this, cx| {
                 this.mounts.installing = false;
                 this.mounts.installed = winfsp_present();
@@ -518,12 +532,13 @@ enum Winget {
     Failed,
 }
 
-/// 让 winget 安装 WinFsp，等它做完。`FR_WINGET` 是测试用的：换成别的程序（假的 winget）。
-fn run_winget() -> Result<(), Winget> {
+/// 启动 winget 安装 WinFsp，不等它做完（见 `wait_winget`）。`FR_WINGET` 是测试用的：换成
+/// 别的程序（假的 winget）。
+fn start_winget() -> Result<std::process::Child, Winget> {
     use std::os::windows::process::CommandExt as _;
     const NO_WINDOW: u32 = 0x0800_0000;
     let winget = std::env::var_os("FR_WINGET").unwrap_or_else(|| "winget".into());
-    let status = std::process::Command::new(winget)
+    let child = std::process::Command::new(winget)
         .args([
             "install",
             "--id",
@@ -534,16 +549,27 @@ fn run_winget() -> Result<(), Winget> {
             "--disable-interactivity",
         ])
         .creation_flags(NO_WINDOW)
-        .status();
-    match status {
+        .spawn();
+    match child {
+        Ok(child) => Ok(child),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(Winget::Missing),
+        Err(err) => {
+            log::warn!("无法启动 winget：{err}");
+            Err(Winget::Failed)
+        }
+    }
+}
+
+/// 等 winget 做完。
+fn wait_winget(mut child: std::process::Child) -> Result<(), Winget> {
+    match child.wait() {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => {
             log::warn!("winget 安装 WinFsp 没成：{status}");
             Err(Winget::Failed)
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(Winget::Missing),
         Err(err) => {
-            log::warn!("无法启动 winget：{err}");
+            log::warn!("等待 winget 时出错：{err}");
             Err(Winget::Failed)
         }
     }
