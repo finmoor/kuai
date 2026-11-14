@@ -30,23 +30,30 @@ struct Gone {
     detail: String,
 }
 
-/// 含有这个分支的远程分支里说哪一个：有主干（main、master、develop）就说主干，没有说第一个。
-/// 「远程名/HEAD」这样的指针不算。
-fn first_remote_branch(output: &str) -> Option<&str> {
+/// 含有这个分支的远程分支里说哪一个，要让人一看就知道「合进去了」：先看当前分支的上游
+/// （`current`），再看主干（main、master、develop），再看发布分支（`release/` 开头），都没有
+/// 才说第一个。「远程名/HEAD」这样的指针不算。
+fn first_remote_branch<'a>(output: &'a str, current: Option<&str>) -> Option<&'a str> {
     let branches = || {
         output
             .lines()
             .map(str::trim)
             .filter(|line| line.contains('/') && !line.ends_with("/HEAD"))
     };
-    let trunk = |line: &&str| {
-        let name = line.split_once('/').map_or("", |(_, name)| name);
-        ["main", "master", "develop", "dev"].contains(&name)
+    let name = |line: &str| {
+        line.split_once('/')
+            .map_or("", |(_, name)| name)
+            .to_string()
     };
-    branches().find(trunk).or_else(|| branches().next())
+    let trunk = |line: &&str| ["main", "master", "develop", "dev"].contains(&name(line).as_str());
+    branches()
+        .find(|line| Some(*line) == current)
+        .or_else(|| branches().find(trunk))
+        .or_else(|| branches().find(|line| name(line).starts_with("release/")))
+        .or_else(|| branches().next())
 }
 
-async fn inspect(channel: &Channel, repo: &str, name: String) -> Gone {
+async fn inspect(channel: &Channel, repo: &str, name: String, current: Option<&str>) -> Gone {
     let full = format!("refs/heads/{name}");
     let count = ["rev-list", "--count", &full, "--not", "--remotes"];
     let count = channel
@@ -59,7 +66,7 @@ async fn inspect(channel: &Channel, repo: &str, name: String) -> Gone {
         Some(0) => {
             let contains = [
                 "for-each-ref",
-                "--count=50",
+                "--count=300",
                 "--contains",
                 &full,
                 "--format=%(refname:short)",
@@ -71,7 +78,10 @@ async fn inspect(channel: &Channel, repo: &str, name: String) -> Gone {
                 .and_then(|out| out.ok())
                 .ok()
                 .map(|out| String::from_utf8_lossy(&out).into_owned());
-            let detail = match found.as_deref().and_then(first_remote_branch) {
+            let detail = match found
+                .as_deref()
+                .and_then(|out| first_remote_branch(out, current))
+            {
                 Some(remote) => tf!("已并入 {remote}", remote),
                 None => tr("已并入远程分支").to_string(),
             };
@@ -115,8 +125,11 @@ impl RepoView {
             return;
         };
         let repo = self.entry.path.clone();
+        let upstream = self.status.as_ref().and_then(|s| s.upstream.clone());
         cx.spawn_in(window, async move |this, cx| {
-            let checks = names.into_iter().map(|name| inspect(&channel, &repo, name));
+            let checks = names
+                .into_iter()
+                .map(|name| inspect(&channel, &repo, name, upstream.as_deref()));
             let list = futures::future::join_all(checks).await;
             this.update_in(cx, |this, window, cx| this.sweep_dialog(list, window, cx))
                 .ok();
@@ -236,17 +249,27 @@ mod tests {
     #[test]
     fn 并入了哪个远程分支_跳过指针() {
         assert_eq!(
-            first_remote_branch("origin\norigin/HEAD\norigin/main\n"),
+            first_remote_branch("origin\norigin/HEAD\norigin/main\n", None),
             Some("origin/main")
         );
-        assert_eq!(first_remote_branch("origin/HEAD\n"), None);
+        assert_eq!(first_remote_branch("origin/HEAD\n", None), None);
         assert_eq!(
-            first_remote_branch("origin/feat/alive\norigin/master\n"),
+            first_remote_branch("origin/feat/alive\norigin/master\n", None),
             Some("origin/master")
         );
         assert_eq!(
-            first_remote_branch("origin/feat/a\norigin/feat/main\n"),
+            first_remote_branch("origin/feat/a\norigin/feat/main\n", None),
             Some("origin/feat/a")
+        );
+        // 主干不叫 main 的仓库：先说当前分支的上游，再说发布分支
+        let out = "origin/20250411\norigin/feat/x\norigin/release/1.7.x\norigin/release/2.0\n";
+        assert_eq!(
+            first_remote_branch(out, Some("origin/release/2.0")),
+            Some("origin/release/2.0")
+        );
+        assert_eq!(
+            first_remote_branch(out, Some("origin/other")),
+            Some("origin/release/1.7.x")
         );
     }
 }

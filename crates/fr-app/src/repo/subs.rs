@@ -786,7 +786,7 @@ impl RepoView {
             .child(head(tr("仓库")).flex_1().min_w(px(160.)))
             .child(head(tr("分支")).w(px(170.)).flex_none())
             .child(head(tr("改动")).w(px(48.)).flex_none())
-            .child(head(tr("同步")).w(px(64.)).flex_none())
+            .child(head(tr("同步")).w(px(88.)).flex_none())
             .child(head(tr("最近提交")).flex_1().min_w(px(120.)))
             .child(div().w(px(56.)).flex_none());
         let body: AnyElement = if shown.is_empty() {
@@ -1007,7 +1007,7 @@ impl RepoView {
             .child(name_cell)
             .child(div().w(px(170.)).flex_none().min_w_0().child(branch))
             .child(div().w(px(48.)).flex_none().child(changes))
-            .child(div().w(px(64.)).flex_none().child(sync))
+            .child(div().w(px(88.)).flex_none().child(sync))
             .child(div().flex_1().min_w(px(120.)).child(last))
             .child(actions)
             .context_menu(self.sub_menu(path, cx))

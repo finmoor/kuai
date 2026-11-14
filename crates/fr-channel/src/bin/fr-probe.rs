@@ -35,6 +35,9 @@
 //!     --fs                       在仓库里建一个 `.kuai-probe-<进程号>` 目录，把新建、保存、冲突、列目录、
 //!                                上传、下载、改名、删除走一遍，核对内容，最后删掉这个目录
 //!     --fs-size <MB>             `--fs` 里上传、下载的那个文件多大，默认 9（大于一次读写的上限，要分段）
+//!
+//! 测找子仓库（子仓库总览走的那条路，本机、服务器都能测，只读）：
+//!     --repos                    列出仓库目录里面的仓库，和每个的分支、改动数
 
 use std::process::Command;
 use std::sync::Arc;
@@ -67,6 +70,7 @@ fn main() -> Result<()> {
     let jump_password = flag("--jump-password");
     let (term_list, term_close) = (flag("--term-list"), flag("--term-close"));
     let fs = flag("--fs");
+    let repos = flag("--repos");
     let value = |name: &str| args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone());
     let options = ConnectOptions {
         forward_agent: false,
@@ -174,6 +178,9 @@ fn main() -> Result<()> {
 
     if fs {
         return block_on(files(&channel, &repo, fs_size << 20));
+    }
+    if repos {
+        return block_on(sub_repos(&channel, &repo));
     }
 
     if let Some(file) = &put {
@@ -465,6 +472,47 @@ async fn files(channel: &Channel, repo: &str, size: u64) -> Result<()> {
     anyhow::ensure!(!channel.fs_stat(repo, &dir).await?.exists, "删除以后还在");
     step("删除", now);
     println!("文件操作全部通过，共 {:.0} ms", ms(started.elapsed()));
+    Ok(())
+}
+
+/// 找仓库目录里面的仓库，再读每个的状态（子仓库总览做的事）。只读。
+async fn sub_repos(channel: &Channel, repo: &str) -> Result<()> {
+    let started = Instant::now();
+    let found = channel.fs_repos(repo).await?;
+    println!(
+        "fs_repos {repo}：{} 个子仓库{}，{:.0} ms",
+        found.repos.len(),
+        if found.truncated {
+            "（没找全）"
+        } else {
+            ""
+        },
+        ms(started.elapsed())
+    );
+    let started = Instant::now();
+    for path in &found.repos {
+        let full = format!("{}/{path}", repo.trim_end_matches(['/', '\\']));
+        let out = channel.git(&full, fr_core::status::args()).await;
+        match out.and_then(|out| out.ok()) {
+            Ok(out) => {
+                let status = fr_core::status::parse(&out);
+                println!(
+                    "  {path}：{}，{} 个改动，↑{} ↓{}{}",
+                    status.branch.as_deref().unwrap_or("（不在分支上）"),
+                    status.entries.len(),
+                    status.ahead,
+                    status.behind,
+                    if status.upstream.is_some() {
+                        ""
+                    } else {
+                        "，无上游"
+                    }
+                );
+            }
+            Err(err) => println!("  {path}：读不了：{err:#}"),
+        }
+    }
+    println!("读状态共 {:.0} ms", ms(started.elapsed()));
     Ok(())
 }
 

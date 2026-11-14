@@ -782,6 +782,16 @@ mod tests {
         client.send("fs_write", save, b"three");
         assert_eq!(client.next().0.result.unwrap()["conflict"], true);
 
+        // 仓库目录里面的仓库：给相对路径，node_modules 里的不报
+        assert_eq!(client.call("fs_repos", at(""))["repos"], json!([]));
+        std::fs::create_dir_all(repo.0.join("packages/plugin-a/.git")).unwrap();
+        std::fs::create_dir_all(repo.0.join("node_modules/dep/.git")).unwrap();
+        let found = client.call("fs_repos", at(""));
+        assert_eq!(found["repos"], json!(["packages/plugin-a"]));
+        assert!(found.get("truncated").is_none());
+        std::fs::remove_dir_all(repo.0.join("packages")).unwrap();
+        std::fs::remove_dir_all(repo.0.join("node_modules")).unwrap();
+
         // 列目录没有 .git；读带着文件现在的情况，可以只读一段
         let listed = client.call("fs_list", at(""));
         assert_eq!(listed["entries"].as_array().unwrap().len(), 1);
