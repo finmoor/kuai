@@ -2,7 +2,7 @@
 
 Windows 上的 Git 客户端，界面和操作方式接近 Fork，目标是完全替代 Fork（本机仓库和服务器上的仓库都能管理）。
 
-与 Fork 相比有两点不同。一是可以打开服务器上的仓库：添加服务器时，会在服务器上安装类似 VS Code Server 的常驻程序 `kuaid`，通过 SSH 的 stdin/stdout 通信；不需要 root 权限，不开放网络端口，服务器也无需联网。服务器上仓库的 git 命令都在服务器上执行，Windows 端只接收结果。二是可以在同一个程序中用终端编程（1.5 起）：每个仓库分为 Git 和终端两页（1.7 起），在终端页中运行 Claude Code、Codex 等工具，再切换到 Git 页查看改动、按行暂存；服务器上的终端运行在 `kuaid` 中，关闭 Kuai 或断线后仍会继续运行；本机的终端也是（1.11 起，运行在本机的 `kuaid` 中）。服务器可以是 Linux，也可以是开启了 OpenSSH 服务的 Windows 电脑（1.11 起）。
+与 Fork 相比有两点不同。一是可以打开服务器上的仓库：添加服务器时，会在服务器上安装类似 VS Code Server 的常驻程序 `kuaid`，通过 SSH 的 stdin/stdout 通信；不需要 root 权限，不开放网络端口，服务器也无需联网。服务器上仓库的 git 命令都在服务器上执行，Windows 端只接收结果。二是可以在同一个程序中用终端编程（1.5 起）：每个仓库分为 Git 和终端两页（1.7 起），在终端页中运行 Claude Code、Codex 等工具，再切换到 Git 页查看改动、按行暂存；服务器上的终端运行在 `kuaid` 中，关闭 Kuai 或断线后仍会继续运行；本机的终端也是（1.11 起，运行在本机的 `kuaid` 中）。服务器可以是 Linux，也可以是开启了 OpenSSH 服务的 Windows 电脑（1.11 起）。服务器上的目录还可以映射成本机的盘符或文件夹，用本机的程序直接打开（1.13 起，需要安装 WinFsp）。
 
 > 名字 2026-11-11 定的：不用叉子（Fork）改用筷子，「筷」也谐音「快」。在这之前暂时叫 fork-remote，仓库目录、crate 前缀 `fr-`、环境变量 `FR_*` 还是那时候的，当内部代号留着。
 
@@ -13,7 +13,7 @@ Windows 上的 Git 客户端，界面和操作方式接近 Fork，目标是完�
 - **安装版** `kuai-<版本>-windows-x64-setup.exe`（推荐）：安装在用户目录下（`%LOCALAPPDATA%\Programs\Kuai`），无需管理员权限；可从开始菜单启动，可在「设置 → 应用」中卸载。
 - **解压版** `kuai-<版本>-windows-x64.zip`：解压得到的 Kuai 文件夹可放在任意位置，双击 `kuai.exe` 运行。
 
-运行要求：64 位 Windows 10 或 11，PATH 中有 git，使用 Windows 自带的 OpenSSH；服务器为 Linux（x86_64），无需 root 权限。程序未进行代码签名，首次运行时 Windows 可能提示「Windows 已保护你的电脑」，请点击「更多信息」，再点击「仍要运行」。
+运行要求：64 位 Windows 10 或 11，PATH 中有 git，使用 Windows 自带的 OpenSSH；服务器为 Linux（x86_64），无需 root 权限。将服务器目录映射到本机时还需安装 [WinFsp](https://winfsp.dev/)，未安装时 Kuai 可经 winget 代为安装。程序未进行代码签名，首次运行时 Windows 可能提示「Windows 已保护你的电脑」，请点击「更多信息」，再点击「仍要运行」。
 
 有新版本时，标题栏齿轮左侧会显示更新提示，点击可查看更新内容并一键更新（安装版在后台运行新的安装程序，解压版直接替换文件）；也可在「设置 → 关于」中检查更新。服务器上的 kuaid 无需单独更新，新版 Kuai 连接时会自动替换。
 
@@ -33,6 +33,7 @@ Windows 上的 Git 客户端，界面和操作方式接近 Fork，目标是完�
 | `crates/fr-channel` | 仓库通道：本机仓库在进程内执行 git，服务器上的仓库经 ssh 交给 kuaid（连接复用、自动安装 kuaid、终端接口）；测试工具 `fr-probe` |
 | `crates/fr-app` | GPUI 客户端 |
 | `crates/kuaid` | 常驻程序 `kuaid`（Linux、Windows）：执行 git、托管终端会话；装在服务器上，Windows 电脑自己也用它开终端 |
+| `crates/fr-mount` | 把服务器上的目录映射成本机的盘符或文件夹：WinFsp 的薄绑定（运行时加载它的 DLL）和文件系统，读写变成 kuaid 的 `fs_*` 请求 |
 | `tools/gen-test-repo.py` | 生成性能测试用的大仓库 |
 | `tools/ui-test/` | 界面测试脚本：建测试仓库、截窗口、往测试窗口投递点击和输入（不动真实鼠标） |
 | `tools/package.ps1` | 打发布包：客户端加 Linux 版、Windows 版 kuaid，出安装程序和解压版的 zip，输出到 `dist/` |
@@ -58,7 +59,7 @@ Windows 上的 Git 客户端，界面和操作方式接近 Fork，目标是完�
 | Ctrl+Shift+` | 为当前仓库新建终端，并切换到终端页 |
 | Ctrl+Shift+B | 收起或展开左侧栏（收起后显示为一列图标，所有标签页共用此状态） |
 | Ctrl+Shift+E | 切换到当前仓库的文件页 |
-| Alt+← | 在子仓库中时，返回根仓库的子仓库总览（焦点在终端、输入框中时不生效） |
+| Alt+← | 在子仓库或工作树中时，返回根仓库的子仓库总览或工作树总览（焦点在终端、输入框中时不生效） |
 | Ctrl+S | 保存文件页中当前打开的文件 |
 
 列表中的按键（先点击列表，或用 Ctrl+1、Ctrl+2 将焦点移到列表）：
