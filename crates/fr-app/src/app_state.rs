@@ -230,7 +230,13 @@ impl AppState {
             || old.identity_file != server.identity_file
             || old.jump != server.jump;
         let id = server.id.clone();
+        // 上次打开的目录不在表单里：初始目录没改就留着，改了就从新的初始目录开始
+        let last_dir = match old.start_dir == server.start_dir {
+            true => old.last_dir.take(),
+            false => None,
+        };
         *old = server;
+        old.last_dir = last_dir;
         if reconnect {
             self.conns.remove(&id);
         }
@@ -255,6 +261,31 @@ impl AppState {
         self.conns.remove(id);
         // 存着的密码、口令跟着删掉
         crate::secrets::delete(id);
+        self.save();
+        cx.notify();
+    }
+
+    /// 记下在这台服务器上「打开仓库」时仓库所在的目录，下次从这里开始浏览。
+    pub fn set_browse_dir(&mut self, server: &str, dir: String, cx: &mut Context<Self>) {
+        let Some(server) = self.settings.servers.iter_mut().find(|s| s.id == server) else {
+            return;
+        };
+        if server.last_dir.as_deref() != Some(dir.as_str()) {
+            server.last_dir = Some(dir);
+            self.save();
+            cx.notify();
+        }
+    }
+
+    /// 收起、展开仓库页「全部仓库」里的一张卡片（本机是 `settings::LOCAL_CARD`，服务器是它的 id）。
+    pub fn toggle_card(&mut self, key: &str, cx: &mut Context<Self>) {
+        let cards = &mut self.settings.collapsed_cards;
+        match cards.iter().position(|card| card == key) {
+            Some(at) => {
+                cards.remove(at);
+            }
+            None => cards.push(key.to_string()),
+        }
         self.save();
         cx.notify();
     }

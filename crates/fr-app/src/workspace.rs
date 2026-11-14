@@ -61,6 +61,14 @@ struct RepoTab {
     _observe: Subscription,
 }
 
+impl RepoTab {
+    /// 这个标签页上显示着的仓库页：进到了子仓库里就是那个子仓库的，快捷键对它生效。
+    fn shown(&self, cx: &App) -> Entity<RepoView> {
+        let sub = self.view.read(cx).active_sub();
+        sub.unwrap_or_else(|| self.view.clone())
+    }
+}
+
 /// 一个工作区里已经建好的标签页和选中的那一个。
 type Parked = (Vec<RepoTab>, usize);
 
@@ -334,6 +342,9 @@ impl Workspace {
         if let Some(hwnd) = self.hwnd {
             cx.spawn(async move |_, _| win::show(hwnd)).detach();
         }
+        // 常驻托盘时很少真的重启：再次启动、点托盘把窗口叫回来，就当作启动，顺便检查更新
+        self.updater
+            .update(cx, |updater, cx| updater.window_shown(cx));
     }
 
     /// 把窗口藏到托盘。和 [`Self::show_window`] 一样放到这一轮更新之后再做。
@@ -491,7 +502,7 @@ impl Workspace {
                     .flatten()
                     .flat_map(|(tabs, _)| tabs.iter()),
             )
-            .map(|tab| tab.view.read(cx).unsaved_files())
+            .map(|tab| tab.view.read(cx).unsaved_with_subs(cx))
             .sum()
     }
 
@@ -507,7 +518,7 @@ impl Workspace {
                     .flatten()
                     .flat_map(|(tabs, _)| tabs.iter()),
             )
-            .map(|tab| tab.view.read(cx).local_terminals_running(cx))
+            .map(|tab| tab.view.read(cx).local_terminals_with_subs(cx))
             .sum();
         open + crate::repo::parked_terminals_running(cx)
     }
@@ -595,6 +606,7 @@ impl Workspace {
     }
 
     /// 给仓库改名：只改这里显示的名字，目录不动。留空恢复成目录名。
+    /// 对话框里写着仓库的路径，可以复制。
     fn rename_repo(&mut self, entry: RepoEntry, window: &mut Window, cx: &mut Context<Self>) {
         let app = self.app.clone();
         let current = app.read(cx).repo_name(&entry).to_string();
@@ -604,6 +616,7 @@ impl Workspace {
             current,
             tr("重命名"),
             true,
+            Some(entry.path.clone().into()),
             window,
             cx,
             move |name, _, cx| app.update(cx, |app, cx| app.rename_repo(&entry, &name, cx)),
@@ -656,10 +669,10 @@ impl Workspace {
         }
         let (busy, cancellable) = {
             let view = tab.view.read(cx);
-            (view.busy(), view.cancellable())
+            (view.busy_with_subs(cx), view.cancellable_with_subs(cx))
         };
         let entry = tab.entry.clone();
-        let unsaved = tab.view.read(cx).unsaved_files();
+        let unsaved = tab.view.read(cx).unsaved_with_subs(cx);
         if busy.is_none() && unsaved > 0 {
             let text = tf!("有 {n} 个文件尚未保存，关闭后修改将丢失。", n = unsaved);
             self.confirm_close(entry, text, tr("放弃修改并关闭"), window, cx);
@@ -783,7 +796,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let tab = self.tabs.iter().find(|tab| tab.entry == entry);
-        if let Some(op) = tab.and_then(|tab| tab.view.read(cx).busy()) {
+        if let Some(op) = tab.and_then(|tab| tab.view.read(cx).busy_with_subs(cx)) {
             let text = tf!("此仓库正在{op}，请等待完成后再移除。", op);
             window.push_notification(Notification::warning(text), cx);
             return;
@@ -835,7 +848,7 @@ impl Workspace {
             .filter(|tab| Some(&tab.entry) != keep_entry.as_ref())
             .filter(|tab| !pinned.contains(&tab.entry))
             .filter(|tab| {
-                let busy = tab.view.read(cx).busy().is_some();
+                let busy = tab.view.read(cx).busy_with_subs(cx).is_some();
                 skipped += busy as usize;
                 !busy
             })
@@ -886,7 +899,7 @@ impl Workspace {
     /// F5：重读当前仓库的状态和提交历史。
     pub fn refresh_active(&mut self, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_repo() {
-            tab.view.update(cx, |view, cx| view.refresh_now(cx));
+            tab.shown(cx).update(cx, |view, cx| view.refresh_now(cx));
         }
     }
 
@@ -897,7 +910,7 @@ impl Workspace {
         } else if let Some(ix) = self.active.checked_sub(1) {
             // 在文件页上、有打开的文件：Ctrl+W 关的是那个文件，不是整个仓库标签页
             let closed_file = self.tabs.get(ix).is_some_and(|tab| {
-                tab.view
+                tab.shown(cx)
                     .update(cx, |view, cx| view.close_active_file(window, cx))
             });
             if !closed_file {
@@ -906,17 +919,26 @@ impl Workspace {
         }
     }
 
+    /// Alt+←：在子仓库里时回到根仓库的子仓库总览。
+    pub fn back_to_root_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_repo() {
+            tab.view
+                .update(cx, |view, cx| view.back_to_root(window, cx));
+        }
+    }
+
     /// Ctrl+Shift+E：当前仓库切到文件页。
     pub fn files_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_repo() {
-            tab.view.update(cx, |view, cx| view.show_files(window, cx));
+            tab.shown(cx)
+                .update(cx, |view, cx| view.show_files(window, cx));
         }
     }
 
     /// Ctrl+S：保存当前仓库文件页上显示着的文件。
     pub fn save_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_repo() {
-            tab.view
+            tab.shown(cx)
                 .update(cx, |view, cx| view.save_active_file(window, cx));
         }
     }
@@ -935,7 +957,7 @@ impl Workspace {
     /// Ctrl+Shift+`：当前仓库再开一个终端，切到终端页显示它。
     pub fn new_terminal_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_repo() {
-            tab.view
+            tab.shown(cx)
                 .update(cx, |view, cx| view.new_terminal(window, cx));
         }
     }
@@ -943,7 +965,7 @@ impl Workspace {
     /// Ctrl+Shift+B：收起、展开仓库页的侧栏（所有标签页一起变）。
     pub fn toggle_sidebar_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_repo() {
-            tab.view
+            tab.shown(cx)
                 .update(cx, |view, cx| view.toggle_sidebar(window, cx));
         }
     }
@@ -951,7 +973,7 @@ impl Workspace {
     /// Ctrl+`：当前仓库在 Git、终端两页之间来回切。
     pub fn terminal_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_repo() {
-            tab.view
+            tab.shown(cx)
                 .update(cx, |view, cx| view.toggle_terminal(window, cx));
         }
     }
@@ -959,7 +981,7 @@ impl Workspace {
     /// Ctrl+1、Ctrl+2：当前仓库切到本地修改、所有提交。
     pub fn show_in_active(&mut self, changes: bool, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_repo() {
-            tab.view.update(cx, |view, cx| {
+            tab.shown(cx).update(cx, |view, cx| {
                 if changes {
                     view.show_changes_view(window, cx);
                 } else {
@@ -979,7 +1001,8 @@ impl Workspace {
     /// Ctrl+F：在当前仓库里搜索提交。
     pub fn find_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_repo() {
-            tab.view.update(cx, |view, cx| view.find_commit(window, cx));
+            tab.shown(cx)
+                .update(cx, |view, cx| view.find_commit(window, cx));
         }
     }
 
@@ -1073,6 +1096,7 @@ impl Workspace {
             String::new(),
             tr("新建"),
             false,
+            None,
             window,
             cx,
             move |name, window, cx| {
@@ -1096,6 +1120,7 @@ impl Workspace {
             old,
             tr("重命名"),
             false,
+            None,
             window,
             cx,
             move |name, _, cx| app.update(cx, |app, cx| app.rename_workspace(ix, &name, cx)),
@@ -1117,7 +1142,7 @@ impl Workspace {
         if self
             .tabs
             .iter()
-            .any(|tab| tab.view.read(cx).busy().is_some())
+            .any(|tab| tab.view.read(cx).busy_with_subs(cx).is_some())
         {
             let text = tr("此工作区中有标签页正在执行操作，请等待完成后再删除。");
             window.push_notification(Notification::warning(text), cx);
@@ -1177,7 +1202,7 @@ impl Workspace {
         let Some(tab) = self.tabs.get(ix) else {
             return;
         };
-        if let Some(op) = tab.view.read(cx).busy() {
+        if let Some(op) = tab.view.read(cx).busy_with_subs(cx) {
             let text = tf!("此仓库正在{op}，请等待完成后再移动。", op);
             window.push_notification(Notification::warning(text), cx);
             return;
@@ -1222,11 +1247,18 @@ impl Workspace {
     fn render_repo_tab(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let tab = &self.tabs[ix];
         let app = self.app.read(cx);
-        let title = app.repo_title(&tab.entry);
+        // 进到了子仓库里：标题后面带上它的名字
+        let title: SharedString = match tab.view.read(cx).sub_title() {
+            Some(sub) => format!("{} / {sub}", app.repo_title(&tab.entry)).into(),
+            None => app.repo_title(&tab.entry),
+        };
         let selected = self.active == ix + 1 && !self.showing_settings;
         let (busy, changes) = {
             let view = tab.view.read(cx);
-            (view.busy().is_some(), view.change_count())
+            (
+                view.busy_with_subs(cx).is_some(),
+                view.change_count_with_subs(),
+            )
         };
         let glyph = if busy {
             IconName::LoaderCircle
@@ -1645,7 +1677,7 @@ fn tab_menu(
 type Submit = Rc<dyn Fn(&mut Window, &mut App)>;
 
 /// 问一个名字的小对话框：一个输入框，回车或点确定时关掉并调用 `on_ok`。
-/// `allow_empty` 为假时名字是空的就不关。
+/// `allow_empty` 为假时名字是空的就不关。`path` 是给仓库改名时它的路径：写在输入框下面，可以复制。
 #[allow(clippy::too_many_arguments)]
 fn ask_name<T: 'static>(
     title: &'static str,
@@ -1653,6 +1685,7 @@ fn ask_name<T: 'static>(
     value: String,
     ok: &'static str,
     allow_empty: bool,
+    path: Option<SharedString>,
     window: &mut Window,
     cx: &mut Context<T>,
     on_ok: impl Fn(String, &mut Window, &mut App) + 'static,
@@ -1685,7 +1718,12 @@ fn ask_name<T: 'static>(
                 on_enter(window, cx);
                 false
             })
-            .child(Input::new(&input))
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(Input::new(&input))
+                    .children(path.clone().map(|path| path_row(path, cx))),
+            )
             .footer(
                 DialogFooter::new()
                     .child(
@@ -1701,6 +1739,40 @@ fn ask_name<T: 'static>(
                     ),
             )
     });
+}
+
+/// 重命名仓库的对话框里写路径的一行：放不下省略开头（悬停看全），右边是复制按钮。
+fn path_row(path: SharedString, cx: &App) -> impl IntoElement {
+    let muted = cx.theme().muted_foreground;
+    let copy = path.clone();
+    h_flex()
+        .gap_2()
+        .child(
+            div()
+                .flex_none()
+                .text_xs()
+                .text_color(muted)
+                .child(tr("路径")),
+        )
+        .child(
+            ui::clipped("repo-path", path)
+                .flex_1()
+                .text_ellipsis_start()
+                .text_xs()
+                .font_family("Consolas")
+                .text_color(muted),
+        )
+        .child(
+            Button::new("copy-path")
+                .ghost()
+                .xsmall()
+                .icon(ui::icon(IconName::Copy))
+                .tooltip(tr("复制路径"))
+                .on_click(move |_, window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy.to_string()));
+                    window.push_notification(Notification::success(tr("已复制路径")), cx);
+                }),
+        )
 }
 
 impl Render for Workspace {

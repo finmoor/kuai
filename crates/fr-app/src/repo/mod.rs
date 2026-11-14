@@ -37,6 +37,8 @@ mod rail;
 mod rebase;
 mod sidebar;
 mod stage_diff;
+mod subs;
+mod sweep;
 mod terminals;
 
 pub(crate) use ops::explain;
@@ -73,6 +75,8 @@ enum Mode {
     Blame,
     /// 合并编辑器：解决一个文件里的冲突，也是盖在上面
     Merge,
+    /// 子仓库总览（仓库目录里面还有别的仓库时才有），见 [`subs`]
+    Subs,
 }
 
 /// 显示哪一页（侧栏里的切换，Ctrl+` 来回切）。
@@ -149,6 +153,10 @@ pub struct RepoView {
     files: files::Files,
     /// 从终端页按 Ctrl+` 回到哪一页（Git 或者文件）
     back_page: Page,
+    /// 这是哪个根仓库的子仓库；平常打开的仓库没有
+    sub_of: Option<subs::SubOf>,
+    /// 仓库目录里面的仓库，和进过的那些的页面
+    subs: subs::Subs,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -172,6 +180,8 @@ impl RepoView {
         subscriptions.push(sidebar_subscription);
         let (files, files_subscription) = files::Files::new(window, cx);
         subscriptions.push(files_subscription);
+        let (subs, subs_subscription) = subs::Subs::new(window, cx);
+        subscriptions.push(subs_subscription);
         let mut this = Self {
             entry,
             app,
@@ -207,6 +217,8 @@ impl RepoView {
             terminals: terminals::Terminals::default(),
             files,
             back_page: Page::Git,
+            sub_of: None,
+            subs,
             _subscriptions: subscriptions,
         };
         // 测试开关：FR_TEST_VIEW=changes 打开仓库时直接显示本地修改
@@ -215,6 +227,19 @@ impl RepoView {
         }
         this.keep_local_terminals(cx);
         this.connect(cx);
+        this
+    }
+
+    /// 根仓库里的一个子仓库的页面（见 [`subs`]）：和平常的仓库页一样，侧栏顶上多一个返回按钮。
+    fn new_sub(
+        entry: RepoEntry,
+        app: Entity<AppState>,
+        of: subs::SubOf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self::new(entry, app, window, cx);
+        this.sub_of = Some(of);
         this
     }
 
@@ -235,6 +260,7 @@ impl RepoView {
                         this.check_server_terminals(&channel, cx);
                         this.channel = Some(channel);
                         this.refresh(cx);
+                        this.scan_subs(cx);
                     }
                     Err(err) => this.error = Some(err),
                 }
@@ -275,12 +301,10 @@ impl RepoView {
     }
 
     /// 切换标签页时由工作区调用；切到这个标签页时刷新。
+    /// 进到了子仓库里时，可见的是那个子仓库的页面，根仓库自己不算。
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
-        let shown = visible && !self.visible;
-        self.visible = visible;
-        if shown {
-            self.refresh(cx);
-        }
+        self.subs.tab_visible = visible;
+        self.apply_visibility(cx);
     }
 
     /// 重读工作区状态、引用和贮藏；引用或 HEAD 变了再重读历史。
@@ -377,6 +401,9 @@ impl RepoView {
     pub fn refresh_now(&mut self, cx: &mut Context<Self>) {
         self.history_key = None;
         self.refresh(cx);
+        if self.mode == Mode::Subs {
+            self.load_sub_summaries(cx);
+        }
     }
 
     /// 换了界面语言时由主窗口调用。大部分文字每次重画都重新取，自己会变；
@@ -385,6 +412,7 @@ impl RepoView {
         self.retranslate_sidebar(window, cx);
         self.retranslate_history(window, cx);
         self.retranslate_changes(window, cx);
+        self.retranslate_subs(window, cx);
         cx.notify();
     }
 
@@ -884,6 +912,7 @@ impl RepoView {
                 Mode::History => self.render_history(cx),
                 Mode::Blame => self.render_blame(cx),
                 Mode::Merge => self.render_merge(cx),
+                Mode::Subs => self.render_subs(cx),
             }
         };
         let banner = self
@@ -955,6 +984,10 @@ fn tool_button_bare(
 
 impl Render for RepoView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 进到了子仓库里：整个页面是它的
+        if let Some(sub) = self.active_sub() {
+            return div().size_full().child(sub).into_any_element();
+        }
         self.tick_bench(window, cx);
         self.viewport = window.viewport_size();
         let sizes = self.sizes(cx);
@@ -977,5 +1010,6 @@ impl Render for RepoView {
             )
             .child(self.render_sidebar(cx))
             .child(right)
+            .into_any_element()
     }
 }

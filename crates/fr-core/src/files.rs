@@ -14,7 +14,7 @@ use std::time::UNIX_EPOCH;
 use anyhow::{Context as _, Result, bail};
 
 use crate::i18n::tr;
-use crate::protocol::{FsEntry, FsStat, FsWrite, FsWritten};
+use crate::protocol::{FsEntry, FsStat, FsWrite, FsWritten, SubRepos};
 use crate::tf;
 
 /// 一次最多读这么多字节；更大的文件分几次读。
@@ -252,6 +252,68 @@ pub fn rename(repo: &str, from: &str, to: &str) -> Result<()> {
     fs::rename(&source, &target).with_context(|| tf!("无法重命名 {path}", path = from))
 }
 
+/// 找子仓库时往下最多走几层（仓库根下面的目录是第 1 层）。
+const REPOS_MAX_DEPTH: usize = 6;
+/// 找子仓库时最多看这么多个目录：再多就不找了，结果标成没找全。
+const REPOS_MAX_DIRS: usize = 40_000;
+/// 最多报这么多个子仓库。
+const REPOS_MAX_FOUND: usize = 500;
+
+/// 仓库目录里面还有哪些仓库（下面有 `.git` 的目录：单独克隆进来的、子模块都算），给的是相对
+/// 仓库根的路径，按名字排。一个项目的各个插件各是一个仓库时（NocoBase 的业务插件），在一个
+/// 标签页里看它们用。
+///
+/// 以 `.` 开头的目录和 `node_modules` 不进去；符号链接、目录联接不跟（会绕出去、绕回来）；
+/// 找到的仓库不再往里找。层数、目录数有上限，到了上限 `truncated` 为真。
+pub fn find_repos(repo: &str) -> Result<SubRepos> {
+    let root = resolve(repo, "")?;
+    fs::read_dir(&root).with_context(|| tf!("无法读取 {path}", path = root.display()))?;
+    let mut found = SubRepos::default();
+    // 一层层往下：近的先找到，到了上限丢掉的是深处的
+    let mut level: Vec<(PathBuf, String)> = vec![(root, String::new())];
+    let mut seen = 0;
+    for _ in 0..REPOS_MAX_DEPTH {
+        let mut next = Vec::new();
+        for (dir, relative) in level {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') || name == "node_modules" {
+                    continue;
+                }
+                seen += 1;
+                if seen > REPOS_MAX_DIRS || found.repos.len() >= REPOS_MAX_FOUND {
+                    found.truncated = true;
+                    found.repos.sort_by_cached_key(|path| path.to_lowercase());
+                    return Ok(found);
+                }
+                let path = entry.path();
+                let relative = match relative.is_empty() {
+                    true => name,
+                    false => format!("{relative}/{name}"),
+                };
+                // 子模块、工作树的 `.git` 是一个文件
+                if fs::symlink_metadata(path.join(".git")).is_ok() {
+                    found.repos.push(relative);
+                } else {
+                    next.push((path, relative));
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        level = next;
+    }
+    found.repos.sort_by_cached_key(|path| path.to_lowercase());
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +379,42 @@ mod tests {
         // 仓库根本身不能读写、删除
         assert!(read(root, "", 0, 10).is_err());
         assert!(remove(root, "/").is_err());
+    }
+
+    #[test]
+    fn 找子仓库_不进点目录和_node_modules_找到的不再往里找() {
+        let temp = TempRepo::new();
+        let make = |path: &str| fs::create_dir_all(temp.0.join(path)).unwrap();
+        make("packages/plugins/@org/plugin-b/.git");
+        make("packages/plugins/@org/Plugin-a/.git");
+        // 仓库里面的仓库不报：要看就进那个仓库看
+        make("packages/plugins/@org/Plugin-a/vendor/inner/.git");
+        make("packages/core/src");
+        make("node_modules/dep/.git");
+        make(".cache/x/.git");
+        // 子模块：.git 是一个文件
+        make("libs/sub");
+        fs::write(
+            temp.0.join("libs/sub/.git"),
+            "gitdir: ../../.git/modules/sub",
+        )
+        .unwrap();
+        // 太深的不找
+        make("a/b/c/d/e/f/deep/.git");
+        make("a/b/c/d/e/ok/.git");
+
+        let found = find_repos(temp.repo()).unwrap();
+        assert_eq!(
+            found.repos,
+            [
+                "a/b/c/d/e/ok",
+                "libs/sub",
+                "packages/plugins/@org/Plugin-a",
+                "packages/plugins/@org/plugin-b",
+            ]
+        );
+        assert!(!found.truncated);
+        assert!(find_repos(temp.0.join("nope").to_str().unwrap()).is_err());
     }
 
     #[test]

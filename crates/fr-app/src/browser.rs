@@ -3,6 +3,9 @@
 //!
 //! 输入框里显示的永远是列表正在显示的那个目录：前往一个进不去的路径时，
 //! 报错里写要去的路径，输入框回到原来的目录，免得显示的和实际要打开的不是一个地方。
+//!
+//! 从哪开始：打开仓库时是上次打开的仓库所在的目录，没有就是这台服务器的初始目录，再没有是主目录
+//! （[`crate::settings::Server::browse_starts`]）；前一个进不去（目录删了）就试下一个。
 
 use fr_channel::DirListing;
 use fr_core::i18n::tr;
@@ -30,6 +33,8 @@ pub struct RemoteBrowser {
     pick_dir: bool,
     input: Entity<InputState>,
     listing: Option<DirListing>,
+    /// 一开始要去的目录进不去时，接着试的几个（最后一个是主目录）
+    fallbacks: Vec<String>,
     /// 进行中的提示或错误
     status: Option<(SharedString, bool)>,
     busy: bool,
@@ -46,11 +51,15 @@ impl RemoteBrowser {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // 从主目录开始
-        Self::build(app, server, String::new(), false, window, cx)
+        let starts = match app.read(cx).server(&server) {
+            Some(server) => server.browse_starts(),
+            None => vec![String::new()],
+        };
+        Self::build(app, server, starts, false, window, cx)
     }
 
-    /// 选一个目录（克隆到服务器时选放仓库的目录）。`start` 为空从主目录开始。
+    /// 选一个目录（克隆到服务器时选放仓库的目录）。`start` 为空从这台服务器的初始目录开始，
+    /// 没设初始目录就是主目录。
     pub fn new_dir_picker(
         app: Entity<AppState>,
         server: String,
@@ -58,17 +67,30 @@ impl RemoteBrowser {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(app, server, start, true, window, cx)
+        let start_dir = app
+            .read(cx)
+            .server(&server)
+            .and_then(|server| server.start_dir.clone());
+        let mut starts: Vec<String> = [Some(start), start_dir]
+            .into_iter()
+            .flatten()
+            .filter(|dir| !dir.trim().is_empty())
+            .collect();
+        starts.dedup();
+        starts.push(String::new());
+        Self::build(app, server, starts, true, window, cx)
     }
 
     fn build(
         app: Entity<AppState>,
         server: String,
-        start: String,
+        starts: Vec<String>,
         pick_dir: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let mut starts = starts.into_iter();
+        let start = starts.next().unwrap_or_default();
         let input =
             cx.new(|cx| InputState::new(window, cx).placeholder(tr("服务器上的路径，按 Enter 前往")));
         let subscription = cx.subscribe_in(
@@ -87,6 +109,7 @@ impl RemoteBrowser {
             pick_dir,
             input,
             listing: None,
+            fallbacks: starts.collect(),
             status: None,
             busy: false,
             task: None,
@@ -112,6 +135,7 @@ impl RemoteBrowser {
             false,
         ));
         self.task = Some(cx.spawn_in(window, async move |this, cx| {
+            // 报错后面带着：连上了、只是这个目录进不去（那样才值得换一个目录再试）
             let result = match channel.await {
                 Ok(channel) => channel.list_dir(&path).await.map_err(|err| {
                     let shown = if path.is_empty() {
@@ -119,13 +143,14 @@ impl RemoteBrowser {
                     } else {
                         &path
                     };
-                    SharedString::from(tf!(
+                    let text = SharedString::from(tf!(
                         "无法进入 {shown}：{err}",
                         shown,
                         err = format!("{:#}", err)
-                    ))
+                    ));
+                    (text, true)
                 }),
-                Err(err) => Err(err),
+                Err(err) => Err((err, false)),
             };
             this.update_in(cx, |this, window, cx| {
                 this.busy = false;
@@ -135,9 +160,16 @@ impl RemoteBrowser {
                             input.set_value(listing.path.clone(), window, cx)
                         });
                         this.listing = Some(listing);
+                        this.fallbacks.clear();
                         this.status = None;
                     }
-                    Err(err) => {
+                    // 一开始要去的目录（上次打开的、初始目录）已经不在了：不报错，接着试下一个
+                    Err((_, true)) if this.listing.is_none() && !this.fallbacks.is_empty() => {
+                        let next = this.fallbacks.remove(0);
+                        this.navigate(next, window, cx);
+                        return;
+                    }
+                    Err((err, _)) => {
                         // 输入框回到列表正在显示的目录：下面的按钮操作的是它，不是没进去的那个
                         if let Some(current) = this.listing.as_ref().map(|l| l.path.clone()) {
                             this.input
@@ -178,6 +210,7 @@ impl RemoteBrowser {
                 match result {
                     Ok((_, Found::Repo(root))) => {
                         this.status = None;
+                        this.remember(&root, cx);
                         cx.emit(BrowserEvent::Open(RepoEntry {
                             server: Some(server),
                             path: root,
@@ -189,7 +222,10 @@ impl RemoteBrowser {
                             channel,
                             Some(server),
                             path,
-                            |_: &mut Self, entry, _, cx| cx.emit(BrowserEvent::Open(entry)),
+                            |this: &mut Self, entry, _, cx| {
+                                this.remember(&entry.path, cx);
+                                cx.emit(BrowserEvent::Open(entry))
+                            },
                             window,
                             cx,
                         );
@@ -202,6 +238,28 @@ impl RemoteBrowser {
         }));
         cx.notify();
     }
+}
+
+impl RemoteBrowser {
+    /// 记下打开的仓库所在的目录：下次「打开仓库」从这里开始，旁边的仓库就在眼前。
+    fn remember(&self, repo: &str, cx: &mut Context<Self>) {
+        let dir = parent_dir(repo).unwrap_or_else(|| repo.to_string());
+        self.app
+            .update(cx, |app, cx| app.set_browse_dir(&self.server, dir, cx));
+    }
+}
+
+/// 服务器上一个路径的上一级目录；已经是根目录（`/`、`C:/`）就没有。两种斜杠都认。
+fn parent_dir(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    let cut = trimmed.rfind(['/', '\\'])?;
+    let parent = &trimmed[..cut];
+    // `/data` 的上一级是 `/`，`C:/data` 的上一级是 `C:/`
+    Some(if parent.is_empty() || parent.ends_with(':') {
+        trimmed[..=cut].to_string()
+    } else {
+        parent.to_string()
+    })
 }
 
 fn join(dir: &str, name: &str) -> String {
@@ -314,7 +372,11 @@ impl Render for RemoteBrowser {
                     .child(v_flex().py_1().children(rows)),
             )
             .child(
+                // 报错可能很长（ssh 说主机密钥变了时有十几行）：限高、可滚动，不把下面的按钮挤出窗口
                 div()
+                    .id("hint")
+                    .max_h(px(72.))
+                    .overflow_y_scroll()
                     .text_xs()
                     .whitespace_normal()
                     .text_color(hint_color)
@@ -349,5 +411,29 @@ impl Render for RemoteBrowser {
                             .on_click(cx.listener(|this, _, window, cx| this.open(window, cx)))
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parent_dir;
+
+    #[test]
+    fn 上一级目录() {
+        let parent = |path: &str| parent_dir(path);
+        assert_eq!(
+            parent("/data/workspaces/platform/gateway").as_deref(),
+            Some("/data/workspaces/platform")
+        );
+        assert_eq!(parent("/data/").as_deref(), Some("/"));
+        assert_eq!(parent("/"), None);
+        // Windows 服务器：两种斜杠都有
+        assert_eq!(
+            parent("C:/Users/me/src/wms").as_deref(),
+            Some("C:/Users/me/src")
+        );
+        assert_eq!(parent(r"C:\Users\me").as_deref(), Some(r"C:\Users"));
+        assert_eq!(parent("C:/repo").as_deref(), Some("C:/"));
+        assert_eq!(parent("C:/"), None);
     }
 }

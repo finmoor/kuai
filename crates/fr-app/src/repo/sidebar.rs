@@ -17,6 +17,7 @@ use std::ops::Range;
 
 use fr_core::i18n::{tr, trc};
 use fr_core::refs::Refs;
+use fr_core::tf;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -69,6 +70,8 @@ impl SideSection {
 pub(super) enum SideItem {
     Changes,
     History,
+    /// 子仓库总览；仓库目录里面有别的仓库时才有这一行
+    SubRepos,
     Header(SideSection),
     /// 目录树里的文件夹；数字是它的键（`前缀/路径`）的哈希
     Folder(u64),
@@ -268,6 +271,16 @@ impl RepoView {
                 count: 0,
             },
         ];
+        if self.has_subs() {
+            rows.push(SideRow {
+                item: SideItem::SubRepos,
+                depth: 0,
+                label: String::new(),
+                key: None,
+                open: false,
+                count: self.sub_count(),
+            });
+        }
         // 一棵目录树 → 侧栏的行。`prefix` 是收起键的前缀，`base` 是这棵树整体缩进几层
         let push_tree = |rows: &mut Vec<SideRow>,
                          names: &[(&str, usize)],
@@ -436,6 +449,7 @@ impl RepoView {
         let place = self.place(cx);
         let name = self.app.read(cx).repo_name(&self.entry);
         let (view, entry) = (cx.entity().downgrade(), self.entry.clone());
+        let is_sub = self.sub_of.is_some();
         v_flex().flex_none().child(
             h_flex()
                 .id("side-header")
@@ -496,17 +510,21 @@ impl RepoView {
                 .context_menu(move |menu, _, _| {
                     let (view, entry) = (view.clone(), entry.clone());
                     let path = entry.path.clone();
-                    menu.item(
-                        gpui_kit::component::menu::PopupMenuItem::new(tr("重命名…")).on_click(
-                            move |_, _, cx| {
-                                view.update(cx, |_, cx| {
-                                    cx.emit(super::RepoEvent::Rename(entry.clone()))
-                                })
-                                .ok();
-                            },
+                    // 子仓库不在仓库列表里，没有可改的显示名称
+                    let menu = match is_sub {
+                        true => menu,
+                        false => menu.item(
+                            gpui_kit::component::menu::PopupMenuItem::new(tr("重命名…")).on_click(
+                                move |_, _, cx| {
+                                    view.update(cx, |_, cx| {
+                                        cx.emit(super::RepoEvent::Rename(entry.clone()))
+                                    })
+                                    .ok();
+                                },
+                            ),
                         ),
-                    )
-                    .item(
+                    };
+                    menu.item(
                         gpui_kit::component::menu::PopupMenuItem::new(tr("复制仓库路径")).on_click(
                             move |_, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
@@ -626,6 +644,8 @@ impl RepoView {
             .relative()
             .bg(bg)
             .child(self.render_side_header(cx))
+            // 子仓库的页面：仓库名下面一个整行的「返回 <根仓库>」
+            .children(self.render_back(cx))
             .child(self.render_page_switch(cx));
         let side = match self.page {
             Page::Terminal => side.child(self.render_terminal_side(cx)),
@@ -769,13 +789,14 @@ impl RepoView {
     ) -> Vec<AnyElement> {
         let rows = self.sidebar_rows(cx);
         let hidden = self.hidden_refs(cx);
+        let gone = self.gone_count();
         let theme = cx.theme();
-        let (fg, muted, active, hover, danger, accent) = (
+        let (fg, muted, active, hover, warning, accent) = (
             theme.sidebar_foreground,
             theme.muted_foreground,
             theme.sidebar_accent,
             theme.list_hover,
-            theme.danger,
+            theme.warning,
             theme.primary,
         );
         range
@@ -876,6 +897,10 @@ impl RepoView {
                                 .text_color(muted),
                         )
                         .child(name(tr("所有提交").to_string())),
+                    SideItem::SubRepos => inner
+                        .child(ui::icon(IconName::FolderTree).flex_none().text_color(muted))
+                        .child(name(tr("子仓库").to_string()))
+                        .child(count(row.count)),
                     SideItem::Header(section) => inner
                         .child(chevron(row.open))
                         .child(ui::icon(section.icon()).flex_none().text_color(muted))
@@ -887,6 +912,34 @@ impl RepoView {
                                 .text_color(muted)
                                 .child(section.title()),
                         )
+                        // 有上游已删除的分支：标题右边一个带字的「清理 N」
+                        .when(section == SideSection::Branches && gone > 0, |r| {
+                            r.child(
+                                h_flex()
+                                    .id("sweep-gone")
+                                    .flex_none()
+                                    .h(px(18.))
+                                    .px(px(7.))
+                                    .gap(px(3.))
+                                    .rounded_full()
+                                    .bg(warning.opacity(0.16))
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(warning)
+                                    .hover(|s| s.bg(warning.opacity(0.28)))
+                                    .child(ui::icon_small(IconName::BrushCleaning))
+                                    .child(tf!("清理 {n}", n = gone))
+                                    .tooltip(move |window, cx| {
+                                        let text = tf!("清理 {n} 个上游已删除的分支…", n = gone);
+                                        ui::tip(text, window, cx)
+                                    })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        // 不让这一下再去收起、展开「分支」这一组
+                                        cx.stop_propagation();
+                                        this.sweep_gone_branches(window, cx);
+                                    })),
+                            )
+                        })
                         .child(count(row.count)),
                     SideItem::Folder(_) => inner
                         .child(chevron(row.open))
@@ -927,15 +980,20 @@ impl RepoView {
                             })
                             .child(
                                 name(row.label)
-                                    .when(branch.current, |d| d.font_weight(FontWeight::SEMIBOLD)),
+                                    .when(branch.current, |d| d.font_weight(FontWeight::SEMIBOLD))
+                                    // 上游已删除：名字变淡，行尾一个云上划斜线的图标
+                                    .when(branch.gone, |d| d.text_color(muted)),
                             )
                             .when(branch.gone, |r| {
                                 r.child(
                                     div()
+                                        .id(("gone", ix))
                                         .flex_none()
-                                        .text_size(px(11.))
-                                        .text_color(danger)
-                                        .child(tr("上游已删除")),
+                                        .text_color(muted.opacity(0.8))
+                                        .child(ui::icon_small(IconName::CloudOff))
+                                        .tooltip(|window, cx| {
+                                            ui::tip(tr("上游分支已删除"), window, cx)
+                                        }),
                                 )
                             })
                             .when(!detail.is_empty(), |r| {
@@ -1036,6 +1094,7 @@ impl RepoView {
         self.sidebar.selected = found.unwrap_or(match self.mode {
             Mode::Changes | Mode::Merge => SideItem::Changes,
             Mode::History | Mode::Blame => SideItem::History,
+            Mode::Subs => SideItem::SubRepos,
         });
     }
 
@@ -1192,6 +1251,7 @@ impl RepoView {
                 }
             }
             SideItem::Changes => self.show_changes(cx),
+            SideItem::SubRepos => self.show_subs(window, cx),
             SideItem::History => {
                 self.sidebar.selected = item;
                 self.mode = Mode::History;

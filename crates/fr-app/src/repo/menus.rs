@@ -478,6 +478,22 @@ impl RepoView {
                     .item(copy_item(tr("复制标签名"), name.clone()))
                 }))
             }
+            SideItem::Header(SideSection::Branches) => {
+                let gone = self.gone_count();
+                Some(Box::new(move |menu, _, _| {
+                    menu.item(item(&view, tr("新建分支…"), |this, w, cx| {
+                        this.new_branch_dialog(w, cx)
+                    }))
+                    .item(
+                        item(
+                            &view,
+                            tr("清理上游已删除的分支…"),
+                            |this, w, cx| this.sweep_gone_branches(w, cx),
+                        )
+                        .disabled(gone == 0),
+                    )
+                }))
+            }
             SideItem::Header(SideSection::Remotes) => Some(Box::new(move |menu, _, _| {
                 menu.item(item(&view, tr("添加远程…"), |this, w, cx| {
                     this.add_remote_dialog(w, cx)

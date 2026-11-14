@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, anyhow, bail};
 use fr_core::protocol::{
     self, DirListing, FilePut, FilePutReply, FsEntry, FsStat, FsWrite, FsWritten, GitResult, Hello,
-    PROTOCOL_VERSION, Request, Response, TermExit, TermInfo, TermOpen, TermOpened,
+    PROTOCOL_VERSION, Request, Response, SubRepos, TermExit, TermInfo, TermOpen, TermOpened,
 };
 use futures::FutureExt as _;
 use futures::channel::{mpsc, oneshot};
@@ -504,6 +504,11 @@ impl Connection {
             serde_json::from_value(result["entries"].take()).context(tr("kuaid 返回的结果格式错误"))
         }
         .boxed()
+    }
+
+    pub(crate) fn fs_repos(&self, repo: &str) -> BoxFuture<'static, Result<SubRepos>> {
+        let call = self.call("fs_repos", json!({ "repo": repo }), Vec::new());
+        async move { parsed(call.await?.0) }.boxed()
     }
 
     pub(crate) fn fs_stat(&self, repo: &str, path: &str) -> BoxFuture<'static, Result<FsStat>> {

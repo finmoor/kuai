@@ -26,6 +26,9 @@ fn default_true() -> bool {
     true
 }
 
+/// 仓库页「全部仓库」里本机那张卡片的名字（收起的卡片记在 [`Settings::collapsed_cards`] 里）。
+pub const LOCAL_CARD: &str = "local";
+
 /// 可以选的自动获取间隔（分钟）；0 是不自动获取。
 pub const AUTO_FETCH_CHOICES: [u32; 6] = [0, 5, 10, 15, 30, 60];
 
@@ -215,6 +218,9 @@ pub struct Settings {
     pub terminal: TerminalSettings,
     #[serde(default)]
     pub layout: Layout,
+    /// 仓库页「全部仓库」里收起的卡片：本机是 [`LOCAL_CARD`]，服务器是它的 id
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collapsed_cards: Vec<String>,
     /// 各个仓库自己记的东西
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repo_memos: Vec<RepoMemo>,
@@ -406,6 +412,7 @@ impl Default for Settings {
             terminal_shell: String::new(),
             terminal: TerminalSettings::default(),
             layout: Layout::default(),
+            collapsed_cards: Vec::new(),
             repo_memos: Vec::new(),
             window: None,
             check_updates: true,
@@ -471,12 +478,19 @@ impl Settings {
                 self.servers[index].jump = None;
             }
         }
+        // 收起的卡片：服务器已经不在了的不用记
+        let servers = &self.servers;
+        self.collapsed_cards
+            .retain(|key| key == LOCAL_CARD || servers.iter().any(|server| server.id == *key));
         // 仓库已经不在列表里、也没开着了，它记的东西就不留
         let (repos, groups) = (&self.repos, &self.workspaces);
+        // 子仓库（在列表里某个仓库的目录下面）不在列表里，它记的东西跟着那个仓库留着
+        let inside = |memo: &RepoMemo| repos.iter().any(|repo| repo.contains(&memo.repo));
         self.repo_memos.retain(|memo| {
             !memo.is_empty()
                 && (repos.contains(&memo.repo)
-                    || groups.iter().any(|group| group.tabs.contains(&memo.repo)))
+                    || groups.iter().any(|group| group.tabs.contains(&memo.repo))
+                    || inside(memo))
         });
     }
 
@@ -618,9 +632,27 @@ pub struct Server {
     /// 它自己也可以有跳板机，见 [`Settings::route`]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jump: Option<String>,
+    /// 初始目录：「打开仓库」「克隆」从这里开始；空着从主目录开始
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_dir: Option<String>,
+    /// 「打开仓库」上次打开的仓库所在的目录，下次从这里开始。不在表单里；改了初始目录就清掉
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_dir: Option<String>,
 }
 
 impl Server {
+    /// 「打开仓库」依次试着从哪里开始：上次打开的目录、初始目录，都进不去就是主目录（空串）。
+    pub fn browse_starts(&self) -> Vec<String> {
+        let mut starts: Vec<String> = Vec::new();
+        for dir in [&self.last_dir, &self.start_dir].into_iter().flatten() {
+            if !dir.is_empty() && !starts.contains(dir) {
+                starts.push(dir.clone());
+            }
+        }
+        starts.push(String::new());
+        starts
+    }
+
     /// 连接时用的私钥文件：用密码登录的不带。
     pub fn key_file(&self) -> Option<&str> {
         match self.auth {
@@ -715,6 +747,16 @@ impl RepoEntry {
     pub fn name(&self) -> &str {
         let path = self.path.trim_end_matches(['/', '\\']);
         path.rsplit(['/', '\\']).next().unwrap_or(path)
+    }
+
+    /// `other` 是不是在这个仓库的目录下面（同一台机器上、路径以这个仓库的路径加一个斜杠开头）。
+    pub fn contains(&self, other: &RepoEntry) -> bool {
+        let root = self.path.trim_end_matches(['/', '\\']);
+        self.server == other.server
+            && other
+                .path
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.len() > 1 && rest.starts_with(['/', '\\']))
     }
 }
 
@@ -953,6 +995,35 @@ mod tests {
     }
 
     #[test]
+    fn 子仓库记的东西跟着根仓库留着() {
+        let repo = |path: &str| RepoEntry {
+            server: None,
+            path: path.into(),
+        };
+        let mut settings = Settings {
+            repos: vec![repo(r"C:\a")],
+            ..Settings::default()
+        };
+        let hide = |memo: &mut RepoMemo| memo.hidden_refs.push("refs/heads/wip".into());
+        // 子仓库不在仓库列表里；名字只是以根仓库的名字开头的不算在它里面
+        settings.edit_memo(&repo(r"C:\a\packages\plugin-x"), hide);
+        settings.edit_memo(&repo(r"C:\ab"), hide);
+        settings.normalize();
+        assert!(settings.memo(&repo(r"C:\a\packages\plugin-x")).is_some());
+        assert!(settings.memo(&repo(r"C:\ab")).is_none());
+        let server = RepoEntry {
+            server: Some("s1".into()),
+            path: "/srv/a/plugin".into(),
+        };
+        assert!(!repo("/srv/a").contains(&server));
+        assert!(!repo("/srv/a").contains(&repo("/srv/a")));
+        // 根仓库移除以后不留
+        settings.repos.clear();
+        settings.normalize();
+        assert!(settings.repo_memos.is_empty());
+    }
+
+    #[test]
     fn ssh目标拆开再拼回去() {
         let target = |host: &str, user: &str, port: &str| Target {
             host: host.into(),
@@ -1021,6 +1092,43 @@ mod tests {
         assert_eq!(server.key_file(), None);
         let again: Server = serde_json::from_str(&text).unwrap();
         assert_eq!(again, server);
+    }
+
+    #[test]
+    fn 打开仓库从上次的目录开始_没有就用初始目录() {
+        let mut server = Server::default();
+        assert_eq!(server.browse_starts(), [""]);
+        server.start_dir = Some("/data/workspaces".into());
+        assert_eq!(server.browse_starts(), ["/data/workspaces", ""]);
+        server.last_dir = Some("/data/build/src".into());
+        assert_eq!(
+            server.browse_starts(),
+            ["/data/build/src", "/data/workspaces", ""]
+        );
+        // 两个一样时只试一次
+        server.last_dir = server.start_dir.clone();
+        assert_eq!(server.browse_starts(), ["/data/workspaces", ""]);
+        // 没设的不写进文件
+        let text = serde_json::to_string(&Server::default()).unwrap();
+        assert!(
+            !text.contains("start_dir") && !text.contains("last_dir"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn 收起的卡片_服务器不在了就不记() {
+        let mut settings = Settings::default();
+        settings.servers.push(Server {
+            id: "s1".into(),
+            ..Server::default()
+        });
+        settings.collapsed_cards = vec![LOCAL_CARD.into(), "s1".into(), "gone".into()];
+        settings.normalize();
+        assert_eq!(settings.collapsed_cards, [LOCAL_CARD, "s1"]);
+        // 没有收起的不写进文件
+        let text = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(!text.contains("collapsed_cards"), "{text}");
     }
 
     #[test]

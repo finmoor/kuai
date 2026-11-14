@@ -2,6 +2,8 @@
 //!
 //! 版本发在 GitHub Releases 上（仓库 [`REPO`]）。启动后过一会儿、之后每 6 小时问一次
 //! `releases/latest`（设置里能关，「设置 → 关于」里能手动问），比自己新就在标题栏上提示
+//! （没问成的过一会儿再试，见 [`wait_before_next`]；窗口从托盘叫回来、再次启动时也问，见
+//! [`Updater::window_shown`]）
 //! （`update_view.rs`）。点「升级」才下载，下到 `%LOCALAPPDATA%\kuai\update\`，和 GitHub 给附件记的
 //! SHA-256（API 里的 `digest`）对一遍，放进暂存目录。下哪个、怎么换看这份 Kuai 是怎么装的（[`Kind`]）：
 //! - 安装版（`tools/installer/kuai.iss` 装的）：下新的安装程序。点「重启完成升级」时在后台跑它
@@ -39,9 +41,21 @@ use crate::app_state::AppState;
 /// 发版的 GitHub 仓库。
 pub const REPO: &str = "finmoor/kuai";
 /// 启动后多久问第一次：别和打开仓库、连服务器抢
-const FIRST_CHECK: Duration = Duration::from_secs(10);
+const FIRST_CHECK: Duration = Duration::from_secs(3);
 /// 之后多久问一次
 const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+/// 自动问没问成（开机自启时网络还没通、GitHub 限流）过多久再试：一次比一次久，之后每小时一次
+const RETRY_AFTER: [Duration; 4] = [
+    Duration::from_secs(60),
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(15 * 60),
+    Duration::from_secs(60 * 60),
+];
+/// 多久看一眼该不该问了
+const TICK: Duration = Duration::from_secs(30);
+/// 窗口被叫回来（再次启动、点托盘）时，离上次问成超过这么久就再问一次。
+/// 常驻托盘的 Kuai 很少真的重启，对用户来说这就是「启动」
+const RECHECK_ON_SHOW: Duration = Duration::from_secs(30 * 60);
 /// 发布说明里最多取几条要点
 const MAX_NOTES: usize = 6;
 /// 暂存目录里的这个文件表示解压完了
@@ -160,6 +174,10 @@ pub struct Updater {
     pub checking: bool,
     /// 上次问成的时候
     pub checked_at: Option<Instant>,
+    /// 上次开始问的时候（成不成都记）
+    tried_at: Option<Instant>,
+    /// 连着几次没问成
+    failures: usize,
     /// 这次启动是从哪个版本升上来的
     pub updated_from: Option<String>,
     _work: Option<Task<()>>,
@@ -176,14 +194,17 @@ impl Updater {
             cx.background_executor().timer(FIRST_CHECK).await;
             loop {
                 let alive = this.update(cx, |this, cx| {
-                    if this.app.read(cx).settings.check_updates {
+                    let due = this
+                        .tried_at
+                        .is_none_or(|at| at.elapsed() >= wait_before_next(this.failures));
+                    if due && this.app.read(cx).settings.check_updates {
                         this.check(false, cx);
                     }
                 });
                 if alive.is_err() {
                     return;
                 }
-                cx.background_executor().timer(CHECK_EVERY).await;
+                cx.background_executor().timer(TICK).await;
             }
         });
         let mut stage = Stage::Idle;
@@ -210,6 +231,8 @@ impl Updater {
             stage,
             checking: false,
             checked_at: None,
+            tried_at: None,
+            failures: 0,
             updated_from,
             _work: None,
             _refetch: None,
@@ -236,12 +259,27 @@ impl Updater {
         skipped.as_deref() == Some(release.version.to_string().as_str())
     }
 
+    /// 窗口被叫回来了（再次启动 Kuai、点托盘图标）：离上次问成有一阵了就再问一次。
+    pub fn window_shown(&mut self, cx: &mut Context<Self>) {
+        let stale = self
+            .checked_at
+            .is_none_or(|at| at.elapsed() >= RECHECK_ON_SHOW);
+        // 刚问过没成的不在这里追着问，照 `wait_before_next` 的间隔来
+        let just_tried = self
+            .tried_at
+            .is_some_and(|at| at.elapsed() < RETRY_AFTER[0]);
+        if stale && !just_tried && self.app.read(cx).settings.check_updates {
+            self.check(false, cx);
+        }
+    }
+
     /// 问 GitHub 有没有新版本。`manual`：在关于页点的，问不成要显示出来。
     pub fn check(&mut self, manual: bool, cx: &mut Context<Self>) {
         if self.checking || matches!(self.stage, Stage::Downloading { .. } | Stage::Ready(_)) {
             return;
         }
         self.checking = true;
+        self.tried_at = Some(Instant::now());
         cx.notify();
         let task = cx
             .background_executor()
@@ -253,6 +291,7 @@ impl Updater {
                 match result {
                     Ok(release) => {
                         this.checked_at = Some(Instant::now());
+                        this.failures = 0;
                         let newer = release.filter(|r| r.version > current_version());
                         match (&mut this.stage, newer) {
                             // 自动检查别盖掉上次没装上的原因，把版本补上，「重试」「去下载页」用得上
@@ -269,6 +308,7 @@ impl Updater {
                     }
                     Err(err) => {
                         log::warn!("检查更新没成：{err:#}");
+                        this.failures += 1;
                         if manual {
                             let problem = Problem::Check(format!("{err:#}"));
                             this.stage = Stage::Failed {
@@ -505,6 +545,15 @@ struct GhAsset {
 
 fn api_base() -> String {
     std::env::var("FR_UPDATE_API").unwrap_or_else(|_| "https://api.github.com".into())
+}
+
+/// 自动问过一次以后，隔多久再问：问成了等 [`CHECK_EVERY`]；连着 `failures` 次没问成的，
+/// 按 [`RETRY_AFTER`] 一次比一次久。
+fn wait_before_next(failures: usize) -> Duration {
+    match failures {
+        0 => CHECK_EVERY,
+        n => RETRY_AFTER[(n - 1).min(RETRY_AFTER.len() - 1)],
+    }
 }
 
 /// HTTP 客户端。代理照环境变量 HTTPS_PROXY、ALL_PROXY 走（ureq 默认就读）。
@@ -926,11 +975,13 @@ fn clean_old_downloads() {
 #[cfg(test)]
 mod tests {
     // 不能 `use super::*`：gpui_kit 里也有个叫 test 的属性宏，会盖住标准库的 #[test]
+    use super::{CHECK_EVERY, wait_before_next};
     use super::{GhAsset, GhRelease, Kind, READY_MARK, Version, common_top, copy_tree, extract};
     use super::{parse_release, plain};
     use std::fs::{self, File};
     use std::io::Write as _;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn gh(tag: &str, assets: &[(&str, Option<&str>)]) -> GhRelease {
         GhRelease {
@@ -949,6 +1000,17 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn 没问成的过一会儿再试() {
+        assert_eq!(wait_before_next(0), CHECK_EVERY);
+        assert_eq!(wait_before_next(1), Duration::from_secs(60));
+        assert_eq!(wait_before_next(3), Duration::from_secs(15 * 60));
+        // 再多也是每小时一次，不会比正常的间隔还久
+        assert_eq!(wait_before_next(4), Duration::from_secs(60 * 60));
+        assert_eq!(wait_before_next(99), Duration::from_secs(60 * 60));
+        assert!(wait_before_next(99) < CHECK_EVERY);
     }
 
     #[test]

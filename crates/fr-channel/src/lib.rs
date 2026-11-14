@@ -37,7 +37,7 @@ use serde_json::json;
 
 pub use fr_core::askpass::PromptKind;
 pub use fr_core::protocol::{
-    DirEntry, DirListing, FsEntry, FsExpect, FsStat, FsWrite, FsWritten, Hello, TermInfo,
+    DirEntry, DirListing, FsEntry, FsExpect, FsStat, FsWrite, FsWritten, Hello, SubRepos, TermInfo,
 };
 pub use hop::run_helper as run_ssh_hop;
 pub use remote::{ConnectOptions, Connection, Jump, StageHandler, local_kuai_root};
@@ -384,6 +384,17 @@ impl Channel {
                 local::blocking(move || fr_core::files::list(&repo, &dir))
             }
             Channel::Remote(conn) => conn.fs_list(repo, dir),
+        }
+    }
+
+    /// 仓库目录里面还有哪些仓库（相对仓库根的路径），见 [`fr_core::files::find_repos`]。
+    pub fn fs_repos(&self, repo: &str) -> BoxFuture<'static, Result<SubRepos>> {
+        match self {
+            Channel::Local => {
+                let repo = repo.to_string();
+                local::blocking(move || fr_core::files::find_repos(&repo))
+            }
+            Channel::Remote(conn) => conn.fs_repos(repo),
         }
     }
 

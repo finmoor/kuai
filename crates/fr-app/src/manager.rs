@@ -2,7 +2,7 @@
 //!
 //! 最上面一张卡片是当前工作区的仓库（开着的、没开的分开列），手滑关掉的在这里找。
 //! 下面的「全部仓库」可以收起：本机和每台服务器各是一张卡片，顶上一条写名字、连接状态和能做的事，
-//! 下面列仓库，点一行打开。
+//! 下面列仓库，点一行打开。服务器多了列表很长，每张卡片点顶上那一条也能单独收起（记在设置里）。
 //! 移除仓库、移除服务器都先问一下；服务器的「编辑」「移除」收在行尾的 ⋯ 菜单里，不和常用按钮挨着。
 
 use std::cell::{Cell, RefCell};
@@ -25,7 +25,7 @@ use gpui_kit::*;
 use crate::app_state::{AppState, ConnStatus};
 use crate::browser::{BrowserEvent, RemoteBrowser};
 use crate::clone::{CloneEvent, CloneView};
-use crate::settings::{Auth, RepoEntry, Server, TabGroup, Target};
+use crate::settings::{Auth, LOCAL_CARD, RepoEntry, Server, TabGroup, Target};
 use crate::ui;
 
 pub enum ManagerEvent {
@@ -140,6 +140,11 @@ impl ManagerView {
         let passphrase = input("", secret_hint(Auth::Key), true);
         let password = input("", secret_hint(Auth::Password), true);
         let name = input(&old.name, tr("默认使用主机名"), false);
+        let start_dir = input(
+            old.start_dir.as_deref().unwrap_or_default(),
+            tr("留空则为主目录"),
+            false,
+        );
         // 能选作跳板机的：别的已配置的服务器，而且不经这台连接（不然绕圈）。
         // 每项是 id、名字、ssh 目标、从本机到它要经过的跳板机的名字
         let candidates: Rc<Vec<JumpChoice>> = {
@@ -192,6 +197,7 @@ impl ManagerView {
                     (host.clone(), port.clone(), user.clone(), key.clone());
                 let (passphrase, password, name) =
                     (passphrase.clone(), password.clone(), name.clone());
+                let start_dir = start_dir.clone();
                 let (app, auth, forward_agent) =
                     (app.clone(), auth.clone(), forward_agent.clone());
                 let (forget, problem, old) = (forget.clone(), problem.clone(), old.clone());
@@ -200,6 +206,7 @@ impl ManagerView {
                     let read = |input: &Entity<InputState>| input.read(cx).value().to_string();
                     let (host, user, port) = (read(&host), read(&user), read(&port));
                     let (key, name) = (read(&key), read(&name));
+                    let start_dir = read(&start_dir);
                     let auth = auth.get();
                     // 密码原样用，不去掉两头的空格
                     let secret = match auth {
@@ -247,6 +254,9 @@ impl ManagerView {
                         // 换成密码登录时填过的私钥文件留着，换回来还在
                         identity_file: (!key.is_empty()).then(|| key.to_string()),
                         jump: jump.borrow().clone(),
+                        start_dir: Some(start_dir.trim().to_string()).filter(|dir| !dir.is_empty()),
+                        // 上次打开的目录留不留由 `update_server` 定
+                        last_dir: None,
                     };
                     // 存着的密码、口令：填了新的就换；没填、登录方式没变、也没点清除，就留着
                     let keep = had_secret && auth == old.auth && !forget.get();
@@ -519,7 +529,23 @@ impl ManagerView {
                                 .child(secret_field(tr("私钥口令"), &passphrase)),
                             Auth::Password => body.child(secret_field(tr("密码"), &password)),
                         })
-                        .child(field(tr("名称"), Input::new(&name)))
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .items_start()
+                                .child(
+                                    div()
+                                        .w(px(190.))
+                                        .flex_none()
+                                        .child(field(tr("名称"), Input::new(&name))),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(field(tr("初始目录"), Input::new(&start_dir))),
+                                ),
+                        )
                         .child(
                             Checkbox::new("forward-agent")
                                 .label(tr("转发本机的 ssh-agent（仅对受信任的服务器启用）"))
@@ -671,6 +697,15 @@ impl ManagerView {
                 .on_ok(|_, _, _| false)
                 .child(browser.clone())
         });
+    }
+
+    /// 卡片顶上那一条的收起、展开：现在收没收起，和点了要做的事。
+    fn fold(&self, key: &str, collapsed: bool, cx: &mut Context<Self>) -> Fold {
+        let key = key.to_string();
+        let toggle = cx.listener(move |this, _: &ClickEvent, _, cx| {
+            this.app.update(cx, |app, cx| app.toggle_card(&key, cx));
+        });
+        (collapsed, Box::new(toggle))
     }
 
     /// 工作区卡片里的一行：点了打开（已经开着就切过去）。`recent` 是刚关掉的，行尾标出来。
@@ -838,11 +873,13 @@ impl ManagerView {
                         .on_click(cx.listener(|_, _, _, cx| cx.emit(ManagerEvent::QuickOpen)))
                         .into_any_element(),
                 ],
+                None,
                 colors,
             ),
             None,
             rows,
             tr("此工作区中暂无仓库。打开的仓库将归入此工作区。"),
+            false,
             colors,
         )
     }
@@ -1091,6 +1128,8 @@ impl Render for ManagerView {
         let background = theme.background;
         let settings = self.app.read(cx).settings.clone();
 
+        let collapsed = |key: &str| settings.collapsed_cards.iter().any(|card| card == key);
+        let local_collapsed = collapsed(LOCAL_CARD);
         let local: Vec<AnyElement> = settings
             .repos
             .iter()
@@ -1126,11 +1165,13 @@ impl Render for ManagerView {
                         .on_click(cx.listener(|this, _, window, cx| this.add_local(window, cx)))
                         .into_any_element(),
                 ],
+                Some(self.fold(LOCAL_CARD, local_collapsed, cx)),
                 colors,
             ),
             None,
             local,
             tr("暂无本机仓库。请点击「添加本机仓库…」或「克隆…」。"),
+            local_collapsed,
             colors,
         )];
 
@@ -1171,6 +1212,12 @@ impl Render for ManagerView {
                     failure = Some(err.clone());
                     (Some(colors.danger), tr("连接失败").into(), true)
                 }
+            };
+            // 收起以后看不到下面的仓库：状态后面写上有几个
+            let folded = collapsed(&server.id);
+            let status_text: SharedString = match folded {
+                true => format!("{status_text} · {}", tf!("{n} 个仓库", n = repo_count)).into(),
+                false => status_text,
             };
             // 名字后面的标签：它经哪几台连接；有没有别的服务器经它连接
             let route: Vec<String> = settings
@@ -1311,6 +1358,7 @@ impl Render for ManagerView {
                     Some(server.destination.clone().into()),
                     status_line(&server.id, dot, status_text, colors),
                     actions,
+                    Some(self.fold(&server.id, folded, cx)),
                     colors,
                 ),
                 failure,
@@ -1320,6 +1368,7 @@ impl Render for ManagerView {
                 } else {
                     tr("仅用作跳板机，暂无此服务器上的仓库。")
                 },
+                folded,
                 colors,
             ));
         }
@@ -1449,7 +1498,12 @@ fn status_line(key: &str, dot: Option<Hsla>, text: SharedString, colors: Colors)
         .into_any_element()
 }
 
+/// 卡片能收起时：现在收没收起，和点了顶上那一条要做的事。
+type Fold = (bool, Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>);
+
 /// 卡片顶上的一条：图标、名字（后面跟小标签和一句小字），下面一行是状态；右边是按钮。
+/// 给了 `fold` 的卡片能收起：最左边多一个箭头，点左边这一段（按钮除外）收起、展开。
+#[allow(clippy::too_many_arguments)]
 fn card_header(
     key: &str,
     icon: IconName,
@@ -1458,15 +1512,26 @@ fn card_header(
     aside: Option<SharedString>,
     status: AnyElement,
     actions: Vec<AnyElement>,
+    fold: Option<Fold>,
     colors: Colors,
 ) -> AnyElement {
-    h_flex()
-        .px(px(14.))
-        .py(px(10.))
+    let collapsed = fold.as_ref().is_some_and(|(collapsed, _)| *collapsed);
+    let lead = h_flex()
+        .id(ElementId::Name(format!("card-fold:{key}").into()))
+        .flex_1()
+        .min_w_0()
         .gap(px(8.))
-        .bg(colors.panel)
-        // 卡片的角是圆的，这一条的底色要跟着圆，不然四个角会戳出去
-        .rounded_t(px(9.))
+        .when_some(fold, |lead, (collapsed, toggle)| {
+            lead.cursor_pointer().on_click(toggle).child(
+                ui::icon_small(if collapsed {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                })
+                .flex_none()
+                .text_color(colors.muted),
+            )
+        })
         .child(
             div()
                 .flex_none()
@@ -1507,25 +1572,41 @@ fn card_header(
                         }),
                 )
                 .child(status),
-        )
+        );
+    h_flex()
+        .px(px(14.))
+        .py(px(10.))
+        .gap(px(8.))
+        .bg(colors.panel)
+        // 卡片的角是圆的，这一条的底色要跟着圆，不然四个角会戳出去；收起时下面两个角也是它的
+        .map(|bar| match collapsed {
+            true => bar.rounded(px(9.)),
+            false => bar.rounded_t(px(9.)),
+        })
+        .child(lead)
         .children(actions)
         .into_any_element()
 }
 
 /// 一张卡片：顶上一条，下面是仓库；`failure` 是连不上的原因，整段显示。
+/// `collapsed`：收起了，只画顶上那一条。
 fn card(
     header: AnyElement,
     failure: Option<SharedString>,
     rows: Vec<AnyElement>,
     empty: &'static str,
+    collapsed: bool,
     colors: Colors,
 ) -> AnyElement {
-    v_flex()
+    let card = v_flex()
         .border_1()
         .border_color(colors.border)
         .rounded(px(10.))
-        .child(header)
-        .child(div().h(px(1.)).bg(colors.border))
+        .child(header);
+    if collapsed {
+        return card.into_any_element();
+    }
+    card.child(div().h(px(1.)).bg(colors.border))
         .when_some(failure, |card, failure| {
             card.child(
                 div()

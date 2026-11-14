@@ -1793,7 +1793,7 @@ pub(super) fn format_date(ts: i64) -> String {
         .unwrap_or_default()
 }
 
-fn format_time(ts: i64) -> SharedString {
+pub(super) fn format_time(ts: i64) -> SharedString {
     chrono::DateTime::from_timestamp(ts, 0)
         .map(|t| {
             t.with_timezone(&chrono::Local)

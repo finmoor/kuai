@@ -68,9 +68,13 @@ impl CloneView {
         });
         let parent = cx.new(|cx| InputState::new(window, cx).placeholder(tr("存放位置")));
         let name = cx.new(|cx| InputState::new(window, cx).placeholder(tr("根据地址自动填写")));
-        // 默认目录：本机用已有仓库所在的目录，没有就用用户目录；服务器用主目录
+        // 默认目录：本机用已有仓库所在的目录，没有就用用户目录；服务器用它的初始目录，没设就是主目录
         let mut status = None;
         let mut connect = None;
+        let start_dir = server
+            .as_deref()
+            .and_then(|id| app.read(cx).server(id))
+            .and_then(|server| server.start_dir.clone());
         let default_parent = match &server {
             None => app
                 .read(cx)
@@ -85,6 +89,7 @@ impl CloneView {
                         .map(|(dir, _)| dir.to_string())
                 })
                 .or_else(|| std::env::var("USERPROFILE").ok()),
+            Some(_) if start_dir.is_some() => start_dir,
             Some(id) => match app.read(cx).status(id) {
                 ConnStatus::Ready(conn) => Some(conn.hello.home.clone()),
                 _ => {
@@ -540,7 +545,7 @@ impl Render for CloneView {
                     .child(Input::new(&self.url).disabled(busy)),
             )
             .child(
-                v_flex().gap_1().child(label(tr("选择此目录"))).child(
+                v_flex().gap_1().child(label(tr("存放位置"))).child(
                     h_flex()
                         .gap_2()
                         .child(

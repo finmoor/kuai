@@ -52,7 +52,8 @@ gpui_kit::actions!(
         NewTerminal,
         ToggleSidebar,
         ShowFiles,
-        SaveFile
+        SaveFile,
+        BackToRoot
     ]
 );
 
@@ -279,6 +280,8 @@ fn main() {
                 // 和 VS Code 的资源管理器一样
                 KeyBinding::new("ctrl-shift-e", ShowFiles, None),
                 KeyBinding::new("ctrl-s", SaveFile, None),
+                // 从子仓库回到根仓库。焦点在终端、输入框里时归它们（往回一个词）
+                KeyBinding::new("alt-left", BackToRoot, None),
             ]);
             release_keys_to_terminal(cx);
             workspace_action::<OpenSettings>(cx, |ws, _, cx| ws.toggle_settings(cx));
@@ -306,6 +309,9 @@ fn main() {
             });
             workspace_action::<ShowFiles>(cx, |ws, window, cx| ws.files_in_active(window, cx));
             workspace_action::<SaveFile>(cx, |ws, window, cx| ws.save_in_active(window, cx));
+            workspace_action::<BackToRoot>(cx, |ws, window, cx| {
+                ws.back_to_root_in_active(window, cx)
+            });
             cx.on_action(|_: &ToggleFrameOverlay, cx: &mut App| {
                 for handle in cx.windows() {
                     handle

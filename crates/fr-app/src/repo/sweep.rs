@@ -1,0 +1,252 @@
+//! 清理上游已删除的分支：把上游没了的本地分支列出来，勾选后一起删掉。
+//!
+//! 上游没了，多半是合并请求合进去以后远程分支被删了，本地这个也就没用了；但也可能是别人删错了、
+//! 本地还有没推上去的提交。所以先逐个看它的提交在不在某个远程分支里：在的默认勾上，不在的
+//! 默认不勾、标出有几个提交会丢。当前分支不列（git 不让删）。删用 `-D`：合并请求合进去时
+//! 常常是压成一个提交的，`-d` 认不出来，会一个都删不掉。
+
+use std::cell::Cell;
+use std::rc::Rc;
+
+use fr_channel::Channel;
+use fr_core::i18n::tr;
+use fr_core::tf;
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::dialog::DialogFooter;
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, WindowExt as _, v_flex};
+use gpui_kit::prelude::*;
+use gpui_kit::*;
+
+use super::RepoView;
+
+/// 一个上游已删除的分支，和它的提交在不在远程分支里。
+struct Gone {
+    name: String,
+    /// 它的提交都在某个远程分支里（删了不丢东西）
+    merged: bool,
+    /// 写在名字下面的一句：并入了哪个远程分支，或者有几个提交没并入
+    detail: String,
+}
+
+/// 含有这个分支的远程分支里说哪一个：有主干（main、master、develop）就说主干，没有说第一个。
+/// 「远程名/HEAD」这样的指针不算。
+fn first_remote_branch(output: &str) -> Option<&str> {
+    let branches = || {
+        output
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains('/') && !line.ends_with("/HEAD"))
+    };
+    let trunk = |line: &&str| {
+        let name = line.split_once('/').map_or("", |(_, name)| name);
+        ["main", "master", "develop", "dev"].contains(&name)
+    };
+    branches().find(trunk).or_else(|| branches().next())
+}
+
+async fn inspect(channel: &Channel, repo: &str, name: String) -> Gone {
+    let full = format!("refs/heads/{name}");
+    let count = ["rev-list", "--count", &full, "--not", "--remotes"];
+    let count = channel
+        .git(repo, count.map(String::from).to_vec())
+        .await
+        .and_then(|out| out.ok())
+        .ok()
+        .and_then(|out| String::from_utf8_lossy(&out).trim().parse::<usize>().ok());
+    let (merged, detail) = match count {
+        Some(0) => {
+            let contains = [
+                "for-each-ref",
+                "--count=50",
+                "--contains",
+                &full,
+                "--format=%(refname:short)",
+                "refs/remotes",
+            ];
+            let found = channel
+                .git(repo, contains.map(String::from).to_vec())
+                .await
+                .and_then(|out| out.ok())
+                .ok()
+                .map(|out| String::from_utf8_lossy(&out).into_owned());
+            let detail = match found.as_deref().and_then(first_remote_branch) {
+                Some(remote) => tf!("已并入 {remote}", remote),
+                None => tr("已并入远程分支").to_string(),
+            };
+            (true, detail)
+        }
+        Some(n) => (false, tf!("{n} 个提交未并入任何远程分支", n)),
+        None => (false, tr("无法确认是否已并入远程分支").to_string()),
+    };
+    Gone {
+        name,
+        merged,
+        detail,
+    }
+}
+
+impl RepoView {
+    /// 上游已删除的本地分支有几个（不算当前分支）。
+    pub(super) fn gone_count(&self) -> usize {
+        self.refs
+            .branches
+            .iter()
+            .filter(|branch| branch.gone && !branch.current)
+            .count()
+    }
+
+    /// 侧栏「分支」标题上的「清理 N」：先看每个分支的提交在不在远程分支里，再弹出对话框。
+    pub(super) fn sweep_gone_branches(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let names: Vec<String> = self
+            .refs
+            .branches
+            .iter()
+            .filter(|branch| branch.gone && !branch.current)
+            .map(|branch| branch.name.to_string())
+            .collect();
+        if names.is_empty() {
+            let text = tr("没有上游已删除的分支。");
+            window.push_notification(Notification::info(text), cx);
+            return;
+        }
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        let repo = self.entry.path.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let checks = names.into_iter().map(|name| inspect(&channel, &repo, name));
+            let list = futures::future::join_all(checks).await;
+            this.update_in(cx, |this, window, cx| this.sweep_dialog(list, window, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    fn sweep_dialog(&mut self, list: Vec<Gone>, window: &mut Window, cx: &mut Context<Self>) {
+        let list = Rc::new(list);
+        let states: Rc<Vec<Cell<bool>>> =
+            Rc::new(list.iter().map(|gone| Cell::new(gone.merged)).collect());
+        let view = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let theme = cx.theme();
+            let (muted, warning, border) = (theme.muted_foreground, theme.warning, theme.border);
+            let mut rows = v_flex()
+                .id("sweep-list")
+                .max_h(px(320.))
+                .overflow_y_scroll()
+                .border_1()
+                .border_color(border)
+                .rounded(px(crate::ui::RADIUS))
+                .p_2()
+                .gap_2();
+            for (ix, gone) in list.iter().enumerate() {
+                let states = states.clone();
+                rows = rows.child(
+                    v_flex()
+                        .gap(px(2.))
+                        .child(
+                            Checkbox::new(("sweep-check", ix))
+                                .label(gone.name.clone())
+                                .checked(states[ix].get())
+                                .on_click(move |checked, window, _| {
+                                    states[ix].set(*checked);
+                                    window.refresh();
+                                }),
+                        )
+                        .child(
+                            div()
+                                .pl(px(24.))
+                                .text_xs()
+                                .text_color(if gone.merged { muted } else { warning })
+                                .child(gone.detail.clone()),
+                        ),
+                );
+            }
+            let picked = states.iter().filter(|state| state.get()).count();
+            let (view, list, states) = (view.clone(), list.clone(), states.clone());
+            dialog
+                .title(tr("清理上游已删除的分支"))
+                .w(px(520.))
+                // 回车不执行，要明确点按钮
+                .on_ok(|_, _, _| false)
+                .child(
+                    v_flex().gap_3().child(rows).child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .whitespace_normal()
+                            .child(tr("仅删除本地分支。未并入远程分支的提交，删除后难以找回。")),
+                    ),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("cancel")
+                                .label(tr("取消"))
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("ok")
+                                .with_variant(ButtonVariant::Danger)
+                                .label(tf!("删除 {n} 个分支", n = picked))
+                                .disabled(picked == 0)
+                                .on_click(move |_, window, cx| {
+                                    let names: Vec<String> = list
+                                        .iter()
+                                        .zip(states.iter())
+                                        .filter(|(_, state)| state.get())
+                                        .map(|(gone, _)| gone.name.clone())
+                                        .collect();
+                                    window.close_dialog(cx);
+                                    view.update(cx, |this, cx| this.run_sweep(names, window, cx))
+                                        .ok();
+                                }),
+                        ),
+                )
+        });
+    }
+
+    fn run_sweep(&mut self, names: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if names.is_empty() {
+            return;
+        }
+        let count = names.len();
+        let mut args: Vec<String> = vec!["branch".into(), "-D".into(), "--".into()];
+        args.extend(names);
+        self.run_op(
+            tr("清理分支"),
+            args,
+            None,
+            window,
+            cx,
+            move |_, _, window, cx| {
+                let text = tf!("已删除 {n} 个分支", n = count);
+                window.push_notification(Notification::success(text), cx);
+            },
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_remote_branch;
+
+    #[test]
+    fn 并入了哪个远程分支_跳过指针() {
+        assert_eq!(
+            first_remote_branch("origin\norigin/HEAD\norigin/main\n"),
+            Some("origin/main")
+        );
+        assert_eq!(first_remote_branch("origin/HEAD\n"), None);
+        assert_eq!(
+            first_remote_branch("origin/feat/alive\norigin/master\n"),
+            Some("origin/master")
+        );
+        assert_eq!(
+            first_remote_branch("origin/feat/a\norigin/feat/main\n"),
+            Some("origin/feat/a")
+        );
+    }
+}

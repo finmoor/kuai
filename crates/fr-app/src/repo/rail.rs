@@ -65,7 +65,7 @@ fn section_of(item: SideItem) -> Option<SideSection> {
         SideItem::Stash(_) => Some(SideSection::Stashes),
         SideItem::Submodule(_) => Some(SideSection::Submodules),
         SideItem::Header(section) => Some(section),
-        SideItem::Changes | SideItem::History | SideItem::Folder(_) => None,
+        SideItem::Changes | SideItem::History | SideItem::SubRepos | SideItem::Folder(_) => None,
     }
 }
 
@@ -91,7 +91,26 @@ fn section_menu(
         return menu;
     };
     let entries = entity.read(cx).rail_entries(section);
+    let gone = match section {
+        SideSection::Branches => entity.read(cx).gone_count(),
+        _ => 0,
+    };
     let mut menu = menu.max_h(px(420.)).scrollable(true);
+    // 有上游已删除的分支：最上面一项是清理它们（放在下面的话，分支多了要滚到底才看得到）
+    if gone > 0 {
+        let view = view.clone();
+        let label = tf!("清理 {n} 个上游已删除的分支…", n = gone);
+        menu = menu
+            .item(
+                PopupMenuItem::new(label)
+                    .icon(IconName::BrushCleaning)
+                    .on_click(move |_, window, cx| {
+                        view.update(cx, |this, cx| this.sweep_gone_branches(window, cx))
+                            .ok();
+                    }),
+            )
+            .separator();
+    }
     if entries.is_empty() {
         return menu.item(PopupMenuItem::new(empty_text(section)).disabled(true));
     }
@@ -145,7 +164,11 @@ impl RepoView {
                     .justify_center()
                     .border_b_1()
                     .border_color(border)
-                    .child(self.render_rail_repo(cx)),
+                    // 子仓库的页面：这个位置是返回按钮
+                    .child(match self.render_rail_back(cx) {
+                        Some(back) => back,
+                        None => self.render_rail_repo(cx).into_any_element(),
+                    }),
             )
             .child(
                 v_flex()
@@ -315,8 +338,22 @@ impl RepoView {
                 this.click_sidebar(SideItem::History, 1, window, cx)
             }))
             .into_any_element(),
-            separator(cx).into_any_element(),
         ];
+        if self.has_subs() {
+            items.push(
+                rail_button(
+                    "rail-subs",
+                    IconName::FolderTree,
+                    selected == SideItem::SubRepos,
+                )
+                .tooltip(tr("子仓库"))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.click_sidebar(SideItem::SubRepos, 1, window, cx)
+                }))
+                .into_any_element(),
+            );
+        }
+        items.push(separator(cx).into_any_element());
         let mut sections = vec![
             SideSection::Branches,
             SideSection::Remotes,

@@ -52,6 +52,9 @@
 //! - `fs_rename`：参数 `{repo, path, to}`，`to` 已经有了就失败。
 //! - `file_put` 带上 `repo`、`path` 就是往仓库里传文件：没传完的放在目标旁边，传完才改成正式的名字。
 //!
+//! 子仓库（协议 8 起）：
+//! - `fs_repos`：参数 `{repo}`，返回 [`SubRepos`]：仓库目录里面还有哪些仓库，见 [`crate::files::find_repos`]。
+//!
 //! 给 ssh 转接程序（`kuaid --connect`）和运维用的：
 //! - `info`：返回 [`DaemonInfo`]。
 //! - `bridge`：参数 `{auth_sock}`，转接程序报告这条 ssh 连接转发过来的 ssh-agent 套接字。不回响应。
@@ -70,7 +73,8 @@ use serde_json::Value;
 /// 协议版本，握手时交换。服务器上的 kuaid 不能比客户端旧（连接时会原地升级），可以比客户端新。
 ///
 /// 7：kuaid 有了 Windows 版；`term_open` 可以带 `shell`。
-pub const PROTOCOL_VERSION: u32 = 7;
+/// 8：`fs_repos`，找仓库目录里面的仓库。
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// 一条消息后面跟多少字节的原始数据。
 pub trait Frame {
@@ -365,6 +369,16 @@ pub struct DirEntry {
     /// 下面有 `.git`
     #[serde(default)]
     pub repo: bool,
+}
+
+/// `fs_repos` 的结果：仓库目录里面的仓库。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SubRepos {
+    /// 相对仓库根的路径，用 `/` 分隔，按名字排
+    pub repos: Vec<String>,
+    /// 目录太多、没找全
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
 }
 
 fn is_zero(n: &u64) -> bool {

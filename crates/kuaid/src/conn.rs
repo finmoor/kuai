@@ -449,6 +449,7 @@ fn fs_request(request: Request, payload: &[u8]) -> Result<(Value, Vec<u8>)> {
     let done = |result: Value| Ok((result, Vec::new()));
     match request.method.as_str() {
         "fs_list" => done(json!({ "entries": files::list(repo, path)? })),
+        "fs_repos" => done(serde_json::to_value(files::find_repos(repo)?)?),
         "fs_stat" => done(serde_json::to_value(files::stat(repo, path)?)?),
         "fs_read" => {
             let (offset, len) = (number("offset").unwrap_or(0), number("len"));

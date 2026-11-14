@@ -1058,7 +1058,7 @@ pub(super) fn failure(window: &mut Window, cx: &mut App, label: &str, detail: St
 /// 「停在一半」那条提示的标识：同一时间只留一条，状态往前走了就收掉。
 struct StoppedNote;
 
-fn with_detail(note: Notification, title: &str, detail: &str) -> Notification {
+pub(super) fn with_detail(note: Notification, title: &str, detail: &str) -> Notification {
     let shown = SharedString::from(tail(detail, SHOWN_LINES));
     let full = format!("{title}\n{detail}");
     note.content(move |_, _, cx| {
