@@ -40,6 +40,7 @@ mod stage_diff;
 mod subs;
 mod sweep;
 mod terminals;
+mod worktrees;
 
 pub(crate) use ops::explain;
 pub(crate) use terminals::{end_parked_terminals, parked_terminals_of, parked_terminals_running};
@@ -77,6 +78,8 @@ enum Mode {
     Merge,
     /// 子仓库总览（仓库目录里面还有别的仓库时才有），见 [`subs`]
     Subs,
+    /// 工作树总览，见 [`worktrees`]
+    Worktrees,
 }
 
 /// 显示哪一页（侧栏里的切换，Ctrl+` 来回切）。
@@ -155,8 +158,10 @@ pub struct RepoView {
     back_page: Page,
     /// 这是哪个根仓库的子仓库；平常打开的仓库没有
     sub_of: Option<subs::SubOf>,
-    /// 仓库目录里面的仓库，和进过的那些的页面
+    /// 仓库目录里面的仓库，和进过的那些（子仓库、工作树）的页面
     subs: subs::Subs,
+    /// 这个仓库的工作树
+    worktrees: worktrees::Worktrees,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -219,6 +224,7 @@ impl RepoView {
             back_page: Page::Git,
             sub_of: None,
             subs,
+            worktrees: worktrees::Worktrees::default(),
             _subscriptions: subscriptions,
         };
         // 测试开关：FR_TEST_VIEW=changes 打开仓库时直接显示本地修改
@@ -328,16 +334,18 @@ impl RepoView {
         let read_state = channel.git_with_input(&repo, state::args(), Some(state::stdin()));
         let read_submodules = channel.git(&repo, menus::submodule_args());
         let read_remotes = channel.git(&repo, vec!["remote".into()]);
+        let read_worktrees = channel.git(&repo, fr_core::worktree::list_args());
         self.refreshing = true;
         self.refresh_again = false;
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
-            let (st, rf, sh, state, sm, rm) = futures::join!(
+            let (st, rf, sh, state, sm, rm, wt) = futures::join!(
                 read_status,
                 read_refs,
                 read_stashes,
                 read_state,
                 read_submodules,
-                read_remotes
+                read_remotes,
+                read_worktrees
             );
             this.update(cx, |this, cx| {
                 this.refreshing = false;
@@ -376,6 +384,13 @@ impl RepoView {
                             .collect()
                     })
                     .unwrap_or_default();
+                // 很旧的 git 没有这条命令：当成没有工作树，侧栏上不出现那一项
+                let trees = wt
+                    .ok()
+                    .filter(|out| out.success())
+                    .map(|out| fr_core::worktree::parse(&out.stdout))
+                    .unwrap_or_default();
+                this.set_worktrees(trees, cx);
                 let head = parsed.head.clone().unwrap_or_default();
                 this.apply_status(parsed, cx);
                 this.files_status_changed(cx);
@@ -401,8 +416,10 @@ impl RepoView {
     pub fn refresh_now(&mut self, cx: &mut Context<Self>) {
         self.history_key = None;
         self.refresh(cx);
-        if self.mode == Mode::Subs {
-            self.load_sub_summaries(cx);
+        match self.mode {
+            Mode::Subs => self.load_sub_summaries(cx),
+            Mode::Worktrees => self.load_worktree_summaries(cx),
+            _ => {}
         }
     }
 
@@ -714,6 +731,7 @@ impl RepoView {
             .as_deref()
             .and_then(|id| self.app.read(cx).server(id))
             .cloned();
+        let app = self.app.clone();
         // 不加悬停提示：提示也出现在按钮下面，会把弹出的菜单第一项盖住
         tool_button_bare(
             "open-in",
@@ -723,26 +741,52 @@ impl RepoView {
             0,
             cx,
         )
-        .dropdown_menu(move |menu, _, _| {
+        .dropdown_menu(move |menu, _, cx| {
             let (a, b, c) = (dir.clone(), dir.clone(), dir.clone());
             match server.clone() {
                 // 服务器上的仓库：终端经 ssh 登录，VS Code 走 Remote-SSH
                 Some(server) => {
                     let dest2 = server.destination.clone();
-                    menu.item(PopupMenuItem::new(tr("在外部终端中打开（ssh）")).on_click(
-                        move |_, window, cx| {
-                            let result = crate::shell::open_terminal_ssh(&server, &a);
-                            crate::shell::report(result, window, cx);
-                        },
-                    ))
-                    .item(
-                        PopupMenuItem::new(tr("在 VS Code 中打开（Remote-SSH）")).on_click(
+                    let server_id = server.id.clone();
+                    let menu = menu
+                        .item(PopupMenuItem::new(tr("在外部终端中打开（ssh）")).on_click(
                             move |_, window, cx| {
-                                let result = crate::shell::open_vscode_remote(&dest2, &b);
+                                let result = crate::shell::open_terminal_ssh(&server, &a);
                                 crate::shell::report(result, window, cx);
                             },
-                        ),
-                    )
+                        ))
+                        .item(
+                            PopupMenuItem::new(tr("在 VS Code 中打开（Remote-SSH）")).on_click(
+                                move |_, window, cx| {
+                                    let result = crate::shell::open_vscode_remote(&dest2, &b);
+                                    crate::shell::report(result, window, cx);
+                                },
+                            ),
+                        )
+                        .separator();
+                    // 映射到本机了：可以直接交给本机的资源管理器、VS Code；没有就给映射的入口
+                    match app.read(cx).local_path(&server_id, &c) {
+                        Some(local) => {
+                            let code = local.clone();
+                            menu.item(PopupMenuItem::new(tr("在资源管理器中打开")).on_click(
+                                move |_, window, cx| {
+                                    let result = crate::shell::open_folder(&local);
+                                    crate::shell::report(result, window, cx)
+                                },
+                            ))
+                            .item(
+                                PopupMenuItem::new(tr("在本机的 VS Code 中打开")).on_click(
+                                    move |_, window, cx| {
+                                        let result = crate::shell::open_vscode(&code);
+                                        crate::shell::report(result, window, cx)
+                                    },
+                                ),
+                            )
+                        }
+                        None => {
+                            crate::mapping::menu_items(menu, &app, &server_id, &c, true, &c, cx)
+                        }
+                    }
                 }
                 None => menu
                     .item(
@@ -913,6 +957,7 @@ impl RepoView {
                 Mode::Blame => self.render_blame(cx),
                 Mode::Merge => self.render_merge(cx),
                 Mode::Subs => self.render_subs(cx),
+                Mode::Worktrees => self.render_worktrees(cx),
             }
         };
         let banner = self
@@ -984,7 +1029,7 @@ fn tool_button_bare(
 
 impl Render for RepoView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // 进到了子仓库里：整个页面是它的
+        // 进到了子仓库、别的工作树里：整个页面是它的
         if let Some(sub) = self.active_sub() {
             return div().size_full().child(sub).into_any_element();
         }

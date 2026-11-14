@@ -652,6 +652,25 @@ impl SettingsPage {
                 .trim_start_matches("https://")
                 .to_string(),
         );
+        // 把服务器目录映射到本机用的是 WinFsp：不随 Kuai 分发，用的时候才装。照它的许可写明出处
+        let winfsp = SettingItem::new(
+            tr("目录映射"),
+            SettingField::render(|_, _, _| {
+                Button::new("open-winfsp")
+                    .small()
+                    .icon(Icon::new(IconName::ExternalLink))
+                    .label(tr("打开"))
+                    .on_click(|_, window, cx| {
+                        let result = crate::shell::open_url(fr_mount::WINFSP_URL);
+                        crate::shell::report(result, window, cx);
+                    })
+            }),
+        )
+        .description(format!(
+            "{}\n{}",
+            tr("将服务器目录映射到本机时使用 WinFsp，需单独安装。"),
+            fr_mount::WINFSP_NOTICE
+        ));
         let file = crate::settings::file();
         let folder = file.parent().map(|dir| dir.to_string_lossy().to_string());
         let path: SharedString = file.to_string_lossy().to_string().into();
@@ -664,6 +683,7 @@ impl SettingsPage {
                     .item(version)
                     .item(check_updates)
                     .item(source)
+                    .item(winfsp)
                     .item(SettingItem::render(move |_, _, cx| {
                         let muted = cx.theme().muted_foreground;
                         let folder = folder.clone();

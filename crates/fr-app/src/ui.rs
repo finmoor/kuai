@@ -25,6 +25,22 @@ pub fn icon_small(name: IconName) -> Icon {
     Icon::new(name).xsmall()
 }
 
+/// 单行输入框里程序填了一个长路径：让它露出结尾（`set_value` 之后默认露出开头，和网页的输入框
+/// 一样）。往哪滚要等新的文字排过版才知道，所以隔两帧再把光标放到最后；不抢焦点。
+pub fn show_input_end(input: &Entity<gpui_kit::component::input::InputState>, window: &Window) {
+    let input = input.downgrade();
+    window.on_next_frame(move |window, _| {
+        window.on_next_frame(move |_, cx| {
+            input
+                .update(cx, |state, cx| {
+                    let end = state.value().len();
+                    state.set_selected_range(end..end, cx);
+                })
+                .ok();
+        });
+    });
+}
+
 /// 一行放不下就省略的文字，鼠标停上去显示全文。只在真的被截掉时才弹，放得下的不弹。
 ///
 /// 返回的块上可以接着设字号、颜色、`flex_1()`；省略开头、中间的接 `text_ellipsis_start()`、

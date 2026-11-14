@@ -12,6 +12,7 @@ repository = "https://github.com/finmoor/kuai"
 [workspace.dependencies]
 fr-core = { path = "crates/fr-core" }
 fr-channel = { path = "crates/fr-channel" }
+fr-mount = { path = "crates/fr-mount" }
 anyhow = "1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

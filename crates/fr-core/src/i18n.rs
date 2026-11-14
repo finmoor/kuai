@@ -376,7 +376,7 @@ mod tests {
             .unwrap();
         let (mut total, mut missing) = (0, Vec::new());
         // kuaid 跑在服务器上，说的话不跟客户端的语言
-        for name in ["fr-app", "fr-core", "fr-channel"] {
+        for name in ["fr-app", "fr-core", "fr-channel", "fr-mount"] {
             let mut files = Vec::new();
             rust_files(&crates.join(name).join("src"), &mut files);
             for file in files {

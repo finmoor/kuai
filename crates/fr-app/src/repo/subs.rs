@@ -9,6 +9,9 @@
 //!   「返回 <根仓库>」（Alt+←），回到总览表。进过的子仓库的页面留着，再进去还是原来的样子，
 //!   里面的终端也接着跑。
 //! - 子仓库里面不再找子仓库。
+//!
+//! 进到另一个工作树（见 [`super::worktrees`]）走的也是这一套：整页换成它、返回按钮、Alt+←。
+//! 子仓库里还能再进它自己的工作树，所以最多两层，返回一次退一层。
 
 use std::collections::HashMap;
 
@@ -36,31 +39,51 @@ use crate::settings::RepoEntry;
 use crate::ui;
 
 /// 同时对几个子仓库执行 git（读状态、获取、拉取）。服务器上每条命令是一个 git 进程。
-const PARALLEL: usize = 6;
+pub(super) const PARALLEL: usize = 6;
 /// 总览表一行的高度
-const ROW_HEIGHT: f32 = 44.;
+pub(super) const ROW_HEIGHT: f32 = 44.;
 
 /// 这个仓库页是哪个根仓库的子仓库。
 pub(super) struct SubOf {
     pub root: WeakEntity<RepoView>,
     /// 根仓库显示的名字，写在返回按钮上
     pub name: SharedString,
+    /// 是从工作树总览进来的（不是子仓库总览）
+    pub worktree: bool,
 }
 
-/// 总览表里一个子仓库的情况。
+/// 从总览表进到的是哪一个页面。
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum Child {
+    /// 仓库目录里的子仓库：相对根仓库的路径
+    Sub(String),
+    /// 这个仓库的另一个工作树：它的目录
+    Worktree(String),
+}
+
+impl Child {
+    /// 目录名：标签页的标题后面带上它。
+    fn name(&self) -> &str {
+        let (Child::Sub(path) | Child::Worktree(path)) = self;
+        let path = path.trim_end_matches(['/', '\\']);
+        path.rsplit(['/', '\\']).next().unwrap_or(path)
+    }
+}
+
+/// 总览表里一个子仓库（或者工作树）的情况。
 #[derive(Clone, Default)]
-struct Summary {
-    branch: Option<String>,
-    head: Option<String>,
-    upstream: bool,
-    changes: usize,
-    ahead: u32,
-    behind: u32,
+pub(super) struct Summary {
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub upstream: bool,
+    pub changes: usize,
+    pub ahead: u32,
+    pub behind: u32,
     /// 最近一次提交的说明和时间
-    subject: String,
-    time: i64,
+    pub subject: String,
+    pub time: i64,
     /// 读不了（目录没了、不是完整的仓库）
-    error: Option<SharedString>,
+    pub error: Option<SharedString>,
 }
 
 /// 进到子仓库以后做什么。
@@ -89,10 +112,10 @@ pub(super) struct Subs {
     summaries: HashMap<String, Summary>,
     loading: bool,
     summary_task: Option<Task<()>>,
-    /// 进过的子仓库的页面
-    views: Vec<(String, Entity<RepoView>)>,
-    /// 现在显示的是哪个子仓库；空着是根仓库自己
-    active: Option<String>,
+    /// 进过的子仓库、工作树的页面
+    views: Vec<(Child, Entity<RepoView>)>,
+    /// 现在显示的是哪一个；空着是这个仓库自己
+    active: Option<Child>,
     /// 这个标签页是不是当前显示的（根仓库自己的 `visible` 在显示子仓库时是假）
     pub(super) tab_visible: bool,
     filter: Entity<InputState>,
@@ -139,7 +162,7 @@ fn folder(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
 
-async fn summarize(channel: Channel, repo: String) -> Summary {
+pub(super) async fn summarize(channel: Channel, repo: String) -> Summary {
     let read_status = channel.git(&repo, status::args());
     let last = ["log", "-1", "--format=%ct%x09%s"]
         .map(String::from)
@@ -195,12 +218,16 @@ impl RepoView {
             .map(|(_, view)| view.clone())
     }
 
-    /// 现在显示的子仓库的名字（标签页的标题后面带上它）。
-    pub fn sub_title(&self) -> Option<SharedString> {
-        self.subs
-            .active
-            .as_deref()
-            .map(|path| leaf(path).to_string().into())
+    /// 现在显示的子仓库、工作树的名字（标签页的标题后面带上它）；进了两层的写成「子仓库 / 工作树」。
+    pub fn sub_title(&self, cx: &App) -> Option<SharedString> {
+        let active = self.subs.active.as_ref()?;
+        let inner = self
+            .active_sub()
+            .and_then(|view| view.read(cx).sub_title(cx));
+        Some(match inner {
+            Some(inner) => format!("{} / {inner}", active.name()).into(),
+            None => active.name().to_string().into(),
+        })
     }
 
     /// 根仓库和各个子仓库里一共有几个文件有没提交的改动（标签页上的小点用）。
@@ -213,16 +240,14 @@ impl RepoView {
     pub fn busy_with_subs(&self, cx: &App) -> Option<SharedString> {
         let mut subs = self.subs.views.iter();
         self.busy()
-            .or_else(|| subs.find_map(|(_, view)| view.read(cx).busy()))
+            .or_else(|| subs.find_map(|(_, view)| view.read(cx).busy_with_subs(cx)))
     }
 
     /// 正在做的写操作是不是都能取消。
     pub fn cancellable_with_subs(&self, cx: &App) -> bool {
         let own = self.busy().is_none() || self.cancellable();
-        own && self.subs.views.iter().all(|(_, view)| {
-            let view = view.read(cx);
-            view.busy().is_none() || view.cancellable()
-        })
+        let mut subs = self.subs.views.iter();
+        own && subs.all(|(_, view)| view.read(cx).cancellable_with_subs(cx))
     }
 
     /// 根仓库和进过的子仓库里一共有几个文件没保存。
@@ -230,7 +255,7 @@ impl RepoView {
         let subs = self.subs.views.iter();
         self.unsaved_files()
             + subs
-                .map(|(_, view)| view.read(cx).unsaved_files())
+                .map(|(_, view)| view.read(cx).unsaved_with_subs(cx))
                 .sum::<usize>()
     }
 
@@ -239,7 +264,7 @@ impl RepoView {
         let subs = self.subs.views.iter();
         self.local_terminals_running(cx)
             + subs
-                .map(|(_, view)| view.read(cx).local_terminals_running(cx))
+                .map(|(_, view)| view.read(cx).local_terminals_with_subs(cx))
                 .sum::<usize>()
     }
 
@@ -290,6 +315,7 @@ impl RepoView {
                     Ok(found) => {
                         this.subs.truncated = found.truncated;
                         this.subs.paths = found.repos;
+                        this.drop_worktrees_from_subs();
                         let paths = &this.subs.paths;
                         this.subs.summaries.retain(|path, _| paths.contains(path));
                     }
@@ -363,7 +389,7 @@ impl RepoView {
         let tab = self.subs.tab_visible;
         let active = self.subs.active.clone();
         for (path, view) in &self.subs.views {
-            let on = tab && active.as_deref() == Some(path.as_str());
+            let on = tab && active.as_ref() == Some(path);
             view.update(cx, |view, cx| view.set_visible(on, cx));
         }
         let own = tab && active.is_none();
@@ -371,9 +397,33 @@ impl RepoView {
         self.visible = own;
         if shown {
             self.refresh(cx);
-            if self.mode == Mode::Subs {
-                self.load_sub_summaries(cx);
+            match self.mode {
+                Mode::Subs => self.load_sub_summaries(cx),
+                Mode::Worktrees => self.load_worktree_summaries(cx),
+                _ => {}
             }
+        }
+    }
+
+    /// 子仓库的清单里去掉这个仓库自己的工作树：工作树的 `.git` 也是一个文件，建在仓库目录里面时
+    /// 会被当成子仓库找出来，它归工作树总览管，不列两遍。
+    pub(super) fn drop_worktrees_from_subs(&mut self) {
+        let trees: Vec<String> = self.worktree_paths();
+        if trees.is_empty() || self.subs.paths.is_empty() {
+            return;
+        }
+        let paths = std::mem::take(&mut self.subs.paths);
+        self.subs.paths = paths
+            .into_iter()
+            .filter(|relative| {
+                let full = self.sub_path(relative);
+                !trees
+                    .iter()
+                    .any(|tree| fr_core::worktree::same_path(tree, &full))
+            })
+            .collect();
+        if self.subs.paths.is_empty() && self.mode == Mode::Subs {
+            self.sidebar_select_history();
         }
     }
 
@@ -385,15 +435,28 @@ impl RepoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let found = self.subs.views.iter().find(|(path, _)| path == relative);
+        let entry = self.sub_entry(relative);
+        self.enter_child(Child::Sub(relative.to_string()), entry, then, window, cx);
+    }
+
+    /// 进到一个子仓库或者工作树：页面整个换成它的。进过的接着用原来的页面。
+    pub(super) fn enter_child(
+        &mut self,
+        child: Child,
+        entry: RepoEntry,
+        then: Then,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let found = self.subs.views.iter().find(|(key, _)| *key == child);
         let view = match found {
             Some((_, view)) => view.clone(),
             None => {
-                let entry = self.sub_entry(relative);
                 let app = self.app.clone();
                 let of = SubOf {
                     root: cx.entity().downgrade(),
                     name: self.app.read(cx).repo_name(&self.entry),
+                    worktree: matches!(child, Child::Worktree(_)),
                 };
                 let view = cx.new(|cx| RepoView::new_sub(entry, app, of, window, cx));
                 // 子仓库里要求在新标签页里打开别的仓库（它的子模块）：转给工作区
@@ -405,13 +468,13 @@ impl RepoView {
                 .detach();
                 // 标签上的「正在做」、标题跟着它变
                 cx.observe(&view, |_, _, cx| cx.notify()).detach();
-                self.subs.views.push((relative.to_string(), view.clone()));
+                self.subs.views.push((child.clone(), view.clone()));
                 view
             }
         };
         // 焦点还留在总览表的过滤框里的话，按键会进到看不见的输入框
         window.blur(cx);
-        self.subs.active = Some(relative.to_string());
+        self.subs.active = Some(child);
         self.apply_visibility(cx);
         view.update(cx, |view, cx| match then {
             Then::Stay => {}
@@ -421,19 +484,48 @@ impl RepoView {
         cx.notify();
     }
 
-    /// 从子仓库回到根仓库的总览表（返回按钮、Alt+←）。没在子仓库里时返回假。
+    /// 从子仓库、工作树回到上一层的总览表（返回按钮、Alt+←），一次退一层。没进到里面时返回假。
     pub fn back_to_root(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.subs.active.take().is_none() {
-            return false;
+        // 里面还进了一层（子仓库的工作树）：先退那一层
+        if let Some(inner) = self.active_sub()
+            && inner.update(cx, |inner, cx| inner.back_to_root(window, cx))
+        {
+            cx.notify();
+            return true;
         }
+        let Some(left) = self.subs.active.take() else {
+            return false;
+        };
         window.blur(cx);
         self.show_page(Page::Git, window, cx);
-        if self.has_subs() {
-            self.show_subs(window, cx);
+        match left {
+            Child::Sub(_) => {
+                if self.has_subs() {
+                    self.show_subs(window, cx);
+                }
+            }
+            Child::Worktree(_) => self.show_worktrees(window, cx),
         }
         self.apply_visibility(cx);
         cx.notify();
         true
+    }
+
+    /// 不再留着某个工作树的页面（它被移除了）。正显示着它的话先回到这个仓库自己。
+    pub(super) fn drop_child(&mut self, child: &Child, cx: &mut Context<Self>) {
+        if self.subs.active.as_ref() == Some(child) {
+            self.subs.active = None;
+        }
+        self.subs.views.retain(|(key, _)| key != child);
+        self.apply_visibility(cx);
+    }
+
+    /// 进过的那个子仓库、工作树的页面；没进过没有。
+    pub(super) fn child_view(&self, child: &Child) -> Option<Entity<RepoView>> {
+        let mut views = self.subs.views.iter();
+        views
+            .find(|(key, _)| key == child)
+            .map(|(_, view)| view.clone())
     }
 
     /// 子仓库页上的返回按钮点了：交给根仓库。等这一轮更新完再做，根仓库那边要反过来改这个页面。
@@ -451,7 +543,7 @@ impl RepoView {
     pub(super) fn render_back(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let of = self.sub_of.as_ref()?;
         let accent = cx.theme().primary;
-        let (name, tip) = (of.name.clone(), of.name.clone());
+        let (name, tip, worktree) = (of.name.clone(), of.name.clone(), of.worktree);
         Some(
             div()
                 .flex_none()
@@ -489,7 +581,11 @@ impl RepoView {
                                 .child("Alt+←"),
                         )
                         .tooltip(move |window, cx| {
-                            let text = tf!("返回 {name} 的子仓库总览（Alt+←）", name = tip);
+                            let name = tip.clone();
+                            let text = match worktree {
+                                true => tf!("返回 {name} 的工作树总览（Alt+←）", name),
+                                false => tf!("返回 {name} 的子仓库总览（Alt+←）", name),
+                            };
                             ui::tip(text, window, cx)
                         })
                         .on_click(
@@ -504,7 +600,7 @@ impl RepoView {
     pub(super) fn render_rail_back(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let of = self.sub_of.as_ref()?;
         let accent = cx.theme().primary;
-        let name = of.name.clone();
+        let (name, worktree) = (of.name.clone(), of.worktree);
         Some(
             div()
                 .id("rail-back")
@@ -521,7 +617,11 @@ impl RepoView {
                 .hover(|s| s.bg(accent.opacity(0.22)))
                 .child(ui::icon(IconName::ArrowLeft))
                 .tooltip(move |window, cx| {
-                    let text = tf!("返回 {name} 的子仓库总览（Alt+←）", name = name.clone());
+                    let name = name.clone();
+                    let text = match worktree {
+                        true => tf!("返回 {name} 的工作树总览（Alt+←）", name),
+                        false => tf!("返回 {name} 的子仓库总览（Alt+←）", name),
+                    };
                     ui::tip(text, window, cx)
                 })
                 .on_click(cx.listener(|this, _, window, cx| this.leave_to_root(window, cx)))
@@ -1019,7 +1119,8 @@ impl RepoView {
         let view = cx.entity().downgrade();
         let entry = self.sub_entry(path);
         let path = path.to_string();
-        Box::new(move |menu, _, _| {
+        let app = self.app.clone();
+        Box::new(move |menu, _, cx| {
             let go = |label: &'static str, then: Then| {
                 let (view, path) = (view.clone(), path.clone());
                 PopupMenuItem::new(label).on_click(move |_, window, cx| {
@@ -1027,8 +1128,10 @@ impl RepoView {
                         .ok();
                 })
             };
+            let mapped = entry.clone();
             let (view, entry, full) = (view.clone(), entry.clone(), entry.path.clone());
-            menu.item(go(tr("进入此仓库"), Then::Stay))
+            let menu = menu
+                .item(go(tr("进入此仓库"), Then::Stay))
                 .item(go(tr("在此新建终端"), Then::NewTerminal))
                 .item(go(tr("在文件页中打开"), Then::Files))
                 .separator()
@@ -1043,7 +1146,8 @@ impl RepoView {
                     PopupMenuItem::new(tr("复制路径")).on_click(move |_, _, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(full.clone()));
                     }),
-                )
+                );
+            crate::mapping::entry_items(menu, &app, &mapped, cx)
         })
     }
 }

@@ -1,0 +1,21 @@
+[package]
+name = "fr-mount"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# 把服务器（或本机）上的一个目录映射成本机的盘符或文件夹：盘上的读写变成 kuaid 的 `fs_*` 请求，
+# 走客户端平时用的那条通道。底下是 WinFsp（用户态文件系统），只在 Windows 上有；别的系统上
+# 这个包只剩「没有这个功能」的空壳。
+#
+# 没有用现成的 Rust 封装 `winfsp`（GPL-3.0，编译还要 libclang）：src/winfsp.rs 是照头文件手写的
+# 薄绑定，运行时从 WinFsp 的安装目录加载 DLL，没装 WinFsp 时程序照样能启动。WinFsp 对开源软件
+# 的例外许可正是「链接它的 DLL」。
+[dependencies]
+fr-core.workspace = true
+fr-channel.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+log = "0.4"

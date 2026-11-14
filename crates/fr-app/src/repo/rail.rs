@@ -65,7 +65,11 @@ fn section_of(item: SideItem) -> Option<SideSection> {
         SideItem::Stash(_) => Some(SideSection::Stashes),
         SideItem::Submodule(_) => Some(SideSection::Submodules),
         SideItem::Header(section) => Some(section),
-        SideItem::Changes | SideItem::History | SideItem::SubRepos | SideItem::Folder(_) => None,
+        SideItem::Changes
+        | SideItem::History
+        | SideItem::SubRepos
+        | SideItem::Worktrees
+        | SideItem::Folder(_) => None,
     }
 }
 
@@ -227,18 +231,25 @@ impl RepoView {
                 .text_color(accent),
             )
             .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
-            .context_menu(move |menu, _, _| {
+            .context_menu(move |menu, _, cx| {
+                let app = view.upgrade().map(|this| this.read(cx).app.clone());
+                let mapped = entry.clone();
                 let (view, entry) = (view.clone(), entry.clone());
                 let path = entry.path.clone();
-                menu.item(PopupMenuItem::new(tr("重命名…")).on_click(move |_, _, cx| {
-                    view.update(cx, |_, cx| cx.emit(super::RepoEvent::Rename(entry.clone())))
-                        .ok();
-                }))
-                .item(
-                    PopupMenuItem::new(tr("复制仓库路径")).on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
-                    }),
-                )
+                let menu = menu
+                    .item(PopupMenuItem::new(tr("重命名…")).on_click(move |_, _, cx| {
+                        view.update(cx, |_, cx| cx.emit(super::RepoEvent::Rename(entry.clone())))
+                            .ok();
+                    }))
+                    .item(
+                        PopupMenuItem::new(tr("复制仓库路径")).on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                        }),
+                    );
+                match app {
+                    Some(app) => crate::mapping::entry_items(menu, &app, &mapped, cx),
+                    None => menu,
+                }
             })
     }
 
@@ -349,6 +360,20 @@ impl RepoView {
                 .tooltip(tr("子仓库"))
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.click_sidebar(SideItem::SubRepos, 1, window, cx)
+                }))
+                .into_any_element(),
+            );
+        }
+        if self.has_worktrees_item() {
+            items.push(
+                rail_button(
+                    "rail-worktrees",
+                    IconName::Layers,
+                    selected == SideItem::Worktrees,
+                )
+                .tooltip(tr("工作树"))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.click_sidebar(SideItem::Worktrees, 1, window, cx)
                 }))
                 .into_any_element(),
             );

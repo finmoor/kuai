@@ -160,6 +160,11 @@ impl State {
                 self.add(&self.common_dir.clone(), RecursiveMode::NonRecursive);
             }
             self.add(&self.common_dir.join("refs"), RecursiveMode::Recursive);
+            // 工作树的增减：每个工作树在这里有一个目录。还没有这个目录时加不上，建出来时再加
+            self.add(
+                &self.common_dir.join("worktrees"),
+                RecursiveMode::NonRecursive,
+            );
         }
     }
 
@@ -212,6 +217,10 @@ impl State {
             for path in &event.paths {
                 if path.starts_with(&self.root) && path.is_dir() {
                     self.add_tree(path);
+                }
+                // 第一个工作树建出来：从这时起监听它们的增减
+                if *path == self.common_dir.join("worktrees") {
+                    self.add(path, RecursiveMode::NonRecursive);
                 }
             }
         }
@@ -284,7 +293,7 @@ impl State {
     }
 }
 
-/// git 目录里哪些变化要紧：HEAD、暂存区、引用、进行到一半的合并或变基。
+/// git 目录里哪些变化要紧：HEAD、暂存区、引用、进行到一半的合并或变基，还有工作树的增减。
 /// 对象库、日志、锁文件、FETCH_HEAD 这些不算。
 fn git_relevant(rel: &Path) -> bool {
     if rel.extension().is_some_and(|e| e == "lock") {
@@ -293,6 +302,15 @@ fn git_relevant(rel: &Path) -> bool {
     let Some(first) = rel.components().next() else {
         return false;
     };
+    // 工作树的增减、锁定、换了分支算；它们各自的暂存区、日志不算（那是另一个工作目录的事）
+    if first.as_os_str() == "worktrees" {
+        let mut rest = rel.components().skip(2);
+        return match (rest.next(), rest.next()) {
+            (None, _) => true,
+            (Some(file), None) => matches!(file.as_os_str().to_str(), Some("HEAD" | "locked")),
+            _ => false,
+        };
+    }
     matches!(
         first.as_os_str().to_str(),
         Some(
@@ -350,6 +368,14 @@ mod tests {
         assert!(!git_relevant(Path::new("objects/ab/cdef")));
         assert!(!git_relevant(Path::new("FETCH_HEAD")));
         assert!(!git_relevant(Path::new("logs/HEAD")));
+        // 工作树：增减、锁定、换分支算，它自己的暂存区和日志不算
+        assert!(git_relevant(Path::new("worktrees")));
+        assert!(git_relevant(Path::new("worktrees/feat-login")));
+        assert!(git_relevant(Path::new("worktrees/feat-login/HEAD")));
+        assert!(git_relevant(Path::new("worktrees/feat-login/locked")));
+        assert!(!git_relevant(Path::new("worktrees/feat-login/index")));
+        assert!(!git_relevant(Path::new("worktrees/feat-login/HEAD.lock")));
+        assert!(!git_relevant(Path::new("worktrees/feat-login/logs/HEAD")));
     }
 
     fn git(dir: &Path, args: &[&str]) {

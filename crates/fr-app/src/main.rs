@@ -9,6 +9,7 @@ mod clone;
 mod graph_paint;
 mod instance;
 mod manager;
+mod mapping;
 mod open_dir;
 mod palette;
 mod prompt;

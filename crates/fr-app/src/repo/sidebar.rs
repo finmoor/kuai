@@ -72,6 +72,8 @@ pub(super) enum SideItem {
     History,
     /// 子仓库总览；仓库目录里面有别的仓库时才有这一行
     SubRepos,
+    /// 工作树总览
+    Worktrees,
     Header(SideSection),
     /// 目录树里的文件夹；数字是它的键（`前缀/路径`）的哈希
     Folder(u64),
@@ -279,6 +281,16 @@ impl RepoView {
                 key: None,
                 open: false,
                 count: self.sub_count(),
+            });
+        }
+        if self.has_worktrees_item() {
+            rows.push(SideRow {
+                item: SideItem::Worktrees,
+                depth: 0,
+                label: String::new(),
+                key: None,
+                open: false,
+                count: self.live_worktrees(),
             });
         }
         // 一棵目录树 → 侧栏的行。`prefix` 是收起键的前缀，`base` 是这棵树整体缩进几层
@@ -507,7 +519,9 @@ impl RepoView {
                             cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx)),
                         ),
                 )
-                .context_menu(move |menu, _, _| {
+                .context_menu(move |menu, _, cx| {
+                    let app = view.upgrade().map(|this| this.read(cx).app.clone());
+                    let mapped = entry.clone();
                     let (view, entry) = (view.clone(), entry.clone());
                     let path = entry.path.clone();
                     // 子仓库不在仓库列表里，没有可改的显示名称
@@ -524,13 +538,17 @@ impl RepoView {
                             ),
                         ),
                     };
-                    menu.item(
+                    let menu = menu.item(
                         gpui_kit::component::menu::PopupMenuItem::new(tr("复制仓库路径")).on_click(
                             move |_, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
                             },
                         ),
-                    )
+                    );
+                    match app {
+                        Some(app) => crate::mapping::entry_items(menu, &app, &mapped, cx),
+                        None => menu,
+                    }
                 }),
         )
     }
@@ -901,6 +919,11 @@ impl RepoView {
                         .child(ui::icon(IconName::FolderTree).flex_none().text_color(muted))
                         .child(name(tr("子仓库").to_string()))
                         .child(count(row.count)),
+                    // 只有主工作树时不写数字
+                    SideItem::Worktrees => inner
+                        .child(ui::icon(IconName::Layers).flex_none().text_color(muted))
+                        .child(name(tr("工作树").to_string()))
+                        .when(row.count > 0, |r| r.child(count(row.count))),
                     SideItem::Header(section) => inner
                         .child(chevron(row.open))
                         .child(ui::icon(section.icon()).flex_none().text_color(muted))
@@ -971,6 +994,11 @@ impl RepoView {
                             }
                             detail.push_str(&format!("↓{}", branch.behind));
                         }
+                        // 已经在别的工作树里检出了：行尾一个标记，提示里写是哪个
+                        let held = self.tree_holding(&branch.name).map(|tree| match tree.main {
+                            true => tr("已在主工作树中检出").to_string(),
+                            false => tf!("已在工作树 {name} 中检出", name = tree.name()),
+                        });
                         // 当前分支：打勾、加粗，颜色用主色
                         inner
                             .child(if branch.current {
@@ -993,6 +1021,18 @@ impl RepoView {
                                         .child(ui::icon_small(IconName::CloudOff))
                                         .tooltip(|window, cx| {
                                             ui::tip(tr("上游分支已删除"), window, cx)
+                                        }),
+                                )
+                            })
+                            .when_some(held, |r, tip| {
+                                r.child(
+                                    div()
+                                        .id(("held", ix))
+                                        .flex_none()
+                                        .text_color(muted.opacity(0.8))
+                                        .child(ui::icon_small(IconName::Layers))
+                                        .tooltip(move |window, cx| {
+                                            ui::tip(tip.clone(), window, cx)
                                         }),
                                 )
                             })
@@ -1095,6 +1135,7 @@ impl RepoView {
             Mode::Changes | Mode::Merge => SideItem::Changes,
             Mode::History | Mode::Blame => SideItem::History,
             Mode::Subs => SideItem::SubRepos,
+            Mode::Worktrees => SideItem::Worktrees,
         });
     }
 
@@ -1252,6 +1293,7 @@ impl RepoView {
             }
             SideItem::Changes => self.show_changes(cx),
             SideItem::SubRepos => self.show_subs(window, cx),
+            SideItem::Worktrees => self.show_worktrees(window, cx),
             SideItem::History => {
                 self.sidebar.selected = item;
                 self.mode = Mode::History;

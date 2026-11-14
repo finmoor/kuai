@@ -445,10 +445,11 @@ fn fs_request(request: Request, payload: &[u8]) -> Result<(Value, Vec<u8>)> {
             .unwrap_or_default()
     };
     let number = |name: &str| request.params.get(name).and_then(Value::as_u64);
+    let flag = |name: &str| request.params.get(name).and_then(Value::as_bool) == Some(true);
     let (repo, path) = (text("repo"), text("path"));
     let done = |result: Value| Ok((result, Vec::new()));
     match request.method.as_str() {
-        "fs_list" => done(json!({ "entries": files::list(repo, path)? })),
+        "fs_list" => done(json!({ "entries": files::list_with(repo, path, flag("all"))? })),
         "fs_repos" => done(serde_json::to_value(files::find_repos(repo)?)?),
         "fs_stat" => done(serde_json::to_value(files::stat(repo, path)?)?),
         "fs_read" => {
@@ -462,8 +463,35 @@ fn fs_request(request: Request, payload: &[u8]) -> Result<(Value, Vec<u8>)> {
             done(serde_json::to_value(files::write(&params, payload)?)?)
         }
         "fs_mkdir" => files::make_dir(repo, path).and_then(|()| done(json!({}))),
-        "fs_remove" => files::remove(repo, path).and_then(|()| done(json!({}))),
-        "fs_rename" => files::rename(repo, path, text("to")).and_then(|()| done(json!({}))),
+        "fs_remove" => match flag("shallow") {
+            true => files::remove_shallow(repo, path),
+            false => files::remove(repo, path),
+        }
+        .and_then(|()| done(json!({}))),
+        "fs_rename" => match flag("replace") {
+            true => files::rename_over(repo, path, text("to")),
+            false => files::rename(repo, path, text("to")),
+        }
+        .and_then(|()| done(json!({}))),
+        "fs_pwrite" => {
+            let offset = number("offset").unwrap_or(0);
+            let stat = files::write_at(repo, path, offset, payload, flag("create"))?;
+            done(serde_json::to_value(stat)?)
+        }
+        "fs_resize" => {
+            let size = number("size").context("fs_resize 没有给大小")?;
+            done(serde_json::to_value(files::resize(
+                repo,
+                path,
+                size,
+                flag("new"),
+            )?)?)
+        }
+        "fs_touch" => {
+            let mtime = number("mtime").context("fs_touch 没有给时间")?;
+            done(serde_json::to_value(files::set_mtime(repo, path, mtime)?)?)
+        }
+        "fs_space" => done(serde_json::to_value(files::space(repo)?)?),
         other => bail!("未知方法：{other}"),
     }
 }
@@ -840,6 +868,58 @@ mod tests {
             std::fs::read(repo.0.join("up/大 文件.bin")).unwrap(),
             b"new"
         );
+
+        // 映射到本机用的（协议 9）：按偏移写、截断、改时间、盘的大小、.git 也列、盖掉已有的、只删空目录
+        let at_offset = |path: &str, offset: u64, create: bool| {
+            json!({ "repo": root, "path": path, "offset": offset, "create": create })
+        };
+        client.send("fs_pwrite", at_offset("m/a.bin", 0, true), b"hello");
+        assert!(client.next().0.error.is_some(), "目录不在不会顺手建");
+        client.call("fs_mkdir", at("m"));
+        client.send("fs_pwrite", at_offset("m/a.bin", 0, true), b"hello");
+        assert_eq!(client.next().0.result.unwrap()["size"], 5);
+        client.send("fs_pwrite", at_offset("m/a.bin", 3, false), b"LO!");
+        assert_eq!(client.next().0.result.unwrap()["size"], 6);
+        assert_eq!(std::fs::read(repo.0.join("m/a.bin")).unwrap(), b"helLO!");
+        let resized = client.call(
+            "fs_resize",
+            json!({ "repo": root, "path": "m/a.bin", "size": 2 }),
+        );
+        assert_eq!(resized["size"], 2);
+        client.send(
+            "fs_resize",
+            json!({ "repo": root, "path": "m/a.bin", "size": 0, "new": true }),
+            &[],
+        );
+        assert!(client.next().0.error.unwrap().contains("已存在"));
+        let touched = client.call(
+            "fs_touch",
+            json!({ "repo": root, "path": "m/a.bin", "mtime": 1_700_000_000_000u64 }),
+        );
+        assert_eq!(touched["mtime"], 1_700_000_000_000u64);
+        assert!(client.call("fs_space", at(""))["total"].as_u64().unwrap() > 0);
+        let all = client.call("fs_list", json!({ "repo": root, "path": "", "all": true }));
+        let names: Vec<&str> = all["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&".git") && names.contains(&"m"));
+        std::fs::write(repo.0.join("m/b.bin"), b"b").unwrap();
+        let onto = json!({ "repo": root, "path": "m/a.bin", "to": "m/b.bin" });
+        client.send("fs_rename", onto.clone(), &[]);
+        assert!(client.next().0.error.is_some());
+        let mut over = onto;
+        over["replace"] = json!(true);
+        client.call("fs_rename", over);
+        assert_eq!(std::fs::read(repo.0.join("m/b.bin")).unwrap(), b"he");
+        let shallow = |path: &str| json!({ "repo": root, "path": path, "shallow": true });
+        client.send("fs_remove", shallow("m"), &[]);
+        assert!(client.next().0.error.is_some(), "目录里有东西不删");
+        client.call("fs_remove", shallow("m/b.bin"));
+        client.call("fs_remove", shallow("m"));
+        assert!(!repo.0.join("m").exists());
 
         // 建目录、改名、删除
         client.call("fs_mkdir", at("docs/图"));

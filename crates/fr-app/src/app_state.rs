@@ -36,6 +36,8 @@ pub struct AppState {
     stages: HashMap<String, usize>,
     /// 过一会儿再存设置的任务（拖动窗口时位置一直在变，不每次都写文件）
     save_later: Option<Task<()>>,
+    /// 映射到本机的目录（见 `mapping`）
+    pub(crate) mounts: crate::mapping::Mounts,
 }
 
 impl AppState {
@@ -45,6 +47,7 @@ impl AppState {
             conns: HashMap::new(),
             stages: HashMap::new(),
             save_later: None,
+            mounts: crate::mapping::Mounts::new(),
         }
     }
 
@@ -176,7 +179,15 @@ impl AppState {
                 ),
                 Err(err) => log::warn!("连接服务器 {id} 失败：{err}"),
             }
-            this.update(cx, |_, cx| cx.notify()).ok();
+            this.update(cx, |this, cx| {
+                // 连上了：这台服务器的映射换到新连接上，设了自动映射的映射上
+                if let Some(Ok(conn)) = this.conns.get(&id).and_then(|c| c.peek()) {
+                    let conn = conn.clone();
+                    this.mappings_connected(&id, &conn, cx);
+                }
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
         cx.notify();
@@ -235,8 +246,11 @@ impl AppState {
             true => old.last_dir.take(),
             false => None,
         };
+        // 映射不在表单里，留着
+        let mappings = std::mem::take(&mut old.mappings);
         *old = server;
         old.last_dir = last_dir;
+        old.mappings = mappings;
         if reconnect {
             self.conns.remove(&id);
         }
@@ -247,6 +261,7 @@ impl AppState {
 
     /// 从列表里去掉服务器和它的仓库；服务器上的东西不动。
     pub fn remove_server(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.unmount_server(id, cx);
         self.settings.servers.retain(|s| s.id != id);
         // 经它连接的服务器改为直接连接（已经连着的不受影响，下次连接时才按新的来）
         for server in &mut self.settings.servers {
@@ -496,7 +511,7 @@ impl AppState {
         }
     }
 
-    fn save(&self) {
+    pub(crate) fn save(&self) {
         if let Err(err) = settings::save(&self.settings) {
             log::error!("{err:#}");
         }

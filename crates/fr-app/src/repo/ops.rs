@@ -594,6 +594,10 @@ impl RepoView {
         if self.status.as_ref().and_then(|s| s.branch.as_deref()) == Some(name) {
             return;
         }
+        // 已经在别的工作树里检出了：git 不让检出两处，改成问要不要进那个工作树
+        if self.offer_tree_holding(name, window, cx) {
+            return;
+        }
         let name = name.to_string();
         self.with_local_changes(
             tf!("切换到 {name}", name = &name),

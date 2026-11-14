@@ -1794,6 +1794,7 @@ dependencies = [
  "encoding_rs",
  "fr-channel",
  "fr-core",
+ "fr-mount",
  "futures",
  "gpui-kit",
  "gpui-pre",
@@ -1833,6 +1834,17 @@ dependencies = [
  "notify",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "fr-mount"
+version = "1.12.0"
+dependencies = [
+ "anyhow",
+ "fr-channel",
+ "fr-core",
+ "futures",
+ "log",
 ]
 
 [[package]]

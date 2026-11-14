@@ -55,6 +55,18 @@
 //! 子仓库（协议 8 起）：
 //! - `fs_repos`：参数 `{repo}`，返回 [`SubRepos`]：仓库目录里面还有哪些仓库，见 [`crate::files::find_repos`]。
 //!
+//! 把目录映射到本机（协议 9 起，见 `fr-mount`）。映射出来的盘要按偏移读写、要看得到 `.git`，
+//! 文件页那几个方法不够用，加了这些；路径的规矩和上面一样：
+//! - `fs_list` 可以带 `all: true`：`.git` 也列。
+//! - `fs_pwrite`：参数 `{repo, path, offset, create}`，请求带的字节写到 `offset` 那里（文件不够长就接长），
+//!   返回 [`FsStat`]。`create` 为真时文件不在就新建，否则文件不在是出错。
+//! - `fs_resize`：参数 `{repo, path, size, new}`，把文件截短或接长到 `size`，返回 [`FsStat`]。
+//!   `new` 为真是新建一个文件：已经有了就失败。
+//! - `fs_touch`：参数 `{repo, path, mtime}`，改修改时间（1970 年起的毫秒数），返回 [`FsStat`]。
+//! - `fs_space`：参数 `{repo}`，返回 [`FsSpace`]：所在的盘一共多大、还剩多少。
+//! - `fs_rename` 可以带 `replace: true`：`to` 已经有文件就盖掉（目录不盖）。
+//! - `fs_remove` 可以带 `shallow: true`：只删文件和空目录，目录里有东西就失败。
+//!
 //! 给 ssh 转接程序（`kuaid --connect`）和运维用的：
 //! - `info`：返回 [`DaemonInfo`]。
 //! - `bridge`：参数 `{auth_sock}`，转接程序报告这条 ssh 连接转发过来的 ssh-agent 套接字。不回响应。
@@ -74,7 +86,8 @@ use serde_json::Value;
 ///
 /// 7：kuaid 有了 Windows 版；`term_open` 可以带 `shell`。
 /// 8：`fs_repos`，找仓库目录里面的仓库。
-pub const PROTOCOL_VERSION: u32 = 8;
+/// 9：把目录映射到本机用的 `fs_pwrite`、`fs_resize`、`fs_touch`、`fs_space`，和几个方法多出来的选项。
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// 一条消息后面跟多少字节的原始数据。
 pub trait Frame {
@@ -298,6 +311,14 @@ pub struct FsStat {
     /// 只读（没有写权限）
     #[serde(default, skip_serializing_if = "is_false")]
     pub readonly: bool,
+}
+
+/// `fs_space` 的结果：目录所在的盘的大小（字节）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsSpace {
+    pub total: u64,
+    /// 当前用户还能用的
+    pub free: u64,
 }
 
 /// `fs_write` 的参数。

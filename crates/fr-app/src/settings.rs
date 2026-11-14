@@ -195,6 +195,9 @@ pub struct Settings {
     /// 最小化时收到托盘，任务栏上不留按钮
     #[serde(default)]
     pub minimize_to_tray: bool,
+    /// 第一次把目录映射到本机时提示过了（映射的目录不适合跑 git、构建）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mapping_tip_shown: bool,
     /// 点窗口的关闭按钮时不退出，收到托盘
     #[serde(default)]
     pub close_to_tray: bool,
@@ -404,6 +407,7 @@ impl Default for Settings {
             light_theme: default_light_theme(),
             dark_theme: default_dark_theme(),
             minimize_to_tray: false,
+            mapping_tip_shown: false,
             close_to_tray: false,
             auto_fetch_minutes: default_auto_fetch(),
             diff_split: false,
@@ -638,6 +642,57 @@ pub struct Server {
     /// 「打开仓库」上次打开的仓库所在的目录，下次从这里开始。不在表单里；改了初始目录就清掉
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_dir: Option<String>,
+    /// 映射到本机的目录（见 `mapping`）。不在服务器的表单里：加、改、删各是各的，马上存
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mappings: Vec<Mapping>,
+}
+
+/// 把服务器上的一个目录映射成本机的盘符或文件夹。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mapping {
+    pub id: String,
+    /// 服务器上的目录（完整路径）
+    pub remote: String,
+    /// 本机的位置：盘符（`K:`）或者文件夹
+    pub local: String,
+    /// 连接服务器后自动映射；否则要在卡片上点「立即映射」
+    #[serde(default)]
+    pub auto: bool,
+    /// 只读：本机改不了服务器上的东西
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+impl Mapping {
+    /// 本机的位置是盘符（`K:`），不是文件夹。
+    pub fn is_drive(&self) -> bool {
+        fr_mount::is_drive(&self.local)
+    }
+
+    /// 映射出来的根目录在本机怎么写：`K:\`，或者那个文件夹。
+    pub fn local_root(&self) -> String {
+        match self.is_drive() {
+            true => format!("{}\\", self.local),
+            false => self.local.clone(),
+        }
+    }
+
+    /// 服务器上的 `path` 在不在这条映射里；在的话给出它在本机的路径。
+    pub fn local_path(&self, path: &str) -> Option<String> {
+        let clean = |path: &str| path.replace('\\', "/").trim_end_matches('/').to_string();
+        let (root, path) = (clean(&self.remote), clean(path));
+        let rest = match path.strip_prefix(&root) {
+            Some("") => "",
+            // 根是 `/` 时 root 是空的，path 的开头就是 `/`
+            Some(rest) if rest.starts_with('/') => &rest[1..],
+            _ => return None,
+        };
+        let base = self.local.trim_end_matches('\\');
+        Some(match rest.is_empty() {
+            true => self.local_root(),
+            false => format!("{base}\\{}", rest.replace('/', "\\")),
+        })
+    }
 }
 
 impl Server {
@@ -1066,6 +1121,61 @@ mod tests {
         for bad in ["", "0", "65536", "22a", "-1"] {
             assert!(!target("dev", "", bad).port_ok(), "{bad}");
         }
+    }
+
+    #[test]
+    fn 服务器上的路径在本机怎么写() {
+        let map = |remote: &str, local: &str| Mapping {
+            remote: remote.into(),
+            local: local.into(),
+            ..Mapping::default()
+        };
+        let drive = map("/data/work", "K:");
+        assert!(drive.is_drive());
+        assert_eq!(drive.local_root(), r"K:\");
+        assert_eq!(drive.local_path("/data/work").as_deref(), Some(r"K:\"));
+        assert_eq!(drive.local_path("/data/work/").as_deref(), Some(r"K:\"));
+        assert_eq!(
+            drive.local_path("/data/work/app/src/main.rs").as_deref(),
+            Some(r"K:\app\src\main.rs")
+        );
+        // 名字只是开头一样的不算在里面
+        assert_eq!(drive.local_path("/data/workspace/x"), None);
+        assert_eq!(drive.local_path("/data"), None);
+
+        let folder = map("/var/log/app/", r"C:\Users\me\Kuai\logs");
+        assert!(!folder.is_drive());
+        assert_eq!(folder.local_root(), r"C:\Users\me\Kuai\logs");
+        assert_eq!(
+            folder.local_path("/var/log/app/today.log").as_deref(),
+            Some(r"C:\Users\me\Kuai\logs\today.log")
+        );
+        // 映射的是根目录
+        let root = map("/", "M:");
+        assert_eq!(root.local_path("/").as_deref(), Some(r"M:\"));
+        assert_eq!(
+            root.local_path("/etc/hosts").as_deref(),
+            Some(r"M:\etc\hosts")
+        );
+        // Windows 服务器：反斜杠、正斜杠都认
+        let windows = map(r"D:\repos", "N:");
+        assert_eq!(
+            windows.local_path("D:/repos/kuai").as_deref(),
+            Some(r"N:\kuai")
+        );
+
+        // 旧设置里没有映射；有映射的存了再读回来一样
+        let old = r#"{"servers":[{"id":"s1","name":"dev","destination":"root@dev"}]}"#;
+        let mut server = super::parse(old).unwrap().servers.remove(0);
+        assert!(server.mappings.is_empty());
+        assert!(!serde_json::to_string(&server).unwrap().contains("mappings"));
+        server.mappings.push(Mapping {
+            id: "m1".into(),
+            auto: true,
+            ..drive
+        });
+        let text = serde_json::to_string(&server).unwrap();
+        assert_eq!(serde_json::from_str::<Server>(&text).unwrap(), server);
     }
 
     #[test]

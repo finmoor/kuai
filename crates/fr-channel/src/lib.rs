@@ -37,7 +37,8 @@ use serde_json::json;
 
 pub use fr_core::askpass::PromptKind;
 pub use fr_core::protocol::{
-    DirEntry, DirListing, FsEntry, FsExpect, FsStat, FsWrite, FsWritten, Hello, SubRepos, TermInfo,
+    DirEntry, DirListing, FsEntry, FsExpect, FsSpace, FsStat, FsWrite, FsWritten, Hello, SubRepos,
+    TermInfo,
 };
 pub use hop::run_helper as run_ssh_hop;
 pub use remote::{ConnectOptions, Connection, Jump, StageHandler, local_kuai_root};
@@ -503,6 +504,124 @@ impl Channel {
             }
             Channel::Remote(conn) => {
                 conn.fs_simple("fs_rename", json!({ "repo": repo, "path": from, "to": to }))
+            }
+        }
+    }
+
+    /// 同 [`Channel::fs_list`]，`.git` 也列。把目录映射到本机时用（下面几个也是），见 `fr-mount`。
+    pub fn fs_list_all(&self, repo: &str, dir: &str) -> BoxFuture<'static, Result<Vec<FsEntry>>> {
+        match self {
+            Channel::Local => {
+                let (repo, dir) = (repo.to_string(), dir.to_string());
+                local::blocking(move || fr_core::files::list_with(&repo, &dir, true))
+            }
+            Channel::Remote(conn) => conn.fs_list_all(repo, dir),
+        }
+    }
+
+    /// 把 `bytes` 写到文件的 `offset` 那里，别的地方不动；`create` 为真时文件不在就新建。
+    pub fn fs_pwrite(
+        &self,
+        repo: &str,
+        path: &str,
+        offset: u64,
+        bytes: Vec<u8>,
+        create: bool,
+    ) -> BoxFuture<'static, Result<FsStat>> {
+        match self {
+            Channel::Local => {
+                let (repo, path) = (repo.to_string(), path.to_string());
+                local::blocking(move || {
+                    fr_core::files::write_at(&repo, &path, offset, &bytes, create)
+                })
+            }
+            Channel::Remote(conn) => {
+                let params =
+                    json!({ "repo": repo, "path": path, "offset": offset, "create": create });
+                conn.fs_call("fs_pwrite", params, bytes)
+            }
+        }
+    }
+
+    /// 把文件截短或接长到 `size`。`new` 为真是新建一个文件：已经有了就失败。
+    pub fn fs_resize(
+        &self,
+        repo: &str,
+        path: &str,
+        size: u64,
+        new: bool,
+    ) -> BoxFuture<'static, Result<FsStat>> {
+        match self {
+            Channel::Local => {
+                let (repo, path) = (repo.to_string(), path.to_string());
+                local::blocking(move || fr_core::files::resize(&repo, &path, size, new))
+            }
+            Channel::Remote(conn) => {
+                let params = json!({ "repo": repo, "path": path, "size": size, "new": new });
+                conn.fs_call("fs_resize", params, Vec::new())
+            }
+        }
+    }
+
+    /// 改文件的修改时间（1970 年起的毫秒数）。
+    pub fn fs_touch(
+        &self,
+        repo: &str,
+        path: &str,
+        mtime: u64,
+    ) -> BoxFuture<'static, Result<FsStat>> {
+        match self {
+            Channel::Local => {
+                let (repo, path) = (repo.to_string(), path.to_string());
+                local::blocking(move || fr_core::files::set_mtime(&repo, &path, mtime))
+            }
+            Channel::Remote(conn) => {
+                let params = json!({ "repo": repo, "path": path, "mtime": mtime });
+                conn.fs_call("fs_touch", params, Vec::new())
+            }
+        }
+    }
+
+    /// 目录所在的盘一共多大、还剩多少。
+    pub fn fs_space(&self, repo: &str) -> BoxFuture<'static, Result<FsSpace>> {
+        match self {
+            Channel::Local => {
+                let repo = repo.to_string();
+                local::blocking(move || fr_core::files::space(&repo))
+            }
+            Channel::Remote(conn) => conn.fs_call("fs_space", json!({ "repo": repo }), Vec::new()),
+        }
+    }
+
+    /// 改名，`to` 已经有文件就盖掉（目录不盖）。
+    pub fn fs_rename_over(
+        &self,
+        repo: &str,
+        from: &str,
+        to: &str,
+    ) -> BoxFuture<'static, Result<()>> {
+        match self {
+            Channel::Local => {
+                let (repo, from, to) = (repo.to_string(), from.to_string(), to.to_string());
+                local::blocking(move || fr_core::files::rename_over(&repo, &from, &to))
+            }
+            Channel::Remote(conn) => {
+                let params = json!({ "repo": repo, "path": from, "to": to, "replace": true });
+                conn.fs_simple("fs_rename", params)
+            }
+        }
+    }
+
+    /// 只删文件和空目录，永久删除（本机的也不进回收站：这是映射出来的盘上的删除，系统自己管回收站）。
+    pub fn fs_remove_shallow(&self, repo: &str, path: &str) -> BoxFuture<'static, Result<()>> {
+        match self {
+            Channel::Local => {
+                let (repo, path) = (repo.to_string(), path.to_string());
+                local::blocking(move || fr_core::files::remove_shallow(&repo, &path))
+            }
+            Channel::Remote(conn) => {
+                let params = json!({ "repo": repo, "path": path, "shallow": true });
+                conn.fs_simple("fs_remove", params)
             }
         }
     }

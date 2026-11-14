@@ -13,6 +13,7 @@ winresource = "0.1"
 [dependencies]
 fr-core.workspace = true
 fr-channel.workspace = true
+fr-mount.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 serde.workspace = true

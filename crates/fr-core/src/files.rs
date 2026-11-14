@@ -14,7 +14,7 @@ use std::time::UNIX_EPOCH;
 use anyhow::{Context as _, Result, bail};
 
 use crate::i18n::tr;
-use crate::protocol::{FsEntry, FsStat, FsWrite, FsWritten, SubRepos};
+use crate::protocol::{FsEntry, FsSpace, FsStat, FsWrite, FsWritten, SubRepos};
 use crate::tf;
 
 /// 一次最多读这么多字节；更大的文件分几次读。
@@ -72,13 +72,18 @@ fn stat_at(full: &Path) -> Result<FsStat> {
 
 /// 列出一层：文件和目录都列，`.git` 不列。顺序不保证，由界面排。
 pub fn list(repo: &str, dir: &str) -> Result<Vec<FsEntry>> {
+    list_with(repo, dir, false)
+}
+
+/// 同 [`list`]；`all` 为真时 `.git` 也列（映射到本机的盘上要看得到它）。
+pub fn list_with(repo: &str, dir: &str, all: bool) -> Result<Vec<FsEntry>> {
     let full = resolve(repo, dir)?;
     let entries =
         fs::read_dir(&full).with_context(|| tf!("无法读取 {path}", path = full.display()))?;
     let mut listed = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == ".git" {
+        if name == ".git" && !all {
             continue;
         }
         let link = entry.file_type().is_ok_and(|kind| kind.is_symlink());
@@ -252,6 +257,145 @@ pub fn rename(repo: &str, from: &str, to: &str) -> Result<()> {
     fs::rename(&source, &target).with_context(|| tf!("无法重命名 {path}", path = from))
 }
 
+/// 把 `bytes` 写到文件的 `offset` 那里，文件不够长就接长；别的地方不动。`create` 为真时文件不在
+/// 就新建，否则文件不在是出错。返回写完以后文件的情况。
+pub fn write_at(repo: &str, path: &str, offset: u64, bytes: &[u8], create: bool) -> Result<FsStat> {
+    let full = resolve_inside(repo, path)?;
+    let failed = || tf!("无法写入 {path}", path = full.display());
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(create)
+        .open(&full)
+        .with_context(failed)?;
+    if !bytes.is_empty() {
+        file.seek(SeekFrom::Start(offset)).with_context(failed)?;
+        file.write_all(bytes).with_context(failed)?;
+    }
+    Ok(stat_of(&file.metadata().with_context(failed)?))
+}
+
+/// 把文件截短或接长到 `size` 字节。`new` 为真是新建一个文件：已经有了就失败。
+pub fn resize(repo: &str, path: &str, size: u64, new: bool) -> Result<FsStat> {
+    let full = resolve_inside(repo, path)?;
+    let failed = || tf!("无法写入 {path}", path = full.display());
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(new)
+        .open(&full)
+        // 系统给的错误留在后面：映射到本机的盘要按错误码分辨是「已存在」还是别的
+        .map_err(|err| match err.kind() {
+            ErrorKind::AlreadyExists => anyhow::Error::new(err).context(tf!("{path} 已存在", path)),
+            _ => anyhow::Error::new(err).context(failed()),
+        })?;
+    file.set_len(size).with_context(failed)?;
+    Ok(stat_of(&file.metadata().with_context(failed)?))
+}
+
+/// 改修改时间（1970 年起的毫秒数）。
+pub fn set_mtime(repo: &str, path: &str, mtime: u64) -> Result<FsStat> {
+    let full = resolve_inside(repo, path)?;
+    let failed = || tf!("无法写入 {path}", path = full.display());
+    let time = UNIX_EPOCH + std::time::Duration::from_millis(mtime);
+    // 目录在 Windows 上要带着「备份」标志才打得开，这里只管文件；目录的时间改不了不算出错
+    if full.is_dir() {
+        return stat_at(&full);
+    }
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(&full)
+        .with_context(failed)?;
+    file.set_modified(time).with_context(failed)?;
+    Ok(stat_of(&file.metadata().with_context(failed)?))
+}
+
+/// 目录所在的盘一共多大、当前用户还能用多少。
+#[cfg(unix)]
+pub fn space(repo: &str) -> Result<FsSpace> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let full = resolve(repo, "")?;
+    let path = std::ffi::CString::new(full.as_os_str().as_bytes())?;
+    // SAFETY：path 是以 NUL 结尾的合法字符串，info 是这里的一块内存，statvfs 往里填
+    let info = unsafe {
+        let mut info: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(path.as_ptr(), &mut info) != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| tf!("无法读取 {path}", path = full.display()));
+        }
+        info
+    };
+    let block = info.f_frsize as u64;
+    Ok(FsSpace {
+        total: info.f_blocks as u64 * block,
+        free: info.f_bavail as u64 * block,
+    })
+}
+
+/// 目录所在的盘一共多大、当前用户还能用多少。
+#[cfg(windows)]
+pub fn space(repo: &str) -> Result<FsSpace> {
+    use std::os::windows::ffi::OsStrExt as _;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            dir: *const u16,
+            free: *mut u64,
+            total: *mut u64,
+            all_free: *mut u64,
+        ) -> i32;
+    }
+    let full = resolve(repo, "")?;
+    let wide: Vec<u16> = full.as_os_str().encode_wide().chain([0]).collect();
+    let (mut free, mut total) = (0u64, 0u64);
+    // SAFETY：wide 以 NUL 结尾，两个数是这里的变量，函数往里填；第四个可以不要
+    let ok =
+        unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, std::ptr::null_mut()) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| tf!("无法读取 {path}", path = full.display()));
+    }
+    Ok(FsSpace { total, free })
+}
+
+/// 同 [`rename`]，`to` 已经有文件时直接盖掉（一步完成，中间没有两个都不在的时候）。目录不盖：
+/// `to` 是目录就失败。
+///
+/// 盖掉的是普通文件时，权限和属主照被盖掉的那个（同 [`replace`]）：Windows 上的程序存盘常常是
+/// 先写一个临时文件、再改名盖过去（映射到本机的盘上就走到这里），不然脚本的可执行位就没了。
+pub fn rename_over(repo: &str, from: &str, to: &str) -> Result<()> {
+    let source = resolve_inside(repo, from)?;
+    let target = resolve_inside(repo, to)?;
+    let existing = fs::symlink_metadata(&target).ok();
+    if existing.as_ref().is_some_and(|meta| meta.is_dir()) && source != target {
+        bail!("{}", tf!("{path} 已存在", path = to));
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| tf!("无法创建 {path}", path = parent.display()))?;
+    }
+    #[cfg(unix)]
+    if let Some(meta) = existing.filter(|meta| meta.is_file())
+        && source != target
+        && fs::symlink_metadata(&source).is_ok_and(|own| own.is_file())
+    {
+        let _ = fs::set_permissions(&source, meta.permissions());
+        keep_owner(&source, &meta);
+    }
+    fs::rename(&source, &target).with_context(|| tf!("无法重命名 {path}", path = from))
+}
+
+/// 只删文件和空目录：目录里有东西就失败（映射到本机的盘上，删目录是系统自己一层层来的）。
+pub fn remove_shallow(repo: &str, path: &str) -> Result<()> {
+    let full = resolve_inside(repo, path)?;
+    let failed = || tf!("无法删除 {path}", path = full.display());
+    let meta = fs::symlink_metadata(&full).with_context(failed)?;
+    match meta.is_dir() {
+        true => fs::remove_dir(&full),
+        // Windows 上指向目录的链接要按目录删
+        false => fs::remove_file(&full).or_else(|_| fs::remove_dir(&full)),
+    }
+    .with_context(failed)
+}
+
 /// 找子仓库时往下最多走几层（仓库根下面的目录是第 1 层）。
 const REPOS_MAX_DEPTH: usize = 6;
 /// 找子仓库时最多看这么多个目录：再多就不找了，结果标成没找全。
@@ -353,6 +497,74 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn 按偏移写_截断_改时间() {
+        let repo = TempRepo::new();
+        let root = repo.repo();
+        // 文件不在：不让新建时出错，让新建时建出来
+        assert!(write_at(root, "a.bin", 0, b"x", false).is_err());
+        assert_eq!(write_at(root, "a.bin", 0, b"hello", true).unwrap().size, 5);
+        // 写中间：别的地方不动；写到末尾以后：中间补零
+        assert_eq!(write_at(root, "a.bin", 1, b"EL", false).unwrap().size, 5);
+        assert_eq!(fs::read(repo.0.join("a.bin")).unwrap(), b"hELlo");
+        assert_eq!(write_at(root, "a.bin", 7, b"!", false).unwrap().size, 8);
+        assert_eq!(fs::read(repo.0.join("a.bin")).unwrap(), b"hELlo\0\0!");
+        // 空的一块：只是把文件建出来
+        assert_eq!(write_at(root, "empty", 0, b"", true).unwrap().size, 0);
+        // 截短、接长；新建时已经有了就失败
+        assert_eq!(resize(root, "a.bin", 2, false).unwrap().size, 2);
+        assert_eq!(fs::read(repo.0.join("a.bin")).unwrap(), b"hE");
+        assert_eq!(resize(root, "a.bin", 4, false).unwrap().size, 4);
+        assert_eq!(fs::read(repo.0.join("a.bin")).unwrap(), b"hE\0\0");
+        assert!(resize(root, "a.bin", 0, true).is_err());
+        assert_eq!(resize(root, "new.bin", 0, true).unwrap().size, 0);
+        assert!(resize(root, "nope.bin", 3, false).is_err());
+        // 改修改时间；目录的不改也不出错
+        let then = 1_700_000_000_000;
+        assert_eq!(set_mtime(root, "a.bin", then).unwrap().mtime, then);
+        assert_eq!(stat(root, "a.bin").unwrap().mtime, then);
+        fs::create_dir(repo.0.join("d")).unwrap();
+        assert!(set_mtime(root, "d", then).unwrap().dir);
+        // 不能动仓库根
+        assert!(write_at(root, "", 0, b"x", true).is_err());
+    }
+
+    #[test]
+    fn 盘的大小_盖掉已有的_只删空目录() {
+        let repo = TempRepo::new();
+        let root = repo.repo();
+        let disk = space(root).unwrap();
+        assert!(disk.total > 0 && disk.free <= disk.total);
+        // 列目录带上 .git
+        let names = |all: bool| -> Vec<String> {
+            let mut names: Vec<String> = list_with(root, "", all)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            names.sort();
+            names
+        };
+        fs::write(repo.0.join("a.txt"), b"a").unwrap();
+        fs::write(repo.0.join("b.txt"), b"b").unwrap();
+        assert_eq!(names(false), ["a.txt", "b.txt"]);
+        assert_eq!(names(true), [".git", "a.txt", "b.txt"]);
+        // 改名盖掉已有的文件；目标是目录就不盖
+        assert!(rename(root, "a.txt", "b.txt").is_err());
+        rename_over(root, "a.txt", "b.txt").unwrap();
+        assert_eq!(fs::read(repo.0.join("b.txt")).unwrap(), b"a");
+        assert!(!repo.0.join("a.txt").exists());
+        fs::create_dir_all(repo.0.join("d/sub")).unwrap();
+        assert!(rename_over(root, "b.txt", "d").is_err());
+        // 只删空目录和文件
+        assert!(remove_shallow(root, "d").is_err());
+        remove_shallow(root, "d/sub").unwrap();
+        remove_shallow(root, "d").unwrap();
+        remove_shallow(root, "b.txt").unwrap();
+        assert_eq!(names(false), Vec::<String>::new());
+        assert!(remove_shallow(root, "nope").is_err());
     }
 
     #[test]
@@ -534,5 +746,30 @@ mod tests {
         // 删链接不删它指向的文件
         remove(temp.repo(), "link.sh").unwrap();
         assert!(script.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 改名盖掉文件时权限照被盖掉的() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = TempRepo::new();
+        let path = |name: &str| temp.0.join(name);
+        let set = |name: &str, mode: u32| {
+            fs::set_permissions(path(name), fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let mode = |name: &str| fs::metadata(path(name)).unwrap().permissions().mode() & 0o777;
+        // Windows 上的程序存盘：写临时文件，再改名盖过去
+        fs::write(path("run.sh"), "#!/bin/sh\n").unwrap();
+        set("run.sh", 0o750);
+        fs::write(path("run.sh.tmp"), "#!/bin/sh\necho hi\n").unwrap();
+        set("run.sh.tmp", 0o644);
+        rename_over(temp.repo(), "run.sh.tmp", "run.sh").unwrap();
+        assert_eq!(fs::read(path("run.sh")).unwrap(), b"#!/bin/sh\necho hi\n");
+        assert_eq!(mode("run.sh"), 0o750);
+        // 改到一个没有的名字上：权限是它自己的
+        fs::write(path("new.txt"), "x").unwrap();
+        set("new.txt", 0o600);
+        rename_over(temp.repo(), "new.txt", "moved.txt").unwrap();
+        assert_eq!(mode("moved.txt"), 0o600);
     }
 }

@@ -257,6 +257,8 @@ impl ManagerView {
                         start_dir: Some(start_dir.trim().to_string()).filter(|dir| !dir.is_empty()),
                         // 上次打开的目录留不留由 `update_server` 定
                         last_dir: None,
+                        // 映射不在这张表单里，`update_server` 留着原来的
+                        mappings: Vec::new(),
                     };
                     // 存着的密码、口令：填了新的就换；没填、登录方式没变、也没点清除，就留着
                     let keep = had_secret && auth == old.auth && !forget.get();
@@ -458,6 +460,8 @@ impl ManagerView {
                 }
                 line
             });
+            // 映射到本机：已经添加的服务器才有（映射是挂在服务器的 id 上的）
+            let mapping_section = editing.then(|| crate::mapping::section(&app, &old, cx));
             dialog
                 .title(if editing {
                     tr("编辑服务器")
@@ -561,6 +565,7 @@ impl ManagerView {
                         .when_some(problem.borrow().clone(), |body, found| {
                             body.child(div().text_sm().text_color(danger).child(found))
                         })
+                        // 这句说的是上面的登录信息，紧跟着它们；映射是单独的一节，放在最后
                         .child(div().text_xs().text_color(muted).child(if jump_now.is_some() {
                             tr(
                                 "密码和私钥口令保存在 Windows 凭据管理器中。首次连接时将在服务器的 ~/.kuai/ 中安装 kuaid，跳板机上不安装任何程序。",
@@ -569,7 +574,8 @@ impl ManagerView {
                             tr(
                                 "密码和私钥口令保存在 Windows 凭据管理器中。首次连接时将在服务器的 ~/.kuai/ 中安装 kuaid。",
                             )
-                        })),
+                        }))
+                        .children(mapping_section),
                 )
                 .footer(
                     DialogFooter::new()
@@ -731,8 +737,13 @@ impl ManagerView {
         } else {
             IconName::FolderGit2
         };
+        // 服务器上的仓库：有映射包含它的话，和服务器卡片里一样写出它在本机的路径
+        let local = entry
+            .server
+            .as_deref()
+            .and_then(|server| app.local_path(server, &entry.path));
         let (open_entry, leave, menu_entry) = (entry.clone(), entry.clone(), entry.clone());
-        let view = cx.entity().downgrade();
+        let (view, menu_app) = (cx.entity().downgrade(), self.app.clone());
         h_flex()
             .id(ElementId::Name(id))
             .h(px(46.))
@@ -762,6 +773,7 @@ impl ManagerView {
                             .text_color(colors.muted),
                     ),
             )
+            .when_some(local, |row, local| row.child(local_badge(local, colors)))
             .when(recent, |row| {
                 row.child(
                     div()
@@ -782,30 +794,33 @@ impl ManagerView {
                         cx.emit(ManagerEvent::RemoveFromWorkspace(leave.clone()));
                     })),
             )
-            .context_menu(move |menu, _, _| {
+            .context_menu(move |menu, _, cx| {
                 let (leave_view, rename_view) = (view.clone(), view.clone());
                 let (leave, rename) = (menu_entry.clone(), menu_entry.clone());
                 let path = menu_entry.path.clone();
-                menu.item(
-                    PopupMenuItem::new(tr("从工作区移除")).on_click(move |_, _, cx| {
-                        leave_view
-                            .update(cx, |_, cx| {
-                                cx.emit(ManagerEvent::RemoveFromWorkspace(leave.clone()))
-                            })
+                let menu = menu
+                    .item(
+                        PopupMenuItem::new(tr("从工作区移除")).on_click(move |_, _, cx| {
+                            leave_view
+                                .update(cx, |_, cx| {
+                                    cx.emit(ManagerEvent::RemoveFromWorkspace(leave.clone()))
+                                })
+                                .ok();
+                        }),
+                    )
+                    .separator()
+                    .item(PopupMenuItem::new(tr("重命名…")).on_click(move |_, _, cx| {
+                        rename_view
+                            .update(cx, |_, cx| cx.emit(ManagerEvent::Rename(rename.clone())))
                             .ok();
-                    }),
-                )
-                .separator()
-                .item(PopupMenuItem::new(tr("重命名…")).on_click(move |_, _, cx| {
-                    rename_view
-                        .update(cx, |_, cx| cx.emit(ManagerEvent::Rename(rename.clone())))
-                        .ok();
-                }))
-                .item(
-                    PopupMenuItem::new(tr("复制仓库路径")).on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
-                    }),
-                )
+                    }))
+                    .item(
+                        PopupMenuItem::new(tr("复制仓库路径")).on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                        }),
+                    );
+                // 服务器上的仓库：和服务器卡片里的行一样，有映射相关的几项
+                crate::mapping::entry_items(menu, &menu_app, &menu_entry, cx)
             })
             .into_any_element()
     }
@@ -896,6 +911,12 @@ impl ManagerView {
         let name = self.app.read(cx).repo_name(entry);
         let remove_name = name.clone();
         let view = cx.entity().downgrade();
+        // 服务器上的仓库：有映射包含它的话，它在本机的路径
+        let local = entry
+            .server
+            .as_deref()
+            .and_then(|server| self.app.read(cx).local_path(server, &entry.path));
+        let (menu_app, menu_server) = (self.app.clone(), entry.server.clone());
         h_flex()
             .id(ElementId::Name(id))
             .h(px(46.))
@@ -925,6 +946,7 @@ impl ManagerView {
                             .text_color(colors.muted),
                     ),
             )
+            .when_some(local, |row, local| row.child(local_badge(local, colors)))
             // 「改名」「移除」一直在行尾，用次要的颜色，不抢眼
             .child(
                 Button::new("rename")
@@ -973,21 +995,45 @@ impl ManagerView {
                         );
                     })),
             )
-            .context_menu(move |menu, _, _| {
+            .context_menu(move |menu, _, cx| {
                 let (view, entry) = (view.clone(), menu_entry.clone());
                 let path = entry.path.clone();
-                menu.item(PopupMenuItem::new(tr("重命名…")).on_click(move |_, _, cx| {
-                    view.update(cx, |_, cx| cx.emit(ManagerEvent::Rename(entry.clone())))
-                        .ok();
-                }))
-                .item(
-                    PopupMenuItem::new(tr("复制仓库路径")).on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
-                    }),
-                )
+                let menu = menu
+                    .item(PopupMenuItem::new(tr("重命名…")).on_click(move |_, _, cx| {
+                        view.update(cx, |_, cx| cx.emit(ManagerEvent::Rename(entry.clone())))
+                            .ok();
+                    }))
+                    .item(
+                        PopupMenuItem::new(tr("复制仓库路径")).on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                        }),
+                    );
+                match &menu_server {
+                    Some(server) => {
+                        let path = menu_entry.path.clone();
+                        crate::mapping::menu_items(menu, &menu_app, server, &path, true, &path, cx)
+                    }
+                    None => menu,
+                }
             })
             .into_any_element()
     }
+}
+
+/// 服务器上的仓库映射到了本机：行尾写出它在本机的路径。
+fn local_badge(local: String, colors: Colors) -> Div {
+    h_flex()
+        .flex_none()
+        .max_w(px(260.))
+        .gap(px(4.))
+        .text_xs()
+        .text_color(colors.muted)
+        .child(Icon::new(IconName::HardDrive).size_3().flex_none())
+        .child(
+            ui::clipped("local", local)
+                .font_family("Consolas")
+                .text_ellipsis_start(),
+        )
 }
 
 #[derive(Clone, Copy)]
@@ -1252,6 +1298,9 @@ impl Render for ManagerView {
                     colors,
                 ));
             }
+            for mapping in &server.mappings {
+                tags.push(crate::mapping::chip(&self.app, server, mapping, cx));
+            }
             let (id_open, id_retry) = (server.id.clone(), server.id.clone());
             let id_clone = server.id.clone();
             let removal_note = if users.is_empty() {
@@ -1305,12 +1354,25 @@ impl Render for ManagerView {
                     .small()
                     .ghost()
                     .icon(ui::icon(IconName::Ellipsis))
-                    .tooltip(tr("编辑或移除此服务器"))
+                    .tooltip(tr("映射、编辑或移除此服务器"))
                     .dropdown_menu(move |menu, _, _| {
                         let (view, edit) = (menu_view.clone(), menu_server.clone());
                         let (app, remove) = (menu_app.clone(), menu_server.clone());
                         let removal_note = removal_note.clone();
-                        menu.item(
+                        let (map_app, map_server) = (menu_app.clone(), menu_server.clone());
+                        menu.item(PopupMenuItem::new(tr("映射目录到本机…")).on_click(
+                            move |_, window, cx| {
+                                crate::mapping::map_dialog(
+                                    map_app.clone(),
+                                    map_server.id.clone(),
+                                    map_server.start_dir.clone().unwrap_or_default(),
+                                    None,
+                                    window,
+                                    cx,
+                                )
+                            },
+                        ))
+                        .item(
                             PopupMenuItem::new(tr("编辑…")).on_click(move |_, window, cx| {
                                 view.update(cx, |this, cx| {
                                     this.server_dialog(Some(edit.clone()), window, cx)

@@ -62,10 +62,13 @@ struct RepoTab {
 }
 
 impl RepoTab {
-    /// 这个标签页上显示着的仓库页：进到了子仓库里就是那个子仓库的，快捷键对它生效。
+    /// 这个标签页上显示着的仓库页：进到了子仓库、别的工作树里就是最里面的那一个，快捷键对它生效。
     fn shown(&self, cx: &App) -> Entity<RepoView> {
-        let sub = self.view.read(cx).active_sub();
-        sub.unwrap_or_else(|| self.view.clone())
+        let mut shown = self.view.clone();
+        while let Some(inner) = shown.read(cx).active_sub() {
+            shown = inner;
+        }
+        shown
     }
 }
 
@@ -157,10 +160,54 @@ impl Workspace {
                 UpdateEvent::Restart => this.restart_for_update(window, cx),
             }),
             // 退出时先撤掉托盘图标：进程退出前没撤的话，托盘里会留一个点不开的图标，鼠标移过去才消失
-            cx.on_app_quit(|this, _| {
+            cx.on_app_quit(|this, cx| {
                 this.tray = None;
+                // 映射到本机的目录都断开（等在路上的写入落到服务器）
+                this.app.update(cx, |app, _| app.unmount_all());
                 async {}
             }),
+            // 映射那边要说的话（映射上了、没成、写入落不到服务器）
+            cx.subscribe_in(
+                &app,
+                window,
+                |_, app, notice: &crate::mapping::Notice, window, cx| {
+                    let note = match notice {
+                        crate::mapping::Notice::Info(text) => Notification::info(text.clone()),
+                        crate::mapping::Notice::Error(text) => Notification::error(text.clone()),
+                        crate::mapping::Notice::NeedWinFsp => {
+                            let app = app.clone();
+                            let text = tr("映射需要先安装 WinFsp。");
+                            Notification::warning(text).action(move |_, _, cx| {
+                                let (app, note) = (app.clone(), cx.entity().downgrade());
+                                Button::new("install-winfsp")
+                                    .small()
+                                    .primary()
+                                    .label(tr("安装 WinFsp"))
+                                    .on_click(move |_, window, cx| {
+                                        app.update(cx, |app, cx| app.install_winfsp(cx));
+                                        // 装的进度和结果另有提示，这一条收起来
+                                        note.update(cx, |note, cx| note.dismiss(window, cx)).ok();
+                                    })
+                            })
+                        }
+                        crate::mapping::Notice::InstallFailed => {
+                            let text = tr("WinFsp 安装未完成。");
+                            Notification::error(text).action(move |_, _, cx| {
+                                let note = cx.entity().downgrade();
+                                Button::new("winfsp-download")
+                                    .small()
+                                    .label(tr("打开下载页面"))
+                                    .on_click(move |_, window, cx| {
+                                        let result = crate::mapping::open_winfsp_download();
+                                        crate::shell::report(result, window, cx);
+                                        note.update(cx, |note, cx| note.dismiss(window, cx)).ok();
+                                    })
+                            })
+                        }
+                    };
+                    window.push_notification(note, cx);
+                },
+            ),
         ];
         // 关闭到托盘：点关闭按钮时不退出，把窗口藏起来
         {
@@ -363,7 +410,8 @@ impl Workspace {
 
     /// 托盘菜单的「退出」：本机终端里没有程序在运行就直接退出；有就把窗口叫出来，问一下。
     fn quit_from_tray(&mut self, cx: &mut Context<Self>) {
-        if self.live_terminals(cx) == 0 && self.unsaved_files(cx) == 0 {
+        let mapped = self.app.read(cx).mapped_open_files();
+        if self.live_terminals(cx) == 0 && self.unsaved_files(cx) == 0 && mapped == 0 {
             self.quitting.set(true);
             cx.quit();
             return;
@@ -382,10 +430,17 @@ impl Workspace {
     fn confirm_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let terminals = self.live_terminals(cx);
         let unsaved = self.unsaved_files(cx);
-        if terminals == 0 && unsaved == 0 {
+        // 映射到本机的目录里，别的程序还开着的文件：退出以后映射就没了
+        let mapped = self.app.read(cx).mapped_open_files();
+        if terminals == 0 && unsaved == 0 && mapped == 0 {
             return false;
         }
+        let mapped_note = tf!(
+            "其他程序在映射的目录中打开了 {n} 个文件，退出后映射将断开，无法继续读写。",
+            n = mapped
+        );
         let description = match (terminals, unsaved) {
+            (0, 0) => mapped_note.clone(),
             (_, 0) => tf!(
                 "有 {n} 个本机终端正在运行，退出将结束其中的程序。服务器上的终端不受影响。",
                 n = terminals
@@ -397,8 +452,14 @@ impl Workspace {
                 m = terminals
             ),
         };
-        let ok = match terminals {
-            0 => tr("放弃修改并退出"),
+        let description = match mapped {
+            0 => description,
+            _ if terminals == 0 && unsaved == 0 => description,
+            _ => format!("{description}\n{mapped_note}"),
+        };
+        let ok = match (terminals, unsaved) {
+            (0, 0) => tr("退出"),
+            (0, _) => tr("放弃修改并退出"),
             _ => tr("结束并退出"),
         };
         let quitting = self.quitting.clone();
@@ -919,7 +980,7 @@ impl Workspace {
         }
     }
 
-    /// Alt+←：在子仓库里时回到根仓库的子仓库总览。
+    /// Alt+←：在子仓库、别的工作树里时回到上一层的总览表。
     pub fn back_to_root_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_repo() {
             tab.view
@@ -1247,8 +1308,8 @@ impl Workspace {
     fn render_repo_tab(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let tab = &self.tabs[ix];
         let app = self.app.read(cx);
-        // 进到了子仓库里：标题后面带上它的名字
-        let title: SharedString = match tab.view.read(cx).sub_title() {
+        // 进到了子仓库、别的工作树里：标题后面带上它的名字
+        let title: SharedString = match tab.view.read(cx).sub_title(cx) {
             Some(sub) => format!("{} / {sub}", app.repo_title(&tab.entry)).into(),
             None => app.repo_title(&tab.entry),
         };

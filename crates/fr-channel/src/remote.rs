@@ -541,6 +541,31 @@ impl Connection {
         async move { parsed(call.await?.0) }.boxed()
     }
 
+    /// 结果是一个 JSON 对象、别的没有的那几个（映射到本机用的 `fs_pwrite`、`fs_space` 这些）。
+    pub(crate) fn fs_call<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        method: &str,
+        params: Value,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<'static, Result<T>> {
+        let call = self.call(method, params, bytes);
+        async move { parsed(call.await?.0) }.boxed()
+    }
+
+    pub(crate) fn fs_list_all(
+        &self,
+        repo: &str,
+        dir: &str,
+    ) -> BoxFuture<'static, Result<Vec<FsEntry>>> {
+        let params = json!({ "repo": repo, "path": dir, "all": true });
+        let call = self.call("fs_list", params, Vec::new());
+        async move {
+            let (mut result, _) = call.await?;
+            serde_json::from_value(result["entries"].take()).context(tr("kuaid 返回的结果格式错误"))
+        }
+        .boxed()
+    }
+
     /// 只看成没成的那几个（建目录、删除、改名）。
     pub(crate) fn fs_simple(&self, method: &str, params: Value) -> BoxFuture<'static, Result<()>> {
         let call = self.call(method, params, Vec::new());

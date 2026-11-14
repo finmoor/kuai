@@ -317,16 +317,26 @@ impl RepoView {
                             .any(|remote| remote.name == candidate)
                             .then_some(candidate)
                     });
+                // 没在哪个工作树里检出的分支，可以另开一个工作树检出它
+                let spare = self.has_worktrees_item() && self.tree_holding(&branch.name).is_none();
                 Some(Box::new(move |mut menu, _, _| {
                     let name = branch.name.clone();
                     if !branch.current {
                         let (a, b, c) = (name.clone(), name.clone(), name.clone());
-                        menu = menu
-                            .item(item(
+                        menu = menu.item(item(
+                            &view,
+                            tf!("切换到 {name}", name),
+                            move |this, w, cx| this.checkout_branch(&a, w, cx),
+                        ));
+                        if spare {
+                            let d = name.clone();
+                            menu = menu.item(item(
                                 &view,
-                                tf!("切换到 {name}", name),
-                                move |this, w, cx| this.checkout_branch(&a, w, cx),
-                            ))
+                                tr("在新工作树中检出…"),
+                                move |this, w, cx| this.new_worktree_dialog(Some(d.clone()), w, cx),
+                            ));
+                        }
+                        menu = menu
                             .separator()
                             .item(item(
                                 &view,

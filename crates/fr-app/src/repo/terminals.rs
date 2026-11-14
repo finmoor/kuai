@@ -44,7 +44,7 @@ struct TermTab {
 /// 一个仓库的终端们。
 #[derive(Default)]
 pub(super) struct Terminals {
-    /// 第一次到终端页时才建；切回 Git 页也留着（里面的程序接着跑）
+    /// 点「新终端」「打开终端」才建，到终端页不自己开；切回 Git 页也留着（里面的程序接着跑）
     tabs: Vec<TermTab>,
     /// 终端页上显示的是哪一个
     active: usize,
@@ -388,7 +388,8 @@ impl RepoView {
         }
     }
 
-    /// 切到 Git、终端或文件页。到终端页时留着的都接回来，一个都没有就开第一个，焦点放进终端；
+    /// 切到 Git、终端或文件页。到终端页时留着的都接回来，焦点放进终端；一个都没有就显示空的
+    /// 样子，不自己开：终端开在 kuaid 里，开了就一直留着，只是过来看一眼不该留下一个空终端。
     /// 离开终端页不结束里面的程序。到文件页时焦点放到打开的文件（没有就是目录树）上。
     pub(super) fn show_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         // 焦点还留在看不见的那一页上的话，键盘就没反应了（或者改到看不见的文件里去）
@@ -408,9 +409,11 @@ impl RepoView {
                 }
                 self.adopt_waiting(window, cx);
                 if self.terminals.tabs.is_empty() {
-                    self.terminals.active = self.add_terminal(1, false, window, cx);
+                    // 焦点留在刚才那一页的输入框里的话，敲的字会进到看不见的地方
+                    window.blur(cx);
+                } else {
+                    self.focus_terminal(window, cx);
                 }
-                self.focus_terminal(window, cx);
             }
             Page::Files => {
                 self.focus_files(window, cx);
@@ -868,7 +871,8 @@ impl RepoView {
             })
     }
 
-    /// 终端页上一个终端都没有了（最后一个结束了）：不自己跳回 Git 页，留在这里等再开。
+    /// 终端页上一个终端都没有（还没开过，或者最后一个结束了）：不自己开，也不跳回 Git 页，
+    /// 留在这里等用户开。
     fn render_no_terminal(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let (muted, bg) = (theme.muted_foreground, theme.background);

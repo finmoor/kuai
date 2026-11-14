@@ -318,8 +318,13 @@ mod tests {
         );
     }
 
+    /// Unix 上套接字文件按进程号起名，同一个测试进程里同时开两个，后开的会把先开的顶掉
+    /// （先开的那个测试连到后开的上，口令对不上），所以开监听的测试排着队跑。
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn 标记原样带给主进程() {
+        let _serial = SERIAL.lock().unwrap_or_else(|err| err.into_inner());
         let dir = std::env::temp_dir();
         let env = serve_tagged(&dir.join("fr-askpass-test-helper"), |prompt, tag| {
             Some(format!("{prompt}/{}", tag.unwrap_or("无")))
@@ -346,6 +351,7 @@ mod tests {
 
     #[test]
     fn 请求带着口令才回答() {
+        let _serial = SERIAL.lock().unwrap_or_else(|err| err.into_inner());
         let dir = std::env::temp_dir();
         let env = serve(&dir.join("fr-askpass-test-helper"), |prompt| {
             (prompt == "问").then(|| "答".to_string())

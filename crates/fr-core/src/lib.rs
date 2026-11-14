@@ -20,3 +20,4 @@ pub mod state;
 pub mod status;
 pub mod watch;
 pub mod workfile;
+pub mod worktree;

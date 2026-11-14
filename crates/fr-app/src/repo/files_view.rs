@@ -810,12 +810,18 @@ impl RepoView {
             .as_deref()
             .and_then(|id| self.app.read(cx).server(id))
             .map(|server| server.destination.clone());
+        let (app, server_id, root) = (
+            self.app.clone(),
+            self.entry.server.clone(),
+            self.entry.path.clone(),
+        );
         super::tool_button_bare("file-more", IconName::Ellipsis, tr("更多"), false, 0, cx)
             .disabled(path.is_none())
-            .dropdown_menu(move |menu, _, _| {
+            .dropdown_menu(move |menu, _, cx| {
                 let (Some(id), Some(path)) = (id, path.clone()) else {
                     return menu;
                 };
+                let full_remote = format!("{}/{path}", root.trim_end_matches('/'));
                 let item = |label: &'static str,
                             run: Box<
                     dyn Fn(&mut RepoView, &mut Window, &mut Context<RepoView>),
@@ -855,12 +861,26 @@ impl RepoView {
                     ))
                     .separator();
                 menu = match remote {
-                    true => menu.item(item(
-                        tr("下载…"),
-                        Box::new(move |this, window, cx| {
-                            this.download_file(download.clone(), window, cx)
-                        }),
-                    )),
+                    true => {
+                        let menu = match &server_id {
+                            Some(server) => crate::mapping::menu_items(
+                                menu,
+                                &app,
+                                server,
+                                &full_remote,
+                                false,
+                                &root,
+                                cx,
+                            ),
+                            None => menu,
+                        };
+                        menu.item(item(
+                            tr("下载…"),
+                            Box::new(move |this, window, cx| {
+                                this.download_file(download.clone(), window, cx)
+                            }),
+                        ))
+                    }
                     false => menu
                         .item(item(
                             tr("用默认程序打开"),
@@ -1500,12 +1520,79 @@ impl RepoView {
             .text_size(px(11.))
             .text_color(muted)
             .child(
-                ui::clipped_with_tip("file-full-path", shown, full)
+                ui::clipped_with_tip("file-full-path", shown, full.clone())
                     .flex_1()
                     .min_w_0()
                     .text_ellipsis_start()
-                    .font_family(mono),
+                    .font_family(mono.clone()),
             );
+        // 服务器上的文件：映射到本机了就写出本机路径（点一下复制），没有就给一个去映射的入口
+        if let Some(server) = self.entry.server.clone() {
+            let app = self.app.clone();
+            let state = app.read(cx);
+            let link = |id: &'static str| {
+                h_flex()
+                    .id(id)
+                    .flex_none()
+                    .max_w(px(360.))
+                    .gap(px(4.))
+                    .px(px(6.))
+                    .mx(px(-6.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(hover).text_color(fg))
+            };
+            // 三种都带盘的图标、都有提示：点了会做什么，一看就知道
+            let drive = || Icon::new(IconName::HardDrive).size_3().flex_none();
+            let cell = if let Some(local) = state.local_path(&server, &full) {
+                let copy = local.clone();
+                let tip: SharedString = format!("{local}\n{}", tr("点击复制本机路径")).into();
+                link("file-local-path")
+                    .child(drive())
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_ellipsis_start()
+                            .font_family(mono)
+                            .child(local),
+                    )
+                    .tooltip(move |window, cx| ui::full_text_tip(tip.clone(), window, cx))
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                        use gpui_kit::component::WindowExt as _;
+                        use gpui_kit::component::notification::Notification;
+                        window.push_notification(Notification::info(tr("已复制本机路径")), cx);
+                    }))
+            } else if let Some(mapping) = state.covering(&server, &full) {
+                let id = mapping.id.clone();
+                let app = app.clone();
+                let tip: SharedString =
+                    tf!("立即映射到 {local}", local = mapping.local_root()).into();
+                link("file-map-now")
+                    .child(drive())
+                    .child(tr("立即映射"))
+                    .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
+                    .on_click(move |_, _, cx| app.update(cx, |app, cx| app.mount_mapping(&id, cx)))
+            } else {
+                let (app, root) = (app.clone(), self.entry.path.clone());
+                link("file-map")
+                    .child(drive())
+                    .child(tr("映射到本机…"))
+                    .tooltip(|window, cx| ui::tip(tr("映射后可用本机程序直接打开"), window, cx))
+                    .on_click(move |_, window, cx| {
+                        crate::mapping::map_dialog(
+                            app.clone(),
+                            server.clone(),
+                            root.clone(),
+                            None,
+                            window,
+                            cx,
+                        )
+                    })
+            };
+            bar = bar.child(cell);
+        }
         match &tab.body {
             Body::Text(doc) => {
                 let position = doc.editor.read(cx).cursor_position();

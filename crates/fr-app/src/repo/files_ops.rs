@@ -203,11 +203,25 @@ pub(super) fn tree_menu(
                     crate::shell::report(crate::shell::reveal_in_explorer(&path), window, cx);
                 }),
             ));
-        } else if !row.dir {
-            menu = menu.item(item(
-                tr("下载…"),
-                Box::new(move |this, window, cx| this.download_file(download.clone(), window, cx)),
-            ));
+        } else {
+            // 服务器上的：映射到本机了就有本机路径，没有就可以在这里映射
+            let state = this.read(cx);
+            let (app, root, full) = (
+                state.app.clone(),
+                state.entry.path.clone(),
+                state.full_path(&row.path),
+            );
+            if let Some(server) = state.entry.server.clone() {
+                menu = crate::mapping::menu_items(menu, &app, &server, &full, row.dir, &root, cx);
+            }
+            if !row.dir {
+                menu = menu.item(item(
+                    tr("下载…"),
+                    Box::new(move |this, window, cx| {
+                        this.download_file(download.clone(), window, cx)
+                    }),
+                ));
+            }
         }
         menu.separator()
             .item(item(
