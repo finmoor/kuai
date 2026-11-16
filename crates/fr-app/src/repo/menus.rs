@@ -683,6 +683,8 @@ impl RepoView {
                             ),
                         );
                     }
+                    // 经别的服务器连的（156>91）：本机连不到它，交不出去
+                    None if !local => {}
                     None => {
                         let file = format!("{full_path}/{}", entry.path);
                         let file2 = file.clone();
@@ -931,7 +933,7 @@ impl RepoView {
             String::new()
         } else {
             tf!(
-                "{cur} 将指向 {id}，之后的提交将从此分支上移除（仍可通过 reflog 找回）。",
+                "{cur} 将指向 {id}，之后的提交将从此分支移除（可通过 reflog 找回）。",
                 cur,
                 id = short(&id)
             )
@@ -1029,7 +1031,7 @@ impl RepoView {
                         } else if no_commit && !stdout.contains("Fast-forward") {
                             this.show_changes(cx);
                             Notification::success(tr(
-                                "尚未提交：请检查后点击上方的「提交合并」，如需放弃，请点击「中止」。",
+                                "尚未提交：请检查后点击上方的「提交合并」，或点击「中止」放弃。",
                             ))
                             .title(tf!("{name} 已合并，尚未提交", name))
                         } else {
@@ -1053,7 +1055,7 @@ impl RepoView {
     ) {
         let cur = self.current_label();
         let description = tf!(
-            "{cur} 独有的提交将在 {shown} 之后重新生成（哈希会改变）。已推送的分支变基后需要强制推送。",
+            "{cur} 独有的提交将在 {shown} 之后重新生成。已推送的分支变基后需强制推送。",
             cur,
             shown
         );
@@ -1113,7 +1115,7 @@ impl RepoView {
                 }
                 Err(text) if text.contains("non-fast-forward") => {
                     let text = tf!(
-                        "{name} 包含 {upstream} 中没有的提交，无法快进。请切换到 {name} 后再拉取。",
+                        "{name} 有 {upstream} 中没有的提交，无法快进。请切换到 {name} 后拉取。",
                         name,
                         upstream
                     );
@@ -1150,7 +1152,7 @@ impl RepoView {
             }
         };
         let description = tf!(
-            "{to} 上的提交将被本地的 {name} 覆盖。如果 {to} 在上次获取后有新提交，则不会推送（--force-with-lease）。",
+            "{to} 上的提交将被本地的 {name} 覆盖。若 {to} 在上次获取后有新提交，则不推送（--force-with-lease）。",
             to,
             name
         );
@@ -1440,7 +1442,7 @@ impl RepoView {
         let (ours, theirs) = self.side_labels();
         let which = if side == "--ours" { ours } else { theirs };
         let description = tf!(
-            "{path} 中的所有冲突都将采用此版本，文件将标记为已解决。另一方的改动和手动编辑的内容将被覆盖。",
+            "{path} 中的所有冲突将采用此版本并标记为已解决，另一方的改动和手动编辑的内容将被覆盖。",
             path
         );
         self.confirm(
@@ -1492,8 +1494,7 @@ impl RepoView {
             title: tr("添加远程").into(),
             placeholder: tr("名称，例如 upstream").into(),
             second: Some(tr("地址，例如 https://example.com/team/project.git").into()),
-            hint: tr("添加后将执行一次获取。即使获取失败，远程也已添加，可在右键菜单中修改地址或删除。")
-                .into(),
+            hint: tr("添加后立即获取；获取失败时远程仍保留，可在右键菜单中修改或删除。").into(),
             ok: tr("添加"),
             validate: Some(Box::new(|this, answer| {
                 if answer.second.is_empty() {
@@ -1658,9 +1659,9 @@ impl RepoView {
         cx: &mut Context<Self>,
     ) {
         let description = match state {
-            InProgress::Rebase => tr(
-                "跳过正在重放的提交：其改动（包括已解决的冲突）将被丢弃，变基将继续处理后续提交。",
-            ),
+            InProgress::Rebase => {
+                tr("跳过正在重放的提交：其改动（含已解决的冲突）将被丢弃，变基继续处理后续提交。")
+            }
             _ => tr("放弃当前正在处理的提交，已解决的冲突将丢失。"),
         };
         self.confirm(

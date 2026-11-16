@@ -11,15 +11,11 @@ use futures::FutureExt as _;
 use futures::future::{LocalBoxFuture, Shared};
 use gpui_kit::*;
 
-use crate::settings::{
-    self, Auth, Layout, RepoEntry, RepoMemo, Server, Settings, TabGroup, WindowState,
-};
+use crate::machines::{LOCAL, Machine, split_relay};
+use crate::settings::{self, Auth, Layout, RepoEntry, RepoMemo, Server, Settings, WindowState};
 
 /// 正在进行或已经结束的连接；多处等同一个连接时共用。
-type Connecting = Shared<Task<Result<Arc<Connection>, SharedString>>>;
-
-/// 这台电脑上的 kuaid 的连接在 `conns` 里用的名字（服务器的 id 不会是空的）。
-const LOCAL: &str = "";
+pub(crate) type Connecting = Shared<Task<Result<Arc<Connection>, SharedString>>>;
 
 /// 一台服务器的连接状态。
 pub enum ConnStatus {
@@ -38,17 +34,34 @@ pub struct AppState {
     save_later: Option<Task<()>>,
     /// 映射到本机的目录（见 `mapping`）
     pub(crate) mounts: crate::mapping::Mounts,
+    /// 各台电脑保存的仓库列表和工作区，这次运行里读到的（见 `machines`）
+    pub(crate) machines: HashMap<String, Machine>,
+    /// 各台电脑那边已经接好的连接：改动经它交过去，改动经它推过来
+    pub(crate) links: HashMap<String, Arc<Connection>>,
+    /// 还没接好就要交的改动（第一次连上时一起交）
+    pub(crate) pending: HashMap<String, Vec<fr_core::store::Op>>,
+    /// 订阅各台电脑改动的任务；丢弃就不订阅了
+    pub(crate) watches: HashMap<String, Task<()>>,
+    /// 断开以后自动重连的任务
+    pub(crate) reconnects: HashMap<String, Task<()>>,
 }
 
 impl AppState {
-    pub fn new(settings: Settings) -> Self {
-        Self {
+    pub fn new(settings: Settings, cx: &mut Context<Self>) -> Self {
+        let mut this = Self {
             settings,
             conns: HashMap::new(),
             stages: HashMap::new(),
             save_later: None,
             mounts: crate::mapping::Mounts::new(),
-        }
+            machines: HashMap::new(),
+            links: HashMap::new(),
+            pending: HashMap::new(),
+            watches: HashMap::new(),
+            reconnects: HashMap::new(),
+        };
+        this.start_machines(cx);
+        this
     }
 
     pub fn server(&self, id: &str) -> Option<&Server> {
@@ -57,6 +70,20 @@ impl AppState {
 
     /// 正在连接时显示的那句话：经跳板机的写明走到哪一台了。
     pub fn connecting_text(&self, id: &str) -> SharedString {
+        // 经服务器连的：跳板机按那台服务器的配置
+        if let Some((via, server)) = split_relay(id) {
+            let names: Vec<String> = self
+                .machines
+                .get(via)
+                .and_then(|m| m.store.route(server).ok())
+                .map(|(_, route)| route.iter().map(|jump| jump.name.clone()).collect())
+                .unwrap_or_default();
+            let done = self.stages.get(id).copied().unwrap_or(0);
+            return match names.get(done) {
+                Some(name) => tf!("正在连接跳板机 {name}…", name).into(),
+                None => tf!("正在经由 {name} 连接…", name = self.machine_name(via)).into(),
+            };
+        }
         let route = self.settings.route(id);
         let done = self.stages.get(id).copied().unwrap_or(0);
         match (route.get(done), route.last()) {
@@ -99,23 +126,30 @@ impl AppState {
             .shared();
         self.conns.insert(LOCAL.to_string(), connecting.clone());
         let done = connecting.clone();
-        cx.background_executor()
-            .spawn(async move {
-                match done.await {
-                    Ok(conn) => log::info!(
-                        "连接本机的 kuaid：{} ms，{}{}",
-                        conn.connect_time.as_millis(),
-                        conn.hello.version,
-                        if conn.installed { "，已安装" } else { "" },
-                    ),
-                    Err(err) => log::warn!("连接本机的 kuaid 失败：{err}"),
-                }
+        cx.spawn(async move |this, cx| {
+            let result = done.await;
+            match &result {
+                Ok(conn) => log::info!(
+                    "连接本机的 kuaid：{} ms，{}{}",
+                    conn.connect_time.as_millis(),
+                    conn.hello.version,
+                    if conn.installed { "，已安装" } else { "" },
+                ),
+                Err(err) => log::warn!("连接本机的 kuaid 失败：{err}"),
+            }
+            // 本机的仓库列表和工作区经它读写；连不上就直接读写状态文件
+            this.update(cx, |this, cx| match result {
+                Ok(conn) => this.machine_connected(LOCAL, conn, cx),
+                Err(_) => this.local_unavailable(cx),
             })
-            .detach();
+            .ok();
+        })
+        .detach();
         connecting
     }
 
     /// 连接服务器；已经连上或正在连就沿用。返回等连接结果的 future。
+    /// `id` 可以是经别的电脑连的服务器（`156的id>91的id`，见 `machines`）：先连那台，再请它的 kuaid 转接。
     pub fn connect(&mut self, id: &str, cx: &mut Context<Self>) -> Connecting {
         if let Some(existing) = self.conns.get(id) {
             match existing.peek() {
@@ -124,15 +158,11 @@ impl AppState {
                 _ => {}
             }
         }
-        let server = self.server(id).cloned();
-        let route: Vec<Server> = self.settings.route(id).into_iter().cloned().collect();
         // 经跳板机的：后台线程每登录上一台报一次，这边记下来、刷新列表上的那句话
         self.stages.remove(id);
         let (stage_tx, mut stage_rx) = futures::channel::mpsc::unbounded::<usize>();
-        let on_stage = (!route.is_empty()).then(|| {
-            Arc::new(move |done: usize| drop(stage_tx.unbounded_send(done)))
-                as fr_channel::StageHandler
-        });
+        let on_stage = Arc::new(move |done: usize| drop(stage_tx.unbounded_send(done)))
+            as fr_channel::StageHandler;
         let stage_id = id.to_string();
         cx.spawn(async move |this, cx| {
             use futures::StreamExt as _;
@@ -147,19 +177,52 @@ impl AppState {
             }
         })
         .detach();
-        let connecting = cx
-            .background_executor()
-            .spawn(async move {
-                let server =
-                    server.ok_or_else(|| SharedString::from(tr("未找到该服务器的设置")))?;
-                let mut options = connect_options(&server);
-                options.jumps = route.iter().map(jump_options).collect();
-                options.on_stage = on_stage;
-                Connection::connect(&server.destination, &options)
-                    .map(Arc::new)
-                    .map_err(|err| SharedString::from(format!("{err:#}")))
-            })
-            .shared();
+        let connecting = match split_relay(id) {
+            Some((via, server)) => {
+                let via_connecting = self.connect(via, cx);
+                let server = server.to_string();
+                cx.background_executor()
+                    .spawn(async move {
+                        let via = via_connecting.await?;
+                        let failed = |err: anyhow::Error| SharedString::from(format!("{err:#}"));
+                        // 怎么连照那台电脑的配置：现读一份，这边只拿名字和目标来报进度、报错
+                        let store = via.state_get().await.map_err(failed)?;
+                        let (target, route) = store.route(&server).map_err(failed)?;
+                        let options = ConnectOptions {
+                            jumps: route
+                                .iter()
+                                .map(|jump| Jump {
+                                    name: jump.name.clone(),
+                                    destination: jump.destination.clone(),
+                                    ..Jump::default()
+                                })
+                                .collect(),
+                            on_stage: (!route.is_empty()).then_some(on_stage),
+                            ..ConnectOptions::default()
+                        };
+                        Connection::connect_via(&via, &server, &target.destination, &options)
+                            .map(Arc::new)
+                            .map_err(failed)
+                    })
+                    .shared()
+            }
+            None => {
+                let server = self.server(id).cloned();
+                let route: Vec<Server> = self.settings.route(id).into_iter().cloned().collect();
+                cx.background_executor()
+                    .spawn(async move {
+                        let server =
+                            server.ok_or_else(|| SharedString::from(tr("未找到该服务器的设置")))?;
+                        let mut options = connect_options(&server);
+                        options.jumps = route.iter().map(jump_options).collect();
+                        options.on_stage = (!route.is_empty()).then_some(on_stage);
+                        Connection::connect(&server.destination, &options)
+                            .map(Arc::new)
+                            .map_err(|err| SharedString::from(format!("{err:#}")))
+                    })
+                    .shared()
+            }
+        };
         self.conns.insert(id.to_string(), connecting.clone());
         // 连完刷新界面上的连接状态
         let done = connecting.clone();
@@ -180,10 +243,14 @@ impl AppState {
                 Err(err) => log::warn!("连接服务器 {id} 失败：{err}"),
             }
             this.update(cx, |this, cx| {
-                // 连上了：这台服务器的映射换到新连接上，设了自动映射的映射上
+                // 连上了：这台服务器的映射换到新连接上，设了自动映射的映射上；
+                // 订阅它的仓库列表和工作区
                 if let Some(Ok(conn)) = this.conns.get(&id).and_then(|c| c.peek()) {
                     let conn = conn.clone();
-                    this.mappings_connected(&id, &conn, cx);
+                    if split_relay(&id).is_none() {
+                        this.mappings_connected(&id, &conn, cx);
+                    }
+                    this.machine_connected(&id, conn, cx);
                 }
                 cx.notify();
             })
@@ -217,7 +284,10 @@ impl AppState {
         let id = format!("s{millis}");
         server.id = id.clone();
         self.settings.servers.push(server);
+        // 新加的服务器没有旧设置里的仓库要并
+        self.settings.merged_servers.push(id.clone());
         self.save();
+        self.push_servers(cx);
         cx.notify();
         id
     }
@@ -255,11 +325,13 @@ impl AppState {
             self.conns.remove(&id);
         }
         self.save();
+        self.push_servers(cx);
         cx.notify();
         reconnect
     }
 
-    /// 从列表里去掉服务器和它的仓库；服务器上的东西不动。
+    /// 从列表里去掉服务器；服务器上的东西不动。本机工作区里它上面的仓库跟着去掉，
+    /// 用过的它上面的工作区不再列出。
     pub fn remove_server(&mut self, id: &str, cx: &mut Context<Self>) {
         self.unmount_server(id, cx);
         self.settings.servers.retain(|s| s.id != id);
@@ -269,14 +341,24 @@ impl AppState {
                 server.jump = None;
             }
         }
-        self.settings
-            .repos
-            .retain(|r| r.server.as_deref() != Some(id));
         self.settings.normalize();
-        self.conns.remove(id);
+        // 它的连接，和经它连的那几台的
+        let relayed = format!("{id}>");
+        let gone = |key: &String| key == id || key.starts_with(&relayed);
+        self.conns.retain(|key, _| !gone(key));
+        self.links.retain(|key, _| !gone(key));
+        self.machines.retain(|key, _| !gone(key));
+        self.pending.retain(|key, _| !gone(key));
+        self.reconnects.retain(|key, _| !gone(key));
         // 存着的密码、口令跟着删掉
         crate::secrets::delete(id);
         self.save();
+        self.push_servers(cx);
+        // 现在用的就是它上面的工作区：回到本机
+        if self.settings.current.machine.is_empty() && self.settings.current.id.is_empty() {
+            let next = self.recent_local();
+            self.set_current(next, cx);
+        }
         cx.notify();
     }
 
@@ -293,8 +375,12 @@ impl AppState {
     }
 
     /// 收起、展开仓库页「全部仓库」里的一张卡片（本机是 `settings::LOCAL_CARD`，服务器是它的 id）。
+    /// 本机的记收起了的，服务器的（默认收起）记展开了的。
     pub fn toggle_card(&mut self, key: &str, cx: &mut Context<Self>) {
-        let cards = &mut self.settings.collapsed_cards;
+        let cards = match key == crate::settings::LOCAL_CARD {
+            true => &mut self.settings.collapsed_cards,
+            false => &mut self.settings.expanded_cards,
+        };
         match cards.iter().position(|card| card == key) {
             Some(at) => {
                 cards.remove(at);
@@ -305,71 +391,6 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn add_repo(&mut self, entry: RepoEntry, cx: &mut Context<Self>) {
-        if !self.settings.repos.contains(&entry) {
-            self.settings.repos.push(entry);
-            self.save();
-            cx.notify();
-        }
-    }
-
-    /// 从列表里去掉仓库；仓库本身不动。
-    pub fn remove_repo(&mut self, entry: &RepoEntry, cx: &mut Context<Self>) {
-        self.settings.repos.retain(|r| r != entry);
-        self.settings.normalize();
-        self.save();
-        cx.notify();
-    }
-
-    /// 记下当前工作区开着的标签页和选中的那一个。
-    pub fn set_open_tabs(&mut self, tabs: Vec<RepoEntry>, active: usize) {
-        let group = self.settings.workspace_mut();
-        if group.tabs != tabs || group.active != active {
-            // 重新打开了的不算「关掉的」了；在这个工作区里打开的仓库就是它的仓库
-            group.closed.retain(|e| !tabs.contains(e));
-            for tab in &tabs {
-                group.adopt(tab);
-            }
-            group.pinned.retain(|e| tabs.contains(e));
-            group.tabs = tabs;
-            group.active = active;
-            self.save();
-        }
-    }
-
-    /// 把仓库从当前工作区去掉（它还在仓库列表里，别的工作区里的也不动）。
-    pub fn remove_from_workspace(&mut self, entry: &RepoEntry, cx: &mut Context<Self>) {
-        self.settings.workspace_mut().drop_repo(entry);
-        self.save();
-        cx.notify();
-    }
-
-    /// 固定、取消固定当前工作区里的一个标签页；返回现在是不是固定的。
-    pub fn toggle_pinned(&mut self, entry: &RepoEntry, cx: &mut Context<Self>) -> bool {
-        let group = self.settings.workspace_mut();
-        let pinned = !group.is_pinned(entry);
-        group.pinned.retain(|e| e != entry);
-        if pinned {
-            group.pinned.push(entry.clone());
-        }
-        group.pinned_first();
-        self.save();
-        cx.notify();
-        pinned
-    }
-
-    /// 记下当前工作区刚关掉的一个标签页（Ctrl+Shift+T 和快速打开里能找回来）。
-    pub fn note_closed_tab(&mut self, entry: RepoEntry) {
-        if self.settings.repos.contains(&entry) {
-            self.settings.workspace_mut().note_closed(entry);
-        }
-    }
-
-    /// 当前工作区最近关掉的标签页，最近的在前。
-    pub fn closed_tabs(&self) -> Vec<RepoEntry> {
-        self.settings.workspace().closed.iter().rev().cloned().collect()
-    }
-
     /// 改设置里的几项（语言、主题、托盘……）并存盘。
     pub fn update_settings(&mut self, cx: &mut Context<Self>, edit: impl FnOnce(&mut Settings)) {
         edit(&mut self.settings);
@@ -378,72 +399,6 @@ impl AppState {
         crate::terminal::set_prefs(&self.settings.terminal, cx);
         self.save();
         cx.notify();
-    }
-
-    /// 新建一个空的工作区，返回它是第几个。名字和已有的重了就在后面加数字。
-    pub fn add_workspace(&mut self, name: &str, cx: &mut Context<Self>) -> usize {
-        let name = unique_name(
-            name,
-            self.settings.workspaces.iter().map(|g| g.name.as_str()),
-        );
-        self.settings.workspaces.push(TabGroup {
-            name,
-            ..TabGroup::default()
-        });
-        self.save();
-        cx.notify();
-        self.settings.workspaces.len() - 1
-    }
-
-    pub fn rename_workspace(&mut self, ix: usize, name: &str, cx: &mut Context<Self>) {
-        let others = self
-            .settings
-            .workspaces
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != ix)
-            .map(|(_, g)| g.name.as_str());
-        let name = unique_name(name, others);
-        if let Some(group) = self.settings.workspaces.get_mut(ix) {
-            group.name = name;
-            self.save();
-            cx.notify();
-        }
-    }
-
-    /// 删掉一个工作区（至少留一个）。里面登记的仓库还在仓库列表里，只是不再开着。
-    pub fn remove_workspace(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if self.settings.workspaces.len() <= 1 || ix >= self.settings.workspaces.len() {
-            return;
-        }
-        self.settings.workspaces.remove(ix);
-        if self.settings.active_workspace > ix {
-            self.settings.active_workspace -= 1;
-        }
-        self.settings.normalize();
-        self.save();
-        cx.notify();
-    }
-
-    pub fn set_active_workspace(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if ix < self.settings.workspaces.len() && self.settings.active_workspace != ix {
-            self.settings.active_workspace = ix;
-            self.save();
-            cx.notify();
-        }
-    }
-
-    /// 往另一个工作区里加一个标签页（把标签页移过去时用）：仓库也成了那个工作区的。
-    pub fn push_tab_to_workspace(&mut self, ix: usize, entry: RepoEntry, cx: &mut Context<Self>) {
-        if let Some(group) = self.settings.workspaces.get_mut(ix) {
-            group.closed.retain(|e| *e != entry);
-            group.adopt(&entry);
-            if !group.tabs.contains(&entry) {
-                group.tabs.push(entry);
-            }
-            self.save();
-            cx.notify();
-        }
     }
 
     /// 改各块的大小（拖分隔条时一直在变），稍后存盘。
@@ -486,31 +441,6 @@ impl AppState {
         self.save_soon(cx);
     }
 
-    /// 仓库显示的名字：起过名字就用它，没有就是目录名。
-    pub fn repo_name(&self, entry: &RepoEntry) -> SharedString {
-        self.settings.repo_name(entry).to_string().into()
-    }
-
-    /// 给仓库改名（只改显示的名字，目录不动）；空的就恢复成目录名。
-    pub fn rename_repo(&mut self, entry: &RepoEntry, name: &str, cx: &mut Context<Self>) {
-        self.settings.set_repo_name(entry, name);
-        self.save();
-        cx.notify();
-    }
-
-    /// 标签页上显示的名字：仓库的名字，服务器上的再加服务器名。
-    pub fn repo_title(&self, entry: &RepoEntry) -> SharedString {
-        let name = self.settings.repo_name(entry);
-        match &entry.server {
-            None => name.to_string().into(),
-            Some(id) => format!(
-                "{name} · {}",
-                self.server(id).map_or("?", |s| s.name.as_str())
-            )
-            .into(),
-        }
-    }
-
     pub(crate) fn save(&self) {
         if let Err(err) = settings::save(&self.settings) {
             log::error!("{err:#}");
@@ -537,34 +467,5 @@ fn jump_options(server: &Server) -> Jump {
         identity_file: server.key_file().map(str::to_string),
         password_auth: server.auth == Auth::Password,
         secret: crate::secrets::get(&server.id),
-    }
-}
-
-/// 名字去掉首尾空白；空的话叫「工作区」；和已有的重了就加上 2、3……
-fn unique_name<'a>(name: &str, existing: impl Iterator<Item = &'a str>) -> String {
-    let base = match name.trim() {
-        "" => fr_core::i18n::tr("工作区"),
-        name => name,
-    };
-    let existing: Vec<&str> = existing.collect();
-    if !existing.contains(&base) {
-        return base.to_string();
-    }
-    (2..)
-        .map(|n| format!("{base} {n}"))
-        .find(|candidate| !existing.contains(&candidate.as_str()))
-        .unwrap_or_else(|| base.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::unique_name;
-
-    #[test]
-    fn 工作区的名字不重复() {
-        let existing = ["默认", "工作", "工作 2"];
-        assert_eq!(unique_name(" 新的 ", existing.iter().copied()), "新的");
-        assert_eq!(unique_name("工作", existing.iter().copied()), "工作 3");
-        assert_eq!(unique_name("  ", existing.iter().copied()), "工作区");
     }
 }

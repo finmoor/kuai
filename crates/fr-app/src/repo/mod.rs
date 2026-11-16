@@ -444,15 +444,27 @@ impl RepoView {
         self.focus_search(window, cx);
     }
 
-    /// 仓库在哪：本机或服务器名。
+    /// 仓库在哪：本机或服务器名（经别的服务器连的是它在那台服务器上的名字）。
     fn place(&self, cx: &App) -> String {
-        match &self.entry.server {
-            None => tr("本机").into(),
-            Some(id) => self
-                .app
-                .read(cx)
-                .server(id)
-                .map_or_else(|| "?".into(), |s| s.name.clone()),
+        let machine = crate::machines::machine_of(&self.entry);
+        self.app.read(cx).machine_name(machine).to_string()
+    }
+
+    /// 侧栏、图标栏上写的位置：经别的服务器连的写明经由哪台（「91 · 经由 156」）。
+    fn place_label(&self, cx: &App) -> String {
+        let place = self.place(cx);
+        match self
+            .entry
+            .server
+            .as_deref()
+            .and_then(crate::machines::split_relay)
+        {
+            Some((via, _)) => tf!(
+                "{place} · 经由 {via}",
+                place,
+                via = self.app.read(cx).machine_name(via)
+            ),
+            None => place,
         }
     }
 
@@ -731,6 +743,13 @@ impl RepoView {
             .as_deref()
             .and_then(|id| self.app.read(cx).server(id))
             .cloned();
+        // 经别的服务器连的（156>91）：本机连不到它，外部终端和 VS Code 都用不了，也不能映射
+        let via = self
+            .entry
+            .server
+            .as_deref()
+            .and_then(crate::machines::split_relay)
+            .map(|(via, _)| self.app.read(cx).machine_name(via));
         let app = self.app.clone();
         // 不加悬停提示：提示也出现在按钮下面，会把弹出的菜单第一项盖住
         tool_button_bare(
@@ -743,6 +762,12 @@ impl RepoView {
         )
         .dropdown_menu(move |menu, _, cx| {
             let (a, b, c) = (dir.clone(), dir.clone(), dir.clone());
+            if let Some(via) = &via {
+                return menu
+                    .item(PopupMenuItem::new(tr("在外部终端中打开（ssh）")).disabled(true))
+                    .item(PopupMenuItem::new(tr("在 VS Code 中打开（Remote-SSH）")).disabled(true))
+                    .label(tf!("经由 {via} 连接的仓库不支持以上两项。", via = via));
+            }
             match server.clone() {
                 // 服务器上的仓库：终端经 ssh 登录，VS Code 走 Remote-SSH
                 Some(server) => {
@@ -835,18 +860,18 @@ impl RepoView {
         };
         let text = if conflicts > 0 {
             tf!(
-                "{name}已暂停：还有 {conflicts} 个文件存在冲突。请在「本地修改」中解决后点击「{go}」。",
+                "{name}已暂停：{conflicts} 个文件有冲突。请在「本地修改」中解决后点击「{go}」。",
                 name = state.name(),
                 conflicts,
                 go
             )
         } else if empty {
             tf!(
-                "{name}已暂停：此提交没有产生改动（内容已存在）。请点击「跳过此提交」继续。",
+                "{name}已暂停：此提交没有改动（内容已存在）。请点击「跳过此提交」。",
                 name = state.name()
             )
         } else if state == InProgress::Merge {
-            tr("合并尚未完成：冲突已全部解决，请点击「提交合并」。未填写说明时将使用默认说明。").into()
+            tr("合并尚未完成：冲突已全部解决，请点击「提交合并」。说明留空则使用默认说明。").into()
         } else {
             tf!(
                 "{name}已暂停：冲突已全部解决，请点击「继续」。",

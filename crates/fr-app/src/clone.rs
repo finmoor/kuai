@@ -78,12 +78,11 @@ impl CloneView {
         let default_parent = match &server {
             None => app
                 .read(cx)
-                .settings
-                .repos
+                .repos_on(crate::machines::LOCAL)
+                .unwrap_or_default()
                 .iter()
                 .rev()
-                .find(|r| r.server.is_none())
-                .and_then(|r| {
+                .find_map(|r| {
                     r.path
                         .rsplit_once(['\\', '/'])
                         .map(|(dir, _)| dir.to_string())
@@ -286,7 +285,7 @@ impl CloneView {
         drop(_task);
         if self.server.is_some() {
             self.status = Some((
-                tf!("克隆已中止。服务器上的 {target} 可能残留未完成的内容，请先删除该目录，或更换文件夹名称后重新克隆。", target)
+                tf!("克隆已中止。服务器上的 {target} 可能有残留内容，请删除该目录或更换名称后重试。", target)
                 .into(),
                 true,
             ));
@@ -432,7 +431,7 @@ fn explain(err: &str, target: &str) -> String {
         || lower.contains("does not appear to be a git repository")
         || lower.contains("does not exist")
     {
-        Some(tr("未找到仓库。请检查地址是否正确，以及该账号是否有访问权限。").to_string())
+        Some(tr("未找到仓库。请检查地址及账号的访问权限。").to_string())
     } else if lower.contains("no such file or directory") || lower.contains("cannot find the path")
     {
         Some(tr("存放位置不存在。请先在服务器上创建该目录，或点击「浏览…」选择。").to_string())
@@ -495,7 +494,7 @@ impl Render for CloneView {
                     div()
                         .flex_1()
                         .text_sm()
-                        .child(tr("中止克隆？已下载的内容将不会保留。")),
+                        .child(tr("中止克隆？已下载的内容不会保留。")),
                 )
                 .child(
                     Button::new("keep")

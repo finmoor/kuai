@@ -70,7 +70,9 @@ use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+use crate::win;
 use colors::Palette;
+use keys::WheelTarget;
 
 /// 字和面板边缘之间留的空
 const PADDING: f32 = 8.;
@@ -1125,6 +1127,28 @@ impl TerminalView {
         }
     }
 
+    /// 窗口里的一个位置在屏幕上的第几列、第几行（从 0 起，不管往回翻了多少），报给程序用。
+    fn screen_cell(&self, position: Point<Pixels>) -> Option<(usize, usize)> {
+        let geometry = self.geometry.get();
+        let grid = geometry.grid?;
+        let at = |offset: Pixels, size: Pixels, count: usize| {
+            let cell = (f32::from(offset) / f32::from(size.max(px(1.)))).max(0.) as usize;
+            cell.min(count.saturating_sub(1))
+        };
+        Some((
+            at(
+                position.x - geometry.origin.x,
+                geometry.cell.width,
+                grid.cols,
+            ),
+            at(
+                position.y - geometry.origin.y,
+                geometry.cell.height,
+                grid.rows,
+            ),
+        ))
+    }
+
     /// 窗口里的一个位置在第几行第几列，偏在这一格的左半边还是右半边。
     fn grid_point(&self, position: Point<Pixels>) -> Option<(GridPoint, GridSide)> {
         let geometry = self.geometry.get();
@@ -1211,29 +1235,60 @@ impl TerminalView {
         let Some(session) = &self.session else {
             return;
         };
-        let cell = self.geometry.get().cell.height.max(px(1.));
-        let moved = f32::from(event.delta.pixel_delta(cell).y) / f32::from(cell) + self.scroll_rest;
-        let lines = moved.trunc() as i32;
-        self.scroll_rest = moved - lines as f32;
         cx.stop_propagation();
-        if lines == 0 {
+        let cell = self.geometry.get().cell.height.max(px(1.));
+        let mods = event.modifiers;
+        let delta = event.delta.pixel_delta(cell);
+        // Windows 把 Shift+滚轮当成横着滚
+        let dy = if mods.shift && delta.y == px(0.) {
+            delta.x
+        } else {
+            delta.y
+        };
+        let moved = f32::from(dy) / f32::from(cell) + self.scroll_rest;
+        let mode = *session.term.lock().mode();
+        let target = keys::wheel_target(mode, mods.shift);
+        // 报给程序的滚一格报一次（和 Windows 终端一样，程序自己定一格翻多少），别的按行数。
+        // 触摸板一次只给零点几行，攒够了再算
+        let unit = match target {
+            WheelTarget::Report => win::wheel_lines(),
+            WheelTarget::Arrows | WheelTarget::Scrollback => 1.,
+        };
+        let steps = (moved / unit).trunc() as i32;
+        self.scroll_rest = moved - steps as f32 * unit;
+        if steps == 0 {
             return;
         }
-        let mode = *session.term.lock().mode();
-        if mode.contains(TermMode::ALT_SCREEN) {
-            // 全屏的程序（less、vim）没有可以往回翻的输出：滚轮当上下键
-            let app_cursor = mode.contains(TermMode::APP_CURSOR);
-            let key: &[u8] = match (lines > 0, app_cursor) {
-                (true, false) => b"\x1b[A",
-                (true, true) => b"\x1bOA",
-                (false, false) => b"\x1b[B",
-                (false, true) => b"\x1bOB",
-            };
-            self.write(key.repeat(lines.unsigned_abs() as usize));
-        } else {
-            session.term.lock().scroll_display(Scroll::Delta(lines));
+        let up = steps > 0;
+        let count = steps.unsigned_abs() as usize;
+        match target {
+            WheelTarget::Report => {
+                let Some((col, row)) = self.screen_cell(event.position) else {
+                    return;
+                };
+                let extra = if mods.alt { 8 } else { 0 } + if mods.control { 16 } else { 0 };
+                let (sgr, utf8) = (
+                    mode.contains(TermMode::SGR_MOUSE),
+                    mode.contains(TermMode::UTF8_MOUSE),
+                );
+                if let Some(report) = keys::wheel_report(up, col, row, extra, sgr, utf8) {
+                    self.write(report.repeat(count));
+                }
+            }
+            WheelTarget::Arrows => {
+                let key: &[u8] = match (up, mode.contains(TermMode::APP_CURSOR)) {
+                    (true, false) => b"\x1b[A",
+                    (true, true) => b"\x1bOA",
+                    (false, false) => b"\x1b[B",
+                    (false, true) => b"\x1bOB",
+                };
+                self.write(key.repeat(count));
+            }
+            WheelTarget::Scrollback => {
+                session.term.lock().scroll_display(Scroll::Delta(steps));
+                cx.notify();
+            }
         }
-        cx.notify();
     }
 
     /// 进程没在跑（或者够不着）时，盖在画面底下的一句话。
@@ -1249,18 +1304,14 @@ impl TerminalView {
         }
         if self.lost && self.exited.is_none() {
             return Some(match self.local {
-                true => {
-                    tr("与 kuaid 的连接已断开，终端中的程序仍在运行。按 Enter 重新连接。").into()
-                }
-                false => {
-                    tr("与服务器的连接已断开，终端中的程序仍在运行。按 Enter 重新连接。").into()
-                }
+                true => tr("与 kuaid 的连接已断开，程序仍在运行。按 Enter 重新连接。").into(),
+                false => tr("与服务器的连接已断开，程序仍在运行。按 Enter 重新连接。").into(),
             });
         }
         match self.exited {
-            Some(Some(0) | None) => return Some(tr("进程已结束。按回车重新启动。").into()),
+            Some(Some(0) | None) => return Some(tr("进程已结束。按 Enter 重新启动。").into()),
             Some(Some(code)) => {
-                return Some(tf!("进程已结束（退出码 {code}）。按回车重新启动。", code).into());
+                return Some(tf!("进程已结束（退出码 {code}）。按 Enter 重新启动。", code).into());
             }
             None => {}
         }

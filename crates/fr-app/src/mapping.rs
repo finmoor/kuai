@@ -32,7 +32,7 @@ use gpui_kit::*;
 
 use crate::app_state::AppState;
 use crate::browser::{BrowserEvent, RemoteBrowser};
-use crate::settings::{Mapping, Server};
+use crate::settings::{Mapping, Server, base_name};
 use crate::ui;
 
 /// WinFsp 的安装包在 winget 里叫什么；没有 winget 时打开的下载页面。
@@ -42,6 +42,7 @@ const WINFSP_DOWNLOAD: &str = "https://winfsp.dev/rel/";
 /// 要弹给用户看的一句话（主窗口订阅）。
 pub enum Notice {
     Info(SharedString),
+    Warning(SharedString),
     Error(SharedString),
     /// 用户要映射，可是没装 WinFsp：提示里带「安装 WinFsp」按钮
     NeedWinFsp,
@@ -101,14 +102,6 @@ fn winfsp_present() -> bool {
     fr_mount::installed()
 }
 
-/// 路径的最后一段（`/data/work/` 是 `work`，`/` 是空的）。
-fn base_name(path: &str) -> &str {
-    path.trim_end_matches(['/', '\\'])
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or_default()
-}
-
 /// 新映射默认放在哪个文件夹：`<用户目录>\Kuai\<服务器名>-<目录名>`。
 fn default_folder(server: &str, remote: &str) -> String {
     let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:".into());
@@ -125,6 +118,60 @@ fn default_folder(server: &str, remote: &str) -> String {
         .collect();
     format!("{home}\\Kuai\\{name}")
 }
+
+/// 资源管理器里盘符映射显示的名称。和在资源管理器里给网络驱动器重命名一样，写在
+/// `HKCU\…\Explorer\MountPoints2\##kuai#<共享名>` 的 `_LabelFromReg` 里，显示成「名称 (K:)」
+/// （2026-11-15 实测）。共享名是网络路径里实际的那个（`unc`，见 [`fr_mount::unc_share`]），
+/// 不是带中文的原名，不然写错了地方。`name` 为 `None` 时删掉这一项，恢复成「共享名 (\\kuai) (K:)」。
+/// 盘符映射着的话，通知资源管理器刷新那个盘。只是显示，出错只记日志。
+#[cfg(windows)]
+fn set_explorer_label(unc: &str, name: Option<&str>, drive: &str) {
+    use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
+    let path =
+        format!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\##kuai#{unc}");
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let result = match name {
+        Some(name) => hkcu
+            .create_subkey(&path)
+            .and_then(|(key, _)| key.set_value("_LabelFromReg", &name.to_string())),
+        None => match hkcu.open_subkey_with_flags(&path, KEY_WRITE) {
+            Ok(key) => match key.delete_value("_LabelFromReg") {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+                _ => Ok(()),
+            },
+            Err(_) => Ok(()),
+        },
+    };
+    if let Err(err) = result {
+        log::warn!("设置资源管理器里 {drive} 的名称失败：{err}");
+        return;
+    }
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn SHChangeNotify(
+            event: i32,
+            flags: u32,
+            item1: *const std::ffi::c_void,
+            item2: *const std::ffi::c_void,
+        );
+    }
+    const SHCNE_UPDATEITEM: i32 = 0x0000_2000;
+    const SHCNF_PATHW: u32 = 0x0005;
+    let root: Vec<u16> = format!("{drive}\\").encode_utf16().chain([0]).collect();
+    // SAFETY：root 是以 0 结尾的宽字符串，调用期间一直有效
+    unsafe {
+        SHChangeNotify(
+            SHCNE_UPDATEITEM,
+            SHCNF_PATHW,
+            root.as_ptr().cast(),
+            std::ptr::null(),
+        )
+    };
+}
+
+#[cfg(not(windows))]
+fn set_explorer_label(_: &str, _: Option<&str>, _: &str) {}
 
 impl AppState {
     pub fn winfsp_installed(&self) -> bool {
@@ -185,8 +232,7 @@ impl AppState {
                     (false, Err(Winget::Missing)) => {
                         let _ = open_winfsp_download();
                         Notice::Info(
-                            tr("未找到 winget，已打开 WinFsp 的下载页面。安装完成后即可映射。")
-                                .into(),
+                            tr("未找到 winget，已打开 WinFsp 下载页。安装后即可映射。").into(),
                         )
                     }
                     (false, _) => Notice::InstallFailed,
@@ -266,8 +312,12 @@ impl AppState {
             mapping.id = format!("m{millis}");
         }
         let id = mapping.id.clone();
+        // 资源管理器里原来的名称：位置变了、名称改了、去掉了，先撤掉
+        let before = self
+            .mapping(&id)
+            .map(|(server, old)| (self.settings.explorer_name(server, old), old.local.clone()));
         let entry = self.settings.servers.iter_mut().find(|s| s.id == server)?;
-        // 只改了「自动映射」：不用重新映射
+        // 只改了「自动映射」、名称：不用重新映射
         let same_place = |old: &Mapping| {
             old.remote == mapping.remote
                 && old.local == mapping.local
@@ -284,6 +334,21 @@ impl AppState {
                 true
             }
         };
+        let after = self
+            .mapping(&id)
+            .map(|(server, now)| (self.settings.explorer_name(server, now), now.local.clone()));
+        if let Some(((unc, Some(_)), local)) = &before
+            && (remount || before.as_ref().map(|b| &b.0) != after.as_ref().map(|a| &a.0))
+        {
+            set_explorer_label(unc, None, local);
+        }
+        // 只改了名称、正映射着：马上换上新名称（卷标要到下次映射时才换，资源管理器看的是这一项）
+        if !remount
+            && self.is_live(&id)
+            && let Some(((unc, Some(label)), local)) = &after
+        {
+            set_explorer_label(unc, Some(label), local);
+        }
         self.save();
         // 没装 WinFsp：存下就好，对话框那边说「安装后生效」
         if (remount || !self.is_live(&id)) && self.mounts.installed {
@@ -302,6 +367,11 @@ impl AppState {
 
     /// 取消一条映射：断开，并从设置里删掉。服务器上的东西不动。
     pub fn remove_mapping(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some((server, mapping)) = self.mapping(id)
+            && let (unc, Some(_)) = self.settings.explorer_name(server, mapping)
+        {
+            set_explorer_label(&unc, None, &mapping.local);
+        }
         self.unmount_mapping(id, cx).detach();
         for server in &mut self.settings.servers {
             server.mappings.retain(|mapping| mapping.id != id);
@@ -384,29 +454,6 @@ impl AppState {
         }
     }
 
-    /// 盘符映射在资源管理器里显示的名字（`\\kuai\<名字>`）：服务器名加目录名；和别的映射
-    /// 重了就再加上是第几条。
-    fn share_name(&self, server: &Server, mapping: &Mapping) -> String {
-        let name = |server: &Server, mapping: &Mapping| match base_name(&mapping.remote) {
-            "" => server.name.clone(),
-            dir => format!("{}-{dir}", server.name),
-        };
-        let mine = name(server, mapping);
-        let clash = self.settings.servers.iter().any(|other| {
-            other
-                .mappings
-                .iter()
-                .any(|m| m.id != mapping.id && name(other, m) == mine)
-        });
-        match (
-            clash,
-            server.mappings.iter().position(|m| m.id == mapping.id),
-        ) {
-            (true, Some(at)) => format!("{mine}-{}", at + 1),
-            _ => mine,
-        }
-    }
-
     /// 用户点了「立即映射」、改了映射：映射上以后说一声。没装 WinFsp 时提示安装（带按钮），
     /// 不然点了什么也不发生。
     pub fn mount_mapping(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -435,7 +482,8 @@ impl AppState {
             return;
         }
         let (server, mapping) = (server.clone(), mapping.clone());
-        let share = self.share_name(&server, &mapping);
+        let share = self.settings.share_name(&server, &mapping);
+        let (unc, explorer_label) = self.settings.explorer_name(&server, &mapping);
         self.mounts.slots.insert(id.to_string(), Slot::Busy);
         cx.notify();
         let connecting = self.connect(&server.id, cx);
@@ -443,6 +491,7 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let (errors_tx, mut errors) = futures::channel::mpsc::unbounded::<String>();
             let (remote, local) = (mapping.remote.clone(), mapping.local_root());
+            let named = mapping.drive_name().map(str::to_string);
             let mounting = match connecting.await {
                 Ok(conn) => {
                     let options = fr_mount::Options {
@@ -450,7 +499,8 @@ impl AppState {
                         place: mapping.local.clone(),
                         read_only: mapping.read_only,
                         windows: conn.hello.os == "windows",
-                        label: share.chars().take(32).collect(),
+                        // 卷标：起了名称用名称（命令行的 `vol`、一些程序看这个）
+                        label: named.clone().unwrap_or_else(|| share.clone()),
                         share,
                     };
                     cx.background_executor()
@@ -478,6 +528,9 @@ impl AppState {
                     Ok(mounted) => {
                         log::info!("映射 {remote} → {local}");
                         this.mounts.slots.insert(id.clone(), Slot::Live(mounted));
+                        if let Some(label) = &explorer_label {
+                            set_explorer_label(&unc, Some(label), &mapping.local);
+                        }
                         if announce {
                             let text =
                                 tf!("已将 {remote} 映射到 {local}", remote = &remote, local = &local);
@@ -487,7 +540,7 @@ impl AppState {
                             this.settings.mapping_tip_shown = true;
                             this.save();
                             cx.emit(Notice::Info(
-                                tr("映射的目录适合用本机程序查看和编辑文件。在其中执行 git 或构建会很慢，请仍在 Kuai 或服务器上进行。")
+                                tr("映射的目录适合用本机程序查看和编辑文件。在其中运行 git 或构建较慢，请在 Kuai 或服务器上进行。")
                                     .into(),
                             ));
                         }
@@ -603,7 +656,7 @@ pub fn winfsp_banner(app: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
                     .flex_1()
                     .min_w_0()
                     .text_sm()
-                    .child(tr("映射需要 WinFsp。安装需要管理员权限，仅需一次。")),
+                    .child(tr("映射需要 WinFsp，安装时需管理员权限（仅一次）。")),
             )
             .child(
                 Button::new("install-winfsp")
@@ -623,10 +676,13 @@ pub fn winfsp_banner(app: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
     )
 }
 
-/// 一条映射后面的两个词：「自动 · 读写」。
+/// 一条映射后面的两个词：「自动 · 读写」；起了名称的盘符前面加上名称。
 pub fn mapping_tags(mapping: &Mapping) -> String {
+    let name = mapping
+        .drive_name()
+        .map_or(String::new(), |name| format!("{name} · "));
     format!(
-        "{} · {}",
+        "{name}{} · {}",
         if mapping.auto {
             tr("自动")
         } else {
@@ -710,6 +766,7 @@ pub fn map_dialog(
         },
         tr("本机上尚不存在的文件夹"),
     );
+    let name_input = input(old.name.clone(), tr("留空则按服务器名和目录名显示"));
     // 打字时预览跟着变
     let subscriptions = Rc::new([
         cx.subscribe(&remote_input, |_, _: &InputEvent, cx| cx.refresh_windows()),
@@ -734,6 +791,7 @@ pub fn map_dialog(
         let submit = {
             let (app, server, old) = (app.clone(), server.clone(), old.clone());
             let (remote_input, folder_input) = (remote_input.clone(), folder_input.clone());
+            let name_input = name_input.clone();
             let (use_drive, drive) = (use_drive.clone(), drive.clone());
             let (auto, read_only, problem) = (auto.clone(), read_only.clone(), problem.clone());
             move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
@@ -775,7 +833,10 @@ pub fn map_dialog(
                     let occupied = folder.exists()
                         && std::fs::read_dir(folder).map_or(true, |mut inside| inside.next().is_some());
                     if occupied && !own {
-                        return fail(tr("该文件夹不为空，请选择空文件夹或尚不存在的文件夹").into(), window);
+                        return fail(
+                            tr("该文件夹不为空，请选择空文件夹或新文件夹").into(),
+                            window,
+                        );
                     }
                 }
                 let clash = app.read(cx).settings.servers.iter().any(|s| {
@@ -786,12 +847,24 @@ pub fn map_dialog(
                 if clash {
                     return fail(tr("另一条映射已使用此位置").into(), window);
                 }
+                // 名称只有盘符有：映射成文件夹的，文件夹名就是它的名称
+                let name = match use_drive.get() {
+                    true => read(&name_input, cx),
+                    false => String::new(),
+                };
+                if name.chars().count() > Mapping::MAX_NAME {
+                    return fail(
+                        tf!("名称最多 {n} 个字符", n = Mapping::MAX_NAME).into(),
+                        window,
+                    );
+                }
                 let mapping = Mapping {
                     id: old.id.clone(),
                     remote,
                     local,
                     auto: auto.get(),
                     read_only: read_only.get(),
+                    name,
                 };
                 window.close_dialog(cx);
                 app.update(cx, |app, cx| {
@@ -995,6 +1068,15 @@ pub fn map_dialog(
                                 ),
                         ),
                     )
+                    // 资源管理器里显示的名称（「名称 (K:)」）：只有盘符有
+                    .when(as_drive, |body| {
+                        body.child(
+                            v_flex()
+                                .gap_1()
+                                .child(div().text_sm().child(tr("名称")))
+                                .child(Input::new(&name_input)),
+                        )
+                    })
                     .children(preview_box)
                     .child(
                         h_flex()
@@ -1016,9 +1098,9 @@ pub fn map_dialog(
                         body.child(div().text_sm().text_color(danger).child(found))
                     })
                     .child(div().text_xs().text_color(muted).child(if as_drive {
-                        tr("盘符在映射期间出现，仅在 Kuai 运行时可用。")
+                        tr("仅在 Kuai 运行时可用。")
                     } else {
-                        tr("文件夹须为空或尚不存在，在映射期间出现，仅在 Kuai 运行时可用。")
+                        tr("文件夹须为空或尚不存在，仅在 Kuai 运行时可用。")
                     })),
             )
             .footer(
@@ -1043,8 +1125,11 @@ pub fn remove_mapping(app: &Entity<AppState>, id: &str, window: &mut Window, cx:
     let Some((_, mapping)) = app.read(cx).mapping(id) else {
         return;
     };
-    // 说盘符（`K:`）或文件夹：用户是按本机的位置认一条映射的
-    let local = mapping.local.clone();
+    // 说盘符（`K:`，起了名称的是「名称 (K:)」）或文件夹：用户是按本机的位置认一条映射的
+    let local = match mapping.drive_name() {
+        Some(_) => mapping.local_label(),
+        None => mapping.local.clone(),
+    };
     let title = tf!("取消映射 {local}？", local = &local);
     let open = match app.read(cx).mount_status(id) {
         MountStatus::Live => app.read(cx).mounts_open_files(id),
@@ -1118,6 +1203,10 @@ pub fn menu_items(
     root: &str,
     cx: &App,
 ) -> PopupMenu {
+    // 经别的服务器连的（156>91）：本机连不到它，不能映射
+    if crate::machines::split_relay(server).is_some() {
+        return menu;
+    }
     let state = app.read(cx);
     if let Some(local) = state.local_path(server, path) {
         let (copy, reveal, open) = (local.clone(), local.clone(), local.clone());
@@ -1390,7 +1479,7 @@ pub fn section(app: &Entity<AppState>, server: &Server, cx: &App) -> AnyElement 
                 ),
         )
         .child(div().text_xs().text_color(muted).child(tr(
-            "将服务器上的目录映射为本机的盘符或文件夹，可用本机程序直接打开其中的文件。仅在 Kuai 运行时可用。",
+            "将服务器上的目录映射为本机的盘符或文件夹，供本机程序直接打开。仅在 Kuai 运行时可用。",
         )))
         .children(winfsp_banner(app, cx))
         .child(list)
@@ -1409,11 +1498,9 @@ pub fn chip(app: &Entity<AppState>, server: &Server, mapping: &Mapping, cx: &App
         MountStatus::Failed(_) => theme.danger,
         _ => theme.muted_foreground,
     };
-    // 标记上写盘符；映射成文件夹的写文件夹名
-    let label: SharedString = match mapping.is_drive() {
-        true => mapping.local.clone().into(),
-        false => base_name(&mapping.local).to_string().into(),
-    };
+    // 标记上写盘符（起了名称的写「名称 (K:)」，和资源管理器里一样）；映射成文件夹的写文件夹名
+    let label: SharedString = mapping.local_label().into();
+    let label_id = SharedString::from(format!("mapping-label-{}", mapping.id));
     let (app, server_id, mapping) = (app.clone(), server.id.clone(), mapping.clone());
     let word = status_word(&status, installed);
     let failure = match &status {
@@ -1441,7 +1528,8 @@ pub fn chip(app: &Entity<AppState>, server: &Server, mapping: &Mapping, cx: &App
                     .size_3()
                     .text_color(color),
                 )
-                .child(label),
+                // 名称最长 32 个字：太长时省略，悬停看全
+                .child(ui::clipped(label_id, label).max_w(px(200.))),
         )
         .dropdown_menu(move |menu, _, cx| {
             let (muted, danger) = (cx.theme().muted_foreground, cx.theme().danger);

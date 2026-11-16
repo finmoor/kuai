@@ -3,7 +3,32 @@
 //! 只管「不是直接打字」的键：回车、方向键、功能键、Ctrl 和 Alt 的组合。普通的字（包括输入法
 //! 上屏的）不经过这里，由系统当文字送进来。
 
+use alacritty_terminal::term::TermMode;
 use gpui_kit::Keystroke;
+
+/// 滚轮交给谁。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WheelTarget {
+    /// 程序要了鼠标（Claude Code、开了鼠标的 vim、htop）：照实报给它，它自己翻
+    Report,
+    /// 全屏的程序没要鼠标（less、vim）：没有可以往回翻的输出，当上下键
+    Arrows,
+    /// 翻终端记着的输出
+    Scrollback,
+}
+
+/// 按着 Shift 总是翻终端记着的输出，不交给程序（和 Windows 终端一样）。
+pub fn wheel_target(mode: TermMode, shift: bool) -> WheelTarget {
+    if shift {
+        WheelTarget::Scrollback
+    } else if mode.intersects(TermMode::MOUSE_MODE) {
+        WheelTarget::Report
+    } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+        WheelTarget::Arrows
+    } else {
+        WheelTarget::Scrollback
+    }
+}
 
 /// 这个按键要发的字节；`None` 表示不是这里管的（普通打字，或者只按了修饰键）。
 /// `app_cursor`：程序把方向键切到了「应用模式」（vim、less 之类会切）。
@@ -128,6 +153,37 @@ fn tilde(number: u8, code: u8) -> Option<Vec<u8>> {
     })
 }
 
+/// 滚一格滚轮报给要了鼠标的程序的字节（xterm 的写法）。`col`、`row` 从 0 起；`extra` 是
+/// 修饰键（Alt 8、Ctrl 16）。程序开了 SGR（`sgr`）就用它，开了 UTF-8 坐标（`utf8`）次之，
+/// 都没开是最早的写法；后两种表示不了的坐标（最早的写法超过 223）不报。
+pub fn wheel_report(
+    up: bool,
+    col: usize,
+    row: usize,
+    extra: u8,
+    sgr: bool,
+    utf8: bool,
+) -> Option<Vec<u8>> {
+    let button = if up { 64 } else { 65 } + extra;
+    if sgr {
+        return Some(format!("\x1b[<{button};{};{}M", col + 1, row + 1).into_bytes());
+    }
+    let mut out = b"\x1b[M".to_vec();
+    out.push(32 + button);
+    for value in [col + 1, row + 1] {
+        let code = u32::try_from(32 + value).ok()?;
+        match utf8 {
+            true if code <= 0x7ff => {
+                let mut buf = [0; 4];
+                out.extend_from_slice(char::from_u32(code)?.encode_utf8(&mut buf).as_bytes());
+            }
+            false if code <= 0xff => out.push(code as u8),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 /// 粘贴进去的文字：程序开了「括号粘贴」就包上标记（它知道这是粘贴的，不会一行行当命令执行），
 /// 没开就把换行换成回车。文字里的 ESC 去掉，免得粘贴的内容冒充按键。
 pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
@@ -141,8 +197,60 @@ pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode, paste};
+    use super::{WheelTarget, encode, paste, wheel_report, wheel_target};
+    use alacritty_terminal::term::TermMode;
     use gpui_kit::Keystroke;
+
+    #[test]
+    fn 滚轮交给谁() {
+        // 「滚轮当上下键」终端一开始就开着；Claude Code 切到备用屏，又要了鼠标（SGR 写法）。
+        // 以前只看备用屏，滚轮成了上下键，Claude Code 提示「Scroll wheel is sending arrow keys」
+        let claude = TermMode::ALT_SCREEN
+            | TermMode::ALTERNATE_SCROLL
+            | TermMode::MOUSE_REPORT_CLICK
+            | TermMode::MOUSE_DRAG
+            | TermMode::SGR_MOUSE;
+        assert_eq!(wheel_target(claude, false), WheelTarget::Report);
+        // 按着 Shift：翻终端记着的输出
+        assert_eq!(wheel_target(claude, true), WheelTarget::Scrollback);
+        // less、没开鼠标的 vim：上下键
+        let less = TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL;
+        assert_eq!(wheel_target(less, false), WheelTarget::Arrows);
+        // 主屏上的程序要了鼠标（只跟踪移动的也算）
+        assert_eq!(
+            wheel_target(TermMode::MOUSE_MOTION, false),
+            WheelTarget::Report
+        );
+        // 普通的命令行
+        assert_eq!(
+            wheel_target(TermMode::ALTERNATE_SCROLL, false),
+            WheelTarget::Scrollback
+        );
+    }
+
+    #[test]
+    fn 滚轮报给要了鼠标的程序() {
+        // SGR（Claude Code、vim 用的）：上 64、下 65，坐标从 1 起
+        let sgr = |up, col, row, extra| wheel_report(up, col, row, extra, true, false).unwrap();
+        assert_eq!(sgr(true, 0, 0, 0), b"\x1b[<64;1;1M");
+        assert_eq!(sgr(false, 79, 23, 0), b"\x1b[<65;80;24M");
+        assert_eq!(sgr(true, 4, 2, 16), b"\x1b[<80;5;3M");
+        // 最早的写法：每个数加 32 成一个字节，超过 223 表示不了
+        assert_eq!(
+            wheel_report(true, 0, 0, 0, false, false).unwrap(),
+            b"\x1b[M\x60\x21\x21"
+        );
+        assert_eq!(
+            wheel_report(false, 222, 0, 0, false, false).unwrap()[4],
+            255
+        );
+        assert_eq!(wheel_report(false, 223, 0, 0, false, false), None);
+        // UTF-8 坐标：大的坐标用两个字节
+        assert_eq!(
+            wheel_report(false, 299, 0, 0, false, true).unwrap(),
+            b"\x1b[M\x61\xc5\x8c\x21"
+        );
+    }
 
     fn send(source: &'static str) -> Option<String> {
         let keystroke = Keystroke::parse(source).unwrap();

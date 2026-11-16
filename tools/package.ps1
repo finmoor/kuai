@@ -8,7 +8,8 @@
 # 安装版找 kuai-*-windows-x64-setup.exe、解压版找 kuai-*-windows-x64.zip（crates/fr-app/src/update.rs）。
 #
 # 包里有客户端 kuai.exe，和常驻程序 kuaid（kuaid\<编译目标>\ 下）：Linux 版连服务器时上传；
-# Windows 版连 Windows 服务器时上传，本机的终端也开在它里面（装到 ~/.kuai 下再启动）。
+# Windows 版连 Windows 服务器时上传，本机的终端也开在它里面（装到 ~/.kuai 下再启动），
+# 旁边带着微软的新版 ConPTY（vendor\conpty，和 kuaid.exe 一起装、一起传）。
 # 还有许可证和第三方库的许可证清单。
 # 解压到哪都能直接运行，不用安装；机器上要有 git（要在 PATH 里）和 Windows 自带的 OpenSSH。
 #
@@ -53,6 +54,8 @@ foreach ($target in $targets) {
 $windows = Join-Path $out 'kuaid\x86_64-pc-windows-msvc'
 New-Item -ItemType Directory -Force $windows | Out-Null
 Copy-Item target\release\kuaid.exe $windows
+# kuaid 开终端用的新版 ConPTY，只认 kuaid.exe 旁边的
+Copy-Item vendor\conpty\x64\conpty.dll, vendor\conpty\x64\OpenConsole.exe $windows
 Copy-Item tools\package-readme.txt (Join-Path $out '使用说明.txt')
 Copy-Item LICENSE-MIT, LICENSE-APACHE $out
 # 编进去的第三方库的许可证（MIT、Apache-2.0 这些要求随程序附上），要 Python 3

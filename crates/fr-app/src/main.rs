@@ -8,6 +8,7 @@ mod browser;
 mod clone;
 mod graph_paint;
 mod instance;
+mod machines;
 mod manager;
 mod mapping;
 mod open_dir;
@@ -323,7 +324,7 @@ fn main() {
 
             let saved_window = settings.window;
             terminal::set_prefs(&settings.terminal, cx);
-            let app = cx.new(|_| AppState::new(settings));
+            let app = cx.new(|cx| AppState::new(settings, cx));
             // 在终端里按 Ctrl+加号、减号调了字号：存进设置
             terminal::set_prefs_writer(cx, {
                 let app = app.clone();

@@ -777,7 +777,7 @@ impl RepoView {
                     "file-terminal",
                     IconName::SquareTerminal,
                     tr("终端"),
-                    tr("新开一个终端，并进入此文件所在的目录"),
+                    tr("在此文件所在目录新建终端"),
                     false,
                     true,
                     0,
@@ -895,19 +895,23 @@ impl RepoView {
                             }),
                         )),
                 };
-                menu.item(item(
-                    tr("在 VS Code 中打开"),
-                    Box::new(move |this, window, cx| {
-                        let path = this.full_path(&vscode);
-                        let result = match &server {
-                            Some(destination) => {
-                                crate::shell::open_vscode_remote(destination, &path)
-                            }
-                            None => crate::shell::open_vscode(&path),
-                        };
-                        crate::shell::report(result, window, cx);
-                    }),
-                ))
+                // 经别的服务器连的（156>91）：本机连不到它，VS Code 打不开
+                let relayed = remote && server.is_none();
+                menu.when(!relayed, |menu| {
+                    menu.item(item(
+                        tr("在 VS Code 中打开"),
+                        Box::new(move |this, window, cx| {
+                            let path = this.full_path(&vscode);
+                            let result = match &server {
+                                Some(destination) => {
+                                    crate::shell::open_vscode_remote(destination, &path)
+                                }
+                                None => crate::shell::open_vscode(&path),
+                            };
+                            crate::shell::report(result, window, cx);
+                        }),
+                    ))
+                })
                 .separator()
                 .item(item(
                     tr("重命名…"),
@@ -1060,7 +1064,7 @@ impl RepoView {
         };
         if doc.is_some_and(|doc| doc.conflict) {
             let text = match tab.deleted {
-                true => tr("此文件已在磁盘上被删除，这里有未保存的修改。"),
+                true => tr("此文件已在磁盘上被删除，但有未保存的修改。"),
                 false => tr("此文件已在磁盘上被其他程序修改，与未保存的修改冲突。"),
             };
             return Some(
@@ -1432,9 +1436,9 @@ impl RepoView {
                     .text_color(muted)
                     .whitespace_normal()
                     .child(if remote {
-                        tr("单击预览，双击保持打开。将本机的文件拖到目录树上即可上传。")
+                        tr("单击预览，双击保持打开。将本机文件拖到目录树上即可上传。")
                     } else {
-                        tr("单击预览，双击保持打开。将文件拖到目录树上即可复制进来。")
+                        tr("单击预览，双击保持打开。将文件拖到目录树上即可复制。")
                     }),
             )
             .child(

@@ -212,7 +212,7 @@ impl RepoView {
         let accent = cx.theme().primary;
         let remote = self.entry.server.is_some();
         let name = self.app.read(cx).repo_name(&self.entry);
-        let tip = format!("{name}\n{} · {}", self.place(cx), self.entry.path);
+        let tip = format!("{name}\n{} · {}", self.place_label(cx), self.entry.path);
         let (view, entry) = (cx.entity().downgrade(), self.entry.clone());
         div()
             .id("rail-repo")

@@ -35,8 +35,20 @@ pub struct Options {
     /// 盘的卷标
     pub label: String,
     /// 挂成盘符时网络路径 `\\kuai\<share>` 里的名字，资源管理器里盘的名字就是它；
-    /// 同时挂着的几个不能一样。只留字母、数字、`.`、`-`、`_`，别的换成 `-`
+    /// 同时挂着的几个不能一样。实际用的是 [`unc_share`] 换过的
     pub share: String,
+}
+
+/// 共享名在网络路径 `\\kuai\<共享名>` 里实际的样子：只留英文字母、数字和 `.`、`-`、`_`，
+/// 别的（中文等）换成 `-`；最长 184 个字符，加上 `\kuai\` 正好是 WinFsp 前缀的上限 190。
+/// 资源管理器在 `MountPoints2` 下记这个盘也用它（`##kuai#<共享名>`）。
+pub fn unc_share(share: &str) -> String {
+    let keep = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_');
+    share
+        .chars()
+        .map(|c| if keep(c) { c } else { '-' })
+        .take(184)
+        .collect()
 }
 
 /// 这个位置是不是盘符（`K:`）。
@@ -188,11 +200,7 @@ mod imp {
         let name: Vec<u16> = "Kuai".encode_utf16().collect();
         params.FileSystemName[..name.len()].copy_from_slice(&name);
         let device = if drive {
-            let keep = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_');
-            let share: String = share
-                .chars()
-                .map(|c| if keep(c) { c } else { '-' })
-                .collect();
+            let share = super::unc_share(&share);
             let prefix: Vec<u16> = format!(r"\kuai\{share}").encode_utf16().take(190).collect();
             params.Prefix[..prefix.len()].copy_from_slice(&prefix);
             "WinFsp.Net"
@@ -321,5 +329,20 @@ mod stub {
         pub fn stats(&self) -> Stats {
             Stats::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unc_share;
+
+    #[test]
+    fn 网络路径里的共享名() {
+        assert_eq!(unc_share("devops-workspaces"), "devops-workspaces");
+        assert_eq!(unc_share("T14P-work.v2_a"), "T14P-work.v2_a");
+        // 中文、空格、别的符号都换成横线，一个字一个横线
+        assert_eq!(unc_share("测试机-src"), "----src");
+        assert_eq!(unc_share("my box/src"), "my-box-src");
+        assert_eq!(unc_share(&"a".repeat(300)).len(), 184);
     }
 }

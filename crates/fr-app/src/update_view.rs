@@ -150,7 +150,7 @@ fn popover_body(
                 div()
                     .text_xs()
                     .text_color(muted)
-                    .child(tr("也可稍后重启，下次启动 Kuai 时将使用新版本。")),
+                    .child(tr("也可稍后重启，下次启动时生效。")),
             )
             .child(
                 h_flex()

@@ -458,7 +458,7 @@ impl RepoView {
         let theme = cx.theme();
         let (muted, border, accent) = (theme.muted_foreground, theme.sidebar_border, theme.primary);
         let remote = self.entry.server.is_some();
-        let place = self.place(cx);
+        let place = self.place_label(cx);
         let name = self.app.read(cx).repo_name(&self.entry);
         let (view, entry) = (cx.entity().downgrade(), self.entry.clone());
         let is_sub = self.sub_of.is_some();

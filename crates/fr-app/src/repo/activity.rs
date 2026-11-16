@@ -345,7 +345,7 @@ impl Render for ActivityPanel {
                             .text_xs()
                             .text_color(muted)
                             .child(tr(
-                                "点击一行查看 git 输出。仅记录会修改仓库或访问网络的命令，关闭标签页后清空。",
+                                "点击一行查看 git 输出。仅记录修改仓库或访问网络的命令，关闭标签页后清空。",
                             )),
                     )
                     .child(

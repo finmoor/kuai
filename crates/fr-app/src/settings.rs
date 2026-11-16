@@ -1,7 +1,9 @@
-//! 设置：服务器列表、仓库列表、工作区和各自开着的标签页、语言、主题、托盘和窗口位置。
+//! 设置：服务器列表、各个工作区开着的标签页、语言、主题、托盘和窗口位置。
 //!
 //! 存在 `%APPDATA%\kuai\settings.json`，不存密码（服务器的密码、私钥口令在系统的凭据管理器里，
 //! 见 `secrets`）。环境变量 FR_SETTINGS 可以指定别的文件（测试用）。
+//!
+//! 仓库列表和工作区（名字、有哪些仓库）1.14 起不在这里，保存在各台电脑上，见 `machines`。
 
 use fr_core::tf;
 use std::path::PathBuf;
@@ -9,6 +11,8 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result};
 use fr_core::i18n::{Language, tr};
 use serde::{Deserialize, Serialize};
+
+use crate::machines::WorkspaceKey;
 
 fn default_light_theme() -> String {
     "light".into()
@@ -94,7 +98,94 @@ impl RepoMemo {
     }
 }
 
-/// 一个工作区：它的仓库，和其中开着的那些标签页。
+/// 一个工作区在这台电脑上记的东西：开着哪些标签页、选中哪个、固定的、刚关掉的（各台电脑各记各的，
+/// 不同步）。工作区本身（名字、有哪些仓库）保存在它所在的那台电脑上，见 `machines`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct View {
+    #[serde(flatten)]
+    pub key: WorkspaceKey,
+    /// 上次看到的工作区名字：连上它所在的电脑之前，标题栏上先显示它
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tabs: Vec<RepoEntry>,
+    /// 选中的标签页：0 是仓库管理器，1 起是 `tabs` 里的
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub active: usize,
+    /// 最近关掉的标签页，新的在后；重新打开了就从这里去掉
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub closed: Vec<RepoEntry>,
+    /// 固定的标签页：排在最前面，没有关闭按钮，Ctrl+W 和中键也关不掉
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned: Vec<RepoEntry>,
+    /// 最近一次切到这个工作区的时间（1970 年起的毫秒数）：连不上服务器时回到本机最近用的那个
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub used_at: u64,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
+impl View {
+    pub fn new(key: WorkspaceKey) -> View {
+        View {
+            key,
+            ..View::default()
+        }
+    }
+
+    /// 记下刚关掉的标签页。
+    pub fn note_closed(&mut self, entry: RepoEntry) {
+        self.closed.retain(|e| *e != entry);
+        self.closed.push(entry);
+        let extra = self.closed.len().saturating_sub(TabGroup::MAX_CLOSED);
+        self.closed.drain(..extra);
+    }
+
+    pub fn is_pinned(&self, entry: &RepoEntry) -> bool {
+        self.pinned.contains(entry)
+    }
+
+    /// 仓库移出了工作区：不再算刚关掉的、固定的。开着的标签页由调用方关。
+    pub fn forget(&mut self, entry: &RepoEntry) {
+        self.closed.retain(|e| e != entry);
+        self.pinned.retain(|e| e != entry);
+    }
+
+    /// 固定的标签页排到最前面，各自内部的先后不变。选中的还是原来那个仓库。
+    pub fn pinned_first(&mut self) {
+        let current = self
+            .active
+            .checked_sub(1)
+            .and_then(|ix| self.tabs.get(ix))
+            .cloned();
+        let pinned = &self.pinned;
+        self.tabs.sort_by_key(|tab| !pinned.contains(tab));
+        if let Some(current) = current {
+            self.active = self
+                .tabs
+                .iter()
+                .position(|tab| *tab == current)
+                .map_or(0, |ix| ix + 1);
+        }
+    }
+
+    fn normalize(&mut self) {
+        self.active = self.active.min(self.tabs.len());
+        let tabs = &self.tabs;
+        self.closed.retain(|e| !tabs.contains(e));
+        self.pinned.retain(|e| tabs.contains(e));
+        self.pinned_first();
+    }
+}
+
+/// 一个工作区：它的仓库，和其中开着的那些标签页。1.14 起工作区保存在它所在的电脑上（见 `machines`），
+/// 这里只剩旧设置读进来、交给本机的 kuaid 时用（[`Settings::store_migrated`]）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabGroup {
     pub name: String,
@@ -119,32 +210,6 @@ impl TabGroup {
     /// 最多记几个关掉的标签页
     pub const MAX_CLOSED: usize = 10;
 
-    /// 记下刚关掉的标签页。
-    pub fn note_closed(&mut self, entry: RepoEntry) {
-        self.closed.retain(|e| *e != entry);
-        self.closed.push(entry);
-        let extra = self.closed.len().saturating_sub(Self::MAX_CLOSED);
-        self.closed.drain(..extra);
-    }
-
-    /// 把仓库加进这个工作区（已经在就不动）。
-    pub fn adopt(&mut self, entry: &RepoEntry) {
-        if !self.repos.contains(entry) {
-            self.repos.push(entry.clone());
-        }
-    }
-
-    /// 把仓库从这个工作区去掉：不再是它的仓库，也不算刚关掉的、固定的。开着的标签页由调用方关。
-    pub fn drop_repo(&mut self, entry: &RepoEntry) {
-        self.repos.retain(|e| e != entry);
-        self.closed.retain(|e| e != entry);
-        self.pinned.retain(|e| e != entry);
-    }
-
-    pub fn is_pinned(&self, entry: &RepoEntry) -> bool {
-        self.pinned.contains(entry)
-    }
-
     /// 固定的标签页排到最前面，各自内部的先后不变。选中的还是原来那个仓库。
     pub fn pinned_first(&mut self) {
         let current = self
@@ -168,6 +233,8 @@ impl TabGroup {
 pub struct Settings {
     #[serde(default)]
     pub servers: Vec<Server>,
+    /// 1.13 以前的仓库列表。1.14 起仓库列表保存在各台电脑上（见 `machines`）：本机的启动时交给本机
+    /// 的 kuaid，服务器的第一次连上时并进那台服务器的列表。这一项原样留着不再改，退回旧版本还能用
     #[serde(default)]
     pub repos: Vec<RepoEntry>,
     /// 旧版本（1.0.x）存标签页的地方，读进来以后挪到第一个工作区里，不再写回去
@@ -175,12 +242,27 @@ pub struct Settings {
     open_tabs: Vec<RepoEntry>,
     #[serde(default, skip_serializing)]
     active_tab: usize,
-    /// 工作区：各自记着开着哪些仓库标签页。至少有一个
+    /// 1.13 以前的工作区，和 [`Self::repos`] 一样只在交给本机的 kuaid 时用，原样留着
     #[serde(default)]
     pub workspaces: Vec<TabGroup>,
-    /// 现在用的是第几个工作区
+    /// 1.13 以前现在用的是第几个工作区
     #[serde(default)]
     pub active_workspace: usize,
+    /// 旧设置里的仓库列表和工作区已经交给本机的 kuaid 了（1.14 起）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub store_migrated: bool,
+    /// 旧设置里各台服务器上的仓库（和起的名字）已经并进那台服务器的列表了：服务器的 id
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_servers: Vec<String>,
+    /// 现在用的工作区
+    #[serde(default)]
+    pub current: WorkspaceKey,
+    /// 各个工作区在这台电脑上记的标签页
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub views: Vec<View>,
+    /// 用过上面的工作区的服务器（工作区菜单里列出它们），按第一次用的先后
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub used_machines: Vec<String>,
     #[serde(default)]
     pub language: Language,
     /// 深色还是浅色：跟随系统，或者固定一种
@@ -221,9 +303,13 @@ pub struct Settings {
     pub terminal: TerminalSettings,
     #[serde(default)]
     pub layout: Layout,
-    /// 仓库页「全部仓库」里收起的卡片：本机是 [`LOCAL_CARD`]，服务器是它的 id
+    /// 仓库页「全部仓库」里本机那张卡片收起了：记 [`LOCAL_CARD`]。1.13 以前服务器收起了也记在
+    /// 这里，现在服务器的卡片默认收起，读的时候去掉，见 [`Settings::expanded_cards`]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collapsed_cards: Vec<String>,
+    /// 「全部仓库」里展开了的服务器卡片（服务器的 id）。服务器的卡片默认收起（2026-11-15 Feng 定）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expanded_cards: Vec<String>,
     /// 各个仓库自己记的东西
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repo_memos: Vec<RepoMemo>,
@@ -400,6 +486,11 @@ impl Default for Settings {
             active_tab: 0,
             workspaces: Vec::new(),
             active_workspace: 0,
+            store_migrated: false,
+            merged_servers: Vec::new(),
+            current: WorkspaceKey::default(),
+            views: Vec::new(),
+            used_machines: Vec::new(),
             language: Language::default(),
             // 新装的默认深色（2026-11-13 Feng 定）。设置文件里没有这一项（1.1 以前的）
             // 时取 ThemeChoice 的默认值，照旧跟随系统，见 parse 的测试
@@ -417,6 +508,7 @@ impl Default for Settings {
             terminal: TerminalSettings::default(),
             layout: Layout::default(),
             collapsed_cards: Vec::new(),
+            expanded_cards: Vec::new(),
             repo_memos: Vec::new(),
             window: None,
             check_updates: true,
@@ -482,24 +574,100 @@ impl Settings {
                 self.servers[index].jump = None;
             }
         }
-        // 收起的卡片：服务器已经不在了的不用记
+        // 收起的卡片只记本机那张（服务器的默认收起，旧设置里记的去掉）；展开的服务器已经不在了的不用记。
+        // 经服务器连的那几台（`156>91`）的卡片跟着那台服务器
         let servers = &self.servers;
-        self.collapsed_cards
-            .retain(|key| key == LOCAL_CARD || servers.iter().any(|server| server.id == *key));
-        // 仓库已经不在列表里、也没开着了，它记的东西就不留
-        let (repos, groups) = (&self.repos, &self.workspaces);
-        // 子仓库（在列表里某个仓库的目录下面）不在列表里，它记的东西跟着那个仓库留着
-        let inside = |memo: &RepoMemo| repos.iter().any(|repo| repo.contains(&memo.repo));
-        self.repo_memos.retain(|memo| {
-            !memo.is_empty()
-                && (repos.contains(&memo.repo)
-                    || groups.iter().any(|group| group.tabs.contains(&memo.repo))
-                    || inside(memo))
+        let known = |key: &str| {
+            let direct = crate::machines::split_relay(key).map_or(key, |(via, _)| via);
+            servers.iter().any(|server| server.id == direct)
+        };
+        self.collapsed_cards.retain(|key| key == LOCAL_CARD);
+        self.expanded_cards.retain(|key| known(key));
+        // 仓库记的东西：空的不留，服务器移除了它上面的仓库的也不留。仓库从列表里移除时另外清掉
+        self.repo_memos
+            .retain(|memo| !memo.is_empty() && memo.repo.server.as_deref().is_none_or(known));
+        // 各个工作区在这台电脑上记的标签页：同一个只留一份，服务器移除了它上面的不留
+        let mut seen = std::collections::HashSet::new();
+        self.views.retain(|view| {
+            known_machine(servers, &view.key.machine) && seen.insert(view.key.clone())
         });
+        for view in &mut self.views {
+            view.normalize();
+        }
+        let mut seen = std::collections::HashSet::new();
+        self.used_machines.retain(|id| {
+            known_machine(servers, id) && *id != crate::machines::LOCAL && seen.insert(id.clone())
+        });
+        self.merged_servers.retain(|id| known_machine(servers, id));
+        if !known_machine(servers, &self.current.machine) {
+            self.current = WorkspaceKey::default();
+        }
+    }
+
+    /// 这个工作区在这台电脑上记的标签页；没记过就是空的。
+    pub fn view(&self, key: &WorkspaceKey) -> Option<&View> {
+        self.views.iter().find(|view| view.key == *key)
+    }
+
+    /// 同 [`Self::view`]，没记过就新建一份。
+    pub fn view_mut(&mut self, key: &WorkspaceKey) -> &mut View {
+        let at = match self.views.iter().position(|view| view.key == *key) {
+            Some(at) => at,
+            None => {
+                self.views.push(View::new(key.clone()));
+                self.views.len() - 1
+            }
+        };
+        &mut self.views[at]
     }
 
     pub fn server(&self, id: &str) -> Option<&Server> {
         self.servers.iter().find(|server| server.id == id)
+    }
+
+    /// 「全部仓库」里的这张卡片收起着没有：本机的默认展开，服务器的默认收起。
+    pub fn card_collapsed(&self, key: &str) -> bool {
+        match key == LOCAL_CARD {
+            true => self.collapsed_cards.iter().any(|card| card == key),
+            false => !self.expanded_cards.iter().any(|card| card == key),
+        }
+    }
+
+    /// 盘符映射的共享名（网络路径 `\\kuai\<共享名>`，资源管理器里也显示它）：服务器名加目录名。
+    /// 网络路径里只能有英文字母、数字（见 [`fr_mount::unc_share`]），中文的服务器名都变成横线，
+    /// 更容易和别的映射重；在网络路径里重了，就再加上这条是所有映射里的第几条。
+    pub fn share_name(&self, server: &Server, mapping: &Mapping) -> String {
+        let name = |server: &Server, mapping: &Mapping| match base_name(&mapping.remote) {
+            "" => server.name.clone(),
+            dir => format!("{}-{dir}", server.name),
+        };
+        let mine = name(server, mapping);
+        let unc = fr_mount::unc_share(&mine);
+        let all = || {
+            self.servers
+                .iter()
+                .flat_map(|s| s.mappings.iter().map(move |m| (s, m)))
+        };
+        let clash =
+            all().any(|(s, m)| m.id != mapping.id && fr_mount::unc_share(&name(s, m)) == unc);
+        match (clash, all().position(|(_, m)| m.id == mapping.id)) {
+            (true, Some(at)) => format!("{mine}-{}", at + 1),
+            _ => mine,
+        }
+    }
+
+    /// 资源管理器里这个盘的共享名（网络路径里实际的那个），和要写进 `_LabelFromReg` 的名称：
+    /// 起了名称用名称；没起、共享名里有网络路径放不下的字（中文服务器名等）时用原来的共享名，
+    /// 不然显示成一串横线。映射成文件夹的没有名称。
+    pub fn explorer_name(&self, server: &Server, mapping: &Mapping) -> (String, Option<String>) {
+        let share = self.share_name(server, mapping);
+        let unc = fr_mount::unc_share(&share);
+        let label = match mapping.drive_name() {
+            Some(name) => Some(name.to_string()),
+            None if mapping.is_drive() && unc != share => Some(share),
+            None => None,
+        };
+        (unc, label)
     }
 
     /// 连接这台服务器要依次经过的跳板机：第一台从本机直接连，最后一台连到这台服务器。
@@ -563,29 +731,20 @@ impl Settings {
         }
     }
 
-    /// 仓库显示的名字：起过名字就用它，没有就是目录名。
-    pub fn repo_name<'a>(&'a self, repo: &'a RepoEntry) -> &'a str {
-        self.memo(repo)
-            .and_then(|memo| memo.name.as_deref())
-            .unwrap_or_else(|| repo.name())
+    /// 仓库从列表里移除了：它（和它里面的子仓库）记的东西不留，各个工作区里记着它刚关掉、
+    /// 固定着的也去掉。
+    pub fn forget_repo(&mut self, entry: &RepoEntry) {
+        self.repo_memos
+            .retain(|memo| memo.repo != *entry && !entry.contains(&memo.repo));
+        for view in &mut self.views {
+            view.forget(entry);
+        }
     }
+}
 
-    /// 给仓库起名字。空的、或者和目录名一样，就是不要自己起的名字了。
-    pub fn set_repo_name(&mut self, repo: &RepoEntry, name: &str) {
-        let name = name.trim();
-        let name = (!name.is_empty() && name != repo.name()).then(|| name.to_string());
-        self.edit_memo(repo, |memo| memo.name = name);
-    }
-
-    /// 现在用的工作区。
-    pub fn workspace(&self) -> &TabGroup {
-        &self.workspaces[self.active_workspace.min(self.workspaces.len() - 1)]
-    }
-
-    pub fn workspace_mut(&mut self) -> &mut TabGroup {
-        let ix = self.active_workspace.min(self.workspaces.len() - 1);
-        &mut self.workspaces[ix]
-    }
+/// 是本机，或者还配置着的服务器。
+fn known_machine(servers: &[Server], machine: &str) -> bool {
+    machine == crate::machines::LOCAL || servers.iter().any(|server| server.id == machine)
 }
 
 /// 窗口的位置和大小（逻辑像素）。最大化时记的是还原后的位置。
@@ -661,9 +820,34 @@ pub struct Mapping {
     /// 只读：本机改不了服务器上的东西
     #[serde(default)]
     pub read_only: bool,
+    /// 盘符映射在资源管理器里显示的名称（「名称 (K:)」）；空着显示「服务器名-目录名 (\\kuai)」。
+    /// 映射成文件夹的没有这一项
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
 }
 
 impl Mapping {
+    /// 名称最多几个字：资源管理器的卷标最多 32 个字符。
+    pub const MAX_NAME: usize = 32;
+
+    /// 起了名称的盘符映射的名称；没起、映射成文件夹的是 `None`。
+    pub fn drive_name(&self) -> Option<&str> {
+        (self.is_drive() && !self.name.trim().is_empty()).then(|| self.name.trim())
+    }
+
+    /// 界面上怎么称呼这条映射的本机位置：起了名称的盘符写「名称 (K:)」，和资源管理器里一样；
+    /// 没起的写盘符；文件夹写文件夹名。
+    pub fn local_label(&self) -> String {
+        match (self.drive_name(), self.is_drive()) {
+            (Some(name), _) => format!("{name} ({})", self.local),
+            (None, true) => self.local.clone(),
+            (None, false) => {
+                let path = self.local.trim_end_matches(['/', '\\']);
+                path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
+            }
+        }
+    }
+
     /// 本机的位置是盘符（`K:`），不是文件夹。
     pub fn is_drive(&self) -> bool {
         fr_mount::is_drive(&self.local)
@@ -797,11 +981,18 @@ pub struct RepoEntry {
     pub path: String,
 }
 
+/// 路径的最后一段（`/data/work/` 是 `work`，`/` 是空的）。两种斜杠都认。
+pub fn base_name(path: &str) -> &str {
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+}
+
 impl RepoEntry {
     /// 目录名。
     pub fn name(&self) -> &str {
-        let path = self.path.trim_end_matches(['/', '\\']);
-        path.rsplit(['/', '\\']).next().unwrap_or(path)
+        base_name(&self.path)
     }
 
     /// `other` 是不是在这个仓库的目录下面（同一台机器上、路径以这个仓库的路径加一个斜杠开头）。
@@ -919,6 +1110,51 @@ mod tests {
         assert_eq!(name(r"C:\work\kuai"), "kuai");
         assert_eq!(name("/data/workspaces/big-repo/"), "big-repo");
         assert_eq!(name("repo"), "repo");
+        assert_eq!(base_name("/"), "");
+        assert_eq!(base_name("C:/"), "C:");
+    }
+
+    #[test]
+    fn 盘符映射的共享名和资源管理器里的名称() {
+        let mapping = |id: &str, remote: &str, local: &str| Mapping {
+            id: id.into(),
+            remote: remote.into(),
+            local: local.into(),
+            ..Mapping::default()
+        };
+        let server = |id: &str, name: &str, mappings: Vec<Mapping>| Server {
+            id: id.into(),
+            name: name.into(),
+            mappings,
+            ..Server::default()
+        };
+        let settings = Settings {
+            servers: vec![
+                server("a", "devbox", vec![mapping("m1", "/data/src", "K:")]),
+                server("b", "测试机", vec![mapping("m2", "/data/src", "L:")]),
+                server("c", "开发机", vec![mapping("m3", "/home/me/src", "M:")]),
+                server("d", "devbox", vec![mapping("m4", "/", r"C:\Kuai\root")]),
+            ],
+            ..Settings::default()
+        };
+        let names = |ix: usize| {
+            let server = &settings.servers[ix];
+            settings.explorer_name(server, &server.mappings[0])
+        };
+        // 英文的名字：网络路径里原样，资源管理器显示「devbox-src (\\kuai) (K:)」，不用另写名称
+        assert_eq!(names(0), ("devbox-src".into(), None));
+        // 两台中文名的服务器都变成「----src」：加上是第几条，各不相同；名称写回原来的中文
+        assert_eq!(names(1), ("----src-2".into(), Some("测试机-src-2".into())));
+        assert_eq!(names(2), ("----src-3".into(), Some("开发机-src-3".into())));
+        // 映射成文件夹的没有名称
+        assert_eq!(names(3).1, None);
+        // 起了名称用名称
+        let mut named = settings.servers[1].mappings[0].clone();
+        named.name = "源码".into();
+        assert_eq!(
+            settings.explorer_name(&settings.servers[1], &named),
+            ("----src-2".into(), Some("源码".into()))
+        );
     }
 
     #[test]
@@ -945,14 +1181,6 @@ mod tests {
         assert_eq!(group.pinned, [repo("b")]);
         assert_eq!(group.tabs, [repo("b"), repo("a")]);
         assert_eq!(group.active, 1);
-
-        // 从工作区去掉：不再补回来
-        settings.workspaces[0].tabs.retain(|r| r.path != "a");
-        settings.workspaces[0].note_closed(repo("a"));
-        settings.workspaces[0].drop_repo(&repo("a"));
-        settings.normalize();
-        assert_eq!(settings.workspaces[0].repos, [repo("b")]);
-        assert!(settings.workspaces[0].closed.is_empty());
     }
 
     #[test]
@@ -996,8 +1224,8 @@ mod tests {
         let mut settings: Settings = serde_json::from_str(old).unwrap();
         settings.normalize();
         assert_eq!(settings.workspaces.len(), 1);
-        assert_eq!(settings.workspace().tabs.len(), 1);
-        assert_eq!(settings.workspace().active, 1);
+        assert_eq!(settings.workspaces[0].tabs.len(), 1);
+        assert_eq!(settings.workspaces[0].active, 1);
         assert_eq!(settings.theme, ThemeChoice::Dark);
         assert_eq!(settings.light_theme, "light");
         // 写回去以后没有旧字段，再读一遍结果一样
@@ -1041,11 +1269,10 @@ mod tests {
         let text = serde_json::to_string(&settings).unwrap();
         let again = super::parse(&text).unwrap();
         assert_eq!(again.repo_memos, settings.repo_memos);
-        // 改完是空的就不留；仓库从列表里去掉以后也不留
+        // 改完是空的就不留；仓库从列表里移除以后也不留
         settings.edit_memo(&repo("C:/b"), |_| {});
         assert!(settings.memo(&repo("C:/b")).is_none());
-        settings.repos.remove(0);
-        settings.normalize();
+        settings.forget_repo(&repo("C:/a"));
         assert!(settings.repo_memos.is_empty());
     }
 
@@ -1060,22 +1287,22 @@ mod tests {
             ..Settings::default()
         };
         let hide = |memo: &mut RepoMemo| memo.hidden_refs.push("refs/heads/wip".into());
-        // 子仓库不在仓库列表里；名字只是以根仓库的名字开头的不算在它里面
+        // 子仓库不在仓库列表里；仓库列表保存在各台电脑上，这里也不知道全不全：都照样留着
         settings.edit_memo(&repo(r"C:\a\packages\plugin-x"), hide);
         settings.edit_memo(&repo(r"C:\ab"), hide);
         settings.normalize();
         assert!(settings.memo(&repo(r"C:\a\packages\plugin-x")).is_some());
-        assert!(settings.memo(&repo(r"C:\ab")).is_none());
+        assert!(settings.memo(&repo(r"C:\ab")).is_some());
         let server = RepoEntry {
             server: Some("s1".into()),
             path: "/srv/a/plugin".into(),
         };
         assert!(!repo("/srv/a").contains(&server));
         assert!(!repo("/srv/a").contains(&repo("/srv/a")));
-        // 根仓库移除以后不留
-        settings.repos.clear();
-        settings.normalize();
-        assert!(settings.repo_memos.is_empty());
+        // 根仓库移除以后，它里面的子仓库记的也不留；名字只是以根仓库的名字开头的不算在它里面
+        settings.forget_repo(&repo(r"C:\a"));
+        assert!(settings.memo(&repo(r"C:\a\packages\plugin-x")).is_none());
+        assert!(settings.memo(&repo(r"C:\ab")).is_some());
     }
 
     #[test]
@@ -1176,6 +1403,29 @@ mod tests {
         });
         let text = serde_json::to_string(&server).unwrap();
         assert_eq!(serde_json::from_str::<Server>(&text).unwrap(), server);
+        // 没起名称的不写进文件
+        assert!(!text.contains("\"name\":\"\""), "{text}");
+    }
+
+    #[test]
+    fn 映射的名称() {
+        let map = |local: &str, name: &str| Mapping {
+            remote: "/data/work".into(),
+            local: local.into(),
+            name: name.into(),
+            ..Mapping::default()
+        };
+        // 盘符：起了名称写成资源管理器里的样子，没起写盘符
+        assert_eq!(map("K:", "项目").drive_name(), Some("项目"));
+        assert_eq!(map("K:", "项目").local_label(), "项目 (K:)");
+        assert_eq!(map("K:", "").local_label(), "K:");
+        assert_eq!(map("K:", "  ").drive_name(), None);
+        // 文件夹没有名称这一项，写文件夹名
+        assert_eq!(map(r"C:\Users\me\Kuai\logs", "日志").drive_name(), None);
+        assert_eq!(map(r"C:\Users\me\Kuai\logs", "").local_label(), "logs");
+        // 旧的映射没有名称
+        let old = r#"{"id":"m1","remote":"/data","local":"K:"}"#;
+        assert_eq!(serde_json::from_str::<Mapping>(old).unwrap().name, "");
     }
 
     #[test]
@@ -1227,18 +1477,31 @@ mod tests {
     }
 
     #[test]
-    fn 收起的卡片_服务器不在了就不记() {
+    fn 服务器的卡片默认收起_本机的默认展开() {
         let mut settings = Settings::default();
-        settings.servers.push(Server {
-            id: "s1".into(),
-            ..Server::default()
-        });
+        for id in ["s1", "s2"] {
+            settings.servers.push(Server {
+                id: id.into(),
+                ..Server::default()
+            });
+        }
+        assert!(!settings.card_collapsed(LOCAL_CARD));
+        assert!(settings.card_collapsed("s1"));
+        // 旧设置里记的「收起的服务器」去掉（现在本来就收起）；展开的服务器不在了就不记
         settings.collapsed_cards = vec![LOCAL_CARD.into(), "s1".into(), "gone".into()];
+        settings.expanded_cards = vec!["s2".into(), "gone".into()];
         settings.normalize();
-        assert_eq!(settings.collapsed_cards, [LOCAL_CARD, "s1"]);
-        // 没有收起的不写进文件
+        assert_eq!(settings.collapsed_cards, [LOCAL_CARD]);
+        assert_eq!(settings.expanded_cards, ["s2"]);
+        assert!(settings.card_collapsed(LOCAL_CARD));
+        assert!(settings.card_collapsed("s1"));
+        assert!(!settings.card_collapsed("s2"));
+        // 都是默认的不写进文件
         let text = serde_json::to_string(&Settings::default()).unwrap();
-        assert!(!text.contains("collapsed_cards"), "{text}");
+        assert!(
+            !text.contains("collapsed_cards") && !text.contains("expanded_cards"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1334,31 +1597,6 @@ mod tests {
     }
 
     #[test]
-    fn 仓库可以另起名字() {
-        let repo = RepoEntry {
-            server: None,
-            path: r"C:\work\chrome-mcp".into(),
-        };
-        let mut settings = Settings {
-            repos: vec![repo.clone()],
-            ..Settings::default()
-        };
-        assert_eq!(settings.repo_name(&repo), "chrome-mcp");
-        settings.set_repo_name(&repo, "  咸鱼插件 ");
-        assert_eq!(settings.repo_name(&repo), "咸鱼插件");
-        // 存一遍再读回来还在
-        let again = super::parse(&serde_json::to_string(&settings).unwrap()).unwrap();
-        assert_eq!(again.repo_name(&repo), "咸鱼插件");
-        // 清空、或者改回目录名：不留自己起的名字
-        settings.set_repo_name(&repo, "chrome-mcp");
-        assert!(settings.memo(&repo).is_none());
-        settings.set_repo_name(&repo, "x");
-        settings.set_repo_name(&repo, "");
-        assert_eq!(settings.repo_name(&repo), "chrome-mcp");
-        assert!(settings.repo_memos.is_empty());
-    }
-
-    #[test]
     fn 自动获取的间隔收到最近的一档() {
         let read = |text: &str| super::parse(text).unwrap().auto_fetch_minutes;
         assert_eq!(read("{}"), 10);
@@ -1373,7 +1611,7 @@ mod tests {
         let mut settings: Settings = serde_json::from_str(text).unwrap();
         settings.normalize();
         assert_eq!(settings.active_workspace, 0);
-        assert_eq!(settings.workspace().active, 0);
+        assert_eq!(settings.workspaces[0].active, 0);
     }
 
     #[test]

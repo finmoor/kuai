@@ -8,13 +8,12 @@
 //! 服务器上的终端也开在 kuaid 里（[`Connection::term_open`]）：流被丢弃只是断开，里面的程序接着跑。
 //! 往终端里发图片、文件：先传到服务器上（[`Connection::upload`]），再把路径贴进终端。
 //!
-//! 服务器可以经跳板机连接（[`ConnectOptions::jumps`]），见 `hop`。
+//! 服务器可以经跳板机连接（[`ConnectOptions::jumps`]），见 `fr_core::hop`。
 //!
 //! 仓库目录里的文件（文件页）：[`Channel::fs_list`] 这一组。本机仓库直接读写磁盘，服务器上的交给
 //! kuaid，做事的是同一份代码（`fr_core::files`），路径都相对仓库根。
 
 mod binaries;
-mod hop;
 mod local;
 mod remote;
 
@@ -36,11 +35,11 @@ use futures::future::BoxFuture;
 use serde_json::json;
 
 pub use fr_core::askpass::PromptKind;
+pub use fr_core::hop::run_helper as run_ssh_hop;
 pub use fr_core::protocol::{
     DirEntry, DirListing, FsEntry, FsExpect, FsSpace, FsStat, FsWrite, FsWritten, Hello, SubRepos,
     TermInfo,
 };
-pub use hop::run_helper as run_ssh_hop;
 pub use remote::{ConnectOptions, Connection, Jump, StageHandler, local_kuai_root};
 
 /// 一次 git 调用的结果。
@@ -125,6 +124,21 @@ pub struct TermStream {
 
 impl Stream for TermStream {
     type Item = Result<TermItem>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.rx).poll_next(cx)
+    }
+}
+
+/// 一台电脑保存的仓库列表和工作区：先来现在的整份，之后每次有改动来一份新的
+/// （见 [`Connection::state_watch`]）。连接断了，流以一个错误结束。丢弃就不订阅了。
+pub struct StateStream {
+    rx: mpsc::UnboundedReceiver<Result<fr_core::store::Store>>,
+    _cancel: Box<dyn Send>,
+}
+
+impl Stream for StateStream {
+    type Item = Result<fr_core::store::Store>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.rx).poll_next(cx)

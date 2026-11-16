@@ -28,6 +28,11 @@ pub fn set_extra_env(env: Vec<(String, String)>) {
     let _ = EXTRA_ENV.set(env);
 }
 
+/// [`set_extra_env`] 设的环境变量；没设是空的。kuaid 起 ssh 时也带上（要密码时一样来问）。
+pub fn extra_env() -> &'static [(String, String)] {
+    EXTRA_ENV.get().map_or(&[], Vec::as_slice)
+}
+
 /// 构造在指定仓库里执行 git 的命令：统一的配置和环境变量，Windows 上不弹控制台窗口。
 /// 标准输入输出由调用方设置。
 pub fn command<S: AsRef<OsStr>>(repo: &Path, args: &[S]) -> Command {

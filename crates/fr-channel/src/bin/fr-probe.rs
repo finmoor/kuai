@@ -25,6 +25,10 @@
 //!     --term <命令>              开（或者接上）终端，敲这条命令，把之后几秒的输出打出来，然后断开；
 //!                                命令给空的只看不敲。终端里的程序接着跑，下次还能接上
 //!     --secs <秒数>              `--term` 看多久，默认 3
+//!     --term-keys <字节>         敲完命令 2 秒后再往终端里送这些字节（`\e` 是 ESC，`\r`、`\xHH` 照常），
+//!                                用来模拟终端发给程序的按键、滚轮
+//!     --term-size <列>x<行>       开（接上）终端用的大小，默认 100x30。接上界面里开着的终端看屏幕时
+//!                                给和它一样的（`--term-list` 里有），程序不会因为改了大小重画
 //!     --term-list                列出 kuaid 里的终端会话
 //!     --term-close               结束这个仓库的终端
 //!
@@ -104,6 +108,14 @@ fn main() -> Result<()> {
         .find(|w| w[0] == "--watch")
         .and_then(|w| w[1].parse().ok());
     let term_command = value("--term");
+    let term_keys = value("--term-keys").map(|text| unescape(&text));
+    let term_size = match value("--term-size") {
+        Some(text) => text
+            .split_once('x')
+            .and_then(|(cols, rows)| Some((cols.parse().ok()?, rows.parse().ok()?)))
+            .context("--term-size 的写法是 <列>x<行>，例如 120x40")?,
+        None => (100, 30),
+    };
     let put = value("--put");
     let fs_size: u64 = value("--fs-size")
         .and_then(|mb| mb.parse().ok())
@@ -119,6 +131,8 @@ fn main() -> Result<()> {
                 | "--key"
                 | "--secret-env"
                 | "--term"
+                | "--term-keys"
+                | "--term-size"
                 | "--secs"
                 | "--put"
                 | "--fs-size"
@@ -201,7 +215,14 @@ fn main() -> Result<()> {
             if conn.hello.daemon { "，常驻" } else { "，不常驻" }
         );
         if let Some(command) = &term_command {
-            terminal(conn, &repo, command, Duration::from_secs(term_secs))?;
+            terminal(
+                conn,
+                &repo,
+                command,
+                term_keys,
+                term_size,
+                Duration::from_secs(term_secs),
+            )?;
         }
         if term_close {
             let terms = block_on(conn.term_list())?;
@@ -245,10 +266,44 @@ fn main() -> Result<()> {
     }
 }
 
+/// `--term-keys` 的写法换成字节：`\e` 是 ESC，`\r`、`\n`、`\t`、`\\`、`\xHH` 照常。
+fn unescape(text: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+            continue;
+        }
+        match chars.next() {
+            Some('e') => out.push(0x1b),
+            Some('r') => out.push(b'\r'),
+            Some('n') => out.push(b'\n'),
+            Some('t') => out.push(b'\t'),
+            Some('x') => {
+                let hex: String = chars.by_ref().take(2).collect();
+                out.push(u8::from_str_radix(&hex, 16).unwrap_or(b'?'));
+            }
+            Some(other) => out.extend_from_slice(other.encode_utf8(&mut [0; 4]).as_bytes()),
+            None => out.push(b'\\'),
+        }
+    }
+    out
+}
+
 /// 开（或者接上）这个仓库的终端，敲一条命令，把 `duration` 这么久里收到的输出原样打出来，然后断开。
-fn terminal(conn: &Connection, repo: &str, command: &str, duration: Duration) -> Result<()> {
+/// 给了 `keys`：敲完命令 2 秒后再送这些字节（等命令里的程序起来）。
+fn terminal(
+    conn: &Connection,
+    repo: &str,
+    command: &str,
+    mut keys: Option<Vec<u8>>,
+    (cols, rows): (u16, u16),
+    duration: Duration,
+) -> Result<()> {
     use std::io::Write as _;
-    let mut stream = conn.term_open(repo, repo, &[], 100, 30);
+    const KEYS_AFTER: Duration = Duration::from_secs(2);
+    let mut stream = conn.term_open(repo, repo, &[], cols, rows);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         block_on(async {
@@ -261,8 +316,16 @@ fn terminal(conn: &Connection, repo: &str, command: &str, duration: Duration) ->
     });
     let started = Instant::now();
     let mut bytes = 0usize;
+    // 敲完命令的时候和终端名，到点送 `keys`
+    let mut typed: Option<(Instant, String)> = None;
     while let Some(left) = duration.checked_sub(started.elapsed()) {
-        match rx.recv_timeout(left) {
+        if let Some((at, term)) = &typed
+            && at.elapsed() >= KEYS_AFTER
+            && let Some(keys) = keys.take()
+        {
+            conn.term_input(term, keys);
+        }
+        match rx.recv_timeout(left.min(Duration::from_millis(100))) {
             Ok(Ok(TermItem::Opened { term, created })) => {
                 println!(
                     "终端 {term}：{}",
@@ -271,6 +334,7 @@ fn terminal(conn: &Connection, repo: &str, command: &str, duration: Duration) ->
                 if !command.is_empty() {
                     conn.term_input(&term, format!("{command}\r").into_bytes());
                 }
+                typed = Some((Instant::now(), term));
             }
             Ok(Ok(TermItem::Output(output))) => {
                 bytes += output.len();
@@ -283,7 +347,8 @@ fn terminal(conn: &Connection, repo: &str, command: &str, duration: Duration) ->
                 return Ok(());
             }
             Ok(Err(err)) => return Err(err),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            // 每 100 ms 醒一次看要不要送 `keys`；看够了由循环条件结束
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(_) => anyhow::bail!("终端的流意外结束"),
         }
     }

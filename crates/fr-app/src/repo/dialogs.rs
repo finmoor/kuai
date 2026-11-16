@@ -394,7 +394,7 @@ impl RepoView {
         let ask = Ask {
             title: tr("贮藏改动").into(),
             placeholder: tr("说明（可选）").into(),
-            hint: tr("将改动贮藏，使工作区恢复干净；之后可在侧栏的「贮藏」中恢复。").into(),
+            hint: tr("贮藏改动，使工作区恢复干净；可在侧栏的「贮藏」中恢复。").into(),
             ok: tr("贮藏"),
             checks: vec![(tr("包含未跟踪的文件"), false)],
             allow_empty: true,

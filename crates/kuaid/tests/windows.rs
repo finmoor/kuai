@@ -48,13 +48,20 @@ impl Home {
         Home { dir }
     }
 
-    /// 装一个版本：`~/.kuai/<build>/kuaid.exe`。
+    /// 装一个版本：`~/.kuai/<build>/kuaid.exe`，旁边是随带的新版 ConPTY（和 Kuai 装的一样）。
     fn install(&self, build: &str) -> PathBuf {
         let dir = self.dir.join(".kuai").join(build);
         std::fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("kuaid.exe");
-        if std::fs::hard_link(kuaid_bin(), &exe).is_err() {
-            std::fs::copy(kuaid_bin(), &exe).unwrap();
+        let conpty = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/conpty/x64");
+        for (from, to) in [
+            (kuaid_bin(), exe.clone()),
+            (conpty.join("conpty.dll"), dir.join("conpty.dll")),
+            (conpty.join("OpenConsole.exe"), dir.join("OpenConsole.exe")),
+        ] {
+            if std::fs::hard_link(&from, &to).is_err() {
+                std::fs::copy(&from, &to).unwrap();
+            }
         }
         exe
     }
@@ -400,6 +407,32 @@ fn 拉起常驻进程_终端在客户端走了以后还在() {
     assert_eq!(second.exit_of(stream), Some(7));
     wait_until("会话被忘掉", || second.terms().is_empty());
     wait_until("shell 退出", || !process_exists(&shell_pid));
+}
+
+#[test]
+fn 程序要鼠标的请求转给客户端() {
+    // 随带的新版 ConPTY 照转，系统自带的吞掉：Claude Code 这类程序要了鼠标，客户端才把滚轮报给它
+    let home = Home::new();
+    let exe = home.install("1.0.0-aaaaaaaaaaaa");
+    let mut client = home.connect(&exe);
+    client.hello();
+    assert!(home.log().contains("终端用随带的 ConPTY"), "{}", home.log());
+    let (stream, opened) = client.open(r"C:\Mouse", &home.dir);
+    // 回显里是 `$([char]27)` 这几个字，真的 ESC 只能是程序写出来的
+    client.line(
+        &opened.term,
+        r#"[Console]::Write("$([char]27)[?1000h$([char]27)[?1006hmouse-$(1+1)")"#,
+    );
+    let seen = client.output_until(stream, "mouse-2");
+    assert!(
+        seen.contains("\x1b[?1000h") && seen.contains("\x1b[?1006h"),
+        "{seen:?}"
+    );
+    assert_eq!(
+        client.call("term_close", json!({ "term": opened.term }))["closed"],
+        true
+    );
+    client.exit_of(stream);
 }
 
 #[test]

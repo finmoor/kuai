@@ -1332,7 +1332,7 @@ impl RepoView {
                     }
                     if data.graph.max_lanes > graph_paint::MAX_LANES {
                         text = tf!(
-                            "提交图共 {lanes} 条线，仅绘制前 {max} 条（带 ··· 的行未完整绘制） · {text}",
+                            "提交图共 {lanes} 条线，仅绘制前 {max} 条（带 ··· 的行不完整） · {text}",
                             lanes = data.graph.max_lanes,
                             max = graph_paint::MAX_LANES,
                             text = text
@@ -1770,7 +1770,7 @@ fn build_loaded(
             t1 = (t2 - t1).as_millis()
         ),
         None => tf!(
-            "已显示前 {commits} 个提交（读取耗时 {fetch_time} ms），正在加载其余提交…",
+            "已显示前 {commits} 个提交（{fetch_time} ms），正在加载其余提交…",
             commits = commits.len(),
             fetch_time = fetch_time.as_millis()
         ),

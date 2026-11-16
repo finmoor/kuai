@@ -6,7 +6,8 @@
 //! 各台的 ssh 选项放在环境变量 [`HOPS_ENV`] 里（一路继承下来），密码不在里面，只有 askpass 的标记，
 //! 这一层按第几台取出来用。几台跳板机就这样一层套一层。
 //!
-//! 所以用到跳板机的程序，`main` 的开头要调用 [`run_helper`]。
+//! 所以用到跳板机的程序，`main` 的开头要调用 [`run_helper`]：客户端、fr-probe，还有替客户端连它
+//! 配置的服务器的 kuaid（协议 10）。
 
 use std::path::Path;
 use std::process::Command;
@@ -15,14 +16,14 @@ use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
 /// 各台跳板机的 ssh 选项（JSON），由最外面那个 ssh 的环境变量一路继承给每一层
-pub(crate) const HOPS_ENV: &str = "FR_SSH_HOPS";
+pub const HOPS_ENV: &str = "FR_SSH_HOPS";
 const FLAG: &str = "--ssh-hop";
 /// 某一台跳板机的 ssh 以失败结束时，往标准错误打这一行，后面跟是第几台。
 /// 最先打出来的那一台是出问题的那一台：它断了，经它连接的后面几台才跟着断
-pub(crate) const FAILED: &str = "KUAI-HOP-FAILED";
+pub const FAILED: &str = "KUAI-HOP-FAILED";
 
 /// 一台跳板机怎么连。
-pub(crate) struct Hop {
+pub struct Hop {
     /// ssh 的目标
     pub destination: String,
     /// 登录用的 ssh 选项（私钥、密码登录、要密码时怎么问）
@@ -31,7 +32,7 @@ pub(crate) struct Hop {
     pub tag: Option<String>,
 }
 
-pub(crate) fn encode(hops: &[Hop]) -> String {
+pub fn encode(hops: &[Hop]) -> String {
     let list: Vec<Value> = hops
         .iter()
         .map(|hop| json!({ "destination": hop.destination, "args": hop.args, "tag": hop.tag }))
@@ -58,7 +59,7 @@ fn decode(text: &str) -> Option<Vec<Hop>> {
 }
 
 /// 经第 `index` 台跳板机转接的 `ProxyCommand`。`helper` 是会在开头调用 [`run_helper`] 的程序。
-pub(crate) fn proxy_command(helper: &Path, index: usize) -> String {
+pub fn proxy_command(helper: &Path, index: usize) -> String {
     // % 在 ProxyCommand 里是占位符的开头，路径里的要写两遍
     let helper = helper.to_string_lossy().replace('%', "%%");
     format!("\"{helper}\" {FLAG} {index} %h %p")
@@ -78,7 +79,7 @@ fn hop_args(hops: &[Hop], index: usize, host: &str, port: &str, helper: &Path) -
             &format!("ProxyCommand={}", proxy_command(helper, index - 1)),
         ]),
     }
-    add(crate::remote::KEEP_OPTIONS);
+    add(crate::ssh::KEEP_OPTIONS);
     // IPv6 地址要加方括号，不然分不清哪个冒号后面是端口
     let to = if host.contains(':') {
         format!("[{host}]:{port}")
@@ -120,14 +121,14 @@ fn run(index: usize, host: &str, port: &str) -> Result<i32> {
         .context("FR_SSH_HOPS")?;
     let hop = hops.get(index).context("FR_SSH_HOPS")?;
     let helper = std::env::current_exe()?;
-    let mut cmd = Command::new(crate::remote::ssh_program());
+    let mut cmd = Command::new(crate::ssh::program());
     cmd.args(hop_args(&hops, index, host, port, &helper));
     // 继承下来的标记是目标服务器那个 ssh 的，换成这一台的
     match &hop.tag {
-        Some(tag) => cmd.env(fr_core::askpass::TAG_ENV, tag),
-        None => cmd.env_remove(fr_core::askpass::TAG_ENV),
+        Some(tag) => cmd.env(crate::askpass::TAG_ENV, tag),
+        None => cmd.env_remove(crate::askpass::TAG_ENV),
     };
-    crate::remote::no_window(&mut cmd);
+    crate::ssh::no_window(&mut cmd);
     // 标准输入输出原样交给它：外面那个 ssh 的数据就从这里过
     let status = cmd.status().context("ssh")?;
     Ok(status.code().unwrap_or(255))

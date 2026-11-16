@@ -23,7 +23,9 @@ use serde_json::{Value, json};
 use crate::VERSION;
 use crate::files::{self, Uploads};
 use crate::out::Outbox;
+use crate::relay::Relays;
 use crate::term::{Registry, Size};
+use crate::workspaces::Workspaces;
 
 /// 密码请求最多等用户这么久
 const ASK_TIMEOUT: Duration = Duration::from_secs(600);
@@ -48,21 +50,30 @@ pub struct Shared {
     pub build: String,
     /// 客户端传上来的文件放在哪
     pub drop_dir: PathBuf,
+    /// 这台电脑保存的仓库列表和工作区（协议 10）
+    pub workspaces: Workspaces,
     /// 最近一次有客户端连着的时间：闲了多久从它算
     last_busy: Mutex<Instant>,
 }
 
 impl Shared {
     pub fn new(terms: Registry, control: Option<Box<dyn Control>>, build: String) -> Arc<Shared> {
-        Self::with_drop_dir(terms, control, build, files::default_dir())
+        Self::with_dirs(
+            terms,
+            control,
+            build,
+            files::default_dir(),
+            Workspaces::default_file(),
+        )
     }
 
-    /// 同 [`Self::new`]，传上来的文件放到 `drop_dir`（测试用）。
-    pub fn with_drop_dir(
+    /// 同 [`Self::new`]，传上来的文件放到 `drop_dir`、仓库列表和工作区存在 `workspaces` 指定的地方（测试用）。
+    pub fn with_dirs(
         terms: Registry,
         control: Option<Box<dyn Control>>,
         build: String,
         drop_dir: PathBuf,
+        workspaces: Workspaces,
     ) -> Arc<Shared> {
         Arc::new(Shared {
             terms,
@@ -71,6 +82,7 @@ impl Shared {
             control,
             build,
             drop_dir,
+            workspaces,
             last_busy: Mutex::new(Instant::now()),
         })
     }
@@ -146,6 +158,8 @@ pub struct Conn {
     auth_sock: Mutex<Option<String>>,
     /// 正在传上来的文件；连接断开时没传完的跟着删掉
     uploads: Mutex<Uploads>,
+    /// 替它连这台电脑配置的服务器的 ssh（协议 10），断开时跟着结束
+    relays: Arc<Relays>,
 }
 
 impl Conn {
@@ -199,10 +213,12 @@ impl Conn {
         answer
     }
 
+    /// 杀掉它正在跑的 git，结束替它连服务器的 ssh。
     fn kill_git(&self) {
         for killer in self.running.lock().unwrap().values() {
             killer.kill();
         }
+        self.relays.kill_all();
     }
 }
 
@@ -215,6 +231,19 @@ struct GitParams {
     /// 标准错误也一块块发回去（要同时开 `stream`）
     #[serde(default)]
     progress: bool,
+}
+
+#[derive(Deserialize)]
+struct StateApply {
+    ops: Vec<fr_core::store::Op>,
+}
+
+#[derive(Deserialize)]
+struct RelayOpen {
+    /// 这台电脑配置的服务器的 id
+    server: String,
+    /// 在那台服务器上执行的命令
+    command: String,
 }
 
 #[derive(Deserialize)]
@@ -236,6 +265,7 @@ pub fn serve(shared: &Arc<Shared>, reader: impl Read, writer: impl Write + Send 
         next_ask: AtomicU64::new(1),
         auth_sock: Mutex::default(),
         uploads: Mutex::new(Uploads::new(shared.drop_dir.clone())),
+        relays: Arc::default(),
     });
     shared.conns.lock().unwrap().insert(conn.id, conn.clone());
     let mut watchers: HashMap<u64, fr_core::watch::Watcher> = HashMap::new();
@@ -255,6 +285,7 @@ pub fn serve(shared: &Arc<Shared>, reader: impl Read, writer: impl Write + Send 
     // 客户端断开了：它的 git 杀掉、监听停掉、等着的密码请求当作取消；终端会话留着
     conn.kill_git();
     drop(watchers);
+    shared.workspaces.unwatch(conn.id, None);
     shared.terms.detach(conn.id, None);
     conn.asks.lock().unwrap().clear();
     shared.conns.lock().unwrap().remove(&conn.id);
@@ -283,8 +314,43 @@ fn handle(
                     }
                 }
                 watchers.remove(&target);
+                shared.workspaces.unwatch(conn.id, Some(target));
                 shared.terms.detach(conn.id, Some(target));
+                conn.relays.kill(target);
             }
+        }
+        "relay_open" => {
+            let opened = serde_json::from_value::<RelayOpen>(request.params)
+                .context("relay_open 参数无效")
+                .and_then(|params| {
+                    let helper = std::env::current_exe().context("无法确定 kuaid 的安装位置")?;
+                    let store = shared.workspaces.get();
+                    let cmd = crate::relay::command(
+                        &store,
+                        &params.server,
+                        &params.command,
+                        &conn.env(),
+                        &helper,
+                    )?;
+                    conn.relays.open(id, cmd, &conn.out)
+                });
+            if let Err(err) = opened {
+                conn.reply(id, Err(err));
+            }
+        }
+        "relay_input" => {
+            if let Some(relay) = param("relay").and_then(Value::as_u64) {
+                let eof = param("eof").and_then(Value::as_bool) == Some(true);
+                conn.relays.input(relay, payload, eof);
+            }
+        }
+        "state_watch" => shared.workspaces.watch(conn.id, id, &conn.out),
+        "state_apply" => {
+            let applied = serde_json::from_value::<StateApply>(request.params)
+                .context("state_apply 参数无效")
+                .and_then(|params| shared.workspaces.apply(&params.ops))
+                .and_then(|store| Ok(serde_json::to_value(store)?));
+            conn.reply(id, applied);
         }
         "watch" => {
             let repo = param("repo").and_then(Value::as_str).unwrap_or_default();
@@ -422,6 +488,7 @@ fn simple(shared: &Shared, request: &Request) -> Result<Value> {
             daemon: shared.control.is_some(),
         })?),
         "info" => Ok(serde_json::to_value(shared.info())?),
+        "state_get" => Ok(serde_json::to_value(shared.workspaces.get())?),
         "list_dir" => Ok(serde_json::to_value(crate::dirs::list_dir(
             param("path").unwrap_or(""),
         )?)?),
@@ -756,7 +823,13 @@ mod tests {
     fn 传文件_分块传上来_断开时没传完的删掉() {
         let dir = files::tests::TempDir::new();
         let (terms, _) = fake_registry();
-        let shared = Shared::with_drop_dir(terms, None, String::new(), dir.0.clone());
+        let shared = Shared::with_dirs(
+            terms,
+            None,
+            String::new(),
+            dir.0.clone(),
+            Workspaces::new(dir.0.join("workspaces.json")),
+        );
         let mut client = connect(&shared);
         // 第一块给名字，拿到编号
         let id = client.send("file_put", json!({ "name": "说明 1.txt" }), "你好，".as_bytes());
@@ -932,6 +1005,64 @@ mod tests {
         assert!(!repo.0.join("docs").exists());
         client.send("fs_remove", at(""), &[]);
         assert!(client.next().0.error.is_some());
+    }
+
+    #[test]
+    fn 仓库和工作区_一边改了_订阅的都收到整份_存进文件() {
+        let dir = files::tests::TempDir::new();
+        let file = dir.0.join("kuai").join("workspaces.json");
+        let (terms, _) = fake_registry();
+        let shared = Shared::with_dirs(
+            terms,
+            None,
+            String::new(),
+            dir.0.clone(),
+            Workspaces::new(file.clone()),
+        );
+        let mut first = connect(&shared);
+        let mut second = connect(&shared);
+        // 订阅：马上收到现在的（还没有文件，是空的）
+        let watch = second.send("state_watch", json!({}), &[]);
+        let (response, _) = second.next();
+        assert!(response.chunk && response.id == watch);
+        let store: fr_core::store::Store =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(store.version, 0);
+        assert!(!file.exists(), "只是读，不写文件");
+
+        // 第一个客户端改：回改完的整份；订阅的那个也收到。这台电脑上的仓库按这台的写法存
+        // （Windows 上是反斜杠），这里给这台上的写法
+        let repo = if cfg!(windows) {
+            r"C:\data\wms"
+        } else {
+            "/data/wms"
+        };
+        let ops = json!({ "ops": [
+            { "op": "add_workspace", "id": "w1", "name": "交付" },
+            { "op": "add_to_workspace", "id": "w1", "repo": { "path": repo } },
+        ]});
+        let applied = first.call("state_apply", ops);
+        assert_eq!(applied["version"], 1);
+        assert_eq!(applied["repos"], json!([repo]));
+        let (response, _) = second.next();
+        assert_eq!((response.id, response.chunk), (watch, true));
+        assert_eq!(response.result.unwrap()["workspaces"][0]["name"], "交付");
+        // 存进了文件，别的进程读得到
+        assert_eq!(fr_core::store::load(&file).version, 1);
+        assert_eq!(first.call("state_get", json!({}))["version"], 1);
+
+        // 做不了的改动：回错误，什么都不变，也不推
+        let bad = json!({ "ops": [{ "op": "rename_workspace", "id": "没有", "name": "x" }] });
+        let id = first.send("state_apply", bad, &[]);
+        let (response, _) = first.next();
+        assert_eq!(response.id, id);
+        assert!(response.error.is_some());
+        // 不订阅了：再改也不推给它
+        second.send("cancel", json!({ "id": watch }), &[]);
+        second.call("ping", json!({}));
+        let rename = json!({ "ops": [{ "op": "rename_workspace", "id": "w1", "name": "WMS" }] });
+        assert_eq!(first.call("state_apply", rename)["version"], 2);
+        second.call("ping", json!({}));
     }
 
     #[test]

@@ -140,7 +140,8 @@ pub fn terminal_launch(
             fallback: Some(local),
         });
     };
-    if app.read(cx).server(server).is_none() {
+    // 经别的服务器连的（156>91）：连接设置在那台服务器上
+    if !app.read(cx).knows_server(server) {
         return Err(tr("未找到该服务器的设置").into());
     }
     let connecting = app.update(cx, |app, cx| app.connect(server, cx));
@@ -232,7 +233,7 @@ pub fn open_terminal_ssh(server: &Server, dir: &str) -> Result<(), String> {
 }
 
 fn no_code() -> &'static str {
-    tr("未找到 VS Code 命令行工具（code）。请在安装 VS Code 时勾选「添加到 PATH」，然后重启 Kuai。")
+    tr("未找到 VS Code 命令行工具（code）。请安装 VS Code 时勾选「添加到 PATH」，并重启 Kuai。")
 }
 
 /// 用 VS Code 打开本机的目录或文件。`code` 是个 cmd 脚本，要经 cmd 启动。

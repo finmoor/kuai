@@ -69,6 +69,76 @@ pub fn open_dir<T: 'static>(
     .detach();
 }
 
+/// 一次打开几个目录（「添加本机仓库…」里多选了）。只选了一个照 [`open_dir`]，不是仓库会问是否初始化；
+/// 几个时把在仓库中的一起交给 `on_open`（同一个仓库里的几个目录只算一个），不是仓库的不逐个问，
+/// 在右下角说一声，要初始化就单独选那个目录。
+pub fn open_dirs<T: 'static>(
+    app: &Entity<AppState>,
+    server: Option<String>,
+    mut dirs: Vec<String>,
+    window: &mut Window,
+    cx: &mut Context<T>,
+    on_open: impl FnOnce(&mut T, Vec<RepoEntry>, &mut Window, &mut Context<T>) + 'static,
+) {
+    if dirs.len() == 1 {
+        let dir = dirs.remove(0);
+        return open_dir(
+            app,
+            server,
+            dir,
+            window,
+            cx,
+            move |this, entry, window, cx| on_open(this, vec![entry], window, cx),
+        );
+    }
+    let channel = app.update(cx, |app, cx| app.channel_for(server.as_deref(), cx));
+    cx.spawn_in(window, async move |this, cx| {
+        let mut repos: Vec<RepoEntry> = Vec::new();
+        let mut not_repos: Vec<String> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        match channel.await {
+            Ok(channel) => {
+                for dir in dirs {
+                    // 同 `open_dir`：本机的目录先看在不在
+                    if server.is_none() && !Path::new(&dir).is_dir() {
+                        errors.push(tf!("未找到目录 {dir}", dir));
+                        continue;
+                    }
+                    match find(&channel, &dir).await {
+                        Ok(Found::Repo(root)) => {
+                            let found = entry(server.clone(), &root);
+                            if !repos.contains(&found) {
+                                repos.push(found);
+                            }
+                        }
+                        Ok(Found::NotRepo) => not_repos.push(dir),
+                        Err(err) => errors.push(err),
+                    }
+                }
+            }
+            Err(err) => errors.push(err.to_string()),
+        }
+        this.update_in(cx, |this, window, cx| {
+            for err in errors {
+                window.push_notification(Notification::error(err), cx);
+            }
+            if !not_repos.is_empty() {
+                let dirs = not_repos.join("、");
+                let text = tf!(
+                    "{dirs} 不是 Git 仓库，未添加。如需初始化，请单独选择该目录。",
+                    dirs
+                );
+                window.push_notification(Notification::warning(text), cx);
+            }
+            if !repos.is_empty() {
+                on_open(this, repos, window, cx);
+            }
+        })
+        .ok();
+    })
+    .detach();
+}
+
 /// 这个目录在不在仓库中。返回的错误是给人看的。
 pub async fn find(channel: &Channel, dir: &str) -> Result<Found, String> {
     let cannot_open = |err: &dyn std::fmt::Display| tf!("无法打开 {dir}：{err}", dir, err);

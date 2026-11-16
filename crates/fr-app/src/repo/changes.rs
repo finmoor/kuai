@@ -924,7 +924,7 @@ impl RepoView {
         args.push(entry.path.clone());
         let description = if untracked {
             tf!(
-                "未跟踪的文件 {path} 会被删除，不能撤销。",
+                "未跟踪的文件 {path} 将被删除，此操作无法撤销。",
                 path = entry.path
             )
         } else {
@@ -1740,11 +1740,11 @@ impl RepoView {
             if count == 0 {
                 let hint = match (area, split) {
                     (Area::Unstaged, false) => {
-                        tr("点击改动行以选中，按住 Shift 可连续选择；按空格键暂存，按 Delete 丢弃")
+                        tr("点击选择行，按住 Shift 连选；空格暂存，Delete 丢弃")
                     }
-                    (Area::Staged, false) => tr("点击改动行以选中，按住 Shift 可连续选择；按空格键取消暂存"),
-                    (Area::Unstaged, true) => tr("在行号上拖动以选择多行；按空格键暂存，按 Delete 丢弃"),
-                    (Area::Staged, true) => tr("在行号上拖动以选择多行；按空格键取消暂存"),
+                    (Area::Staged, false) => tr("点击选择行，按住 Shift 连选；空格取消暂存"),
+                    (Area::Unstaged, true) => tr("在行号上拖动选择多行；空格暂存，Delete 丢弃"),
+                    (Area::Staged, true) => tr("在行号上拖动选择多行；空格取消暂存"),
                 };
                 return bar
                     .child(crate::ui::clipped("select-hint", hint).flex_1())

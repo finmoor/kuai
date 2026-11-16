@@ -119,7 +119,10 @@ impl StageDiff {
             }
         }
         let notice: Option<SharedString> = if file.is_combined() {
-            Some(tr("存在冲突：点击「解决冲突…」逐处选择；如已在其他位置解决，请点击「标记为已解决」").into())
+            Some(
+                tr("存在冲突：点击「解决冲突…」逐处选择；已在别处解决的，点击「标记为已解决」")
+                    .into(),
+            )
         } else if file.is_binary() {
             Some(tr("二进制文件，只能对整个文件操作").into())
         } else if file.hunks.is_empty() {

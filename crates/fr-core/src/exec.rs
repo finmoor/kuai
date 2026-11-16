@@ -33,6 +33,12 @@ pub struct Finished {
 pub struct Killer(Arc<Mutex<Child>>);
 
 impl Killer {
+    /// 别的进程也用这一套（kuaid 替客户端起的 ssh）。Unix 上要在启动时 `process_group(0)`，
+    /// 子进程才会跟着结束。
+    pub fn new(child: Arc<Mutex<Child>>) -> Killer {
+        Killer(child)
+    }
+
     pub fn kill(&self) {
         if let Ok(mut child) = self.0.lock() {
             if matches!(child.try_wait(), Ok(Some(_))) {

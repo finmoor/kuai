@@ -5,7 +5,8 @@
 //! 右边多出一个列出全部标签页的按钮；设置和窗口的按钮一直留在原地。
 //!
 //! 工作区是一组标签页：切到另一个工作区，标签栏整个换成它的那一组。别的工作区里已经打开过
-//! 的标签页留在内存里（正在做的操作不会被打断），只是不显示。
+//! 的标签页留在内存里（正在做的操作不会被打断），只是不显示。工作区保存在它所在的电脑上
+//! （本机或服务器，见 `machines`），菜单里按电脑分组；开着哪些标签页各台电脑各记各的。
 //!
 //! 快捷键：F5 刷新、Ctrl+W 关标签页、Ctrl+Tab 切标签页、Ctrl+F 搜索提交、Ctrl+P 快速打开仓库、
 //! Ctrl+1 本地修改、Ctrl+2 所有提交、Ctrl+, 设置、Ctrl+Shift+T 重新打开刚关掉的标签页、
@@ -22,7 +23,8 @@
 //! 关掉的标签页每个工作区记最近 10 个（存在设置里），手滑关错了能找回来；
 //! 设置里还可以把标签页上的关闭按钮藏起来。
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use fr_core::i18n::{self, tr, trc};
@@ -40,6 +42,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::app_state::AppState;
+use crate::machines::{LOCAL, WorkspaceKey};
 use crate::manager::{ManagerEvent, ManagerView};
 use crate::prompt::{self, Prompts};
 use crate::repo::{RepoEvent, RepoView};
@@ -92,8 +95,11 @@ pub struct Workspace {
     tabs: Vec<RepoTab>,
     /// 0 是仓库管理器，i 是 `tabs[i - 1]`
     active: usize,
-    /// 其他工作区里已经建好的标签页，下标和设置里的工作区对应；当前工作区的那一格是空的
-    parked: Vec<Option<Parked>>,
+    /// `tabs` 是哪个工作区的。和设置里现在用的不一样了（别的电脑删了这个工作区、连不上服务器换回了
+    /// 本机的），就换成那一组
+    shown: WorkspaceKey,
+    /// 其他工作区里已经建好的标签页
+    parked: HashMap<WorkspaceKey, Parked>,
     /// 设置页开着；它盖在当前标签页上面，关掉回到原来那一页
     showing_settings: bool,
     /// 标签栏的横向滚动位置
@@ -130,11 +136,14 @@ impl Workspace {
                     this.remove_from_workspace(entry.clone(), window, cx)
                 }
                 ManagerEvent::QuickOpen => this.quick_open(window, cx),
+                ManagerEvent::SwitchTo(key) => this.switch_workspace(key.clone(), window, cx),
             }),
             // 设置变了：服务器改名要刷新标签上的名字；服务器被移除了，它上面的仓库的标签页跟着关掉；
+            // 现在用的工作区换了（不在了、连不上回到本机）就换上那一组；
             // 主题、语言、托盘的选项变了就应用到窗口上
             cx.observe_in(&app, window, |this, _, window, cx| {
                 this.drop_tabs_of_removed_servers(cx);
+                this.follow_current(window, cx);
                 this.apply_settings(window, cx);
                 cx.notify();
             }),
@@ -173,6 +182,9 @@ impl Workspace {
                 |_, app, notice: &crate::mapping::Notice, window, cx| {
                     let note = match notice {
                         crate::mapping::Notice::Info(text) => Notification::info(text.clone()),
+                        crate::mapping::Notice::Warning(text) => {
+                            Notification::warning(text.clone())
+                        }
                         crate::mapping::Notice::Error(text) => Notification::error(text.clone()),
                         crate::mapping::Notice::NeedWinFsp => {
                             let app = app.clone();
@@ -233,7 +245,6 @@ impl Workspace {
                 !asked
             });
         }
-        let count = app.read(cx).settings.workspaces.len();
         // 刚升级完：说一声，给个看更新说明的按钮
         if updater.read(cx).updated_from.is_some() {
             cx.defer_in(window, |_, window, cx| {
@@ -260,7 +271,8 @@ impl Workspace {
             settings_page,
             tabs: Vec::new(),
             active: 0,
-            parked: (0..count).map(|_| None).collect(),
+            shown: app.read(cx).current().clone(),
+            parked: HashMap::new(),
             showing_settings: false,
             tab_scroll: ScrollHandle::new(),
             tabs_overflow: false,
@@ -273,18 +285,66 @@ impl Workspace {
             _prompts: prompt::show_in(prompts, window, cx),
         };
         // 恢复上次开着的标签页
-        let (open, active) = {
-            let group = app.read(cx).settings.workspace();
-            (group.tabs.clone(), group.active)
-        };
-        for entry in open {
+        let view = app.read(cx).view();
+        for entry in view.tabs {
             let tab = this.build_tab(entry, window, cx);
             this.tabs.push(tab);
         }
-        this.active = active.min(this.tabs.len());
+        this.active = view.active.min(this.tabs.len());
         this.update_visibility(cx);
         this.apply_settings(window, cx);
+        // 上次用的是服务器上的工作区：连上它；连不上就回到本机的工作区
+        let machine = this.shown.machine.clone();
+        if machine != LOCAL {
+            cx.defer_in(window, move |this, window, cx| {
+                this.ensure_connected(machine, window, cx)
+            });
+        }
         this
+    }
+
+    /// 用的是服务器 `machine` 上的工作区：连上它（会读到它的工作区）。连不上就回到本机最近用的
+    /// 工作区，说一声；那个工作区开着的标签页本机记着，连上以后切回去还在。
+    fn ensure_connected(&mut self, machine: String, window: &mut Window, cx: &mut Context<Self>) {
+        let connecting = self.app.update(cx, |app, cx| app.connect(&machine, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let Err(err) = connecting.await else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| {
+                // 已经换到别处了就不管
+                if this.app.read(cx).current().machine != machine {
+                    return;
+                }
+                log::warn!("连不上 {machine}，回到本机的工作区：{err}");
+                let key = this.app.read(cx).recent_local();
+                this.switch_workspace(key, window, cx);
+                let (name, workspace) = {
+                    let app = this.app.read(cx);
+                    (
+                        app.machine_name(&machine),
+                        app.workspace_name(app.current()),
+                    )
+                };
+                let text = tf!(
+                    "无法连接 {name}，已切换到本机的工作区「{workspace}」",
+                    name,
+                    workspace
+                );
+                window.push_notification(Notification::warning(text), cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 设置里现在用的工作区和显示着的不一样了（别的电脑删了这个工作区，或者连不上回到了本机的）：
+    /// 换成现在用的那一组。
+    fn follow_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.app.read(cx).current().clone();
+        if current != self.shown && !current.id.is_empty() {
+            self.load_workspace(current, window, cx);
+        }
     }
 
     /// 把设置里的主题、语言、托盘应用到窗口上；和上次一样就不动。
@@ -309,12 +369,7 @@ impl Workspace {
                 let views: Vec<_> = self
                     .tabs
                     .iter()
-                    .chain(
-                        self.parked
-                            .iter()
-                            .flatten()
-                            .flat_map(|(tabs, _)| tabs.iter()),
-                    )
+                    .chain(self.parked.values().flat_map(|(tabs, _)| tabs.iter()))
                     .map(|tab| tab.view.clone())
                     .collect();
                 for view in views {
@@ -436,7 +491,7 @@ impl Workspace {
             return false;
         }
         let mapped_note = tf!(
-            "其他程序在映射的目录中打开了 {n} 个文件，退出后映射将断开，无法继续读写。",
+            "其他程序在映射的目录中打开了 {n} 个文件，退出后将无法继续读写。",
             n = mapped
         );
         let description = match (terminals, unsaved) {
@@ -501,10 +556,12 @@ impl Workspace {
     }
 
     /// 最小化到托盘：窗口最小化了、设置里开着、托盘图标也在，就把窗口藏起来。
+    /// 点任务栏上的按钮最小化的不藏：留在任务栏上，再点一下就回来。
     fn hide_if_minimized(&mut self, cx: &mut Context<Self>) {
         let on = self.app.read(cx).settings.minimize_to_tray && self.tray.is_some();
         if let (true, Some(hwnd)) = (on, self.hwnd)
             && win::is_minimized(hwnd)
+            && !win::cursor_on_taskbar()
         {
             win::hide(hwnd);
         }
@@ -522,6 +579,7 @@ impl Workspace {
     }
 
     /// 打开本机的目录（命令行给的、再次启动时交过来的）：在仓库中就打开仓库，不是仓库先问是否初始化。
+    /// 现在用的是服务器上的工作区（放不进本机的仓库）：先回到本机最近用的工作区。
     pub fn open_local_dir(&mut self, dir: String, window: &mut Window, cx: &mut Context<Self>) {
         let app = self.app.clone();
         crate::open_dir::open_dir(
@@ -531,8 +589,10 @@ impl Workspace {
             window,
             cx,
             |this: &mut Self, entry, window, cx| {
-                this.app
-                    .update(cx, |app, cx| app.add_repo(entry.clone(), cx));
+                if !this.app.read(cx).current().is_local() {
+                    let key = this.app.read(cx).recent_local();
+                    this.switch_workspace(key, window, cx);
+                }
                 this.open(entry, window, cx);
             },
         );
@@ -557,12 +617,7 @@ impl Workspace {
     fn unsaved_files(&self, cx: &App) -> usize {
         self.tabs
             .iter()
-            .chain(
-                self.parked
-                    .iter()
-                    .flatten()
-                    .flat_map(|(tabs, _)| tabs.iter()),
-            )
+            .chain(self.parked.values().flat_map(|(tabs, _)| tabs.iter()))
             .map(|tab| tab.view.read(cx).unsaved_with_subs(cx))
             .sum()
     }
@@ -573,27 +628,25 @@ impl Workspace {
         let open: usize = self
             .tabs
             .iter()
-            .chain(
-                self.parked
-                    .iter()
-                    .flatten()
-                    .flat_map(|(tabs, _)| tabs.iter()),
-            )
+            .chain(self.parked.values().flat_map(|(tabs, _)| tabs.iter()))
             .map(|tab| tab.view.read(cx).local_terminals_with_subs(cx))
             .sum();
         open + crate::repo::parked_terminals_running(cx)
     }
 
-    /// 服务器被移除了：它上面的仓库的标签页跟着关掉（各个工作区里的都关）。
+    /// 服务器被移除了：它上面的仓库的标签页跟着关掉（各个工作区里的都关），经它连的也关。
     fn drop_tabs_of_removed_servers(&mut self, cx: &mut Context<Self>) {
         let app = self.app.read(cx);
         let gone = |entry: &RepoEntry| {
-            entry
-                .server
-                .as_deref()
-                .is_some_and(|id| app.server(id).is_none())
+            entry.server.as_deref().is_some_and(|id| {
+                let direct = crate::machines::split_relay(id).map_or(id, |(via, _)| via);
+                app.server(direct).is_none()
+            })
         };
-        for parked in self.parked.iter_mut().flatten() {
+        // 服务器上的工作区整个不在了（服务器移除了）
+        self.parked
+            .retain(|key, _| key.is_local() || app.server(&key.machine).is_some());
+        for parked in self.parked.values_mut() {
             let current = parked
                 .1
                 .checked_sub(1)
@@ -629,11 +682,12 @@ impl Workspace {
         }
     }
 
-    /// 打开仓库：已经开着就切过去。
+    /// 打开仓库：已经开着就切过去。新开的成了当前工作区的仓库，也进它所在那台电脑的列表。
     pub fn open(&mut self, entry: RepoEntry, window: &mut Window, cx: &mut Context<Self>) {
         match self.tabs.iter().position(|t| t.entry == entry) {
             Some(ix) => self.active = ix + 1,
             None => {
+                self.app.update(cx, |app, cx| app.adopt(&entry, cx));
                 let tab = self.build_tab(entry, window, cx);
                 self.tabs.push(tab);
                 self.active = self.tabs.len();
@@ -694,11 +748,7 @@ impl Workspace {
         let view = cx.new(|cx| RepoView::new(entry.clone(), app, window, cx));
         // 仓库页要求打开另一个仓库（子模块）
         cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
-            RepoEvent::Open(entry) => {
-                this.app
-                    .update(cx, |app, cx| app.add_repo(entry.clone(), cx));
-                this.open(entry.clone(), window, cx);
-            }
+            RepoEvent::Open(entry) => this.open(entry.clone(), window, cx),
             RepoEvent::Rename(entry) => this.rename_repo(entry.clone(), window, cx),
         })
         .detach();
@@ -831,7 +881,7 @@ impl Workspace {
             .map(|tab| tab.entry.clone());
         self.app
             .update(cx, |app, cx| app.toggle_pinned(&entry, cx));
-        let pinned = self.app.read(cx).settings.workspace().pinned.clone();
+        let pinned = self.app.read(cx).view().pinned;
         self.tabs.sort_by_key(|tab| !pinned.contains(&tab.entry));
         if let Some(current) = current {
             self.active = self
@@ -846,7 +896,7 @@ impl Workspace {
     }
 
     fn is_pinned(&self, entry: &RepoEntry, cx: &App) -> bool {
-        self.app.read(cx).settings.workspace().is_pinned(entry)
+        self.app.read(cx).view().is_pinned(entry)
     }
 
     /// 把仓库从当前工作区移除（先问一下）：开着的标签页跟着关，仓库还在「全部仓库」里。
@@ -863,21 +913,40 @@ impl Workspace {
             return;
         }
         let open = tab.is_some();
-        let (name, workspace) = {
+        let (name, workspace, machine) = {
             let app = self.app.read(cx);
+            let current = app.current().clone();
+            if !app.writable(&current.machine) {
+                let text = tf!(
+                    "与 {name} 的连接已断开，暂时无法修改。",
+                    name = app.machine_name(&current.machine)
+                );
+                window.push_notification(Notification::warning(text), cx);
+                return;
+            }
             (
                 app.repo_name(&entry),
-                app.settings.workspace().name.clone(),
+                app.workspace_name(&current),
+                (!current.is_local()).then(|| app.machine_name(&current.machine)),
             )
         };
+        let mut description = String::new();
+        // 服务器上的工作区：别的电脑上也跟着变
+        if let Some(machine) = machine {
+            description.push_str(&tf!(
+                "此工作区保存在 {machine} 上，所有电脑将同步移除。",
+                machine
+            ));
+        }
+        description.push_str(if open {
+            tr("已打开的标签页将关闭，仓库仍保留在「全部仓库」中。")
+        } else {
+            tr("仓库仍保留在「全部仓库」中。")
+        });
         let this = cx.entity().downgrade();
         crate::manager::confirm(
             tf!("将 {name} 从工作区「{workspace}」移除？", name, workspace),
-            if open {
-                tr("已打开的标签页将关闭，仓库仍保留在「全部仓库」中。").to_string()
-            } else {
-                tr("仓库仍保留在「全部仓库」中。").to_string()
-            },
+            description,
             tr("移除"),
             false,
             window,
@@ -901,7 +970,7 @@ impl Workspace {
         let keep_entry = keep
             .and_then(|ix| self.tabs.get(ix))
             .map(|tab| tab.entry.clone());
-        let pinned = self.app.read(cx).settings.workspace().pinned.clone();
+        let pinned = self.app.read(cx).view().pinned;
         let mut skipped = 0;
         let targets: Vec<RepoEntry> = self
             .tabs
@@ -1106,65 +1175,92 @@ impl Workspace {
 
     // ---- 工作区 ----
 
-    fn current_workspace(&self, cx: &App) -> usize {
-        self.app.read(cx).settings.active_workspace
-    }
-
-    /// 切到第 `ix` 个工作区：当前的标签页收起来（留在内存里），换上那一组。
-    fn switch_workspace(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let current = self.current_workspace(cx);
-        let count = self.app.read(cx).settings.workspaces.len();
-        self.parked.resize_with(count, || None);
-        if ix == current || ix >= count {
+    /// 切到另一个工作区：当前的标签页收起来（留在内存里），换上那一组。
+    fn switch_workspace(&mut self, key: WorkspaceKey, window: &mut Window, cx: &mut Context<Self>) {
+        if key == self.shown || key.id.is_empty() {
             return;
         }
+        self.app
+            .update(cx, |app, cx| app.set_current(key.clone(), cx));
+        self.load_workspace(key, window, cx);
+    }
+
+    /// 把 `key` 那一组标签页换上来。服务器上的工作区：那台没连着就连上（连不上回到本机的工作区）。
+    fn load_workspace(&mut self, key: WorkspaceKey, window: &mut Window, cx: &mut Context<Self>) {
         // 收起来之前先让它们知道自己不显示了
         for tab in &self.tabs {
             tab.view.update(cx, |view, cx| view.set_visible(false, cx));
         }
         let tabs = std::mem::take(&mut self.tabs);
-        self.parked[current] = Some((tabs, self.active));
-        self.app
-            .update(cx, |app, cx| app.set_active_workspace(ix, cx));
-        match self.parked[ix].take() {
+        let old = std::mem::replace(&mut self.shown, key.clone());
+        self.parked.insert(old, (tabs, self.active));
+        match self.parked.remove(&key) {
             Some((tabs, active)) => {
                 self.tabs = tabs;
                 self.active = active.min(self.tabs.len());
             }
             None => {
-                let (open, active) = {
-                    let group = self.app.read(cx).settings.workspace();
-                    (group.tabs.clone(), group.active)
-                };
-                for entry in open {
+                let view = self.app.read(cx).view();
+                for entry in view.tabs {
                     let tab = self.build_tab(entry, window, cx);
                     self.tabs.push(tab);
                 }
-                self.active = active.min(self.tabs.len());
+                self.active = view.active.min(self.tabs.len());
             }
         }
         self.showing_settings = false;
         self.reveal_active_tab();
         self.persist(cx);
         cx.notify();
+        if !key.is_local() && !self.app.read(cx).writable(&key.machine) {
+            self.ensure_connected(key.machine.clone(), window, cx);
+        }
     }
 
+    /// 那台电脑断开着：说一声，返回假。
+    fn check_writable(&self, machine: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let app = self.app.read(cx);
+        if app.writable(machine) {
+            return true;
+        }
+        let text = tf!(
+            "与 {name} 的连接已断开，暂时无法修改。",
+            name = app.machine_name(machine)
+        );
+        window.push_notification(Notification::warning(text), cx);
+        false
+    }
+
+    /// 新建工作区：填名称、选保存在哪台电脑上（默认是当前工作区所在的那台，它没连着时默认本机）。
+    /// 建好了切过去。
     fn new_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let app = self.app.read(cx);
+        let current = app.current().machine.clone();
+        let default = match app.writable(&current) {
+            true => current,
+            false => LOCAL.to_string(),
+        };
+        let mut places: Vec<(String, SharedString)> = vec![(LOCAL.to_string(), tr("本机").into())];
+        places.extend(
+            app.settings
+                .servers
+                .iter()
+                .map(|server| (server.id.clone(), server.name.clone().into())),
+        );
         let this = cx.entity().downgrade();
-        ask_name(
-            tr("新建工作区"),
-            tr("工作区名称，例如「公司」「个人」"),
-            String::new(),
-            tr("新建"),
-            false,
-            None,
+        new_workspace_dialog(
+            places,
+            default,
             window,
             cx,
-            move |name, window, cx| {
+            move |name, machine, window, cx| {
                 this.update(cx, |this, cx| {
-                    let ix = this.app.update(cx, |app, cx| app.add_workspace(&name, cx));
-                    this.parked.push(None);
-                    this.switch_workspace(ix, window, cx);
+                    let key = this
+                        .app
+                        .update(cx, |app, cx| app.add_workspace(&machine, &name, cx));
+                    if let Some(key) = key {
+                        this.switch_workspace(key, window, cx);
+                    }
                 })
                 .ok();
             },
@@ -1172,8 +1268,11 @@ impl Workspace {
     }
 
     fn rename_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ix = self.current_workspace(cx);
-        let old = self.app.read(cx).settings.workspace().name.clone();
+        let key = self.shown.clone();
+        if !self.check_writable(&key.machine, window, cx) {
+            return;
+        }
+        let old = self.app.read(cx).workspace_name(&key).to_string();
         let app = self.app.clone();
         ask_name(
             tr("重命名工作区"),
@@ -1184,19 +1283,29 @@ impl Workspace {
             None,
             window,
             cx,
-            move |name, _, cx| app.update(cx, |app, cx| app.rename_workspace(ix, &name, cx)),
+            move |name, _, cx| app.update(cx, |app, cx| app.rename_workspace(&key, &name, cx)),
         );
     }
 
-    /// 删掉当前工作区（先问一下）。只剩一个时不能删；里面有标签页正在做操作时不删。
+    /// 删掉当前工作区（先问一下）。每台电脑至少留一个；里面有标签页正在做操作时不删。
     fn delete_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ix = self.current_workspace(cx);
-        let (name, count) = {
-            let settings = &self.app.read(cx).settings;
-            (settings.workspace().name.clone(), settings.workspaces.len())
+        let key = self.shown.clone();
+        if !self.check_writable(&key.machine, window, cx) {
+            return;
+        }
+        let (name, machine, count) = {
+            let app = self.app.read(cx);
+            (
+                app.workspace_name(&key),
+                app.machine_name(&key.machine),
+                app.workspace_count(&key.machine),
+            )
         };
         if count <= 1 {
-            let text = tr("这是最后一个工作区，无法删除。");
+            let text = match key.is_local() {
+                true => tr("这是最后一个工作区，无法删除。").to_string(),
+                false => tf!("这是 {machine} 上的最后一个工作区，无法删除。", machine),
+            };
             window.push_notification(Notification::warning(text), cx);
             return;
         }
@@ -1210,16 +1319,25 @@ impl Workspace {
             return;
         }
         let tabs = self.tabs.len();
+        let mut description = String::new();
+        // 服务器上的工作区：别的电脑上也跟着没了
+        if !key.is_local() {
+            description.push_str(&tf!(
+                "此工作区保存在 {machine} 上，所有电脑将同步删除。",
+                machine
+            ));
+        }
+        description.push_str(&if tabs == 0 {
+            tr("此工作区中没有打开的标签页。").to_string()
+        } else {
+            tf!("其中的 {tabs} 个标签页将关闭，仓库仍保留在列表中。", tabs)
+        });
         let this = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, _, _| {
-            let this = this.clone();
+            let (this, key) = (this.clone(), key.clone());
             alert
                 .title(tf!("删除工作区「{name}」？", name))
-                .description(if tabs == 0 {
-                    tr("此工作区中没有打开的标签页。").to_string()
-                } else {
-                    tf!("其中的 {tabs} 个标签页将关闭，仓库仍保留在列表中。", tabs)
-                })
+                .description(description.clone())
                 .on_ok(|_, _, _| false)
                 .footer(
                     DialogFooter::new()
@@ -1234,8 +1352,9 @@ impl Workspace {
                                 .with_variant(ButtonVariant::Danger)
                                 .on_click(move |_, window, cx| {
                                     window.close_dialog(cx);
+                                    let key = key.clone();
                                     this.update(cx, |this, cx| {
-                                        this.delete_workspace_now(ix, window, cx)
+                                        this.delete_workspace_now(key, window, cx)
                                     })
                                     .ok();
                                 }),
@@ -1244,22 +1363,39 @@ impl Workspace {
         });
     }
 
-    fn delete_workspace_now(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.current_workspace(cx) != ix {
+    fn delete_workspace_now(
+        &mut self,
+        key: WorkspaceKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shown != key {
             return;
         }
-        // 先切到旁边的一个，再把这个删掉
-        let next = if ix == 0 { 1 } else { ix - 1 };
+        // 先切到同一台电脑上的另一个，再把这个删掉
+        let next = self
+            .app
+            .read(cx)
+            .workspaces_on(&key.machine)
+            .and_then(|list| list.into_iter().map(|(k, ..)| k).find(|k| *k != key));
+        let Some(next) = next else {
+            return;
+        };
         self.switch_workspace(next, window, cx);
-        if ix < self.parked.len() {
-            self.parked.remove(ix);
-        }
-        self.app.update(cx, |app, cx| app.remove_workspace(ix, cx));
+        self.parked.remove(&key);
+        self.app
+            .update(cx, |app, cx| app.remove_workspace(&key, cx));
         cx.notify();
     }
 
-    /// 把一个标签页移到另一个工作区：仓库也跟着换，不再是这个工作区的。
-    fn move_tab(&mut self, ix: usize, to: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// 把一个标签页移到同一台电脑上的另一个工作区：仓库也跟着换，不再是这个工作区的。
+    fn move_tab(
+        &mut self,
+        ix: usize,
+        to: WorkspaceKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(tab) = self.tabs.get(ix) else {
             return;
         };
@@ -1268,18 +1404,20 @@ impl Workspace {
             window.push_notification(Notification::warning(text), cx);
             return;
         }
+        if !self.check_writable(&to.machine, window, cx) {
+            return;
+        }
         // 移过去是在那边重新打开；本机终端跟着关标签页留下来，到那边的终端页时接回
         let entry = tab.entry.clone();
         self.close_now(ix, cx);
         self.app.update(cx, |app, cx| {
             app.remove_from_workspace(&entry, cx);
-            app.push_tab_to_workspace(to, entry.clone(), cx)
+            app.push_tab_to_workspace(&to, entry.clone(), cx)
         });
         // 那个工作区的标签页已经建好了（切过去过）：给它补上这一页
-        let loaded = self.parked.get(to).is_some_and(|p| p.is_some());
-        if loaded {
+        if self.parked.contains_key(&to) {
             let tab = self.build_tab(entry.clone(), window, cx);
-            if let Some(Some((tabs, _))) = self.parked.get_mut(to)
+            if let Some((tabs, _)) = self.parked.get_mut(&to)
                 && !tabs.iter().any(|t| t.entry == entry)
             {
                 tabs.push(tab);
@@ -1289,9 +1427,13 @@ impl Workspace {
 
     // ---- 标题栏 ----
 
+    /// 工作区按钮：工作区的名字，服务器上的后面跟一个服务器名的小标签。
     fn render_workspace_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let settings = &self.app.read(cx).settings;
-        let name: SharedString = settings.workspace().name.clone().into();
+        let app = self.app.read(cx);
+        let key = app.current().clone();
+        let name = app.workspace_name(&key);
+        let machine = (!key.is_local()).then(|| app.machine_name(&key.machine));
+        let (chip, accent) = (cx.theme().primary.opacity(0.16), cx.theme().primary);
         let this = cx.entity().downgrade();
         let app = self.app.clone();
         div().occlude().child(
@@ -1300,6 +1442,18 @@ impl Workspace {
                 .small()
                 .icon(ui::icon(IconName::Layers))
                 .label(name)
+                .when_some(machine, |button, machine| {
+                    button.child(
+                        div()
+                            .flex_none()
+                            .px(px(6.))
+                            .rounded_full()
+                            .bg(chip)
+                            .text_xs()
+                            .text_color(accent)
+                            .child(machine),
+                    )
+                })
                 .dropdown_menu(move |menu, _, cx| workspace_menu(menu, &app, &this, cx)),
         )
     }
@@ -1329,9 +1483,9 @@ impl Workspace {
             IconName::FolderGit2
         };
         let (accent, muted) = (cx.theme().primary, cx.theme().muted_foreground);
-        let pinned = app.settings.workspace().is_pinned(&tab.entry);
+        let pinned = app.view().is_pinned(&tab.entry);
         let show_close = app.settings.tab_close_button && !pinned;
-        let can_reopen = !app.settings.workspace().closed.is_empty();
+        let can_reopen = !app.closed_tabs().is_empty();
         let close = tab_close(("close-tab", ix), selected, cx).on_click(cx.listener(
             move |this, _, window, cx| {
                 cx.stop_propagation();
@@ -1340,8 +1494,12 @@ impl Workspace {
         ));
         let (menu_this, menu_app, entry) =
             (cx.entity().downgrade(), self.app.clone(), tab.entry.clone());
-        // 标签页窄了名字会被截掉：停上去显示完整的名字和路径
-        let (tip_title, tip_path) = (title.clone(), SharedString::from(tab.entry.path.clone()));
+        // 标签页窄了名字会被截掉：停上去显示完整的名字和路径；经服务器连的写明经由哪台
+        let tip_title: SharedString = match tab.view.read(cx).sub_title(cx) {
+            Some(sub) => format!("{} / {sub}", app.repo_tip(&tab.entry)).into(),
+            None => app.repo_tip(&tab.entry),
+        };
+        let tip_path = SharedString::from(tab.entry.path.clone());
         tab_shell(("tab", ix), selected, cx)
             .flex_shrink(1.)
             .min_w(px(TAB_MIN_WIDTH))
@@ -1592,25 +1750,48 @@ fn tab_close(id: impl Into<ElementId>, selected: bool, cx: &App) -> Stateful<Div
         .child(ui::icon_small(IconName::X))
 }
 
-/// 工作区按钮的下拉菜单：各个工作区（当前的打勾），下面是新建、改名、删除。
+/// 工作区按钮的下拉菜单：按电脑分组列出工作区（本机在前，再是用过上面工作区的服务器），当前的
+/// 打勾；这次还没连上的服务器那一组只有「连接」。下面是新建、改名、删除。
 fn workspace_menu(
     mut menu: PopupMenu,
     app: &Entity<AppState>,
     this: &WeakEntity<Workspace>,
     cx: &App,
 ) -> PopupMenu {
-    let settings = &app.read(cx).settings;
-    let current = settings.active_workspace;
-    for (ix, group) in settings.workspaces.iter().enumerate() {
-        let this = this.clone();
-        // 括号里是这个工作区有几个仓库，不是开着几个标签页：全关了它也不是空的
-        let label = tf!("{name}（{n}）", name = group.name, n = group.repos.len());
-        menu = menu.item(PopupMenuItem::new(label).checked(ix == current).on_click(
-            move |_, window, cx| {
-                this.update(cx, |this, cx| this.switch_workspace(ix, window, cx))
-                    .ok();
-            },
-        ));
+    let state = app.read(cx);
+    let current = state.current().clone();
+    let mut machines = vec![LOCAL.to_string()];
+    machines.extend(state.menu_machines());
+    for (ix, machine) in machines.iter().enumerate() {
+        if ix > 0 {
+            menu = menu.separator();
+        }
+        menu = menu.item(machine_header(state, machine, cx));
+        let Some(list) = state.workspaces_on(machine) else {
+            let (app, machine) = (app.clone(), machine.clone());
+            let label = tf!("连接 {name}", name = state.machine_name(&machine));
+            menu = menu.item(
+                PopupMenuItem::new(label)
+                    .icon(ui::icon(IconName::Plug))
+                    .on_click(move |_, _, cx| {
+                        app.update(cx, |app, cx| drop(app.connect(&machine, cx)));
+                    }),
+            );
+            continue;
+        };
+        for (key, name, count) in list {
+            let this = this.clone();
+            let checked = key == current;
+            // 括号里是这个工作区有几个仓库，不是开着几个标签页：全关了它也不是空的
+            let label = tf!("{name}（{n}）", name, n = count);
+            menu = menu.item(PopupMenuItem::new(label).checked(checked).on_click(
+                move |_, window, cx| {
+                    let key = key.clone();
+                    this.update(cx, |this, cx| this.switch_workspace(key, window, cx))
+                        .ok();
+                },
+            ));
+        }
     }
     let (new, rename, delete) = (this.clone(), this.clone(), this.clone());
     menu.separator()
@@ -1636,6 +1817,35 @@ fn workspace_menu(
         )
 }
 
+/// 工作区菜单里一组的标题：电脑的名字，服务器的右边写着连没连上。
+fn machine_header(state: &AppState, machine: &str, cx: &App) -> PopupMenuItem {
+    let name = state.machine_name(machine);
+    if machine == LOCAL {
+        return PopupMenuItem::label(name);
+    }
+    let theme = cx.theme();
+    let (status, dot): (SharedString, Hsla) = match state.machine(machine) {
+        Some(loaded) if loaded.live => (tr("已连接").into(), theme.success),
+        Some(_) => (tr("已断开").into(), theme.muted_foreground),
+        None => match state.status(machine) {
+            crate::app_state::ConnStatus::Connecting => (tr("正在连接…").into(), theme.primary),
+            _ => (tr("未连接").into(), theme.muted_foreground),
+        },
+    };
+    let muted = theme.muted_foreground;
+    PopupMenuItem::element(move |_, _| {
+        h_flex()
+            .w_full()
+            .gap_2()
+            .text_xs()
+            .text_color(muted)
+            .child(div().flex_1().child(name.clone()))
+            .child(div().flex_none().size(px(6.)).rounded_full().bg(dot))
+            .child(status.clone())
+    })
+    .disabled(true)
+}
+
 /// 标签页的右键菜单。
 fn tab_menu(
     menu: PopupMenu,
@@ -1650,7 +1860,7 @@ fn tab_menu(
     let (reopen, pin, leave) = (this.clone(), this.clone(), this.clone());
     let leave_entry = entry.clone();
     let path = entry.path.clone();
-    let pinned = app.read(cx).settings.workspace().is_pinned(&entry);
+    let pinned = app.read(cx).view().is_pinned(&entry);
     let mut menu = menu
         .item(
             PopupMenuItem::new(if pinned {
@@ -1693,17 +1903,19 @@ fn tab_menu(
                 }),
         )
         .separator();
-    // 移到别的工作区：有别的工作区才列出来
-    let settings = &app.read(cx).settings;
-    let current = settings.active_workspace;
-    for (to, group) in settings.workspaces.iter().enumerate() {
+    // 移到同一台电脑上的别的工作区（别的电脑上的工作区放不了这台的仓库）：有才列出来
+    let state = app.read(cx);
+    let current = state.current().clone();
+    let others = state.workspaces_on(&current.machine).unwrap_or_default();
+    for (to, name, _) in others {
         if to == current {
             continue;
         }
         let this = this.clone();
         menu = menu.item(
-            PopupMenuItem::new(tf!("移动到工作区「{name}」", name = group.name)).on_click(
+            PopupMenuItem::new(tf!("移动到工作区「{name}」", name)).on_click(
                 move |_, window, cx| {
+                    let to = to.clone();
                     this.update(cx, |this, cx| this.move_tab(ix, to, window, cx))
                         .ok();
                 },
@@ -1802,6 +2014,118 @@ fn ask_name<T: 'static>(
     });
 }
 
+/// 新建工作区的对话框：名称，和保存在哪台电脑上（`places` 是本机和各台服务器：键和名字，
+/// `default` 是一开始选中的）。点「新建」或回车时关掉并调用 `on_ok(名称, 电脑)`。
+fn new_workspace_dialog<T: 'static>(
+    places: Vec<(String, SharedString)>,
+    default: String,
+    window: &mut Window,
+    cx: &mut Context<T>,
+    on_ok: impl Fn(String, String, &mut Window, &mut App) + 'static,
+) {
+    let input = cx
+        .new(|cx| InputState::new(window, cx).placeholder(tr("工作区名称，例如「公司」「个人」")));
+    let selected = Rc::new(RefCell::new(default));
+    let submit: Submit = {
+        let (input, selected) = (input.clone(), selected.clone());
+        Rc::new(move |window, cx| {
+            let name = input.read(cx).value().trim().to_string();
+            if name.is_empty() {
+                return;
+            }
+            window.close_dialog(cx);
+            on_ok(name, selected.borrow().clone(), window, cx);
+        })
+    };
+    let first_build = Cell::new(true);
+    window.open_dialog(cx, move |dialog, window, cx| {
+        if first_build.replace(false) {
+            input.focus_handle(cx).focus(window, cx);
+        }
+        let (on_enter, on_click) = (submit.clone(), submit.clone());
+        let current = selected.borrow().clone();
+        let current_name = places
+            .iter()
+            .find(|(key, _)| *key == current)
+            .map_or_else(|| tr("本机").into(), |(_, name)| name.clone());
+        let hint: SharedString = match current == LOCAL {
+            true => tr("只保存在本机。").into(),
+            false => tf!(
+                "保存在 {name} 上，连接它的电脑均可查看和修改。",
+                name = &current_name
+            )
+            .into(),
+        };
+        let (menu_places, menu_selected) = (places.clone(), selected.clone());
+        let muted = cx.theme().muted_foreground;
+        let label = |text: &'static str| div().text_sm().child(text);
+        dialog
+            .title(tr("新建工作区"))
+            .w(px(420.))
+            .on_ok(move |_, window, cx| {
+                on_enter(window, cx);
+                false
+            })
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(label(tr("名称")))
+                    .child(Input::new(&input))
+                    .child(div().h(px(4.)))
+                    .child(label(tr("保存位置")))
+                    .child(
+                        h_flex().child(
+                            Button::new("place")
+                                .outline()
+                                .small()
+                                .icon(ui::icon(if current == LOCAL {
+                                    IconName::Monitor
+                                } else {
+                                    IconName::Server
+                                }))
+                                .label(current_name)
+                                .dropdown_caret(true)
+                                .dropdown_menu(move |mut menu, _, _| {
+                                    let chosen = menu_selected.borrow().clone();
+                                    for (key, name) in &menu_places {
+                                        let (key, selected) = (key.clone(), menu_selected.clone());
+                                        let icon = match key == LOCAL {
+                                            true => IconName::Monitor,
+                                            false => IconName::Server,
+                                        };
+                                        menu = menu.item(
+                                            PopupMenuItem::new(name.clone())
+                                                .icon(ui::icon(icon))
+                                                .checked(key == chosen)
+                                                .on_click(move |_, window, _| {
+                                                    *selected.borrow_mut() = key.clone();
+                                                    window.refresh();
+                                                }),
+                                        );
+                                    }
+                                    menu
+                                }),
+                        ),
+                    )
+                    .child(div().text_xs().text_color(muted).child(hint)),
+            )
+            .footer(
+                DialogFooter::new()
+                    .child(
+                        Button::new("cancel")
+                            .label(tr("取消"))
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    )
+                    .child(
+                        Button::new("ok")
+                            .primary()
+                            .label(tr("新建"))
+                            .on_click(move |_, window, cx| on_click(window, cx)),
+                    ),
+            )
+    });
+}
+
 /// 重命名仓库的对话框里写路径的一行：放不下省略开头（悬停看全），右边是复制按钮。
 fn path_row(path: SharedString, cx: &App) -> impl IntoElement {
     let muted = cx.theme().muted_foreground;
@@ -1893,29 +2217,41 @@ impl QuickOpen {
     }
 
     /// 匹配输入内容的仓库：名字、路径、服务器名里有这几个字（不分大小写）。
-    /// 先是这个工作区里刚关掉的（最近关的在最上），再是这个工作区别的仓库，最后是其余的。
-    /// 第三项是行尾标的小字：刚关掉、开着。
+    /// 先是这个工作区里刚关掉的（最近关的在最上），再是这个工作区别的仓库，最后是这个工作区所在的
+    /// 电脑看得到的其余仓库（它自己的、它配置的服务器上的）。第三项是行尾标的小字：刚关掉、开着。
     fn matches(&self, cx: &App) -> Vec<(RepoEntry, SharedString, Option<&'static str>)> {
         let needle = self.input.read(cx).value().trim().to_lowercase();
         let app = self.app.read(cx);
-        let group = app.settings.workspace();
+        let current = app.current().clone();
+        let view = app.view();
         let closed = app.closed_tabs();
-        let members = group
-            .repos
+        let mut members = app.members(&current);
+        // 开着、但已经不在工作区里的（别的电脑上移除了）也列着
+        for tab in &view.tabs {
+            if !members.contains(tab) {
+                members.push(tab.clone());
+            }
+        }
+        let rest: Vec<RepoEntry> = app
+            .perspective_repos(&current.machine)
+            .into_iter()
+            .filter(|entry| !members.contains(entry))
+            .collect();
+        let members: Vec<(RepoEntry, Option<&'static str>)> = members
             .iter()
             .filter(|entry| !closed.contains(entry))
-            .map(|entry| (entry.clone(), group.tabs.contains(entry).then(|| tr("已打开"))));
-        let rest = app
-            .settings
-            .repos
-            .iter()
-            .filter(|entry| !group.repos.contains(entry))
-            .map(|entry| (entry.clone(), None));
+            .map(|entry| {
+                (
+                    entry.clone(),
+                    view.tabs.contains(entry).then(|| tr("已打开")),
+                )
+            })
+            .collect();
         closed
             .iter()
             .map(|entry| (entry.clone(), Some(tr("最近关闭"))))
             .chain(members)
-            .chain(rest)
+            .chain(rest.into_iter().map(|entry| (entry, None)))
             .map(|(entry, mark)| {
                 let title = app.repo_title(&entry);
                 (entry, title, mark)

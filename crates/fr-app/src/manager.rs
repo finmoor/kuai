@@ -18,14 +18,17 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::radio::Radio;
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::app_state::{AppState, ConnStatus};
 use crate::browser::{BrowserEvent, RemoteBrowser};
 use crate::clone::{CloneEvent, CloneView};
-use crate::settings::{Auth, LOCAL_CARD, RepoEntry, Server, TabGroup, Target};
+use crate::machines::{LOCAL, WorkspaceKey};
+use crate::settings::{Auth, LOCAL_CARD, RepoEntry, Server, Target};
 use crate::ui;
 
 pub enum ManagerEvent {
@@ -36,6 +39,8 @@ pub enum ManagerEvent {
     RemoveFromWorkspace(RepoEntry),
     /// 打开「快速打开」
     QuickOpen,
+    /// 切到这个工作区（服务器卡片上的「3 个工作区」）
+    SwitchTo(WorkspaceKey),
 }
 
 pub struct ManagerView {
@@ -58,35 +63,42 @@ impl ManagerView {
         cx.emit(ManagerEvent::Open(entry));
     }
 
-    /// 选一个本机目录；在仓库中就找到仓库根目录加进列表，不是仓库先问是否初始化。
+    /// 各开一个标签页（打开时加进当前工作区和仓库所在那台电脑的列表），按给的先后，最后一个是选中的。
+    fn add_and_open(&mut self, entries: Vec<RepoEntry>, cx: &mut Context<Self>) {
+        for entry in entries {
+            self.open(entry, cx);
+        }
+    }
+
+    /// 选本机的目录，可以一次选几个；在仓库中就找到仓库根目录加进列表。
+    /// 只选了一个、又不是仓库时问是否初始化；选了几个时不是仓库的不逐个问（见 `open_dir::open_dirs`）。
     fn add_local(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
-            multiple: false,
+            multiple: true,
             prompt: Some(tr("添加仓库").into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = picked.await else {
                 return;
             };
-            let Some(dir) = paths.into_iter().next() else {
+            let dirs: Vec<String> = paths
+                .into_iter()
+                .map(|dir| dir.to_string_lossy().into_owned())
+                .collect();
+            if dirs.is_empty() {
                 return;
-            };
-            let dir = dir.to_string_lossy().into_owned();
+            }
             this.update_in(cx, |this, window, cx| {
                 let app = this.app.clone();
-                crate::open_dir::open_dir(
+                crate::open_dir::open_dirs(
                     &app,
                     None,
-                    dir,
+                    dirs,
                     window,
                     cx,
-                    |this: &mut Self, entry, _, cx| {
-                        this.app
-                            .update(cx, |app, cx| app.add_repo(entry.clone(), cx));
-                        this.open(entry, cx);
-                    },
+                    |this: &mut Self, entries, _, cx| this.add_and_open(entries, cx),
                 );
             })
             .ok();
@@ -568,11 +580,11 @@ impl ManagerView {
                         // 这句说的是上面的登录信息，紧跟着它们；映射是单独的一节，放在最后
                         .child(div().text_xs().text_color(muted).child(if jump_now.is_some() {
                             tr(
-                                "密码和私钥口令保存在 Windows 凭据管理器中。首次连接时将在服务器的 ~/.kuai/ 中安装 kuaid，跳板机上不安装任何程序。",
+                                "密码和私钥口令保存在 Windows 凭据管理器中。首次连接时在服务器的 ~/.kuai/ 中安装 kuaid，跳板机上不安装。",
                             )
                         } else {
                             tr(
-                                "密码和私钥口令保存在 Windows 凭据管理器中。首次连接时将在服务器的 ~/.kuai/ 中安装 kuaid。",
+                                "密码和私钥口令保存在 Windows 凭据管理器中。首次连接时在服务器的 ~/.kuai/ 中安装 kuaid。",
                             )
                         }))
                         .children(mapping_section),
@@ -634,11 +646,8 @@ impl ManagerView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let title = match server
-            .as_deref()
-            .and_then(|id| self.app.read(cx).server(id))
-        {
-            Some(s) => tf!("克隆到 {name}", name = s.name),
+        let title = match server.as_deref() {
+            Some(id) => tf!("克隆到 {name}", name = self.app.read(cx).machine_name(id)),
             None => tr("克隆到本机").into(),
         };
         let app = self.app.clone();
@@ -646,8 +655,6 @@ impl ManagerView {
         cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
             CloneEvent::Done(entry) => {
                 window.close_dialog(cx);
-                this.app
-                    .update(cx, |app, cx| app.add_repo(entry.clone(), cx));
                 this.open(entry.clone(), cx);
             }
         })
@@ -677,20 +684,16 @@ impl ManagerView {
 
     /// 在服务器上挑一个仓库打开。
     fn open_remote_dialog(&mut self, server: String, window: &mut Window, cx: &mut Context<Self>) {
-        let title = self
-            .app
-            .read(cx)
-            .server(&server)
-            .map(|s| tf!("打开 {name} 上的仓库", name = s.name))
-            .unwrap_or_default();
+        let title = tf!(
+            "打开 {name} 上的仓库",
+            name = self.app.read(cx).machine_name(&server)
+        );
         let app = self.app.clone();
         let browser = cx.new(|cx| RemoteBrowser::new(app, server, window, cx));
         cx.subscribe_in(&browser, window, |this, _, event, window, cx| match event {
-            BrowserEvent::Open(entry) => {
+            BrowserEvent::Open(entries) => {
                 window.close_dialog(cx);
-                this.app
-                    .update(cx, |app, cx| app.add_repo(entry.clone(), cx));
-                this.open(entry.clone(), cx);
+                this.add_and_open(entries.clone(), cx);
             }
             BrowserEvent::Dir(_) => {}
         })
@@ -742,6 +745,19 @@ impl ManagerView {
             .server
             .as_deref()
             .and_then(|server| app.local_path(server, &entry.path));
+        // 经服务器连的：行尾写明经由哪台
+        let relay = entry.server.as_deref().and_then(|key| {
+            let (via, _) = crate::machines::split_relay(key)?;
+            let via = app.machine_name(via);
+            let tip = tf!(
+                "由 {via} 连接 {name}",
+                via = &via,
+                name = app.machine_name(key)
+            );
+            Some(relay_tag(&id, via, tip.into(), colors))
+        });
+        // 工作区所在的电脑断开着：只能看，不能从工作区移除
+        let writable = app.writable(&app.current().machine);
         let (open_entry, leave, menu_entry) = (entry.clone(), entry.clone(), entry.clone());
         let (view, menu_app) = (cx.entity().downgrade(), self.app.clone());
         h_flex()
@@ -774,6 +790,7 @@ impl ManagerView {
                     ),
             )
             .when_some(local, |row, local| row.child(local_badge(local, colors)))
+            .children(relay)
             .when(recent, |row| {
                 row.child(
                     div()
@@ -787,6 +804,7 @@ impl ManagerView {
                 Button::new("leave")
                     .ghost()
                     .xsmall()
+                    .disabled(!writable)
                     .icon(ui::icon(IconName::CircleMinus).text_color(colors.muted))
                     .tooltip(tr("从工作区移除"))
                     .on_click(cx.listener(move |_, _, _, cx| {
@@ -800,13 +818,15 @@ impl ManagerView {
                 let path = menu_entry.path.clone();
                 let menu = menu
                     .item(
-                        PopupMenuItem::new(tr("从工作区移除")).on_click(move |_, _, cx| {
-                            leave_view
-                                .update(cx, |_, cx| {
-                                    cx.emit(ManagerEvent::RemoveFromWorkspace(leave.clone()))
-                                })
-                                .ok();
-                        }),
+                        PopupMenuItem::new(tr("从工作区移除"))
+                            .disabled(!writable)
+                            .on_click(move |_, _, cx| {
+                                leave_view
+                                    .update(cx, |_, cx| {
+                                        cx.emit(ManagerEvent::RemoveFromWorkspace(leave.clone()))
+                                    })
+                                    .ok();
+                            }),
                     )
                     .separator()
                     .item(PopupMenuItem::new(tr("重命名…")).on_click(move |_, _, cx| {
@@ -826,43 +846,49 @@ impl ManagerView {
     }
 
     /// 最上面那张卡片：当前工作区的仓库。开着的在上（按标签页的顺序），没开的在下（刚关掉的排前）。
-    fn render_workspace_card(
-        &self,
-        group: &TabGroup,
-        colors: Colors,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let closed: Vec<&RepoEntry> = group.closed.iter().rev().collect();
-        let idle = group
-            .repos
+    fn render_workspace_card(&self, colors: Colors, cx: &mut Context<Self>) -> AnyElement {
+        let app = self.app.read(cx);
+        let key = app.current().clone();
+        let view = app.view();
+        let members = app.members(&key);
+        let name = app.workspace_name(&key);
+        let subtitle: SharedString = match key.is_local() {
+            true => tr("当前工作区").into(),
+            false => tf!("{name} 上的工作区", name = app.machine_name(&key.machine)).into(),
+        };
+        // 刚关掉的：已经移出工作区的不算
+        let closed: Vec<RepoEntry> = app.closed_tabs();
+        let idle = members
             .iter()
-            .filter(|e| !group.tabs.contains(e) && !group.closed.contains(e));
-        let away: Vec<(&RepoEntry, bool)> = closed
+            .filter(|e| !view.tabs.contains(e) && !closed.contains(e))
+            .cloned();
+        let away: Vec<(RepoEntry, bool)> = closed
             .iter()
-            .map(|e| (*e, true))
+            .cloned()
+            .map(|e| (e, true))
             .chain(idle.map(|e| (e, false)))
             .collect();
-        let (open_count, away_count) = (group.tabs.len(), away.len());
+        let (open_count, away_count) = (view.tabs.len(), away.len());
         let mut rows: Vec<AnyElement> = Vec::new();
         if open_count > 0 {
             rows.push(group_label(tf!("已打开 · {n}", n = open_count), colors));
-            for entry in &group.tabs {
+            for entry in &view.tabs {
                 rows.push(self.render_member(entry, true, false, colors, cx));
             }
         }
         if away_count > 0 {
             rows.push(group_label(tf!("未打开 · {n}", n = away_count), colors));
             for (entry, recent) in away {
-                rows.push(self.render_member(entry, false, recent, colors, cx));
+                rows.push(self.render_member(&entry, false, recent, colors, cx));
             }
         }
         card(
             card_header(
                 "workspace",
                 IconName::Layers,
-                group.name.clone().into(),
+                name,
                 Vec::new(),
-                Some(tr("当前工作区").into()),
+                Some(subtitle),
                 status_line(
                     "workspace",
                     None,
@@ -899,7 +925,14 @@ impl ManagerView {
         )
     }
 
-    fn render_repo(&self, entry: &RepoEntry, colors: Colors, cx: &mut Context<Self>) -> AnyElement {
+    /// 列表里的一行。`writable` 为假（那台电脑断开着）时不能改名、移除。
+    fn render_repo(
+        &self,
+        entry: &RepoEntry,
+        writable: bool,
+        colors: Colors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let id = SharedString::from(format!(
             "repo:{}:{}",
             entry.server.as_deref().unwrap_or(""),
@@ -910,6 +943,11 @@ impl ManagerView {
         let (rename, menu_entry) = (entry.clone(), entry.clone());
         let name = self.app.read(cx).repo_name(entry);
         let remove_name = name.clone();
+        // 服务器的列表保存在那台服务器上：移除了别的电脑上也跟着没了
+        let shared_on = entry
+            .server
+            .as_deref()
+            .map(|server| self.app.read(cx).machine_name(server));
         let view = cx.entity().downgrade();
         // 服务器上的仓库：有映射包含它的话，它在本机的路径
         let local = entry
@@ -952,6 +990,7 @@ impl ManagerView {
                 Button::new("rename")
                     .ghost()
                     .xsmall()
+                    .disabled(!writable)
                     .icon(ui::icon(IconName::Pencil).text_color(colors.muted))
                     .tooltip(tr("重命名"))
                     .on_click(cx.listener(move |_, _, _, cx| {
@@ -963,6 +1002,7 @@ impl ManagerView {
                 Button::new("remove")
                     .ghost()
                     .xsmall()
+                    .disabled(!writable)
                     .icon(ui::icon(IconName::X).text_color(colors.muted))
                     .tooltip(tr("从列表中移除"))
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -972,6 +1012,13 @@ impl ManagerView {
                             "{path}\n仅从列表中移除，仓库本身不受影响。",
                             path = remove.path
                         );
+                        if let Some(machine) = &shared_on {
+                            description.push('\n');
+                            description.push_str(&tf!(
+                                "此列表保存在 {machine} 上，所有电脑将同步移除。",
+                                machine = machine
+                            ));
+                        }
                         // 关掉的标签页留下的本机终端：移除以后再也打不开，一起结束
                         let terminals = crate::repo::parked_terminals_of(&remove, cx);
                         if terminals > 0 {
@@ -999,25 +1046,44 @@ impl ManagerView {
                 let (view, entry) = (view.clone(), menu_entry.clone());
                 let path = entry.path.clone();
                 let menu = menu
-                    .item(PopupMenuItem::new(tr("重命名…")).on_click(move |_, _, cx| {
-                        view.update(cx, |_, cx| cx.emit(ManagerEvent::Rename(entry.clone())))
-                            .ok();
-                    }))
+                    .item(
+                        PopupMenuItem::new(tr("重命名…"))
+                            .disabled(!writable)
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |_, cx| {
+                                    cx.emit(ManagerEvent::Rename(entry.clone()))
+                                })
+                                .ok();
+                            }),
+                    )
                     .item(
                         PopupMenuItem::new(tr("复制仓库路径")).on_click(move |_, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
                         }),
                     );
+                // 映射到本机只对直接连的服务器
                 match &menu_server {
-                    Some(server) => {
+                    Some(server) if crate::machines::split_relay(server).is_none() => {
                         let path = menu_entry.path.clone();
                         crate::mapping::menu_items(menu, &menu_app, server, &path, true, &path, cx)
                     }
-                    None => menu,
+                    _ => menu,
                 }
             })
             .into_any_element()
     }
+}
+
+/// 经服务器连的（工作区卡片的行尾、服务器卡片的名字后面）：「经由 156」。
+fn relay_tag(key: &str, via: SharedString, tip: SharedString, colors: Colors) -> AnyElement {
+    name_tag(
+        format!("relay:{key}"),
+        Some(IconName::CornerDownRight),
+        tf!("经由 {path}", path = &via).into(),
+        tip,
+        true,
+        colors,
+    )
 }
 
 /// 服务器上的仓库映射到了本机：行尾写出它在本机的路径。
@@ -1043,6 +1109,7 @@ struct Colors {
     border: Hsla,
     danger: Hsla,
     success: Hsla,
+    warning: Hsla,
     accent: Hsla,
     /// 卡片顶上那一条的底色
     panel: Hsla,
@@ -1159,30 +1226,17 @@ fn field_with(
         .child(body)
 }
 
-impl Render for ManagerView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let colors = Colors {
-            muted: theme.muted_foreground,
-            hover: theme.list_hover,
-            border: theme.border,
-            danger: theme.danger,
-            success: theme.success,
-            accent: theme.primary,
-            panel: theme.sidebar,
-        };
-        let background = theme.background;
-        let settings = self.app.read(cx).settings.clone();
-
-        let collapsed = |key: &str| settings.collapsed_cards.iter().any(|card| card == key);
-        let local_collapsed = collapsed(LOCAL_CARD);
-        let local: Vec<AnyElement> = settings
-            .repos
+impl ManagerView {
+    /// 本机那张卡片：本机的仓库。
+    fn render_local_card(&self, colors: Colors, cx: &mut Context<Self>) -> AnyElement {
+        let settings = &self.app.read(cx).settings;
+        let local_collapsed = settings.card_collapsed(LOCAL_CARD);
+        let repos = self.app.read(cx).repos_on(LOCAL).unwrap_or_default();
+        let local: Vec<AnyElement> = repos
             .iter()
-            .filter(|r| r.server.is_none())
-            .map(|r| self.render_repo(r, colors, cx))
+            .map(|r| self.render_repo(r, true, colors, cx))
             .collect();
-        let mut sections = vec![card(
+        card(
             card_header(
                 "local",
                 IconName::Monitor,
@@ -1219,29 +1273,61 @@ impl Render for ManagerView {
             tr("暂无本机仓库。请点击「添加本机仓库…」或「克隆…」。"),
             local_collapsed,
             colors,
-        )];
+        )
+    }
 
-        for server in &settings.servers {
-            let status = self.app.read(cx).status(&server.id);
-            let repos: Vec<AnyElement> = settings
-                .repos
-                .iter()
-                .filter(|r| r.server.as_deref() == Some(&server.id))
-                .map(|r| self.render_repo(r, colors, cx))
-                .collect();
-            let repo_count = repos.len();
-            // 状态：一个小圆点加一句话；连不上的原因可能很长，单放一块，不截断
-            let mut failure: Option<SharedString> = None;
-            let (dot, status_text, retry): (Option<Hsla>, SharedString, bool) = match &status {
-                ConnStatus::Idle => (Some(colors.muted.opacity(0.6)), tr("未连接").into(), true),
-                ConnStatus::Connecting => (
-                    Some(colors.accent),
-                    self.app.read(cx).connecting_text(&server.id),
-                    false,
-                ),
-                ConnStatus::Ready(conn) => (
-                    Some(colors.success),
-                    tf!(
+    /// 一台服务器的卡片。`key` 是本机配置的服务器的 id，或者经服务器连的（`156>91`）：
+    /// 后者的连接设置保存在那台服务器上，这里只能连接、打开，不能映射、编辑、移除。
+    /// 仓库列表保存在服务器上，连上了才有。
+    fn render_server_card(&self, key: &str, colors: Colors, cx: &mut Context<Self>) -> AnyElement {
+        let app = self.app.read(cx);
+        let relay = crate::machines::split_relay(key);
+        let (name, destination): (SharedString, SharedString) = match relay {
+            Some(_) => {
+                let server = app.relayed_server(key);
+                (
+                    app.machine_name(key),
+                    server.map_or_else(SharedString::default, |s| s.destination.clone().into()),
+                )
+            }
+            None => {
+                let server = app.server(key);
+                (
+                    app.machine_name(key),
+                    server.map_or_else(SharedString::default, |s| s.destination.clone().into()),
+                )
+            }
+        };
+        let status = app.status(key);
+        let loaded = app.machine(key).map(|m| m.live);
+        let writable = app.writable(key);
+        let repos = app.repos_on(key);
+        let rows: Vec<AnyElement> = repos
+            .iter()
+            .flatten()
+            .map(|r| self.render_repo(r, writable, colors, cx))
+            .collect();
+        let repo_count = repos.as_ref().map(Vec::len);
+        let app = self.app.read(cx);
+        // 状态：一个小圆点加一句话；连不上的原因可能很长，单放一块，不截断
+        let mut failure: Option<SharedString> = None;
+        let via = relay.map(|(via, _)| app.machine_name(via));
+        let (dot, status_text, retry): (Option<Hsla>, SharedString, bool) = match &status {
+            ConnStatus::Idle => (Some(colors.muted.opacity(0.6)), tr("未连接").into(), true),
+            ConnStatus::Connecting => (Some(colors.accent), app.connecting_text(key), false),
+            // 连着，但订阅断了（还没来得及重连）
+            ConnStatus::Ready(_) if loaded == Some(false) => {
+                (Some(colors.muted.opacity(0.6)), tr("已断开").into(), true)
+            }
+            ConnStatus::Ready(conn) => (
+                Some(colors.success),
+                match &via {
+                    Some(via) => tf!(
+                        "已连接 · 经由 {via} · {ms} ms",
+                        via = via,
+                        ms = conn.connect_time.as_millis()
+                    ),
+                    None => tf!(
                         "已连接 · git {git} · {ms} ms{installed}",
                         git = conn.hello.git.trim_start_matches("git version "),
                         ms = conn.connect_time.as_millis(),
@@ -1250,47 +1336,72 @@ impl Render for ManagerView {
                         } else {
                             ""
                         }
-                    )
-                    .into(),
-                    false,
-                ),
-                ConnStatus::Failed(err) => {
-                    failure = Some(err.clone());
-                    (Some(colors.danger), tr("连接失败").into(), true)
+                    ),
                 }
-            };
-            // 收起以后看不到下面的仓库：状态后面写上有几个
-            let folded = collapsed(&server.id);
-            let status_text: SharedString = match folded {
-                true => format!("{status_text} · {}", tf!("{n} 个仓库", n = repo_count)).into(),
-                false => status_text,
-            };
+                .into(),
+                false,
+            ),
+            ConnStatus::Failed(_) if loaded == Some(false) => {
+                (Some(colors.muted.opacity(0.6)), tr("已断开").into(), true)
+            }
+            ConnStatus::Failed(err) => {
+                failure = Some(err.clone());
+                (Some(colors.danger), tr("连接失败").into(), true)
+            }
+        };
+        // 收起以后看不到下面的仓库：状态后面写上有几个
+        let folded = app.settings.card_collapsed(key);
+        let status_text: SharedString = match (folded, repo_count) {
+            (true, Some(n)) => format!("{status_text} · {}", tf!("{n} 个仓库", n)).into(),
+            _ => status_text,
+        };
+        let mut tags: Vec<AnyElement> = Vec::new();
+        if let Some(via) = &via {
+            let tip = tf!("由 {via} 连接，连接设置需在 {via} 上修改。", via = via);
+            tags.push(relay_tag(key, via.clone(), tip.into(), colors));
+        }
+        // 本机视角里，有工作区的服务器：点开可以切到它的工作区
+        if relay.is_none()
+            && app.current().is_local()
+            && let Some(workspaces) = app.workspaces_on(key).filter(|list| !list.is_empty())
+        {
+            tags.push(self.workspaces_tag(key, workspaces, colors, cx));
+        }
+        let app = self.app.read(cx);
+        let mut users: Vec<String> = Vec::new();
+        let mut removal_note = String::new();
+        if relay.is_none() {
             // 名字后面的标签：它经哪几台连接；有没有别的服务器经它连接
-            let route: Vec<String> = settings
-                .route(&server.id)
+            let route: Vec<String> = app
+                .settings
+                .route(key)
                 .iter()
                 .map(|jump| jump.name.clone())
                 .collect();
-            let users: Vec<String> = settings
-                .jump_users(&server.id)
+            users = app
+                .settings
+                .jump_users(key)
                 .iter()
                 .map(|user| user.name.clone())
                 .collect();
-            let mut tags: Vec<AnyElement> = Vec::new();
             if !users.is_empty() {
                 tags.push(name_tag(
-                    format!("tag-jump:{}", server.id),
+                    format!("tag-jump:{key}"),
                     None,
                     tr("跳板机").into(),
                     tf!("经此服务器连接：{names}", names = users.join("、")).into(),
                     false,
                     colors,
                 ));
+                removal_note = tf!(
+                    "{names} 经此服务器连接，移除后改为直接连接，需重新选择跳板机。\n",
+                    names = users.join("、")
+                );
             }
             if !route.is_empty() {
                 let path = route.join(" → ");
                 tags.push(name_tag(
-                    format!("tag-via:{}", server.id),
+                    format!("tag-via:{key}"),
                     Some(IconName::CornerDownRight),
                     tf!("经由 {path}", path = &path).into(),
                     tf!("连接时依次经过：{path}", path = &path).into(),
@@ -1298,148 +1409,318 @@ impl Render for ManagerView {
                     colors,
                 ));
             }
-            for mapping in &server.mappings {
-                tags.push(crate::mapping::chip(&self.app, server, mapping, cx));
+            if let Some(server) = app.server(key).cloned() {
+                for mapping in &server.mappings {
+                    tags.push(crate::mapping::chip(&self.app, &server, mapping, cx));
+                }
             }
-            let (id_open, id_retry) = (server.id.clone(), server.id.clone());
-            let id_clone = server.id.clone();
-            let removal_note = if users.is_empty() {
-                String::new()
-            } else {
-                tf!(
-                    "{names} 经此服务器连接，移除后将改为直接连接，需重新选择跳板机。\n",
-                    names = users.join("、")
-                )
-            };
-            let (menu_view, menu_server, menu_app) =
-                (cx.entity().downgrade(), server.clone(), self.app.clone());
-            let mut actions: Vec<AnyElement> = Vec::new();
-            if retry {
-                actions.push(
-                    Button::new(SharedString::from(format!("connect-{}", server.id)))
-                        .small()
-                        .ghost()
-                        .icon(ui::icon(IconName::Plug))
-                        .label(tr("连接"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.app.update(cx, |app, cx| {
-                                drop(app.connect(&id_retry, cx));
-                            });
-                        }))
-                        .into_any_element(),
-                );
-            }
+        }
+        let (id_open, id_retry, id_clone) = (key.to_string(), key.to_string(), key.to_string());
+        let mut actions: Vec<AnyElement> = Vec::new();
+        if retry {
             actions.push(
-                Button::new(SharedString::from(format!("clone-{}", server.id)))
-                    .small()
-                    .icon(ui::icon(IconName::Download))
-                    .label(tr("克隆…"))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.clone_dialog(Some(id_clone.clone()), window, cx)
-                    }))
-                    .into_any_element(),
-            );
-            actions.push(
-                Button::new(SharedString::from(format!("open-{}", server.id)))
-                    .small()
-                    .icon(ui::icon(IconName::FolderSearch))
-                    .label(tr("打开仓库…"))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_remote_dialog(id_open.clone(), window, cx)
-                    }))
-                    .into_any_element(),
-            );
-            actions.push(
-                Button::new(SharedString::from(format!("more-{}", server.id)))
+                Button::new(SharedString::from(format!("connect-{key}")))
                     .small()
                     .ghost()
-                    .icon(ui::icon(IconName::Ellipsis))
-                    .tooltip(tr("映射、编辑或移除此服务器"))
-                    .dropdown_menu(move |menu, _, _| {
-                        let (view, edit) = (menu_view.clone(), menu_server.clone());
-                        let (app, remove) = (menu_app.clone(), menu_server.clone());
-                        let removal_note = removal_note.clone();
-                        let (map_app, map_server) = (menu_app.clone(), menu_server.clone());
-                        menu.item(PopupMenuItem::new(tr("映射目录到本机…")).on_click(
-                            move |_, window, cx| {
-                                crate::mapping::map_dialog(
-                                    map_app.clone(),
-                                    map_server.id.clone(),
-                                    map_server.start_dir.clone().unwrap_or_default(),
-                                    None,
-                                    window,
-                                    cx,
-                                )
-                            },
-                        ))
-                        .item(
-                            PopupMenuItem::new(tr("编辑…")).on_click(move |_, window, cx| {
-                                view.update(cx, |this, cx| {
-                                    this.server_dialog(Some(edit.clone()), window, cx)
-                                })
-                                .ok();
-                            }),
-                        )
-                        .separator()
-                        .item(
-                            PopupMenuItem::new(tr("移除…")).on_click(move |_, window, cx| {
-                                let (app, id) = (app.clone(), remove.id.clone());
-                                let repos = if repo_count == 0 {
-                                    String::new()
-                                } else {
-                                    tf!(
-                                        "该服务器的 {n} 个仓库也将从列表中移除，已打开的标签页将关闭。",
-                                        n = repo_count
-                                    )
-                                };
-                                confirm(
-                                    tf!("移除服务器 {name}？", name = remove.name),
-                                    tf!(
-                                        "{destination}\n{jump}{repos}服务器上的内容不受影响。",
-                                        destination = remove.destination,
-                                        jump = &removal_note,
-                                        repos = repos
-                                    ),
-                                    tr("移除服务器"),
-                                    true,
-                                    window,
-                                    cx,
-                                    move |cx| app.update(cx, |app, cx| app.remove_server(&id, cx)),
-                                );
-                            }),
-                        )
-                    })
+                    .icon(ui::icon(IconName::Plug))
+                    .label(tr("连接"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.app.update(cx, |app, cx| {
+                            drop(app.connect(&id_retry, cx));
+                        });
+                    }))
                     .into_any_element(),
             );
-            sections.push(card(
-                card_header(
-                    &server.id,
-                    IconName::Server,
-                    server.name.clone().into(),
-                    tags,
-                    Some(server.destination.clone().into()),
-                    status_line(&server.id, dot, status_text, colors),
-                    actions,
-                    Some(self.fold(&server.id, folded, cx)),
-                    colors,
-                ),
-                failure,
-                repos,
-                if users.is_empty() {
-                    tr("暂无此服务器上的仓库。请点击「打开仓库…」选择。")
-                } else {
-                    tr("仅用作跳板机，暂无此服务器上的仓库。")
-                },
-                folded,
+        }
+        actions.push(
+            Button::new(SharedString::from(format!("clone-{key}")))
+                .small()
+                .disabled(loaded == Some(false))
+                .icon(ui::icon(IconName::Download))
+                .label(tr("克隆…"))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.clone_dialog(Some(id_clone.clone()), window, cx)
+                }))
+                .into_any_element(),
+        );
+        actions.push(
+            Button::new(SharedString::from(format!("open-{key}")))
+                .small()
+                .disabled(loaded == Some(false))
+                .icon(ui::icon(IconName::FolderSearch))
+                .label(tr("打开仓库…"))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_remote_dialog(id_open.clone(), window, cx)
+                }))
+                .into_any_element(),
+        );
+        if relay.is_none()
+            && let Some(server) = self.app.read(cx).server(key).cloned()
+        {
+            actions.push(self.server_menu(server, repo_count, removal_note, cx));
+        }
+        let empty = match (&repos, users.is_empty()) {
+            (None, _) => tr("连接后显示此服务器上的仓库。"),
+            (Some(_), true) => tr("暂无此服务器上的仓库。请点击「打开仓库…」选择。"),
+            (Some(_), false) => tr("仅用作跳板机，暂无此服务器上的仓库。"),
+        };
+        card(
+            card_header(
+                key,
+                IconName::Server,
+                name,
+                tags,
+                Some(destination),
+                status_line(key, dot, status_text, colors),
+                actions,
+                Some(self.fold(key, folded, cx)),
                 colors,
-            ));
+            ),
+            failure,
+            rows,
+            empty,
+            folded,
+            colors,
+        )
+    }
+
+    /// 服务器名字后面的「3 个工作区」：点开列出它上面的工作区，选一个切过去。
+    fn workspaces_tag(
+        &self,
+        key: &str,
+        workspaces: Vec<(crate::machines::WorkspaceKey, String, usize)>,
+        colors: Colors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = tf!("{n} 个工作区", n = workspaces.len());
+        let tip = tf!(
+            "切换到 {name} 上的工作区",
+            name = self.app.read(cx).machine_name(key)
+        );
+        let view = cx.entity().downgrade();
+        Button::new(SharedString::from(format!("workspaces-{key}")))
+            .ghost()
+            .xsmall()
+            .icon(ui::icon(IconName::Layers).text_color(colors.accent))
+            .label(label)
+            .tooltip(tip)
+            .dropdown_caret(true)
+            .dropdown_menu(move |mut menu, _, _| {
+                for (to, name, count) in &workspaces {
+                    let (view, to) = (view.clone(), to.clone());
+                    let label = tf!("{name}（{n}）", name, n = count);
+                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        view.update(cx, |_, cx| cx.emit(ManagerEvent::SwitchTo(to.clone())))
+                            .ok();
+                    }));
+                }
+                menu
+            })
+            .into_any_element()
+    }
+
+    /// 本机配置的服务器卡片上的 ⋯：映射目录到本机、编辑、移除。
+    fn server_menu(
+        &self,
+        server: Server,
+        repo_count: Option<usize>,
+        removal_note: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (menu_view, menu_app) = (cx.entity().downgrade(), self.app.clone());
+        Button::new(SharedString::from(format!("more-{}", server.id)))
+            .small()
+            .ghost()
+            .icon(ui::icon(IconName::Ellipsis))
+            .tooltip(tr("映射、编辑或移除此服务器"))
+            .dropdown_menu(move |menu, _, _| {
+                let (view, edit) = (menu_view.clone(), server.clone());
+                let (app, remove) = (menu_app.clone(), server.clone());
+                let removal_note = removal_note.clone();
+                let (map_app, map_server) = (menu_app.clone(), server.clone());
+                menu.item(PopupMenuItem::new(tr("映射目录到本机…")).on_click(
+                    move |_, window, cx| {
+                        crate::mapping::map_dialog(
+                            map_app.clone(),
+                            map_server.id.clone(),
+                            map_server.start_dir.clone().unwrap_or_default(),
+                            None,
+                            window,
+                            cx,
+                        )
+                    },
+                ))
+                .item(
+                    PopupMenuItem::new(tr("编辑…")).on_click(move |_, window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.server_dialog(Some(edit.clone()), window, cx)
+                        })
+                        .ok();
+                    }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new(tr("移除…")).on_click(move |_, window, cx| {
+                        let (app, id) = (app.clone(), remove.id.clone());
+                        // 仓库列表保存在服务器上，不跟着没；这里只是不再连它
+                        let repos = match repo_count {
+                            Some(n) if n > 0 => tf!(
+                                "该服务器上的 {n} 个仓库将不再列出，已打开的标签页将关闭。",
+                                n = n
+                            ),
+                            _ => String::new(),
+                        };
+                        confirm(
+                            tf!("移除服务器 {name}？", name = remove.name),
+                            tf!(
+                                "{destination}\n{jump}{repos}服务器上的内容不受影响。",
+                                destination = remove.destination,
+                                jump = &removal_note,
+                                repos = repos
+                            ),
+                            tr("移除服务器"),
+                            true,
+                            window,
+                            cx,
+                            move |cx| app.update(cx, |app, cx| app.remove_server(&id, cx)),
+                        );
+                    }),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// 服务器上的工作区：页面顶上一行写明保存在哪，断开时写明暂时不能改、给一个「重新连接」。
+    fn render_banner(&self, colors: Colors, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let app = self.app.read(cx);
+        let key = app.current().clone();
+        if key.is_local() {
+            return None;
+        }
+        let machine = app.machine_name(&key.machine);
+        let workspace = app.workspace_name(&key);
+        let live = app.writable(&key.machine);
+        let loaded = app.machine(&key.machine).is_some();
+        let connecting = matches!(app.status(&key.machine), ConnStatus::Connecting);
+        let warning = IconName::TriangleAlert;
+        let (icon, color, text, button): (IconName, Hsla, SharedString, Option<&'static str>) =
+            match (live, connecting, loaded) {
+                (true, ..) => (
+                    IconName::RefreshCw,
+                    colors.accent,
+                    tf!(
+                        "工作区「{workspace}」保存在 {machine} 上，修改将同步到连接它的所有电脑。",
+                        workspace = &workspace,
+                        machine = &machine
+                    )
+                    .into(),
+                    None,
+                ),
+                (false, true, true) => (
+                    warning,
+                    colors.warning,
+                    tf!("正在重新连接 {name}…", name = &machine).into(),
+                    None,
+                ),
+                (false, true, false) => (
+                    warning,
+                    colors.warning,
+                    tf!("正在连接 {cx}…", cx = &machine).into(),
+                    None,
+                ),
+                (false, false, true) => (
+                    warning,
+                    colors.warning,
+                    tf!("与 {name} 的连接已断开，暂时无法修改。", name = &machine).into(),
+                    Some(tr("重新连接")),
+                ),
+                (false, false, false) => (
+                    warning,
+                    colors.warning,
+                    tf!("尚未连接 {name}，暂时无法修改。", name = &machine).into(),
+                    Some(tr("连接")),
+                ),
+            };
+        let id = key.machine.clone();
+        Some(
+            h_flex()
+                .px(px(14.))
+                .py(px(9.))
+                .gap(px(10.))
+                .rounded(px(9.))
+                .border_1()
+                .border_color(color.opacity(0.35))
+                .bg(color.opacity(0.08))
+                .child(Icon::new(icon).size_4().flex_none().text_color(color))
+                .child(div().flex_1().min_w_0().text_sm().child(text))
+                .when_some(button, |row, label| {
+                    row.child(
+                        Button::new("reconnect")
+                            .small()
+                            .icon(ui::icon(IconName::Plug))
+                            .label(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.app.update(cx, |app, cx| drop(app.connect(&id, cx)));
+                            })),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+}
+
+impl Render for ManagerView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let colors = Colors {
+            muted: theme.muted_foreground,
+            hover: theme.list_hover,
+            border: theme.border,
+            danger: theme.danger,
+            success: theme.success,
+            warning: theme.warning,
+            accent: theme.primary,
+            panel: theme.sidebar,
+        };
+        let background = theme.background;
+        let app = self.app.read(cx);
+        // 「全部仓库」跟着当前工作区所在的电脑：本机的工作区列本机和本机配置的服务器，
+        // 156 的工作区列 156 和 156 配置的服务器（和在 156 上看到的一样）
+        let machine = app.current().machine.clone();
+        let local_view = machine == crate::machines::LOCAL;
+        let servers: Vec<String> = match local_view {
+            true => app.settings.servers.iter().map(|s| s.id.clone()).collect(),
+            false => app
+                .machine(&machine)
+                .map(|loaded| {
+                    loaded
+                        .store
+                        .servers
+                        .iter()
+                        .map(|s| crate::machines::relay_key(&machine, &s.id))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        let total = app.perspective_repos(&machine).len();
+        let machine_name = app.machine_name(&machine);
+        let workspace_has_repos = !app.members(app.current()).is_empty();
+        let all_repos = app.settings.layout.all_repos;
+
+        let mut sections = Vec::new();
+        match local_view {
+            true => sections.push(self.render_local_card(colors, cx)),
+            false => sections.push(self.render_server_card(&machine, colors, cx)),
+        }
+        for key in &servers {
+            sections.push(self.render_server_card(key, colors, cx));
         }
 
         // 当前工作区的仓库先列出来；别的都在「全部仓库」里，工作区里有仓库时可以收起
-        let group = settings.workspace();
-        let workspace_card = self.render_workspace_card(group, colors, cx);
-        let collapsible = !group.repos.is_empty();
-        let all_open = settings.layout.all_repos || !collapsible;
+        let banner = self.render_banner(colors, cx);
+        let workspace_card = self.render_workspace_card(colors, cx);
+        let collapsible = workspace_has_repos;
+        let all_open = all_repos || !collapsible;
         let all_header = h_flex()
             .id("all-repos")
             .h(px(30.))
@@ -1469,15 +1750,39 @@ impl Render for ManagerView {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(tr("全部仓库")),
             )
-            .child(ui::count_pill(settings.repos.len(), false, cx))
-            .when(!all_open, |row| {
-                row.child(
+            .child(ui::count_pill(total, false, cx))
+            .map(|row| match (local_view, all_open) {
+                (false, _) => row.child(
+                    div()
+                        .text_xs()
+                        .text_color(colors.muted)
+                        .child(tf!("{name} 及其服务器上的仓库", name = &machine_name)),
+                ),
+                (true, false) => row.child(
                     div()
                         .text_xs()
                         .text_color(colors.muted)
                         .child(tr("在此添加或克隆仓库")),
-                )
+                ),
+                (true, true) => row,
             });
+
+        let add_server = Button::new("add-server")
+            .primary()
+            .icon(ui::icon(IconName::Plus))
+            .label(tr("添加服务器…"))
+            .disabled(!local_view)
+            .on_click(cx.listener(|this, _, window, cx| this.server_dialog(None, window, cx)));
+        let add_server = match local_view {
+            true => add_server.into_any_element(),
+            // 别的电脑的服务器在那台电脑上加
+            false => add_server
+                .tooltip(tf!(
+                    "{name} 的服务器需在 {name} 上添加",
+                    name = &machine_name
+                ))
+                .into_any_element(),
+        };
 
         div()
             .id("manager")
@@ -1514,16 +1819,9 @@ impl Render for ManagerView {
                                             .child(tr("点击仓库即可在新标签页中打开。")),
                                     ),
                             )
-                            .child(
-                                Button::new("add-server")
-                                    .primary()
-                                    .icon(ui::icon(IconName::Plus))
-                                    .label(tr("添加服务器…"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.server_dialog(None, window, cx)
-                                    })),
-                            ),
+                            .child(add_server),
                     )
+                    .children(banner)
                     .child(workspace_card)
                     .child(all_header)
                     .when(all_open, |page| page.children(sections)),

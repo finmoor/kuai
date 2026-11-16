@@ -778,7 +778,7 @@ impl RepoView {
         );
         let place: SharedString = match &self.entry.server {
             Some(_) => tf!(
-                "运行在 {place} 上，关闭 Kuai 后仍会继续运行",
+                "运行在 {place} 上，关闭 Kuai 后继续运行",
                 place = self.place(cx)
             )
             .into(),
@@ -787,9 +787,9 @@ impl RepoView {
                 .active_terminal()
                 .is_some_and(|view| view.read(cx).in_process()) =>
             {
-                tr("运行在本机，关闭标签页后仍会继续运行").into()
+                tr("运行在本机，关闭标签页后继续运行").into()
             }
-            None => tr("运行在本机，关闭 Kuai 后仍会继续运行").into(),
+            None => tr("运行在本机，关闭 Kuai 后继续运行").into(),
         };
         let index = self.terminals.active;
         let title = self.active_terminal().map(|view| {
@@ -843,7 +843,7 @@ impl RepoView {
                         "terminal-attach",
                         IconName::Paperclip,
                         tr("发送文件"),
-                        tr("发送图片或文件（也可拖放到此处，或复制后按 Ctrl+V）"),
+                        tr("发送图片或文件（也可拖放，或按 Ctrl+V 粘贴）"),
                         false,
                         true,
                         0,

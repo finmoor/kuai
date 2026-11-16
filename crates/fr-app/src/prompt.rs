@@ -99,13 +99,8 @@ fn open(request: Request, window: &mut Window, cx: &mut App) {
         reply,
     } = request;
     // 跳板机在问：写明是哪一台，不然用户会当成是目标服务器的密码
-    let jump: Option<SharedString> = jump.map(|name| {
-        fr_core::tf!(
-            "此为跳板机 {name} 的登录提示。连接目标服务器前需先登录跳板机。",
-            name
-        )
-        .into()
-    });
+    let jump: Option<SharedString> =
+        jump.map(|name| fr_core::tf!("此为跳板机 {name} 的登录提示。", name).into());
     let secret = fr_core::askpass::is_secret(&prompt);
     let input = cx.new(|cx| InputState::new(window, cx).masked(secret));
     let prompt: SharedString = prompt.trim().to_string().into();
@@ -154,7 +149,7 @@ fn open(request: Request, window: &mut Window, cx: &mut App) {
                         div()
                             .text_xs()
                             .text_color(muted)
-                            .child(tr("此为 git 或 ssh 的原始提示，输入的内容不会被保存。")),
+                            .child(tr("此为 git 或 ssh 的原始提示，输入的内容不保存。")),
                     ),
             )
             .footer(

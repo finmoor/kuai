@@ -5,6 +5,7 @@
 
 只算编进程序的依赖：Windows 上 fr-app 的、Linux 上 kuaid 的普通依赖（连带过程宏），
 不算只在编译时跑的构建脚本依赖和测试用的。全文一样的许可证只印一次，后面列出用它的库。
+另外加上不是 cargo 依赖、原样随包带的程序文件（VENDORED）。
 """
 import collections
 import hashlib
@@ -15,6 +16,16 @@ import sys
 
 ROOTS = [('fr-app', 'x86_64-pc-windows-msvc'), ('kuaid', 'x86_64-unknown-linux-musl')]
 LICENSE_PREFIXES = ('license', 'licence', 'copying', 'notice', 'unlicense', 'copyright')
+REPO = pathlib.Path(__file__).resolve().parent.parent
+# 原样随包带的程序文件：许可证全文在 manifest_path 所在的目录里。换版本时和 vendor/conpty/README.md 一起改
+VENDORED = [
+    {
+        'name': 'Microsoft.Windows.Console.ConPTY (conpty.dll, OpenConsole.exe)',
+        'version': '1.25.260930003',
+        'license': 'MIT',
+        'manifest_path': str(REPO / 'vendor' / 'conpty' / 'README.md'),
+    },
+]
 
 
 def metadata(target):
@@ -59,6 +70,8 @@ def main():
     for root, target in ROOTS:
         for package in runtime_packages(metadata(target), root):
             packages[(package['name'], package['version'])] = package
+    for package in VENDORED:
+        packages[(package['name'], package['version'])] = package
     rows = sorted(packages.values(), key=lambda p: (p['name'].lower(), p['version']))
 
     texts = collections.OrderedDict()  # 全文的哈希 -> (全文, [用它的库])

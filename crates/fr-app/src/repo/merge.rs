@@ -116,7 +116,7 @@ impl RepoView {
                     Ok(Ok(text)) => text,
                     Ok(Err(_)) => {
                         view.error = Some(
-                            tr("此文件不是 UTF-8 编码，无法在此编辑。请在外部编辑器中解决后，回到「本地修改」点击「标记为已解决」。")
+                            tr("此文件不是 UTF-8 编码，无法在此编辑。请在外部编辑器中解决，再在「本地修改」中点击「标记为已解决」。")
                                 .into(),
                         );
                         cx.notify();
@@ -243,7 +243,7 @@ impl RepoView {
                     view.manual = false;
                 }
                 Ok(_) => {
-                    let note = tr("已无冲突标记。确认无误后，请点击「保存并标记为已解决」。");
+                    let note = tr("已无冲突标记。请确认后点击「保存并标记为已解决」。");
                     window.push_notification(Notification::info(note), cx);
                 }
                 Err(_) => {
@@ -281,7 +281,7 @@ impl RepoView {
             }
             None => {
                 let note = tr(
-                    "仍有不完整的冲突标记（<<<<<<<、=======、>>>>>>>）。请在「手动编辑」中删除后再保存。",
+                    "仍有不完整的冲突标记（<<<<<<<、=======、>>>>>>>）。请在「手动编辑」中删除后保存。",
                 );
                 window.push_notification(Notification::warning(note), cx);
                 return;
@@ -346,10 +346,10 @@ impl RepoView {
         let status: SharedString = if view.loading {
             tr("正在读取文件…").into()
         } else if manual {
-            tr("手动编辑：直接修改文件内容，并删除所有冲突标记（<<<<<<<、=======、>>>>>>>）。").into()
+            tr("手动编辑：直接修改文件，并删除所有冲突标记（<<<<<<<、=======、>>>>>>>）。").into()
         } else {
             tf!(
-                "共 {total} 处冲突，已选择 {picked} 处。请使用每处右上角的按钮选择一方，或保留双方。",
+                "共 {total} 处冲突，已选择 {picked} 处。请用每处右上角的按钮选择一方或保留双方。",
                 total,
                 picked
             )

@@ -271,8 +271,8 @@ impl RepoView {
 
     fn where_hint(dir: &str) -> SharedString {
         match dir.is_empty() {
-            true => tr("位置：仓库根目录。名称中可以用 / 同时创建上级目录。").into(),
-            false => tf!("位置：{dir}。名称中可以用 / 同时创建上级目录。", dir).into(),
+            true => tr("位置：仓库根目录。名称中可用 / 创建上级目录。").into(),
+            false => tf!("位置：{dir}。名称中可用 / 创建上级目录。", dir).into(),
         }
     }
 

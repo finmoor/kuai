@@ -315,7 +315,7 @@ pub fn run(resume: Option<&str>) -> Result<()> {
     let build = crate::build();
     let _ = std::fs::write(paths.current(), &build);
     log(&format!(
-        "{}：kuaid {} {build}，进程号 {}，接管 {adopted} 个终端",
+        "{}：kuaid {} {build}，进程号 {}，接管 {adopted} 个终端，终端用{}的 ConPTY",
         if resume.is_some() {
             "升级完成"
         } else {
@@ -323,6 +323,11 @@ pub fn run(resume: Option<&str>) -> Result<()> {
         },
         crate::VERSION,
         std::process::id(),
+        if crate::term::conpty::uses_bundled() {
+            "随带"
+        } else {
+            "系统自带"
+        },
     ));
 
     let daemon = Daemon {

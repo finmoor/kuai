@@ -202,7 +202,7 @@ impl Render for FilePicker {
             Files::Ready(_) if total == 0 => Some((tr("没有匹配的文件").into(), muted)),
             Files::Ready(_) if total > shown => Some((
                 tf!(
-                    "共 {total} 个匹配项，仅显示前 {shown} 个，请输入更多字符以缩小范围",
+                    "共 {total} 个匹配项，仅显示前 {shown} 个，请输入更多字符",
                     total,
                     shown
                 )
@@ -226,7 +226,7 @@ impl Render for FilePicker {
                 note.map(|(text, color)| div().px_2().text_xs().text_color(color).child(text)),
             )
             .child(div().px_2().text_xs().text_color(muted).child(tr(
-                "按 Enter 或点击查看文件历史；点击右侧的「逐行追溯」可查看每行的修改者。",
+                "按 Enter 或点击查看文件历史；右侧的「逐行追溯」显示每行的修改者。",
             )))
     }
 }

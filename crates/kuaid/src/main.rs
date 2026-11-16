@@ -14,6 +14,9 @@
 //!
 //! kuaid 尽量少做事：`git` 方法执行客户端给的任意 git 参数，原样回传输出，解析和布局都在
 //! 客户端做。协议见 `fr_core::protocol`。
+//!
+//! 协议 10 起还保存这台电脑的仓库列表和工作区（见 `workspaces`），并替连上来的客户端连这台电脑
+//! 配置的服务器（见 `relay`）：经跳板机时 ssh 把 kuaid 自己当 `ProxyCommand` 启动（`--ssh-hop`）。
 
 mod bridge;
 mod conn;
@@ -25,9 +28,11 @@ mod daemon;
 mod dirs;
 mod files;
 mod out;
+mod relay;
 mod term;
 #[cfg(windows)]
 mod win;
+mod workspaces;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -36,6 +41,10 @@ const USAGE: &str = "用法：kuaid --connect | --daemon | --stdio | --status | 
 fn main() {
     // 被 git 或 ssh 当作 askpass 启动时：去问主进程，打出回答就退出
     if let Some(code) = fr_core::askpass::run_helper() {
+        std::process::exit(code);
+    }
+    // 替客户端经跳板机连服务器时（见 `relay`），被 ssh 当作 ProxyCommand 启动
+    if let Some(code) = fr_core::hop::run_helper() {
         std::process::exit(code);
     }
     let args: Vec<String> = std::env::args().skip(1).collect();

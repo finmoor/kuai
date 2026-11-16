@@ -1184,12 +1184,9 @@ impl RepoView {
         };
         let (path, name) = (tree.path.clone(), tree.name().to_string());
         let text = match tree.main {
-            true => tf!(
-                "分支 {branch} 已在主工作树中检出，同一分支不能同时检出到两个工作树。",
-                branch
-            ),
+            true => tf!("分支 {branch} 已在主工作树中检出，无法在此检出。", branch),
             false => tf!(
-                "分支 {branch} 已在工作树 {name} 中检出，同一分支不能同时检出到两个工作树。",
+                "分支 {branch} 已在工作树 {name} 中检出，无法在此检出。",
                 branch,
                 name
             ),

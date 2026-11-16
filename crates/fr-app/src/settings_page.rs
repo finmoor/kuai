@@ -86,7 +86,7 @@ impl SettingsPage {
                 },
             ),
         )
-        .description(tr("登录 Windows 后自动启动；如已开启托盘选项，将直接最小化到托盘。"));
+        .description(tr("登录 Windows 后自动启动；开启托盘选项时直接进入托盘。"));
         let minimize = {
             let (get, set) = (app.clone(), app.clone());
             SettingItem::new(
@@ -100,7 +100,7 @@ impl SettingsPage {
                     },
                 ),
             )
-            .description(tr("最小化后不在任务栏显示，点击托盘图标可恢复窗口。"))
+            .description(tr("最小化按钮将窗口收进托盘，点击托盘图标恢复。"))
         };
         let close = {
             let (get, set) = (app.clone(), app.clone());
@@ -115,7 +115,7 @@ impl SettingsPage {
                     },
                 ),
             )
-            .description(tr("点击关闭按钮仅隐藏窗口，可从托盘图标的右键菜单退出。"))
+            .description(tr("点击关闭按钮仅隐藏窗口，从托盘图标的右键菜单退出。"))
         };
         let auto_fetch = {
             let (get, set) = (app.clone(), app.clone());
@@ -136,7 +136,7 @@ impl SettingsPage {
                 ),
             )
             .description(tr(
-                "定时在后台获取当前查看的仓库（git fetch --all），需要密码时跳过，不弹出提示。",
+                "定时在后台获取当前仓库（git fetch --all），需要密码时跳过。",
             ))
         };
         let stash = {
@@ -168,7 +168,7 @@ impl SettingsPage {
                 ),
             )
             .description(tr(
-                "关闭此项可避免误关；仍可用鼠标中键、Ctrl+W 或右键菜单关闭标签页，按 Ctrl+Shift+T 可恢复。",
+                "关闭可避免误关；仍可用中键、Ctrl+W 或右键菜单关闭，Ctrl+Shift+T 恢复。",
             ))
         };
         SettingPage::new(tr("常规"))
@@ -318,7 +318,7 @@ impl SettingsPage {
                 ),
             )
             .description(tr(
-                "上面的字体中没有的中文用此字体显示。中文固定占两个字符宽，更换字体不影响对齐。",
+                "上方字体中缺少的中文用此字体显示，固定占两格，不影响对齐。",
             ))
         };
         let font_size = SettingItem::new(
@@ -335,7 +335,7 @@ impl SettingsPage {
             .default_value(f64::from(defaults.font_size)),
         )
         .description(tr(
-            "在终端中按 Ctrl+加号、Ctrl+减号也可调整，按 Ctrl+0 恢复默认。",
+            "终端中也可按 Ctrl+加号、Ctrl+减号调整，Ctrl+0 恢复默认。",
         ));
         let line_height = {
             let key = |height: f32| SharedString::from(format!("{height}"));
@@ -430,7 +430,7 @@ impl SettingsPage {
                 .default_value(key(defaults.scrollback)),
             )
             .description(tr(
-                "每个终端保留的历史输出行数。服务器上的终端重新连接后，可回看最近 2,000 行。",
+                "每个终端保留的输出行数。服务器上的终端重新连接后可回看最近 2,000 行。",
             ))
         };
         let copy_on_select = SettingItem::new(
@@ -441,7 +441,7 @@ impl SettingsPage {
             )
             .default_value(defaults.copy_on_select),
         )
-        .description(tr("用鼠标选中文字后自动复制到剪贴板。"));
+        .description(tr("选中文字后自动复制。"));
         let right_click = {
             let key = |choice: RightClick| -> SharedString {
                 match choice {
@@ -550,7 +550,7 @@ impl SettingsPage {
                     },
                 ),
             )
-            .description(tr("「跟随系统」将跟随 Windows 的深色或浅色设置。"))
+            .description(tr("「跟随系统」使用 Windows 的深色或浅色设置。"))
         };
         let palette_item = |dark: bool| {
             let (get, set) = (app.clone(), app.clone());
@@ -632,7 +632,7 @@ impl SettingsPage {
                     },
                 ),
             )
-            .description(tr("启动时及之后每 6 小时检查一次 GitHub 上的新版本。"))
+            .description(tr("启动时及每 6 小时检查一次新版本。"))
         };
         let source = SettingItem::new(
             tr("源代码"),
@@ -668,7 +668,7 @@ impl SettingsPage {
         )
         .description(format!(
             "{}\n{}",
-            tr("将服务器目录映射到本机时使用 WinFsp，需单独安装。"),
+            tr("映射服务器目录需要 WinFsp，须单独安装。"),
             fr_mount::WINFSP_NOTICE
         ));
         let file = crate::settings::file();

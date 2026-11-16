@@ -67,6 +67,21 @@
 //! - `fs_rename` 可以带 `replace: true`：`to` 已经有文件就盖掉（目录不盖）。
 //! - `fs_remove` 可以带 `shallow: true`：只删文件和空目录，目录里有东西就失败。
 //!
+//! 仓库列表和工作区（协议 10 起）。每台电脑的由它的 kuaid 保存，格式和改法见 [`crate::store`]：
+//! - `state_get`：返回 [`crate::store::Store`]。
+//! - `state_watch`：订阅。先回一条 `chunk: true`、`result` 是现在的整份，之后每次有改动（哪个客户端改的
+//!   都算）再回一条整份，直到被 `cancel`。
+//! - `state_apply`：参数 `{ops: [Op]}`，依次执行，返回改完的整份。有一个做不了就都不算，回 `error`。
+//!
+//! 经这台电脑连它配置的服务器（协议 10 起）。工作区里有这台电脑配置的服务器上的仓库时，连上来的
+//! 客户端不用自己配置那台服务器，由 kuaid 起 ssh 连过去，标准输入输出经这条连接转：
+//! - `relay_open`：参数 `{server, command}`，`server` 是 `Store::servers` 里的 id，`command` 在那台
+//!   服务器上执行。登录方式、跳板机照这台电脑的配置；要密码时发 `ask` 问这个客户端。
+//!   响应是一个流：ssh 的标准输出每块一条 `chunk: true`，标准错误每块一条 `chunk: true, err: true`，
+//!   ssh 结束时最后一条 `result` 是 `{code}`（退出码，被杀掉时为空）。`cancel` 结束 ssh。
+//! - `relay_input`：参数 `{relay, eof}`，`relay` 是 `relay_open` 的请求编号，请求带的字节写进 ssh 的
+//!   标准输入；`eof` 为真时写完关掉标准输入。不回响应。
+//!
 //! 给 ssh 转接程序（`kuaid --connect`）和运维用的：
 //! - `info`：返回 [`DaemonInfo`]。
 //! - `bridge`：参数 `{auth_sock}`，转接程序报告这条 ssh 连接转发过来的 ssh-agent 套接字。不回响应。
@@ -87,7 +102,9 @@ use serde_json::Value;
 /// 7：kuaid 有了 Windows 版；`term_open` 可以带 `shell`。
 /// 8：`fs_repos`，找仓库目录里面的仓库。
 /// 9：把目录映射到本机用的 `fs_pwrite`、`fs_resize`、`fs_touch`、`fs_space`，和几个方法多出来的选项。
-pub const PROTOCOL_VERSION: u32 = 9;
+/// 10：kuaid 保存仓库列表和工作区（`state_get`、`state_watch`、`state_apply`），经它连它配置的服务器
+/// （`relay_open`、`relay_input`）。
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// 一条消息后面跟多少字节的原始数据。
 pub trait Frame {

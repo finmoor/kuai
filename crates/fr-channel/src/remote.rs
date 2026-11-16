@@ -7,6 +7,9 @@
 //! 没在跑就拉起来，比客户端旧就让它原地换成新的。所以这条连接断了，开在 kuaid 里的终端还在。
 //!
 //! 线程：一个写线程把请求依次写进 ssh 的标准输入；一个读线程读响应，按编号交给等待的 future。
+//!
+//! 协议 10 起还可以经另一台电脑的 kuaid 连它配置的服务器（[`Connection::connect_via`]）：ssh 由那台
+//! 电脑起，标准输入输出经和它的连接转（`relay_open`），这边在上面做的和直接连一样。
 
 use fr_core::i18n::tr;
 use fr_core::tf;
@@ -14,16 +17,19 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use fr_core::hop;
 use fr_core::protocol::{
     self, DirListing, FilePut, FilePutReply, FsEntry, FsStat, FsWrite, FsWritten, GitResult, Hello,
     PROTOCOL_VERSION, Request, Response, SubRepos, TermExit, TermInfo, TermOpen, TermOpened,
 };
+use fr_core::ssh::{KEEP_OPTIONS, STAGE_OPTIONS, no_window, program as ssh_program};
+use fr_core::store::{Op, Store};
 use futures::FutureExt as _;
 use futures::channel::{mpsc, oneshot};
 use futures::future::{self, BoxFuture};
@@ -31,7 +37,7 @@ use serde_json::{Value, json};
 
 use crate::binaries::{Binaries, Os};
 use crate::{
-    ChangeStream, GitOutput, GitStream, StreamItem, TermItem, TermStream, UploadItem,
+    ChangeStream, GitOutput, GitStream, StateStream, StreamItem, TermItem, TermStream, UploadItem,
     UploadSource, UploadStream,
 };
 
@@ -43,6 +49,8 @@ const MISSING_MARKER: &str = "KUAID-MISSING";
 const STDERR_TAIL: usize = 4096;
 /// 上传文件时一块这么大：每块等 kuaid 回一声再发下一块，进度和中止都按块算
 const UPLOAD_CHUNK: usize = 512 * 1024;
+/// 经另一台电脑转接时，写给那边 ssh 的标准输入一条消息最多带这么多
+const RELAY_CHUNK: usize = 256 * 1024;
 
 /// 和一台服务器的连接。丢弃时断开。
 pub struct Connection {
@@ -64,7 +72,7 @@ struct Inner {
     pending: Mutex<HashMap<u64, Pending>>,
     next_id: AtomicU64,
     alive: AtomicBool,
-    child: Arc<Mutex<Child>>,
+    link: Arc<Link>,
     stderr: Arc<StderrLog>,
 }
 
@@ -76,6 +84,318 @@ enum Pending {
     Stream(mpsc::UnboundedSender<Result<StreamItem>>),
     Watch(mpsc::UnboundedSender<()>),
     Term(mpsc::UnboundedSender<Result<TermItem>>),
+    /// `state_watch`：每次推来的整份
+    State(mpsc::UnboundedSender<Result<Store>>),
+    /// `relay_open`：经这条连接连的另一台服务器，ssh 的输出交给那条连接
+    Relay(RelaySink),
+}
+
+/// 连接底下的那一段。
+enum Link {
+    /// 本机起的进程：ssh，或者本机的 kuaid
+    Process(Mutex<Child>),
+    /// 经另一台电脑的 kuaid 转接（协议 10）
+    Relay(RelayLink),
+}
+
+impl Link {
+    /// 等它结束，返回退出码（被杀掉、经转接时转接断了为空）。
+    fn wait(&self) -> Option<i32> {
+        match self {
+            Link::Process(child) => child
+                .lock()
+                .unwrap()
+                .wait()
+                .ok()
+                .and_then(|status| status.code()),
+            Link::Relay(relay) => relay.exit.wait(),
+        }
+    }
+
+    /// 结束它。`tree`：连它启动的进程一起（经跳板机的 ssh 下面挂着转接的那几层，见 [`kill_tree`]）。
+    fn kill(&self, tree: bool) {
+        match self {
+            Link::Process(child) => {
+                let mut child = child.lock().unwrap();
+                match tree {
+                    true => kill_tree(&mut child),
+                    false => drop(child.kill()),
+                }
+            }
+            Link::Relay(relay) => relay.close(),
+        }
+    }
+}
+
+/// 经另一台电脑的 kuaid 转接：那边的 ssh 是它的 `relay_open` 请求。
+struct RelayLink {
+    /// 转接的那台电脑的连接：这条连接用着，它就不能断
+    via: Arc<Connection>,
+    /// `relay_open` 的请求编号
+    id: u64,
+    exit: Arc<RelayExit>,
+}
+
+impl RelayLink {
+    /// 不要了：那边的 ssh 结束掉，这边读输出的两头随之读到结尾。
+    fn close(&self) {
+        self.exit.set(None);
+        let removed = self.via.inner.pending.lock().unwrap().remove(&self.id);
+        if removed.is_some() {
+            let cancel = Request {
+                id: 0,
+                method: "cancel".into(),
+                params: json!({ "id": self.id }),
+                bytes: 0,
+            };
+            let _ = self.via.inner.send(cancel, Vec::new());
+        }
+    }
+}
+
+/// 转接那边的 ssh 的退出码：结束了才有。
+#[derive(Default)]
+struct RelayExit {
+    code: Mutex<Option<Option<i32>>>,
+    done: Condvar,
+}
+
+impl RelayExit {
+    /// 记下退出码；已经记过就不改。
+    fn set(&self, code: Option<i32>) {
+        let mut slot = self.code.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(code);
+        }
+        self.done.notify_all();
+    }
+
+    fn wait(&self) -> Option<i32> {
+        let mut slot = self.code.lock().unwrap();
+        loop {
+            if let Some(code) = *slot {
+                return code;
+            }
+            slot = self.done.wait(slot).unwrap();
+        }
+    }
+}
+
+/// 转接那边的 ssh 的输出往哪送：经它连的那条连接读的两头。丢弃就是读到结尾。
+struct RelaySink {
+    stdout: std::sync::mpsc::Sender<Vec<u8>>,
+    stderr: std::sync::mpsc::Sender<Vec<u8>>,
+    exit: Arc<RelayExit>,
+}
+
+impl RelaySink {
+    fn chunk(&self, err: bool, payload: Vec<u8>) {
+        let _ = match err {
+            true => self.stderr.send(payload),
+            false => self.stdout.send(payload),
+        };
+    }
+
+    /// ssh 结束了（`Ok` 里是结果 `{code}`），或者开不起来、转接的连接断了（`Err`，原因当作 ssh 的报错）。
+    fn finish(self, outcome: Result<Value>) {
+        match outcome {
+            Ok(result) => {
+                let code = result.get("code").and_then(Value::as_i64);
+                self.exit.set(code.map(|code| code as i32));
+            }
+            Err(err) => {
+                let _ = self.stderr.send(format!("{err:#}\n").into_bytes());
+                self.exit.set(None);
+            }
+        }
+    }
+}
+
+/// 从转接送来的一块块输出里读，像读管子一样。送的那头丢弃了就是读到结尾。
+struct ChannelReader {
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    chunk: Vec<u8>,
+    at: usize,
+}
+
+impl ChannelReader {
+    fn new(rx: std::sync::mpsc::Receiver<Vec<u8>>) -> ChannelReader {
+        ChannelReader {
+            rx,
+            chunk: Vec::new(),
+            at: 0,
+        }
+    }
+}
+
+impl Read for ChannelReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self.at >= self.chunk.len() {
+            match self.rx.recv() {
+                Ok(chunk) => {
+                    self.chunk = chunk;
+                    self.at = 0;
+                }
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = out.len().min(self.chunk.len() - self.at);
+        out[..n].copy_from_slice(&self.chunk[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
+    }
+}
+
+/// 往转接那边的 ssh 的标准输入写：每次写变成一条 `relay_input`。丢弃时关掉那边的标准输入。
+struct RelayWriter {
+    via: Arc<Connection>,
+    id: u64,
+}
+
+impl RelayWriter {
+    fn send(&self, bytes: &[u8], eof: bool) -> std::io::Result<()> {
+        let request = Request {
+            id: 0,
+            method: "relay_input".into(),
+            params: json!({ "relay": self.id, "eof": eof }),
+            bytes: bytes.len() as u64,
+        };
+        self.via
+            .inner
+            .send(request, bytes.to_vec())
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, format!("{err:#}")))
+    }
+}
+
+impl Write for RelayWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let n = bytes.len().min(RELAY_CHUNK);
+        self.send(&bytes[..n], false)?;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for RelayWriter {
+    fn drop(&mut self) {
+        let _ = self.send(&[], true);
+    }
+}
+
+/// 连接底下那一段的三根管子，和它本身（结束、等它退出用）。
+struct Pipes {
+    stdin: Box<dyn Write + Send>,
+    stdout: Box<dyn Read + Send>,
+    stderr: Box<dyn Read + Send>,
+    link: Arc<Link>,
+}
+
+/// 起本机的进程（ssh，或者 kuaid 本身），接上它的标准输入输出。
+fn spawn_pipes(mut cmd: Command) -> Result<Pipes> {
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    no_window(&mut cmd);
+    let mut child = cmd.spawn().with_context(|| {
+        tf!(
+            "无法启动 {to_string_lossy}",
+            to_string_lossy = cmd.get_program().to_string_lossy()
+        )
+    })?;
+    let stdin = child.stdin.take().context(tr("无法获取 ssh 的标准输入"))?;
+    let stdout = child.stdout.take().context(tr("无法获取 ssh 的标准输出"))?;
+    let stderr = child.stderr.take().context(tr("无法获取 ssh 的标准错误"))?;
+    Ok(Pipes {
+        stdin: Box::new(stdin),
+        stdout: Box::new(stdout),
+        stderr: Box::new(stderr),
+        link: Arc::new(Link::Process(Mutex::new(child))),
+    })
+}
+
+/// 请 `via` 那台电脑的 kuaid 起 ssh 连它配置的服务器 `server`，在上面执行 `command`。
+fn relay_pipes(via: &Arc<Connection>, server: &str, command: &str) -> Result<Pipes> {
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+    let exit = Arc::new(RelayExit::default());
+    let sink = RelaySink {
+        stdout: out_tx,
+        stderr: err_tx,
+        exit: exit.clone(),
+    };
+    let inner = &via.inner;
+    let id = inner.next_id();
+    inner
+        .pending
+        .lock()
+        .unwrap()
+        .insert(id, Pending::Relay(sink));
+    let request = Request {
+        id,
+        method: "relay_open".into(),
+        params: json!({ "server": server, "command": command }),
+        bytes: 0,
+    };
+    if let Err(err) = inner.send(request, Vec::new()) {
+        inner.pending.lock().unwrap().remove(&id);
+        return Err(err);
+    }
+    Ok(Pipes {
+        stdin: Box::new(RelayWriter {
+            via: via.clone(),
+            id,
+        }),
+        stdout: Box::new(ChannelReader::new(out_rx)),
+        stderr: Box::new(ChannelReader::new(err_rx)),
+        link: Arc::new(Link::Relay(RelayLink {
+            via: via.clone(),
+            id,
+            exit,
+        })),
+    })
+}
+
+/// 经哪条路连服务器。
+#[derive(Clone, Copy)]
+enum Route<'a> {
+    /// 本机起 ssh
+    Direct,
+    /// 经 `via` 那台电脑的 kuaid 连它配置的服务器 `server`（协议 10）
+    Via {
+        via: &'a Arc<Connection>,
+        server: &'a str,
+    },
+}
+
+impl Route<'_> {
+    /// 在服务器上执行 `script`。返回的第二项要留到登录完成（见 [`login`]）。
+    fn run(
+        &self,
+        destination: &str,
+        script: &str,
+        options: &ConnectOptions,
+        forward_agent: bool,
+    ) -> Result<(Pipes, Vec<crate::SavedSecret>)> {
+        match self {
+            Route::Direct => {
+                let (cmd, saved) = ssh(destination, script, options, forward_agent);
+                Ok((spawn_pipes(cmd)?, saved))
+            }
+            // 登录方式、要不要转发 ssh-agent 都照那台电脑的配置
+            Route::Via { via, server } => Ok((relay_pipes(via, server, script)?, Vec::new())),
+        }
+    }
+
+    /// 记「这台是 Windows」用的键。
+    fn key(&self, destination: &str) -> String {
+        match self {
+            Route::Direct => destination.to_string(),
+            Route::Via { via, .. } => format!("{}>{destination}", via.destination),
+        }
+    }
 }
 
 enum Started {
@@ -164,13 +484,40 @@ impl Connection {
     /// 连接服务器：经 ssh 启动 kuaid；没装或版本不对就先上传再连。
     /// 会阻塞（建立连接要几百毫秒，第一次还要上传），放在后台线程里调用。
     pub fn connect(destination: &str, options: &ConnectOptions) -> Result<Connection> {
+        Self::connect_on(Route::Direct, destination, options)
+    }
+
+    /// 经 `via` 那台电脑的 kuaid 连它配置的服务器 `server`（那台电脑的 `Store::servers` 里的 id）：
+    /// 这台电脑不用配置那台服务器，登录方式、跳板机都照那台电脑的配置，要密码时照样在这边问。
+    /// `destination` 是那台服务器的 ssh 目标，只用来显示；`options` 只用 `jumps`（报错时写明是哪一台，
+    /// 不用里面的登录方式）和 `on_stage`。会阻塞，放在后台线程里调用。
+    pub fn connect_via(
+        via: &Arc<Connection>,
+        server: &str,
+        destination: &str,
+        options: &ConnectOptions,
+    ) -> Result<Connection> {
+        if via.hello.protocol < 10 {
+            bail!(
+                "{}",
+                tf!(
+                    "{destination} 上的 kuaid 过旧，无法经它连接其他服务器",
+                    destination = via.destination
+                )
+            );
+        }
+        Self::connect_on(Route::Via { via, server }, destination, options)
+    }
+
+    fn connect_on(route: Route, destination: &str, options: &ConnectOptions) -> Result<Connection> {
         let started = Instant::now();
         let binaries = Binaries::find()?;
         let dir = binaries.dir_name();
         let mut installed = false;
         // 服务器是 Linux 还是 Windows 事先不知道：先按 Linux 的写法问（上次是 Windows 的先按
         // Windows），服务器跑不了这种写法再换另一种。两种都不行，报头一次的错
-        let mut windows = known_windows(destination);
+        let key = route.key(destination);
+        let mut windows = known_windows(&key);
         let (mut tried_sh, mut tried_cmd) = (false, false);
         let mut refused: Option<String> = None;
         loop {
@@ -179,10 +526,11 @@ impl Connection {
                 false => bootstrap_script(&dir),
             };
             // _saved 留到握手完：登录阶段 ssh 要密码时用得上
-            let (cmd, _saved) = ssh(destination, &script, options, options.forward_agent);
-            match start(cmd, true, destination, Some(options))? {
+            let (pipes, _saved) =
+                route.run(destination, &script, options, options.forward_agent)?;
+            match start(pipes, true, destination, Some(options))? {
                 Started::Ready(inner, hello) => {
-                    remember_windows(destination, windows);
+                    remember_windows(&key, windows);
                     return Ok(Connection {
                         destination: destination.to_string(),
                         hello,
@@ -210,12 +558,13 @@ impl Connection {
                     match server_os(&os) {
                         Some(Os::Linux) => {
                             let binary = binaries.binary_for(Os::Linux, &arch)?;
-                            install(destination, options, &install_script(&dir), binary)?;
+                            install(route, destination, options, &install_script(&dir), binary)?;
                         }
                         Some(Os::Windows) if windows => {
-                            let binary = binaries.binary_for(Os::Windows, &arch)?;
-                            let archive = tar_single("kuaid.exe", &binary);
-                            install(destination, options, &windows_install_script(&dir), archive)?;
+                            let files = binaries.files_for(Os::Windows, &arch)?;
+                            let archive = tar_files(&files);
+                            let script = windows_install_script(&dir);
+                            install(route, destination, options, &script, archive)?;
                         }
                         // Windows 上 PATH 里有 Git 带的 sh，头一种写法跑得了：按 Windows 的写法再问一次
                         Some(Os::Windows) => {
@@ -236,7 +585,7 @@ impl Connection {
     /// 直接启动一个 kuaid 进程（测试用，比如本机的 `kuaid --stdio`）。
     pub fn spawn_stdio(cmd: Command) -> Result<Connection> {
         let started = Instant::now();
-        match start(cmd, false, tr("本机 kuaid"), None)? {
+        match start(spawn_pipes(cmd)?, false, tr("本机 kuaid"), None)? {
             Started::Ready(inner, hello) => Ok(Connection {
                 destination: tr("本机 kuaid").into(),
                 hello,
@@ -269,7 +618,7 @@ impl Connection {
         }
         let mut cmd = Command::new(&exe);
         cmd.arg("--connect");
-        match start(cmd, false, tr("本机 kuaid"), None)? {
+        match start(spawn_pipes(cmd)?, false, tr("本机 kuaid"), None)? {
             Started::Ready(inner, hello) => Ok(Connection {
                 destination: tr("本机 kuaid").into(),
                 hello,
@@ -291,6 +640,55 @@ impl Connection {
     /// 连接还在不在。断开后所有调用都会失败，要重新连接。
     pub fn is_alive(&self) -> bool {
         self.inner.alive.load(Ordering::Acquire)
+    }
+
+    /// 经哪台电脑的 kuaid 连的（[`Self::connect_via`]）；直接连的为空。
+    pub fn via(&self) -> Option<&Arc<Connection>> {
+        match &*self.inner.link {
+            Link::Relay(relay) => Some(&relay.via),
+            Link::Process(_) => None,
+        }
+    }
+
+    /// 这台电脑保存的仓库列表和工作区（协议 10）。
+    pub fn state_get(&self) -> BoxFuture<'static, Result<Store>> {
+        let call = self.call("state_get", json!({}), Vec::new());
+        async move { parsed(call.await?.0) }.boxed()
+    }
+
+    /// 订阅这台电脑保存的仓库列表和工作区：先给现在的整份，之后每次有改动（哪台电脑改的都算）
+    /// 给一份新的。连接断了，流以一个错误结束。
+    pub fn state_watch(&self) -> StateStream {
+        let (tx, rx) = mpsc::unbounded();
+        let id = self.inner.next_id();
+        self.inner
+            .pending
+            .lock()
+            .unwrap()
+            .insert(id, Pending::State(tx.clone()));
+        let request = Request {
+            id,
+            method: "state_watch".into(),
+            params: json!({}),
+            bytes: 0,
+        };
+        if let Err(err) = self.inner.send(request, Vec::new()) {
+            self.inner.pending.lock().unwrap().remove(&id);
+            let _ = tx.unbounded_send(Err(err));
+        }
+        StateStream {
+            rx,
+            _cancel: Box::new(CancelOnDrop {
+                inner: Arc::downgrade(&self.inner),
+                id,
+            }),
+        }
+    }
+
+    /// 依次执行这串改动，返回改完的整份。有一个做不了就都不算。
+    pub fn state_apply(&self, ops: Vec<Op>) -> BoxFuture<'static, Result<Store>> {
+        let call = self.call("state_apply", json!({ "ops": ops }), Vec::new());
+        async move { parsed(call.await?.0) }.boxed()
     }
 
     pub fn ping(&self) -> BoxFuture<'static, Result<()>> {
@@ -727,16 +1125,11 @@ fn upload_blocking(
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        // 关掉标准输入，kuaid 读到结尾就退出；再杀掉 ssh，免得服务器那边卡住时它不退
+        // 关掉标准输入，kuaid 读到结尾就退出；再杀掉 ssh，免得服务器那边卡住时它不退。
+        // 本机的转接程序下面挂着它拉起的常驻进程和终端：只结束它自己
         self.inner.outgoing.lock().unwrap().take();
-        if let Ok(mut child) = self.inner.child.lock() {
-            match self.local {
-                // 本机的转接程序下面挂着它拉起的常驻进程和终端：只结束它自己
-                true => drop(child.kill()),
-                false => kill_tree(&mut child),
-            }
-            let _ = child.wait();
-        }
+        self.inner.link.kill(!self.local);
+        let _ = self.inner.link.wait();
     }
 }
 
@@ -819,6 +1212,8 @@ impl Inner {
     fn ask(self: &Arc<Self>, ask_id: u64, prompt: String) {
         let inner = Arc::downgrade(self);
         std::thread::spawn(move || {
+            // 经这台电脑连别的服务器时，那边的 ssh 要密码也是这样来问：等用户回答的时间不算超时
+            let _asking = crate::Asking::start();
             let answer = crate::prompt_handler().and_then(|handler| handler(&prompt, None));
             if let Some(inner) = inner.upgrade() {
                 let reply = Request {
@@ -864,6 +1259,12 @@ impl Inner {
                     };
                     let _ = tx.unbounded_send(item);
                 }
+                Some(Pending::State(tx)) => {
+                    if let Some(store) = response.result.take() {
+                        let _ = tx.unbounded_send(parsed(store));
+                    }
+                }
+                Some(Pending::Relay(sink)) => sink.chunk(response.err, payload),
                 _ => {}
             }
             return;
@@ -904,6 +1305,13 @@ impl Inner {
                 });
                 let _ = tx.unbounded_send(item);
             }
+            // 订阅只会以出错结束
+            Pending::State(tx) => {
+                if let Err(err) = outcome {
+                    let _ = tx.unbounded_send(Err(err));
+                }
+            }
+            Pending::Relay(sink) => sink.finish(outcome),
         }
     }
 
@@ -927,6 +1335,10 @@ impl Inner {
                 Pending::Term(tx) => {
                     let _ = tx.unbounded_send(Err(anyhow!(message.clone())));
                 }
+                Pending::State(tx) => {
+                    let _ = tx.unbounded_send(Err(anyhow!(message.clone())));
+                }
+                Pending::Relay(sink) => sink.finish(Err(anyhow!(message.clone()))),
                 Pending::Watch(_) => {}
             }
         }
@@ -957,60 +1369,51 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// 启动 ssh（或 kuaid 本身），完成握手，开始收发。`options` 是连服务器时的连接选项。
+/// 在接好的管子上完成握手，开始收发。`options` 是连服务器时的连接选项。
 fn start(
-    mut cmd: Command,
+    pipes: Pipes,
     expect_marker: bool,
     destination: &str,
     options: Option<&ConnectOptions>,
 ) -> Result<Started> {
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    no_window(&mut cmd);
-    let mut child = cmd.spawn().with_context(|| {
-        tf!(
-            "无法启动 {to_string_lossy}",
-            to_string_lossy = cmd.get_program().to_string_lossy()
-        )
-    })?;
-    let mut stdin = child.stdin.take().context(tr("无法获取 ssh 的标准输入"))?;
-    let stdout = child.stdout.take().context(tr("无法获取 ssh 的标准输出"))?;
-    let stderr = collect_stderr(child.stderr.take().context(tr("无法获取 ssh 的标准错误"))?);
-    let child = Arc::new(Mutex::new(child));
+    let Pipes {
+        mut stdin,
+        stdout,
+        stderr,
+        link,
+    } = pipes;
+    let stderr = collect_stderr(stderr);
     let jumps = options.map_or(&[][..], |options| &options.jumps);
     // 经跳板机连接时自己看着超时（见 Watchdog）；握手完或者这个函数返回就不看了
     let watchdog = (!jumps.is_empty()).then(|| {
         let on_stage = options.and_then(|options| options.on_stage.clone());
-        Watchdog::start(child.clone(), stderr.clone(), jumps.len(), on_stage)
+        Watchdog::start(link.clone(), stderr.clone(), jumps.len(), on_stage)
     });
     let give_up = |noise: &[String]| {
-        let _ = child.lock().unwrap().wait();
+        let _ = link.wait();
         let timed_out = watchdog.as_ref().is_some_and(Watchdog::timed_out);
         connect_error(destination, &stderr, noise, jumps, timed_out)
     };
 
-    // 握手请求先发出去，省一次往返。没装 kuaid 时远程的 sh 不读它，丢掉就是了
+    // 握手请求先发出去，省一次往返。没装 kuaid 时远程的 sh 不读它，丢掉就是了。
+    // 拼好了一次写：经转接时一次写是一条消息
     let hello = Request {
         id: 0,
         method: "hello".into(),
         params: json!({ "protocol": PROTOCOL_VERSION }),
         bytes: 0,
     };
-    let _ = protocol::write_message(&mut stdin, &hello, &[]);
+    let mut first = Vec::new();
+    let _ = protocol::write_message(&mut first, &hello, &[]);
+    let _ = stdin.write_all(&first).and_then(|()| stdin.flush());
 
-    let mut reader = BufReader::with_capacity(1 << 20, stdout);
+    let mut reader: BufReader<Box<dyn Read + Send>> = BufReader::with_capacity(1 << 20, stdout);
     if expect_marker {
         let mut noise = Vec::new();
         loop {
             let mut line = String::new();
             if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                let code = child
-                    .lock()
-                    .unwrap()
-                    .wait()
-                    .ok()
-                    .and_then(|status| status.code());
+                let code = link.wait();
                 let timed_out = watchdog.as_ref().is_some_and(Watchdog::timed_out);
                 let message = give_up(&noise);
                 // ssh 自己出的错（连不上、登录不了）退出码是 255；别的退出码是服务器上那条命令的：
@@ -1025,7 +1428,7 @@ fn start(
                 break;
             }
             if let Some(rest) = line.strip_prefix(MISSING_MARKER) {
-                let _ = child.lock().unwrap().wait();
+                let _ = link.wait();
                 let mut parts = rest.split_whitespace();
                 return Ok(Started::Missing {
                     os: parts.next().unwrap_or_default().to_string(),
@@ -1052,7 +1455,7 @@ fn start(
         bail!(
             "{}",
             tf!(
-                "服务器上的 kuaid 版本过旧（协议 {protocol}，客户端为 {PROTOCOL_VERSION}），且无法自动替换。请在服务器上运行 ~/.kuai/*/kuaid --stop 后重新连接",
+                "服务器上的 kuaid 过旧（协议 {protocol}，客户端 {PROTOCOL_VERSION}），无法自动替换。请在服务器上运行 ~/.kuai/*/kuaid --stop 后重新连接",
                 protocol = hello.protocol,
                 PROTOCOL_VERSION
             )
@@ -1065,7 +1468,7 @@ fn start(
         pending: Mutex::default(),
         next_id: AtomicU64::new(1),
         alive: AtomicBool::new(true),
-        child,
+        link,
         stderr,
     });
     std::thread::Builder::new()
@@ -1086,7 +1489,7 @@ fn start(
     Ok(Started::Ready(inner, hello))
 }
 
-fn read_loop(inner: Weak<Inner>, mut reader: BufReader<ChildStdout>) {
+fn read_loop(inner: Weak<Inner>, mut reader: BufReader<Box<dyn Read + Send>>) {
     let reason = loop {
         match protocol::read_message::<_, Response>(&mut reader) {
             Ok(Some((response, payload))) => match inner.upgrade() {
@@ -1121,7 +1524,7 @@ impl StderrLog {
             self.authenticated.fetch_add(1, Ordering::SeqCst);
             return;
         }
-        if let Some(index) = line.strip_prefix(crate::hop::FAILED) {
+        if let Some(index) = line.strip_prefix(hop::FAILED) {
             if let Ok(index) = index.trim().parse() {
                 self.failed_hop.lock().unwrap().get_or_insert(index);
             }
@@ -1145,7 +1548,7 @@ impl StderrLog {
 }
 
 /// 在后台读 ssh 的标准错误，一行一行地记（见 [`StderrLog`]）。
-fn collect_stderr(mut stderr: ChildStderr) -> Arc<StderrLog> {
+fn collect_stderr(mut stderr: impl Read + Send + 'static) -> Arc<StderrLog> {
     let log = Arc::new(StderrLog::default());
     let sink = log.clone();
     std::thread::spawn(move || {
@@ -1186,7 +1589,7 @@ const STAGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Watchdog {
     fn start(
-        child: Arc<Mutex<Child>>,
+        link: Arc<Link>,
         stderr: Arc<StderrLog>,
         jumps: usize,
         on_stage: Option<StageHandler>,
@@ -1214,7 +1617,7 @@ impl Watchdog {
                     progress = Instant::now();
                 } else if progress.elapsed() > STAGE_TIMEOUT && !stop.load(Ordering::Acquire) {
                     flag.store(true, Ordering::Release);
-                    kill_tree(&mut child.lock().unwrap());
+                    link.kill(true);
                     return;
                 }
             }
@@ -1310,7 +1713,7 @@ fn connect_error(
             hint = login_hint(&stderr, timed_out)
         ),
         Trouble::Beyond(index) => tf!(
-            "已连接跳板机 {name}，但无法从它连接 {next}：{hint}。请确认主机填写的是跳板机能访问到的地址。",
+            "已连接跳板机 {name}，但它无法连接 {next}：{hint}。请确认跳板机能访问该主机地址。",
             name = jumps[index].name,
             next = jumps
                 .get(index + 1)
@@ -1340,7 +1743,7 @@ fn login_hint(stderr: &str, timed_out: bool) -> &'static str {
     } else if stderr.contains("Host key verification failed")
         || stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
     {
-        tr("主机密钥与 known_hosts 中的记录不一致，请先在终端中使用 ssh 确认")
+        tr("主机密钥与 known_hosts 中的记录不一致，请先在终端中用 ssh 确认")
     } else {
         tr("连接失败")
     }
@@ -1377,60 +1780,35 @@ fn login(
     Vec<(String, String)>,
     Option<crate::SavedSecret>,
 ) {
-    let mut args: Vec<String> = Vec::new();
+    // 要密码或密钥口令时 ssh 启动 askpass 程序来问我们：存着的自动回答，没存的由界面弹窗。
+    // 没有界面可以弹窗（比如测试工具）：只用密钥，要密码就直接失败
+    let askpass = crate::ssh_env();
+    let args = fr_core::ssh::login_args(
+        identity_file,
+        password_auth,
+        forward_agent,
+        askpass.is_some(),
+    );
     let mut env: Vec<(String, String)> = Vec::new();
     let mut saved = None;
-    let mut add = |items: &[&str]| args.extend(items.iter().map(|item| item.to_string()));
-    if forward_agent {
-        add(&["-A"]);
-    }
-    if let Some(key) = identity_file {
-        // 指定了私钥就只用它，不把 ssh-agent 里的密钥挨个试一遍（试多了服务器会直接断开）
-        add(&["-i", key, "-o", "IdentitiesOnly=yes"]);
-    }
-    if password_auth {
-        add(&[
-            "-o",
-            "PreferredAuthentications=keyboard-interactive,password",
-        ]);
-    }
-    match crate::ssh_env() {
-        // 要密码或密钥口令时 ssh 启动 askpass 程序来问我们：存着的自动回答，没存的由界面弹窗
-        // 密码只问一次：ssh 默认问三次，用户点了取消它还会接着再问两次。输错了点「重试」重连
-        Some(askpass) => {
-            env.extend(askpass.iter().cloned());
-            add(&["-o", "NumberOfPasswordPrompts=1"]);
-            if secret.is_some() || jump.is_some() {
-                let kind = if password_auth {
-                    crate::PromptKind::Password
-                } else {
-                    crate::PromptKind::Passphrase
-                };
-                let entry = crate::SavedSecret::register_for(secret, kind, jump);
-                env.push((
-                    fr_core::askpass::TAG_ENV.to_string(),
-                    entry.tag().to_string(),
-                ));
-                saved = Some(entry);
-            }
+    if let Some(askpass) = askpass {
+        env.extend(askpass.iter().cloned());
+        if secret.is_some() || jump.is_some() {
+            let kind = if password_auth {
+                crate::PromptKind::Password
+            } else {
+                crate::PromptKind::Passphrase
+            };
+            let entry = crate::SavedSecret::register_for(secret, kind, jump);
+            env.push((
+                fr_core::askpass::TAG_ENV.to_string(),
+                entry.tag().to_string(),
+            ));
+            saved = Some(entry);
         }
-        // 没有界面可以弹窗（比如测试工具）：只用密钥，要密码就直接失败
-        None => add(&["-o", "BatchMode=yes"]),
     }
     (args, env, saved)
 }
-
-/// 每个 ssh 都带的：第一次连的主机自动记进 known_hosts（记录过的密钥对不上仍然拒绝）；保活
-pub(crate) const KEEP_OPTIONS: &[&str] = &[
-    "-o",
-    "StrictHostKeyChecking=accept-new",
-    "-o",
-    "ServerAliveInterval=15",
-    "-o",
-    "ServerAliveCountMax=4",
-];
-/// 经跳板机连接时每个 ssh 都带的：登录成功时打一行「Authenticated to …」，用来看进度（见 [`Watchdog`]）
-pub(crate) const STAGE_OPTIONS: &[&str] = &["-o", "LogLevel=VERBOSE"];
 
 /// 构造 ssh 命令。`--` 防止以 `-` 开头的目标被当成选项。
 /// 返回的第二项要留到登录完成（见 [`login`]）。
@@ -1470,15 +1848,15 @@ fn ssh(
                 .find(|(name, _)| name == fr_core::askpass::TAG_ENV)
                 .map(|(_, tag)| tag.clone());
             held.extend(saved);
-            hops.push(crate::hop::Hop {
+            hops.push(hop::Hop {
                 destination: jump.destination.clone(),
                 args,
                 tag,
             });
         }
-        cmd.env(crate::hop::HOPS_ENV, crate::hop::encode(&hops));
+        cmd.env(hop::HOPS_ENV, hop::encode(&hops));
         let helper = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kuai"));
-        let proxy = crate::hop::proxy_command(&helper, hops.len() - 1);
+        let proxy = hop::proxy_command(&helper, hops.len() - 1);
         cmd.args(["-o", &format!("ProxyCommand={proxy}")]);
         cmd.args(STAGE_OPTIONS);
     }
@@ -1486,17 +1864,6 @@ fn ssh(
     cmd.args(KEEP_OPTIONS);
     cmd.args(["--", destination, remote_command]);
     (cmd, held)
-}
-
-pub(crate) fn ssh_program() -> PathBuf {
-    #[cfg(windows)]
-    if let Some(root) = std::env::var_os("SystemRoot") {
-        let builtin = PathBuf::from(root).join(r"System32\OpenSSH\ssh.exe");
-        if builtin.is_file() {
-            return builtin;
-        }
-    }
-    PathBuf::from("ssh")
 }
 
 /// 远程执行的启动脚本：这一版的 kuaid 装了就启动它的转接程序，没装就报告系统和架构。
@@ -1535,8 +1902,8 @@ fn windows_bootstrap_script(dir: &str) -> String {
     )
 }
 
-/// Windows 服务器上的安装脚本：标准输入进来的是一个 tar 包，里面只有 `kuaid.exe`，用系统自带的
-/// `tar.exe` 解开（Windows 10 1803 起就有；PowerShell 从标准输入收二进制会卡住，不用它）。
+/// Windows 服务器上的安装脚本：标准输入进来的是一个 tar 包，里面是 `kuaid.exe` 和它带的 ConPTY，
+/// 用系统自带的 `tar.exe` 解开（Windows 10 1803 起就有；PowerShell 从标准输入收二进制会卡住，不用它）。
 /// 先解到临时目录再改名，免得留下半个文件。清掉旧版本的事交给刚装好的 kuaid 自己做
 /// （`kuaid --installed`）：正在用的那一版、还有程序占着的目录它会留着。
 fn windows_install_script(dir: &str) -> String {
@@ -1545,30 +1912,35 @@ fn windows_install_script(dir: &str) -> String {
     )
 }
 
-/// 只有一个文件的 tar 包（ustar 格式）。
-fn tar_single(name: &str, data: &[u8]) -> Vec<u8> {
-    let mut header = [0u8; 512];
-    header[..name.len()].copy_from_slice(name.as_bytes());
-    let mut field =
-        |at: usize, text: &str| header[at..at + text.len()].copy_from_slice(text.as_bytes());
-    field(100, "0000755\0");
-    field(108, "0000000\0");
-    field(116, "0000000\0");
-    field(124, &format!("{:011o}\0", data.len()));
-    field(136, "00000000000\0");
-    // 校验和算的时候这一格当成 8 个空格
-    field(148, "        ");
-    // 普通文件
-    field(156, "0");
-    field(257, "ustar\0");
-    field(263, "00");
-    let sum: u32 = header.iter().map(|b| u32::from(*b)).sum();
-    header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
-    let mut archive = Vec::with_capacity(512 + data.len() + 2048);
-    archive.extend_from_slice(&header);
-    archive.extend_from_slice(data);
-    // 内容补齐到 512 的整数倍，最后是两块全零
-    archive.resize(archive.len().div_ceil(512) * 512 + 1024, 0);
+/// 几个文件打成一个 tar 包（ustar 格式），文件名不超过 100 字节。
+fn tar_files(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let total: usize = files.iter().map(|(_, data)| 512 + data.len() + 511).sum();
+    let mut archive = Vec::with_capacity(total + 1024);
+    for (name, data) in files {
+        let mut header = [0u8; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        let mut field =
+            |at: usize, text: &str| header[at..at + text.len()].copy_from_slice(text.as_bytes());
+        field(100, "0000755\0");
+        field(108, "0000000\0");
+        field(116, "0000000\0");
+        field(124, &format!("{:011o}\0", data.len()));
+        field(136, "00000000000\0");
+        // 校验和算的时候这一格当成 8 个空格
+        field(148, "        ");
+        // 普通文件
+        field(156, "0");
+        field(257, "ustar\0");
+        field(263, "00");
+        let sum: u32 = header.iter().map(|b| u32::from(*b)).sum();
+        header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        archive.extend_from_slice(&header);
+        archive.extend_from_slice(data);
+        // 内容补齐到 512 的整数倍
+        archive.resize(archive.len().div_ceil(512) * 512, 0);
+    }
+    // 最后是两块全零
+    archive.resize(archive.len() + 1024, 0);
     archive
 }
 
@@ -1584,23 +1956,38 @@ fn install_script(dir: &str) -> String {
 /// 那一版（它记在 `run/current` 里：下次连接时才换成新的，换之前它的程序不能没）；
 /// 还有 1.2.2 以前产品叫 fork-remote 时装在 `~/.fork-remote` 的旧程序。
 /// `script` 是服务器上执行的安装脚本，`data` 是喂给它标准输入的内容。
-fn install(destination: &str, options: &ConnectOptions, script: &str, data: Vec<u8>) -> Result<()> {
-    let (mut cmd, _saved) = ssh(destination, script, options, false);
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    no_window(&mut cmd);
-    let mut child = cmd.spawn().context(tr("无法启动 ssh"))?;
-    let mut stdin = child.stdin.take().context(tr("无法获取 ssh 的标准输入"))?;
-    let writer = std::thread::spawn(move || stdin.write_all(&data));
-    let out = child.wait_with_output().context(tr("上传 kuaid 失败"))?;
+fn install(
+    route: Route,
+    destination: &str,
+    options: &ConnectOptions,
+    script: &str,
+    data: Vec<u8>,
+) -> Result<()> {
+    let (pipes, _saved) = route.run(destination, script, options, false)?;
+    let Pipes {
+        mut stdin,
+        mut stdout,
+        mut stderr,
+        link,
+    } = pipes;
+    // 写完就关掉标准输入：安装脚本读到结尾才往下走
+    let writer = std::thread::spawn(move || {
+        let written = stdin.write_all(&data).and_then(|()| stdin.flush());
+        drop(stdin);
+        written
+    });
+    let drain = std::thread::spawn(move || std::io::copy(&mut stdout, &mut std::io::sink()));
+    let mut errors = Vec::new();
+    let _ = stderr.read_to_end(&mut errors);
+    let _ = drain.join();
+    let code = link.wait();
     let written = writer.join();
-    if !out.status.success() {
+    if code != Some(0) {
         bail!(
             "{}",
             tf!(
                 "上传 kuaid 失败：{stderr}",
-                stderr = String::from_utf8_lossy(&out.stderr).trim()
+                stderr = String::from_utf8_lossy(&errors).trim()
             )
         );
     }
@@ -1608,17 +1995,6 @@ fn install(destination: &str, options: &ConnectOptions, script: &str, data: Vec<
         bail!(tr("上传 kuaid 时连接中断"));
     }
     Ok(())
-}
-
-pub(crate) fn no_window(cmd: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW：不弹出控制台窗口
-        cmd.creation_flags(0x0800_0000);
-    }
-    #[cfg(not(windows))]
-    let _ = cmd;
 }
 
 #[cfg(test)]
@@ -1708,17 +2084,23 @@ mod tests {
     #[test]
     fn tar_包系统的_tar_解得开() {
         let data: Vec<u8> = (0..70_001u32).map(|i| (i % 251) as u8).collect();
-        let archive = tar_single("kuaid.exe", &data);
+        let dll: Vec<u8> = (0..1_000u32).map(|i| (i % 7) as u8).collect();
+        let archive = tar_files(&[("kuaid.exe", data.clone()), ("conpty.dll", dll.clone())]);
         assert_eq!(archive.len() % 512, 0);
         assert_eq!(&archive[..9], b"kuaid.exe");
         assert_eq!(&archive[124..136], b"00000210561\0");
         assert_eq!(&archive[512..512 + data.len()], &data[..]);
+        // 第二个文件的头从第一个文件补齐后的下一块开始
+        let second = 512 + data.len().div_ceil(512) * 512;
+        assert_eq!(&archive[second..second + 10], b"conpty.dll");
         // 校验和对得上：按 tar 的算法重算一遍
-        let mut header = archive[..512].to_vec();
-        let stored = std::str::from_utf8(&header[148..154]).unwrap().to_string();
-        header[148..156].copy_from_slice(b"        ");
-        let sum: u32 = header.iter().map(|b| u32::from(*b)).sum();
-        assert_eq!(stored, format!("{sum:06o}"));
+        for at in [0, second] {
+            let mut header = archive[at..at + 512].to_vec();
+            let stored = std::str::from_utf8(&header[148..154]).unwrap().to_string();
+            header[148..156].copy_from_slice(b"        ");
+            let sum: u32 = header.iter().map(|b| u32::from(*b)).sum();
+            assert_eq!(stored, format!("{sum:06o}"));
+        }
         // 有 tar 的话真的解一遍（Windows 10 1803 起自带）
         let dir = std::env::temp_dir().join(format!("fr-tar-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1732,6 +2114,7 @@ mod tests {
             child.stdin.take().unwrap().write_all(&archive).unwrap();
             assert!(child.wait().unwrap().success());
             assert_eq!(std::fs::read(dir.join("kuaid.exe")).unwrap(), data);
+            assert_eq!(std::fs::read(dir.join("conpty.dll")).unwrap(), dll);
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1772,7 +2155,7 @@ mod tests {
         // 各台跳板机的登录选项在环境变量里，按顺序
         let hops = cmd
             .get_envs()
-            .find(|(name, _)| *name == crate::hop::HOPS_ENV)
+            .find(|(name, _)| *name == hop::HOPS_ENV)
             .and_then(|(_, value)| value)
             .unwrap()
             .to_string_lossy()
@@ -1796,11 +2179,7 @@ mod tests {
 
         // 不经跳板机：和以前一样
         let (plain, _held) = ssh("u@h", "true", &ConnectOptions::default(), false);
-        assert!(
-            plain
-                .get_envs()
-                .all(|(name, _)| name != crate::hop::HOPS_ENV)
-        );
+        assert!(plain.get_envs().all(|(name, _)| name != hop::HOPS_ENV));
         let plain: Vec<String> = plain
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -1862,7 +2241,7 @@ mod tests {
         let message = connect_error("feng@10.20.1.15", &log, &[], &jumps, false);
         assert_eq!(
             message,
-            "已连接跳板机 bastion，但无法从它连接 feng@10.20.1.15：连接被拒绝。请确认主机填写的是跳板机能访问到的地址。\
+            "已连接跳板机 bastion，但它无法连接 feng@10.20.1.15：连接被拒绝。请确认跳板机能访问该主机地址。\
              （ssh：channel 0: open failed: connect failed: Connection refused\nstdio forwarding failed）"
         );
     }

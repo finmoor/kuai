@@ -2,11 +2,16 @@
 //!
 //! shell 放进一个作业对象：托管进程退出（或者明说结束）时，里面的程序连同它们起的子进程一起结束；
 //! 自己声明要脱离作业的程序（`CREATE_BREAKAWAY_FROM_JOB`）可以留下，相当于 Linux 上的 nohup。
+//!
+//! 伪控制台优先用 kuaid 旁边的新版 ConPTY（`conpty.dll` 加 `OpenConsole.exe`，Windows 终端用的那套，
+//! 随 Kuai 带来，见 `vendor/conpty`），没有或开不了才用系统自带的。系统自带的把程序要鼠标的请求
+//! （`ESC[?1000h` 等）吞掉，终端就不知道程序要了鼠标，Claude Code 这类程序收不到滚轮；新版照转。
 
 use std::ffi::OsStr;
 use std::fs::File;
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::FromRawHandle as _;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context as _, Result, bail};
@@ -19,6 +24,9 @@ use windows_sys::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
 };
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW,
+};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
@@ -26,11 +34,81 @@ use windows_sys::Win32::System::Threading::{
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
     STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
+use windows_sys::core::HRESULT;
+use windows_sys::s;
 
 use super::Size;
 
+/// 一套伪控制台的函数：系统自带的，或者随带的 `conpty.dll` 里的（签名一样，见它的 `conpty.h`）。
+#[derive(Clone, Copy)]
+struct Api {
+    create: unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> HRESULT,
+    resize: unsafe extern "system" fn(HPCON, COORD) -> HRESULT,
+    close: unsafe extern "system" fn(HPCON),
+}
+
+fn system_api() -> Api {
+    Api {
+        create: CreatePseudoConsole,
+        resize: ResizePseudoConsole,
+        close: ClosePseudoConsole,
+    }
+}
+
+/// 随带的那套：kuaid 所在目录里的 `conpty.dll`，旁边要有 `OpenConsole.exe`（`conpty.dll` 从自己旁边
+/// 启动它）。只加载一次；不在或者加载不了是 `None`。
+fn bundled_api() -> Option<Api> {
+    static BUNDLED: OnceLock<Option<Api>> = OnceLock::new();
+    *BUNDLED.get_or_init(|| {
+        let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        if !dir.join("OpenConsole.exe").is_file() {
+            return None;
+        }
+        let path: Vec<u16> = dir
+            .join("conpty.dll")
+            .as_os_str()
+            .encode_wide()
+            .chain([0])
+            .collect();
+        // SAFETY: 按完整路径加载，不到别的目录里找同名的；取出的三个函数和系统的同名函数签名一样
+        unsafe {
+            let module = LoadLibraryExW(
+                path.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_WITH_ALTERED_SEARCH_PATH,
+            );
+            if module.is_null() {
+                return None;
+            }
+            let create = GetProcAddress(module, s!("ConptyCreatePseudoConsole"))?;
+            let resize = GetProcAddress(module, s!("ConptyResizePseudoConsole"))?;
+            let close = GetProcAddress(module, s!("ConptyClosePseudoConsole"))?;
+            Some(Api {
+                create: std::mem::transmute::<
+                    unsafe extern "system" fn() -> isize,
+                    unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> HRESULT,
+                >(create),
+                resize: std::mem::transmute::<
+                    unsafe extern "system" fn() -> isize,
+                    unsafe extern "system" fn(HPCON, COORD) -> HRESULT,
+                >(resize),
+                close: std::mem::transmute::<
+                    unsafe extern "system" fn() -> isize,
+                    unsafe extern "system" fn(HPCON),
+                >(close),
+            })
+        }
+    })
+}
+
+/// 开终端用的是不是随带的新版 ConPTY（常驻进程启动时记进日志）。
+pub fn uses_bundled() -> bool {
+    bundled_api().is_some()
+}
+
 /// 一个伪控制台和里面的 shell。
 pub struct Console {
+    api: Api,
     hpc: HPCON,
     process: HANDLE,
     job: HANDLE,
@@ -57,8 +135,15 @@ impl Console {
         let (in_read, in_write) = pipe()?;
         let (out_read, out_write) = pipe()?;
         let mut hpc: HPCON = 0;
+        // 随带的开不了（比如 OpenConsole.exe 被拦了）就用系统自带的，管道还是这两根
+        let mut api = bundled_api().unwrap_or_else(system_api);
         // SAFETY: 两个句柄是刚开的管道；hpc 是合法的输出位置
-        let created = unsafe { CreatePseudoConsole(coord(size), in_read, out_write, 0, &mut hpc) };
+        let mut created = unsafe { (api.create)(coord(size), in_read, out_write, 0, &mut hpc) };
+        if created < 0 && bundled_api().is_some() {
+            api = system_api();
+            // SAFETY: 同上
+            created = unsafe { (api.create)(coord(size), in_read, out_write, 0, &mut hpc) };
+        }
         // 伪控制台自己留了一份，这两头我们用不着了
         // SAFETY: 刚开的句柄，只关这一次
         unsafe {
@@ -79,13 +164,14 @@ impl Console {
         let (process, pid) = match started {
             Ok(started) => started,
             Err(err) => {
-                // SAFETY: hpc 是刚创建的
-                unsafe { ClosePseudoConsole(hpc) };
+                // SAFETY: hpc 是刚用这套函数创建的
+                unsafe { (api.close)(hpc) };
                 return Err(err);
             }
         };
         Ok((
             Console {
+                api,
                 hpc,
                 process: process.process,
                 job: process.job,
@@ -99,8 +185,8 @@ impl Console {
 
     pub fn resize(&self, size: Size) {
         if !self.closed.load(Ordering::Acquire) {
-            // SAFETY: hpc 还没关
-            unsafe { ResizePseudoConsole(self.hpc, coord(size)) };
+            // SAFETY: hpc 还没关，是这套函数创建的
+            unsafe { (self.api.resize)(self.hpc, coord(size)) };
         }
     }
 
@@ -108,8 +194,8 @@ impl Console {
     /// 所以放在自己的线程里调用。只做一次。
     pub fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
-            // SAFETY: 只关这一次
-            unsafe { ClosePseudoConsole(self.hpc) };
+            // SAFETY: 只关这一次，用创建它的那套函数
+            unsafe { (self.api.close)(self.hpc) };
         }
     }
 

@@ -59,8 +59,8 @@ impl Kind {
         tr(match self {
             Kind::Pick => tr_key("保留（pick）：保持原样"),
             Kind::Reword => tr_key("修改说明（reword）：改动不变，仅修改提交说明"),
-            Kind::Squash => tr_key("并入下方提交（squash）：合并为一个提交，保留两者的说明"),
-            Kind::Fixup => tr_key("并入下方提交并丢弃说明（fixup）：合并为一个提交，仅保留下方提交的说明"),
+            Kind::Squash => tr_key("并入下方提交（squash）：保留两者的说明"),
+            Kind::Fixup => tr_key("并入下方提交并丢弃说明（fixup）：仅保留下方提交的说明"),
             Kind::Drop => tr_key("丢弃（drop）：删除此提交及其改动"),
         })
     }
@@ -340,11 +340,11 @@ impl Render for RebaseEditor {
         v_flex()
             .gap_3()
             .child(div().text_xs().text_color(muted).whitespace_normal().child(tr(
-                "最新的提交在最上方。使用箭头调整顺序，在下拉列表中选择操作。提交将重新生成（哈希会改变），已推送的提交完成后需要强制推送。",
+                "最新的提交在最上方。用箭头调整顺序，在下拉列表中选择操作。提交将重新生成，已推送的需强制推送。",
             )))
             .when(merges > 0, |d| {
                 d.child(div().text_xs().text_color(warning).whitespace_normal().child(tf!(
-                    "其中包含 {merges} 个合并提交。变基后历史将变为线性，不保留合并关系。",
+                    "其中有 {merges} 个合并提交，变基后不保留合并关系。",
                     merges
                 )))
             })
