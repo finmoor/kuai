@@ -13,7 +13,7 @@ Windows 上的 Git 客户端，界面和操作方式接近 Fork，目标是完�
 - **安装版** `kuai-<版本>-windows-x64-setup.exe`（推荐）：安装在用户目录下（`%LOCALAPPDATA%\Programs\Kuai`），无需管理员权限；可从开始菜单启动，可在「设置 → 应用」中卸载。
 - **解压版** `kuai-<版本>-windows-x64.zip`：解压得到的 Kuai 文件夹可放在任意位置，双击 `kuai.exe` 运行。
 
-运行要求：64 位 Windows 10 或 11，PATH 中有 git，使用 Windows 自带的 OpenSSH；服务器为 Linux（x86_64），无需 root 权限。将服务器目录映射到本机时还需安装 [WinFsp](https://winfsp.dev/)，未安装时 Kuai 可经 winget 代为安装。程序未进行代码签名，首次运行时 Windows 可能提示「Windows 已保护你的电脑」，请点击「更多信息」，再点击「仍要运行」。
+运行要求：64 位 Windows 10 或 11，PATH 中有 git，使用 Windows 自带的 OpenSSH；服务器为 Linux（x86_64）或开启了 OpenSSH 服务的 Windows，并已安装 git，无需 root 权限。将服务器目录映射到本机时还需安装 [WinFsp](https://winfsp.dev/)，未安装时 Kuai 可经 winget 代为安装。程序未进行代码签名，首次运行时 Windows 可能提示「Windows 已保护你的电脑」，请点击「更多信息」，再点击「仍要运行」。
 
 有新版本时，标题栏齿轮左侧会显示更新提示，点击可查看更新内容并一键更新（安装版在后台运行新的安装程序，解压版直接替换文件）；也可在「设置 → 关于」中检查更新。服务器上的 kuaid 无需单独更新，新版 Kuai 连接时会自动替换。
 
@@ -73,7 +73,7 @@ Windows 上的 Git 客户端，界面和操作方式接近 Fork，目标是完�
 | 逐行追溯 | 上下方向键、PageUp、PageDown、Home、End 选择行，Enter 跳转到修改该行的提交，Esc 关闭 |
 | 文件页的目录树 | 上下方向键切换，左右方向键折叠、展开目录，Enter 打开文件并保留，空格键预览；F2 重命名，Delete 删除（会先确认） |
 
-焦点位于终端中时，只有以下快捷键仍由 Kuai 处理：Ctrl+Tab、Ctrl+Shift+Tab、Ctrl+Shift+T、Ctrl+1、Ctrl+2、Ctrl+Shift+E、Ctrl+\`、Ctrl+Shift+\`、Ctrl+,、Ctrl+Shift+B。其余按键（Tab、Shift+Tab、Esc、F5、Ctrl+W、Ctrl+F、Ctrl+P、Ctrl+S、功能键、Alt 组合键等）全部交给终端中的程序。终端中：Ctrl+C 中断（选中文字时为复制），Ctrl+Shift+C 复制，Ctrl+V、Shift+Insert 粘贴（剪贴板中为图片或文件时，粘贴的是其路径）；右键在有选中文字时复制，否则粘贴；Shift+PageUp、Shift+PageDown 和鼠标滚轮可查看之前的输出。
+焦点位于终端中时，只有以下快捷键仍由 Kuai 处理：Ctrl+Tab、Ctrl+Shift+Tab、Ctrl+Shift+T、Ctrl+1、Ctrl+2、Ctrl+Shift+E、Ctrl+\`、Ctrl+Shift+\`、Ctrl+,、Ctrl+Shift+B。其余按键（Tab、Shift+Tab、Esc、F5、Ctrl+W、Ctrl+F、Ctrl+P、Ctrl+S、功能键、Alt 组合键等）全部交给终端中的程序。终端中：Ctrl+C 中断（选中文字时为复制），Ctrl+Shift+C 复制，Ctrl+V、Shift+Insert 粘贴（剪贴板中为图片或文件时，粘贴的是其路径）；右键在有选中文字时复制，否则粘贴；Shift+PageUp、Shift+PageDown 和鼠标滚轮可查看之前的输出；终端中的程序使用鼠标时（例如 Claude Code），滚轮交给程序，按住 Shift 滚动则查看终端的记录。
 
 ## 构建与运行
 
