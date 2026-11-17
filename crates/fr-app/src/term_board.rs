@@ -1,0 +1,525 @@
+//! 所有工作区里的终端现在怎么样了（终端总览页、标题栏上的个数、「已停下」的提醒都从这里读）。
+//!
+//! 终端开在各台电脑的 kuaid 里。连着哪台就订阅哪台的终端列表（`term_watch`，协议 11）：开了、结束了、
+//! 有输出变成没输出时 kuaid 推一份过来，每个终端带着「多久没有输出了」和屏幕上最后一行字。
+//! 不用把每个终端都接上。没连着的电脑上的终端不知道，也不为了看它去连。
+//!
+//! 一个终端的三种状态（[`TermState`]）只看输出：
+//!
+//! - 运行中：[`QUIET`] 以内有过输出。
+//! - 已停下：超过这么久没有输出，而且停下以后还没看过。
+//! - 空闲：停下以后看过了，或者不知道它什么时候输出过。
+//!
+//! 「看过」：它正显示在窗口里（仓库标签页的终端页上选中的那个，见 [`TermBoard::set_shown`]），
+//! 在总览页里选中过，或者从总览页前往过。总览页里正选中的那个不提醒、不计入标题栏上的个数，
+//! 但在列表里仍写着「已停下」，选到别的、离开那一页以后才变成空闲：不然一打开总览页，自动选中的
+//! 那个马上变成空闲，就看不出是哪个停下了。启动 Kuai、刚连上一台电脑时已经停着的终端都算看过：
+//! 只提醒这次运行期间停下来的。记在内存里，不同步。
+//!
+//! 不准的情况：十几秒不出字的命令（链接、下载）会先被当成已停下，再出字时变回运行中。
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use fr_channel::{Connection, TermInfo};
+use futures::StreamExt as _;
+use gpui_kit::*;
+
+use crate::app_state::AppState;
+use crate::machines::{LOCAL, WorkspaceKey, machine_of};
+use crate::settings::RepoEntry;
+use crate::terminal;
+
+/// 这么久没有新输出就算停下了
+pub const QUIET: Duration = Duration::from_secs(10);
+/// 重新算一遍状态的间隔
+const TICK: Duration = Duration::from_secs(1);
+/// 状态没变也隔这么多次重画一遍：界面上「停了多久」的字要跟着走
+const REDRAW_EVERY: u32 = 30;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TermState {
+    Running,
+    Stopped,
+    Idle,
+}
+
+/// 按最近一次输出、最近一次看它的时间算状态。
+pub fn state_of(last_output: Option<Instant>, seen: Option<Instant>, now: Instant) -> TermState {
+    match last_output {
+        None => TermState::Idle,
+        Some(at) if now.saturating_duration_since(at) < QUIET => TermState::Running,
+        Some(at) if seen.is_some_and(|seen| seen >= at) => TermState::Idle,
+        Some(_) => TermState::Stopped,
+    }
+}
+
+/// 哪台电脑上的哪个终端。
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct TermId {
+    /// 电脑的键：本机是空串，服务器是它的 id（经别的电脑连的是 `那台>它`）
+    pub machine: String,
+    /// kuaid 给这个终端的编号
+    pub term: String,
+}
+
+/// 正显示在窗口里的终端。
+#[derive(Clone, PartialEq)]
+pub enum Shown {
+    /// 仓库标签页的终端页上：哪个仓库的第几个终端
+    Repo(RepoEntry, u32),
+    /// 总览页里选中的
+    Term(TermId),
+}
+
+/// 读到的一个终端。
+struct Listed {
+    info: TermInfo,
+    /// 最近一次输出的时刻，按收到时的「多久没有输出」倒推的；不知道是 None
+    last_output: Option<Instant>,
+}
+
+/// 列表里的一行。
+#[derive(Clone)]
+pub struct Row {
+    pub id: TermId,
+    /// 它是哪个仓库的终端
+    pub entry: RepoEntry,
+    /// 那个仓库的第几个终端
+    pub number: u32,
+    /// 程序自己设的标题
+    pub title: Option<String>,
+    /// 屏幕上最后一行有字的内容
+    pub last: String,
+    pub cols: u16,
+    pub rows: u16,
+    /// 里面的程序还在跑
+    pub alive: bool,
+    pub state: TermState,
+    pub last_output: Option<Instant>,
+}
+
+/// 一个工作区里的终端。
+pub struct Group {
+    /// 不在任何工作区里的仓库的终端归到最后一组，这里是 None
+    pub workspace: Option<WorkspaceKey>,
+    pub rows: Vec<Row>,
+}
+
+/// 一个不在眼前的终端从运行中变成了已停下。
+pub struct Stopped(pub Row);
+
+pub struct TermBoard {
+    app: Entity<AppState>,
+    lists: HashMap<String, Vec<Listed>>,
+    /// 订阅各台电脑终端列表的任务，和订阅用的连接；丢弃就不订阅了
+    watches: HashMap<String, (Arc<Connection>, Task<()>)>,
+    seen: HashMap<TermId, Instant>,
+    /// 上一次算出来的状态：和这一次不一样才重画、才提醒
+    states: HashMap<TermId, TermState>,
+    shown: Option<Shown>,
+    _observe: Subscription,
+    _tick: Task<()>,
+}
+
+impl EventEmitter<Stopped> for TermBoard {}
+
+impl TermBoard {
+    pub fn new(app: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        // 连上、断开了哪台电脑，跟着订阅、退订
+        let observe = cx.observe(&app, |this, _, cx| this.sync_watches(cx));
+        let tick = cx.spawn(async move |this, cx| {
+            let mut count = 0;
+            loop {
+                cx.background_executor().timer(TICK).await;
+                count += 1;
+                let redraw = count % REDRAW_EVERY == 0;
+                let done = this.update(cx, |this, cx| {
+                    this.recompute(cx);
+                    if redraw && !this.lists.is_empty() {
+                        cx.notify();
+                    }
+                });
+                if done.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut this = Self {
+            app,
+            lists: HashMap::new(),
+            watches: HashMap::new(),
+            seen: HashMap::new(),
+            states: HashMap::new(),
+            shown: None,
+            _observe: observe,
+            _tick: tick,
+        };
+        this.sync_watches(cx);
+        this
+    }
+
+    fn sync_watches(&mut self, cx: &mut Context<Self>) {
+        let links: Vec<(String, Arc<Connection>)> = self
+            .app
+            .read(cx)
+            .links
+            .iter()
+            .map(|(key, conn)| (key.clone(), conn.clone()))
+            .collect();
+        let before = self.watches.len();
+        self.watches
+            .retain(|key, (conn, _)| links.iter().any(|(k, c)| k == key && Arc::ptr_eq(c, conn)));
+        let mut changed = self.watches.len() != before;
+        for (key, conn) in links {
+            // 旧版 kuaid 不会有（连接时就升级了），保险起见
+            if self.watches.contains_key(&key) || conn.hello.protocol < 11 {
+                continue;
+            }
+            let task = cx.spawn({
+                let (key, conn) = (key.clone(), conn.clone());
+                async move |this, cx| {
+                    let mut updates = conn.term_watch();
+                    let mut first = true;
+                    while let Some(Ok(list)) = updates.next().await {
+                        let arrived = this.update(cx, |this, cx| {
+                            this.arrived(&key, list, first, cx);
+                        });
+                        if arrived.is_err() {
+                            return;
+                        }
+                        first = false;
+                    }
+                    this.update(cx, |this, cx| this.dropped(&key, &conn, cx))
+                        .ok();
+                }
+            });
+            self.watches.insert(key, (conn, task));
+            changed = true;
+        }
+        // 断开了的电脑：它上面的终端不再列着
+        let gone: Vec<String> = self
+            .lists
+            .keys()
+            .filter(|key| !self.watches.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in gone {
+            self.forget(&key);
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn forget(&mut self, machine: &str) {
+        self.lists.remove(machine);
+        self.seen.retain(|id, _| id.machine != machine);
+        self.states.retain(|id, _| id.machine != machine);
+    }
+
+    /// 订阅断了（连接断开）。
+    fn dropped(&mut self, machine: &str, conn: &Arc<Connection>, cx: &mut Context<Self>) {
+        // 已经换上了新的连接：旧的断了不算
+        if self
+            .watches
+            .get(machine)
+            .is_some_and(|(current, _)| Arc::ptr_eq(current, conn))
+        {
+            self.watches.remove(machine);
+            self.forget(machine);
+            cx.notify();
+        }
+    }
+
+    /// 一台电脑推来一份终端列表。`first`：这次订阅的第一份。
+    fn arrived(&mut self, machine: &str, list: Vec<TermInfo>, first: bool, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let old = self.lists.remove(machine).unwrap_or_default();
+        let listed: Vec<Listed> = list
+            .into_iter()
+            .map(|info| {
+                let before = old
+                    .iter()
+                    .find(|listed| listed.info.term == info.term)
+                    .and_then(|listed| listed.last_output);
+                // 正在输出时 kuaid 隔几秒才推一次，这个时刻会落后几秒；输出停下以后它还会推一次，
+                // 到判断「已停下还是空闲」的时候（停下 10 秒后）已经是准的
+                let fresh = info
+                    .idle_ms
+                    .and_then(|idle| now.checked_sub(Duration::from_millis(idle)));
+                let last_output = fresh.or(before);
+                Listed { info, last_output }
+            })
+            .collect();
+        // 不在了的终端不用再记着
+        let here = |id: &TermId| {
+            id.machine != machine || listed.iter().any(|listed| listed.info.term == id.term)
+        };
+        self.seen.retain(|id, _| here(id));
+        self.states.retain(|id, _| here(id));
+        if first {
+            // 刚连上时已经停着的都算看过：只提醒这次运行期间停下来的
+            for item in &listed {
+                let id = TermId {
+                    machine: machine.to_string(),
+                    term: item.info.term.clone(),
+                };
+                if state_of(item.last_output, None, now) == TermState::Stopped {
+                    self.seen.insert(id, now);
+                }
+            }
+        }
+        self.lists.insert(machine.to_string(), listed);
+        self.recompute(cx);
+        // 标题、最后一行也可能变了
+        cx.notify();
+    }
+
+    /// 重新算一遍各个终端的状态：变了就重画；不在眼前的从运行中变成已停下的，说一声。
+    fn recompute(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let shown = self.shown_id();
+        // 终端页上正显示着的一直算看过。总览页里选中的那个先不记：它在列表里还得写着「已停下」，
+        // 选到别的、离开这一页时才记（见 `set_shown`）
+        if let (Some(id), Some(Shown::Repo(..))) = (&shown, &self.shown) {
+            self.seen.insert(id.clone(), now);
+        }
+        let mut changed = false;
+        let mut stopped = Vec::new();
+        for (machine, list) in &self.lists {
+            for item in list {
+                let id = TermId {
+                    machine: machine.clone(),
+                    term: item.info.term.clone(),
+                };
+                let state = state_of(item.last_output, self.seen.get(&id).copied(), now);
+                let before = self.states.insert(id.clone(), state);
+                if before == Some(state) {
+                    continue;
+                }
+                changed = true;
+                // 只在 FR_LOG=1 时打出来：断开远程桌面、看不到画面时靠它核对
+                log::info!(
+                    "终端 {}（{}）：{before:?} -> {state:?}",
+                    item.info.key,
+                    if machine.is_empty() {
+                        "本机"
+                    } else {
+                        machine
+                    }
+                );
+                let watching = shown.as_ref() == Some(&id);
+                if before == Some(TermState::Running) && state == TermState::Stopped && !watching {
+                    stopped.push(id);
+                }
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+        for id in stopped {
+            if let Some(row) = self.row(&id, cx) {
+                cx.emit(Stopped(row));
+            }
+        }
+    }
+
+    /// 正显示在窗口里的是哪个终端（窗口不在前台、显示的不是终端时是 None）。
+    pub fn set_shown(&mut self, shown: Option<Shown>, cx: &mut Context<Self>) {
+        if self.shown != shown {
+            // 总览页里刚才选中的那个：看过了
+            if let Some(Shown::Term(id)) = &self.shown {
+                self.seen.insert(id.clone(), Instant::now());
+            }
+            self.shown = shown;
+            match &self.shown {
+                None => log::info!("正显示的终端：没有"),
+                Some(Shown::Repo(entry, number)) => {
+                    log::info!("正显示的终端：{} 的第 {number} 个", entry.path)
+                }
+                Some(Shown::Term(id)) => log::info!("正显示的终端：总览页里选中的 {}", id.term),
+            }
+            self.recompute(cx);
+            // 状态没变，标题栏上的个数也可能变了（正选中的那个不算）
+            cx.notify();
+        }
+    }
+
+    fn shown_id(&self) -> Option<TermId> {
+        match self.shown.as_ref()? {
+            Shown::Term(id) => Some(id.clone()),
+            Shown::Repo(entry, number) => {
+                let machine = machine_of(entry);
+                let term = self.lists.get(machine)?.iter().find(|listed| {
+                    terminal::session_number(&entry.path, &listed.info.key) == Some(*number)
+                })?;
+                Some(TermId {
+                    machine: machine.to_string(),
+                    term: term.info.term.clone(),
+                })
+            }
+        }
+    }
+
+    /// 看过了（从总览页前往它）。
+    pub fn mark_seen(&mut self, id: &TermId, cx: &mut Context<Self>) {
+        self.seen.insert(id.clone(), Instant::now());
+        self.recompute(cx);
+    }
+
+    /// 那台电脑的终端列表订阅着没有（连着才订阅）。
+    pub fn watching(&self, machine: &str) -> bool {
+        self.watches.contains_key(machine)
+    }
+
+    /// 订阅那台电脑用的连接（预览经它接上终端）。
+    pub fn conn(&self, machine: &str) -> Option<Arc<Connection>> {
+        self.watches.get(machine).map(|(conn, _)| conn.clone())
+    }
+
+    /// 已停下、还没看过的有几个（总览页里正选中的那个不算：正看着它）。
+    pub fn attention(&self) -> usize {
+        let shown = self.shown_id();
+        self.states
+            .iter()
+            .filter(|(id, state)| **state == TermState::Stopped && shown.as_ref() != Some(*id))
+            .count()
+    }
+
+    fn make_row(&self, machine: &str, listed: &Listed, app: &AppState) -> Row {
+        let id = TermId {
+            machine: machine.to_string(),
+            term: listed.info.term.clone(),
+        };
+        let (entry, number) = owner(app, machine, &listed.info.key);
+        let state = self.states.get(&id).copied().unwrap_or(TermState::Idle);
+        Row {
+            id,
+            entry,
+            number,
+            title: listed.info.title.clone().filter(|title| !title.is_empty()),
+            last: listed.info.last.clone(),
+            cols: listed.info.cols,
+            rows: listed.info.rows,
+            alive: listed.info.alive,
+            state,
+            last_output: listed.last_output,
+        }
+    }
+
+    pub fn row(&self, id: &TermId, cx: &App) -> Option<Row> {
+        let listed = self
+            .lists
+            .get(&id.machine)?
+            .iter()
+            .find(|listed| listed.info.term == id.term)?;
+        Some(self.make_row(&id.machine, listed, self.app.read(cx)))
+    }
+
+    /// 全部终端，按工作区分组：现在用的工作区在最前，不在任何工作区里的在最后。
+    /// 一个仓库在几个工作区里时，它的终端只列在第一个里（先看现在用的）。
+    pub fn groups(&self, cx: &App) -> Vec<Group> {
+        let app = self.app.read(cx);
+        let mut machines: Vec<&String> = self.lists.keys().collect();
+        machines.sort();
+        let mut rows: Vec<Row> = Vec::new();
+        for machine in machines {
+            let mut list: Vec<Row> = self.lists[machine]
+                .iter()
+                .map(|listed| self.make_row(machine, listed, app))
+                .collect();
+            list.sort_by(|a, b| (&a.entry.path, a.number).cmp(&(&b.entry.path, b.number)));
+            rows.extend(list);
+        }
+        let mut groups: Vec<Group> = Vec::new();
+        for key in workspace_order(app) {
+            let members = app.members(&key);
+            let (mine, rest): (Vec<Row>, Vec<Row>) = rows
+                .into_iter()
+                .partition(|row| members.contains(&row.entry));
+            rows = rest;
+            if !mine.is_empty() {
+                groups.push(Group {
+                    workspace: Some(key),
+                    rows: mine,
+                });
+            }
+        }
+        if !rows.is_empty() {
+            groups.push(Group {
+                workspace: None,
+                rows,
+            });
+        }
+        groups
+    }
+}
+
+/// 全部读到了的工作区：现在用的在最前，然后是本机的，再是各台服务器的。
+fn workspace_order(app: &AppState) -> Vec<WorkspaceKey> {
+    let mut machines: Vec<&String> = app.machines.keys().collect();
+    machines.sort_by(|a, b| (a.as_str() != LOCAL, a).cmp(&(b.as_str() != LOCAL, b)));
+    let mut keys: Vec<WorkspaceKey> = machines
+        .into_iter()
+        .flat_map(|machine| app.workspaces_on(machine).unwrap_or_default())
+        .map(|(key, _, _)| key)
+        .collect();
+    let current = app.current();
+    if let Some(at) = keys.iter().position(|key| key == current) {
+        let key = keys.remove(at);
+        keys.insert(0, key);
+    }
+    keys
+}
+
+/// 这个终端是哪个仓库的第几个：会话的名字是仓库路径加序号（见 [`terminal::session_key`]）。
+/// Windows 上的 kuaid 把名字统一成了小写、正斜杠，所以先拿知道的仓库去对；对不上就用名字里的路径。
+fn owner(app: &AppState, machine: &str, key: &str) -> (RepoEntry, u32) {
+    let known = app
+        .machines
+        .keys()
+        .flat_map(|at| app.workspaces_on(at).unwrap_or_default())
+        .flat_map(|(workspace, _, _)| app.members(&workspace))
+        .chain(app.repos_on(machine).unwrap_or_default())
+        .filter(|entry| machine_of(entry) == machine)
+        .find_map(|entry| {
+            let number = terminal::session_number(&entry.path, key)?;
+            Some((entry, number))
+        });
+    known.unwrap_or_else(|| {
+        let (path, number) = terminal::split_session_key(key);
+        let entry = RepoEntry {
+            server: (machine != LOCAL).then(|| machine.to_string()),
+            path: path.to_string(),
+        };
+        (entry, number)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{TermState, state_of};
+
+    #[test]
+    fn 终端的三种状态() {
+        let now = Instant::now() + Duration::from_secs(3600);
+        let ago = |secs| Some(now - Duration::from_secs(secs));
+        // 不知道什么时候输出过：空闲
+        assert_eq!(state_of(None, None, now), TermState::Idle);
+        // 10 秒以内有过输出：运行中，看没看过都一样
+        assert_eq!(state_of(ago(3), None, now), TermState::Running);
+        assert_eq!(state_of(ago(3), ago(1), now), TermState::Running);
+        // 停下了、没看过：已停下
+        assert_eq!(state_of(ago(10), None, now), TermState::Stopped);
+        // 停下以前看过不算（之后又有过输出）
+        assert_eq!(state_of(ago(30), ago(60), now), TermState::Stopped);
+        // 停下以后看过：空闲
+        assert_eq!(state_of(ago(30), ago(20), now), TermState::Idle);
+        assert_eq!(state_of(ago(30), ago(30), now), TermState::Idle);
+    }
+}

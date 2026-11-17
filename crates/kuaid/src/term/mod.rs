@@ -34,6 +34,12 @@ const KEEP_ENDED: Duration = Duration::from_secs(24 * 3600);
 const DUMP_CHUNK: usize = 64 * 1024;
 /// 客户端收得太慢、输出积压太多时，断开它的时候说的话
 const LAGGING: &str = "终端输出积压过多，连接已断开；重新连接后可继续使用";
+/// 订阅了终端列表（`term_watch`）时，隔这么久看一次有没有变化
+const WATCH_EVERY: Duration = Duration::from_secs(1);
+/// 最近这么久以内有过输出的算「正在输出」
+const BUSY: Duration = Duration::from_secs(3);
+/// 有终端正在输出时，每看这么多次推一次列表（客户端靠它知道还在输出）
+const BUSY_BEAT: u64 = 3;
 
 /// 伪终端那一层。
 pub trait Backend: Send + Sync {
@@ -77,6 +83,8 @@ struct Client {
     conn: u64,
     request: u64,
     out: Outbox,
+    /// 只看的（`term_attach` 带 `watch`）：不往里写，不算「有人接着」
+    watch: bool,
 }
 
 pub struct Session {
@@ -96,7 +104,16 @@ struct State {
     /// 程序结束了：里面是退出码
     exit: Option<Option<i32>>,
     ended: Option<Instant>,
+    /// 最近一次输出是什么时候。升级换程序后还没有过输出时是空的
+    last_output: Option<Instant>,
     clients: Vec<Client>,
+}
+
+impl State {
+    /// 有没有能回答程序、能看到结束的客户端接着（只看的不算）。
+    fn attended(&self) -> bool {
+        self.clients.iter().any(|client| !client.watch)
+    }
 }
 
 impl Session {
@@ -104,14 +121,9 @@ impl Session {
     pub fn output(&self, bytes: &[u8]) {
         let mut state = self.state.lock().unwrap();
         let reply = state.screen.advance(bytes);
-        if state.clients.is_empty() {
-            drop(state);
-            // 没人接着：程序问终端的话由我们回答，不然它会一直等
-            if !reply.is_empty() {
-                self.backend.write(reply);
-            }
-            return;
-        }
+        state.last_output = Some(Instant::now());
+        // 没人接着（只看的不算）：程序问终端的话由我们回答，不然它会一直等
+        let answer = !reply.is_empty() && !state.attended();
         state.clients.retain(|client| {
             let header = Response {
                 id: client.request,
@@ -131,6 +143,10 @@ impl Session {
             client.out.push(&lagging, &[]);
             false
         });
+        drop(state);
+        if answer {
+            self.backend.write(reply);
+        }
     }
 
     /// 隔一会儿调用一次（没有输出的时候也要）。
@@ -146,7 +162,8 @@ impl Session {
         }
         state.exit = Some(code);
         state.ended = Some(Instant::now());
-        let seen = !state.clients.is_empty();
+        // 只看的客户端看到了不算：正经接上来的人还没见过最后的画面和退出码
+        let seen = state.attended();
         for client in state.clients.drain(..) {
             client.out.push(&exit_message(client.request, code), &[]);
         }
@@ -172,7 +189,17 @@ impl Session {
 
     /// 接上一个客户端：先告诉它会话的编号，再把现在的屏幕还原给它（新开的会话是空的，不用），
     /// 之后的输出都发给它。程序已经结束的话，它收到最后的画面和退出码，这个会话就此忘掉。
-    fn attach(&self, conn: u64, request: u64, out: &Outbox, size: Size, created: bool) {
+    ///
+    /// `watch` 是只看：不改会话的大小（`size` 不用），程序已经结束时也不忘掉这个会话。
+    fn attach(
+        &self,
+        conn: u64,
+        request: u64,
+        out: &Outbox,
+        size: Size,
+        created: bool,
+        watch: bool,
+    ) {
         let mut state = self.state.lock().unwrap();
         let opened = TermOpened {
             term: self.id.clone(),
@@ -185,7 +212,7 @@ impl Session {
             ..Default::default()
         };
         out.push(&header, &[]);
-        if state.exit.is_none() && state.screen.size() != size {
+        if !watch && state.exit.is_none() && state.screen.size() != size {
             state.screen.resize(size);
             self.backend.resize(size);
         }
@@ -205,7 +232,9 @@ impl Session {
             Some(code) => {
                 out.push(&exit_message(request, code), &[]);
                 drop(state);
-                self.forget();
+                if !watch {
+                    self.forget();
+                }
             }
             None => {
                 // 同一个请求号重复接（不该有）时不发两份
@@ -216,6 +245,7 @@ impl Session {
                     conn,
                     request,
                     out: out.clone(),
+                    watch,
                 });
             }
         }
@@ -255,8 +285,10 @@ impl Session {
             cols: size.cols,
             rows: size.rows,
             alive: state.exit.is_none(),
-            attached: state.clients.len(),
+            attached: state.clients.iter().filter(|c| !c.watch).count(),
             age: now_secs().saturating_sub(self.created),
+            idle_ms: state.last_output.map(|at| at.elapsed().as_millis() as u64),
+            last: state.screen.last_text(),
         }
     }
 
@@ -311,6 +343,88 @@ struct Inner {
     sessions: Mutex<BTreeMap<String, Arc<Session>>>,
     next: AtomicU64,
     spawner: Spawner,
+    watchers: Mutex<Watchers>,
+}
+
+/// 订阅了终端列表的客户端（`term_watch`）。
+#[derive(Default)]
+struct Watchers {
+    list: Vec<ListWatcher>,
+    /// 盯着变化的线程在跑。没人订阅了它自己退出
+    running: bool,
+}
+
+struct ListWatcher {
+    conn: u64,
+    id: u64,
+    out: Outbox,
+}
+
+/// 列表里一个终端「变没变」看的那几样。正在输出的多带一个隔几秒变一次的数，所以每隔几秒推一次。
+#[derive(PartialEq)]
+struct Brief {
+    term: String,
+    title: Option<String>,
+    size: (u16, u16),
+    alive: bool,
+    attached: usize,
+    last: String,
+    known: bool,
+    busy: Option<u64>,
+}
+
+fn briefs(list: &[TermInfo], beat: u64) -> Vec<Brief> {
+    list.iter()
+        .map(|info| Brief {
+            term: info.term.clone(),
+            title: info.title.clone(),
+            size: (info.cols, info.rows),
+            alive: info.alive,
+            attached: info.attached,
+            last: info.last.clone(),
+            known: info.idle_ms.is_some(),
+            busy: info
+                .idle_ms
+                .filter(|idle| *idle < BUSY.as_millis() as u64)
+                .map(|_| beat / BUSY_BEAT),
+        })
+        .collect()
+}
+
+/// 推给订阅者的一条：流里的一块，`result` 是整份列表。
+fn listing(id: u64, list: &[TermInfo]) -> Response {
+    Response {
+        id,
+        chunk: true,
+        result: Some(json!({ "terms": list })),
+        ..Default::default()
+    }
+}
+
+/// 盯着列表的线程：隔一会儿看一次，变了就推给所有订阅的。
+fn watch_loop(inner: Weak<Inner>) {
+    let (mut sent, mut beat) = (None, 0u64);
+    loop {
+        std::thread::sleep(WATCH_EVERY);
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        let registry = Registry(inner);
+        let list = registry.list();
+        beat += 1;
+        let now = briefs(&list, beat);
+        let mut watchers = registry.0.watchers.lock().unwrap();
+        if watchers.list.is_empty() {
+            watchers.running = false;
+            return;
+        }
+        if sent.as_ref() != Some(&now) {
+            for watcher in &watchers.list {
+                watcher.out.push(&listing(watcher.id, &list), &[]);
+            }
+            sent = Some(now);
+        }
+    }
 }
 
 impl Registry {
@@ -319,6 +433,7 @@ impl Registry {
             sessions: Mutex::default(),
             next: AtomicU64::new(1),
             spawner,
+            watchers: Mutex::default(),
         }))
     }
 
@@ -347,7 +462,7 @@ impl Registry {
             .cloned();
         if let Some(session) = existing {
             drop(sessions);
-            session.attach(conn, request, out, size, false);
+            session.attach(conn, request, out, size, false, false);
             return Ok(());
         }
         let id = format!("t{}", self.0.next.fetch_add(1, Ordering::Relaxed));
@@ -369,6 +484,7 @@ impl Registry {
                 screen: Screen::new(size),
                 exit: None,
                 ended: None,
+                last_output: None,
                 clients: Vec::new(),
             }),
             registry: Arc::downgrade(&self.0),
@@ -376,23 +492,50 @@ impl Registry {
         sessions.insert(id, session.clone());
         drop(sessions);
         // 先接上再开始读输出：第一个字也不会漏
-        session.attach(conn, request, out, size, true);
+        session.attach(conn, request, out, size, true, false);
         session.backend.start(session.clone());
         Ok(())
     }
 
-    /// `term_attach`：接上指定的会话。
+    /// `term_attach`：接上指定的会话。`watch` 是只看（见 [`Session::attach`]）。
     pub fn attach(
         &self,
         term: &str,
         size: Size,
+        watch: bool,
         conn: u64,
         request: u64,
         out: &Outbox,
     ) -> Result<()> {
         let session = self.get(term).context("终端会话不存在（可能已结束）")?;
-        session.attach(conn, request, out, size, false);
+        session.attach(conn, request, out, size, false, watch);
         Ok(())
+    }
+
+    /// `term_watch`：订阅终端列表。马上推一份现在的，之后有变化再推（见 [`watch_loop`]）。
+    pub fn watch(&self, conn: u64, id: u64, out: &Outbox) {
+        let mut watchers = self.0.watchers.lock().unwrap();
+        watchers.list.push(ListWatcher {
+            conn,
+            id,
+            out: out.clone(),
+        });
+        out.push(&listing(id, &self.list()), &[]);
+        if !watchers.running {
+            watchers.running = true;
+            let inner = Arc::downgrade(&self.0);
+            std::thread::spawn(move || watch_loop(inner));
+        }
+    }
+
+    /// 不订阅了：`id` 为 None 是这个客户端的全部（断开了）。
+    pub fn unwatch(&self, conn: u64, id: Option<u64>) {
+        self.0
+            .watchers
+            .lock()
+            .unwrap()
+            .list
+            .retain(|w| !(w.conn == conn && id.is_none_or(|id| id == w.id)));
     }
 
     pub fn get(&self, term: &str) -> Option<Arc<Session>> {
@@ -509,6 +652,7 @@ impl Registry {
                 screen,
                 exit: frozen.exit,
                 ended: frozen.exit.map(|_| Instant::now()),
+                last_output: None,
                 clients: Vec::new(),
             }),
             registry: Arc::downgrade(&self.0),
@@ -679,7 +823,7 @@ pub(crate) mod tests {
         registry.detach(1, None);
         let (out2, mut inbox2) = mailbox();
         registry
-            .attach(&term, Size::new(50, 10), 2, 1, &out2)
+            .attach(&term, Size::new(50, 10), false, 2, 1, &out2)
             .unwrap();
         inbox2.opened();
         let fake = fakes.lock().unwrap()[0].clone();
@@ -797,5 +941,109 @@ pub(crate) mod tests {
         // 新开的会话编号接着往下排，不和带过来的重
         open(&fresh, "/other", 9, 2, &out2);
         assert_eq!(inbox2.opened().term, format!("t{next}"));
+    }
+
+    #[test]
+    fn 只看的客户端不改大小_不算接着的() {
+        let (registry, fakes) = fake_registry();
+        let (out, mut inbox) = mailbox();
+        open(&registry, "/repo", 1, 1, &out);
+        let term = inbox.opened().term;
+        let fake = fakes.lock().unwrap()[0].clone();
+        let session = fake.session.lock().unwrap().clone().unwrap();
+        session.output(b"hello");
+        inbox.next();
+
+        // 只看：大小给得不一样也不改，先收到现在的屏幕，之后的输出照收
+        let (watch_out, mut watcher) = mailbox();
+        registry
+            .attach(&term, Size::new(50, 10), true, 2, 7, &watch_out)
+            .unwrap();
+        assert!(!watcher.opened().created);
+        assert_eq!(*fake.size.lock().unwrap(), None);
+        assert_eq!((registry.list()[0].cols, registry.list()[0].rows), (20, 4));
+        assert_eq!(first_line(&watcher.next().1), "hello");
+        session.output(b"!");
+        assert_eq!(watcher.next().1, b"!");
+        assert_eq!(registry.list()[0].attached, 1, "只看的不算接着的");
+
+        // 正经接着的那个走了，只剩只看的：程序问终端的话还是由 kuaid 回答
+        registry.detach(1, None);
+        assert_eq!(registry.list()[0].attached, 0);
+        session.output(b"\x1b[6n");
+        assert_eq!(*fake.written.lock().unwrap(), b"\x1b[1;7R");
+
+        // 程序结束：只看的收到退出码，会话还留着等正经接上来的人
+        session.finish(Some(0));
+        watcher.next();
+        let (response, _) = watcher.next();
+        assert!(!response.chunk);
+        assert_eq!(registry.count(), 1);
+        // 结束以后再来只看：收到最后的画面和退出码，会话仍然留着
+        let (late_out, mut late) = mailbox();
+        registry
+            .attach(&term, Size::new(20, 4), true, 3, 1, &late_out)
+            .unwrap();
+        late.opened();
+        assert_eq!(first_line(&late.next().1), "hello!");
+        assert!(!late.next().0.chunk);
+        assert_eq!(registry.count(), 1);
+    }
+
+    /// 订阅的流里的一条：整份列表。
+    fn listed(inbox: &mut Inbox) -> Vec<TermInfo> {
+        let (response, _) = inbox.next();
+        assert!(response.chunk);
+        serde_json::from_value(response.result.unwrap()["terms"].clone()).unwrap()
+    }
+
+    #[test]
+    fn 订阅终端列表_有变化就推() {
+        let (registry, fakes) = fake_registry();
+        let (watch_out, mut watcher) = mailbox();
+        registry.watch(5, 1, &watch_out);
+        assert!(listed(&mut watcher).is_empty(), "订阅时先推一份现在的");
+
+        let (out, mut inbox) = mailbox();
+        open(&registry, "/repo", 1, 1, &out);
+        let term = inbox.opened().term;
+        let list = listed(&mut watcher);
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            (list[0].term.as_str(), list[0].idle_ms),
+            (term.as_str(), None)
+        );
+
+        // 有了输出：推来最后一行和「多久以前」
+        let session = fakes.lock().unwrap()[0]
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        session.output(b"building 62%");
+        let list = listed(&mut watcher);
+        assert_eq!(list[0].last, "building 62%");
+        assert!(list[0].idle_ms.is_some_and(|idle| idle <= 2000));
+
+        // 一直没有新输出：「正在输出」的那几秒里隔一会儿推一次，过了以后推一次「停了」的
+        loop {
+            let list = listed(&mut watcher);
+            if list[0]
+                .idle_ms
+                .is_some_and(|idle| idle >= BUSY.as_millis() as u64)
+            {
+                break;
+            }
+        }
+
+        // 结束这个终端：推来空的列表
+        registry.close(&term);
+        assert!(listed(&mut watcher).is_empty());
+
+        // 不订阅了：盯着的线程自己退出
+        registry.unwatch(5, Some(1));
+        std::thread::sleep(WATCH_EVERY * 3);
+        assert!(!registry.0.watchers.lock().unwrap().running);
     }
 }

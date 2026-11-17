@@ -5,11 +5,16 @@
 //!
 //! 文件列表可以多选（Ctrl、Shift 加点击）和用键盘操作：上下键换文件，空格或回车暂存、取消暂存，
 //! Delete 丢弃，Ctrl+A 全选这一栏，Ctrl+Enter 提交。
+//!
+//! 文件列表上面一行：过滤框（只留路径里有这几个字的文件）、树形和平铺的切换（见
+//! [`super::file_tree`]，和提交详情、比较共用一个设置）、筛选按钮（隐藏未跟踪的文件）。
+//! 选择、上下键、Shift 连选都按列表里显示的顺序走；过滤掉的、藏起来的文件不参与。
 
 use fr_core::i18n::tr;
 use fr_core::tf;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ops::Range;
+use std::rc::Rc;
 
 use fr_core::patch::{self, LineKind};
 use fr_core::status::{Entry, Kind, Status};
@@ -17,7 +22,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _, DropdownButton};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffLineRange, DiffMode, DiffState};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
@@ -27,6 +32,10 @@ use gpui_kit::component::{
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+use super::diff_search::Where;
+use super::diff_tools;
+use super::file_tree::{self, Row as ListRow};
+use super::image_diff::{self, Blob, ImageDiff, Source};
 use super::layout::Split;
 use super::ops::Step;
 use super::stage_diff::{Row, StageDiff};
@@ -62,6 +71,10 @@ pub(super) struct Changes {
     diff_focus: FocusHandle,
     unstaged_scroll: UniformListScrollHandle,
     staged_scroll: UniformListScrollHandle,
+    /// 过滤框：只留路径里有这几个字的文件，两栏一起
+    filter: Entity<InputState>,
+    /// 树形里收起的目录：哪一栏加目录的完整路径（`u:src/repo`、`s:docs`）
+    folded: HashSet<String>,
     diff: Option<StageDiff>,
     /// 并排着看时用组件库的改动视图，这是它的状态；内容和 `diff` 是同一份补丁
     split: Entity<DiffState>,
@@ -71,6 +84,10 @@ pub(super) struct Changes {
     hold_selection: bool,
     /// 显示整个文件，不只是改动附近的几行
     whole_file: bool,
+    /// 忽略空白时改动上面写的那句话（少显示了多少行）
+    ws_note: Option<SharedString>,
+    /// 选中的是图片时的图片对比
+    image: Option<Entity<ImageDiff>>,
     /// 显示的改动可能已经过时（刚做完操作、正在重读），这时不能按块、按行操作
     diff_stale: bool,
     diff_task: Option<Task<()>>,
@@ -129,6 +146,17 @@ impl Changes {
                 }
             },
         );
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder(tr("过滤文件…")));
+        let filter_events =
+            cx.subscribe(&filter, |this: &mut RepoView, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    for area in [Area::Unstaged, Area::Staged] {
+                        let scroll = this.changes.scroll(area);
+                        scroll.scroll_to_item(0, ScrollStrategy::Top);
+                    }
+                    cx.notify();
+                }
+            });
         let changes = Self {
             unstaged: Vec::new(),
             staged: Vec::new(),
@@ -140,11 +168,15 @@ impl Changes {
             diff_focus: cx.focus_handle(),
             unstaged_scroll: UniformListScrollHandle::new(),
             staged_scroll: UniformListScrollHandle::new(),
+            filter,
+            folded: HashSet::new(),
             diff: None,
             split,
             split_selection: None,
             hold_selection: false,
             whole_file: false,
+            ws_note: None,
+            image: None,
             diff_stale: false,
             diff_task: None,
             message,
@@ -152,7 +184,7 @@ impl Changes {
             amend_message: None,
             amend_task: None,
         };
-        (changes, vec![subscription, split_events])
+        (changes, vec![subscription, split_events, filter_events])
     }
 
     fn list(&self, area: Area) -> &Vec<Entry> {
@@ -289,7 +321,111 @@ fn kind_color(kind: Kind, c: Colors) -> Hsla {
     }
 }
 
+/// 收起的目录在 [`Changes::folded`] 里的键。
+/// 选中的文件要是图片：旧的、新的两张各从哪取。不是图片（或者有冲突、是子模块）时没有。
+fn image_sources(area: Area, entry: &Entry) -> Option<(Option<Source>, Option<Source>)> {
+    if entry.submodule || !image_diff::is_image(&entry.path) {
+        return None;
+    }
+    let path = entry.path.as_str();
+    let at = |blob: Blob, path: &str| Some(Source::new(blob, path));
+    Some(match area {
+        // 工作区相对暂存区
+        Area::Unstaged => match entry.unstaged? {
+            Kind::Conflicted => return None,
+            Kind::Untracked | Kind::Added => (None, at(Blob::Worktree, path)),
+            Kind::Deleted => (at(Blob::Index, path), None),
+            _ => (at(Blob::Index, path), at(Blob::Worktree, path)),
+        },
+        // 暂存区相对 HEAD；改了名的旧图在原来的路径上
+        Area::Staged => {
+            let orig = entry.orig_path.as_deref().unwrap_or(path);
+            match entry.staged? {
+                Kind::Added => (None, at(Blob::Index, path)),
+                Kind::Deleted => (at(Blob::Rev("HEAD".into()), path), None),
+                _ => (at(Blob::Rev("HEAD".into()), orig), at(Blob::Index, path)),
+            }
+        }
+    })
+}
+
+fn fold_key(area: Area, path: &str) -> String {
+    match area {
+        Area::Unstaged => format!("u:{path}"),
+        Area::Staged => format!("s:{path}"),
+    }
+}
+
 impl RepoView {
+    /// 本地修改里是不是不列未跟踪的文件（所有标签页共用的设置）。
+    fn hide_untracked(&self, cx: &App) -> bool {
+        self.app.read(cx).settings.hide_untracked
+    }
+
+    /// 藏起来了几个未跟踪的文件。
+    fn hidden_untracked(&self, cx: &App) -> usize {
+        match self.hide_untracked(cx) {
+            true => {
+                let untracked = |e: &&Entry| e.unstaged == Some(Kind::Untracked);
+                self.changes.unstaged.iter().filter(untracked).count()
+            }
+            false => 0,
+        }
+    }
+
+    /// 这一栏里列出来的文件（下标对着这一栏的清单）：过滤框里的字、隐藏未跟踪都算进去了。
+    fn shown_entries(&self, area: Area, cx: &App) -> Vec<usize> {
+        let needle = self.changes.filter.read(cx).value().trim().to_lowercase();
+        let hide = area == Area::Unstaged && self.hide_untracked(cx);
+        let list = self.changes.list(area).iter().enumerate();
+        list.filter(|(_, e)| !(hide && e.unstaged == Some(Kind::Untracked)))
+            .filter(|(_, e)| file_tree::matches(&e.path, &needle))
+            .map(|(ix, _)| ix)
+            .collect()
+    }
+
+    /// 这一栏现在显示的行：树形时有目录行，收起的目录不往下列。
+    fn changes_rows(&self, area: Area, cx: &App) -> Vec<ListRow> {
+        let list = self.changes.list(area);
+        let shown = self.shown_entries(area, cx);
+        let files: Vec<(&str, usize)> = shown
+            .iter()
+            .map(|ix| (list[*ix].path.as_str(), *ix))
+            .collect();
+        let tree = self.app.read(cx).settings.file_tree;
+        // 过滤时目录全部展开
+        let filtering = !self.changes.filter.read(cx).value().trim().is_empty();
+        let folded = &self.changes.folded;
+        file_tree::rows(&files, tree, &|path| {
+            !filtering && folded.contains(&fold_key(area, path))
+        })
+    }
+
+    /// 这一栏里看得见的文件，按显示的顺序（下标对着这一栏的清单）。
+    fn file_order(&self, area: Area, cx: &App) -> Vec<usize> {
+        let rows = self.changes_rows(area, cx).into_iter();
+        rows.filter_map(|row| match row {
+            ListRow::File { index, .. } => Some(index),
+            ListRow::Dir { .. } => None,
+        })
+        .collect()
+    }
+
+    /// 这个文件显示在这一栏的第几行；过滤掉了、在收起的目录里就没有。
+    fn row_of(&self, area: Area, ix: usize, cx: &App) -> Option<usize> {
+        let rows = self.changes_rows(area, cx);
+        rows.iter()
+            .position(|row| matches!(row, ListRow::File { index, .. } if *index == ix))
+    }
+
+    fn scroll_to_file(&self, area: Area, ix: usize, cx: &App) {
+        if let Some(row) = self.row_of(area, ix, cx) {
+            self.changes
+                .scroll(area)
+                .scroll_to_item(row, ScrollStrategy::Nearest);
+        }
+    }
+
     pub(super) fn apply_status(&mut self, status: Status, cx: &mut Context<Self>) {
         self.changes.unstaged = status.unstaged().cloned().collect();
         self.changes.staged = status.staged().cloned().collect();
@@ -327,10 +463,12 @@ impl RepoView {
             self.load_file_diff(cx);
             return;
         }
-        let list = self.changes.list(area);
-        if !list.is_empty() {
-            let ix = self.changes.selected_ix.min(list.len() - 1);
-            let next = list[ix].path.clone();
+        // 同一位置的下一个：只在列出来的文件里挑
+        let shown = self.shown_entries(area, cx);
+        let at = self.changes.selected_ix;
+        let next = shown.iter().copied().find(|ix| *ix >= at);
+        if let Some(ix) = next.or(shown.last().copied()) {
+            let next = self.changes.list(area)[ix].path.clone();
             self.changes.selected = Some((area, next));
             self.changes.selected_ix = ix;
             self.load_file_diff(cx);
@@ -366,21 +504,14 @@ impl RepoView {
         self.changes.selected_entries()
     }
 
-    /// 切到本地修改时还没选文件：选第一个。
+    /// 切到本地修改时还没选文件：选显示出来的第一个。
     pub(super) fn select_first_file(&mut self, cx: &mut Context<Self>) {
-        let first = self
-            .changes
-            .unstaged
-            .first()
-            .map(|e| (Area::Unstaged, e.path.clone()))
-            .or_else(|| {
-                self.changes
-                    .staged
-                    .first()
-                    .map(|e| (Area::Staged, e.path.clone()))
-            });
+        let first = [Area::Unstaged, Area::Staged].into_iter().find_map(|area| {
+            let ix = self.file_order(area, cx).first().copied()?;
+            Some((area, self.changes.list(area)[ix].path.clone(), ix))
+        });
         match first {
-            Some((area, path)) => self.select_file(area, path, 0, cx),
+            Some((area, path, ix)) => self.select_file(area, path, ix, cx),
             None => {
                 self.changes.selected = None;
                 self.changes.diff = None;
@@ -396,9 +527,7 @@ impl RepoView {
             Some((area, list.iter().position(|entry| entry.path == path)?))
         };
         if let Some((area, ix)) = at(Area::Unstaged).or_else(|| at(Area::Staged)) {
-            self.changes
-                .scroll(area)
-                .scroll_to_item(ix, ScrollStrategy::Nearest);
+            self.scroll_to_file(area, ix, cx);
             self.select_file(area, path.to_string(), ix, cx);
         }
     }
@@ -429,14 +558,7 @@ impl RepoView {
         self.changes.focus.focus(window, cx);
         let same_area = matches!(&self.changes.selected, Some((a, _)) if *a == area);
         if modifiers.shift && same_area {
-            let (lo, hi) = (self.changes.anchor.min(ix), self.changes.anchor.max(ix));
-            let list = self.changes.list(area);
-            let hi = hi.min(list.len().saturating_sub(1));
-            let picked: BTreeSet<String> = list[lo.min(hi)..=hi]
-                .iter()
-                .map(|e| e.path.clone())
-                .collect();
-            self.changes.multi = picked;
+            self.changes.multi = self.paths_between(area, self.changes.anchor, ix, cx);
             self.select_file(area, path, ix, cx);
         } else if (modifiers.control || modifiers.platform) && same_area {
             if self.changes.multi.is_empty()
@@ -479,6 +601,19 @@ impl RepoView {
         cx.notify();
     }
 
+    /// 显示的顺序里从 `from` 到 `to`（两头都算）的文件；有一头没显示出来就只有 `to`。
+    fn paths_between(&self, area: Area, from: usize, to: usize, cx: &App) -> BTreeSet<String> {
+        let order = self.file_order(area, cx);
+        let at = |ix: usize| order.iter().position(|shown| *shown == ix);
+        let list = self.changes.list(area);
+        let picked: Vec<usize> = match (at(from), at(to)) {
+            (Some(a), Some(b)) => order[a.min(b)..=a.max(b)].to_vec(),
+            _ => vec![to],
+        };
+        let paths = picked.into_iter().filter_map(|ix| list.get(ix));
+        paths.map(|e| e.path.clone()).collect()
+    }
+
     /// 文件列表上的按键。
     fn changes_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !self.changes.focus.is_focused(window) {
@@ -498,12 +633,11 @@ impl RepoView {
             }
             "a" if m.control || m.platform => {
                 if let Some((area, _)) = &self.changes.selected {
-                    let all: BTreeSet<String> = self
-                        .changes
-                        .list(*area)
-                        .iter()
-                        .map(|e| e.path.clone())
-                        .collect();
+                    // 全选这一栏里列出来的（过滤掉的、藏起来的不算）
+                    let list = self.changes.list(*area);
+                    let shown = self.shown_entries(*area, cx);
+                    let all: BTreeSet<String> =
+                        shown.iter().map(|ix| list[*ix].path.clone()).collect();
                     self.changes.multi = if all.len() > 1 { all } else { BTreeSet::new() };
                     cx.notify();
                 }
@@ -517,6 +651,10 @@ impl RepoView {
     /// Delete 丢弃选中的行（会先问），左键回到文件列表。
     fn diff_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !self.changes.diff_focus.contains_focused(window, cx) {
+            return;
+        }
+        // 搜索条也在这一块里：在它的输入框里打空格、按回车、Delete 是在输入，不是暂存、丢弃选中的行
+        if self.diff_search.at(Where::Changes).is_focused(window, cx) {
             return;
         }
         let (key, m) = (event.keystroke.key.as_str(), event.keystroke.modifiers);
@@ -560,32 +698,38 @@ impl RepoView {
             self.select_first_file(cx);
             return;
         };
-        let (ix, len) = (self.changes.selected_ix, self.changes.list(area).len());
-        let target = if down && ix + 1 < len {
-            Some((area, ix + 1))
-        } else if !down && ix > 0 {
-            Some((area, ix - 1))
-        } else if extend {
-            None
-        } else if down && area == Area::Unstaged && !self.changes.staged.is_empty() {
-            Some((Area::Staged, 0))
-        } else if !down && area == Area::Staged && !self.changes.unstaged.is_empty() {
-            Some((Area::Unstaged, self.changes.unstaged.len() - 1))
-        } else {
-            None
+        // 按显示的顺序走；选中的文件没显示出来（过滤掉了、目录收起了）就从这一栏的头上开始
+        let order = self.file_order(area, cx);
+        let at = order.iter().position(|ix| *ix == self.changes.selected_ix);
+        let step = match (at, down) {
+            (Some(at), true) => order.get(at + 1).copied(),
+            (Some(at), false) => at.checked_sub(1).map(|at| order[at]),
+            (None, _) => order.first().copied(),
+        };
+        let other = match area {
+            Area::Unstaged => Area::Staged,
+            Area::Staged => Area::Unstaged,
+        };
+        let target = match step {
+            Some(ix) => Some((area, ix)),
+            None if extend => None,
+            // 到头了：往下从未暂存跨到已暂存的第一个，往上从已暂存跨到未暂存的最后一个
+            None if down == (area == Area::Unstaged) => {
+                let order = self.file_order(other, cx);
+                let ix = match down {
+                    true => order.first().copied(),
+                    false => order.last().copied(),
+                };
+                ix.map(|ix| (other, ix))
+            }
+            None => None,
         };
         let Some((area, ix)) = target else {
             return;
         };
         let path = self.changes.list(area)[ix].path.clone();
         if extend {
-            let (lo, hi) = (self.changes.anchor.min(ix), self.changes.anchor.max(ix));
-            let list = self.changes.list(area);
-            let hi = hi.min(list.len() - 1);
-            self.changes.multi = list[lo.min(hi)..=hi]
-                .iter()
-                .map(|e| e.path.clone())
-                .collect();
+            self.changes.multi = self.paths_between(area, self.changes.anchor, ix, cx);
             if self.changes.multi.len() <= 1 {
                 self.changes.multi.clear();
             }
@@ -593,9 +737,7 @@ impl RepoView {
             self.changes.multi.clear();
             self.changes.anchor = ix;
         }
-        self.changes
-            .scroll(area)
-            .scroll_to_item(ix, ScrollStrategy::Nearest);
+        self.scroll_to_file(area, ix, cx);
         self.select_file(area, path, ix, cx);
     }
 
@@ -756,7 +898,7 @@ impl RepoView {
         );
     }
 
-    fn load_file_diff(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn load_file_diff(&mut self, cx: &mut Context<Self>) {
         let Some((area, path)) = self.changes.selected.clone() else {
             return;
         };
@@ -772,6 +914,21 @@ impl RepoView {
         let Some(channel) = self.channel.clone() else {
             return;
         };
+        // 图片：另外建一个图片对比（同一个文件重读时只刷新，不重建）
+        match image_sources(area, &entry) {
+            None => self.changes.image = None,
+            Some((old, new)) => match &self.changes.image {
+                Some(view) if view.read(cx).shows(&old, &new) => {
+                    view.update(cx, |view, cx| view.reload(cx))
+                }
+                _ => {
+                    let (app, repo) = (self.app.clone(), self.entry.path.clone());
+                    let channel = channel.clone();
+                    self.changes.image =
+                        Some(cx.new(|cx| ImageDiff::new(app, channel, repo, old, new, cx)));
+                }
+            },
+        }
         let (mut args, ok): (Vec<String>, &'static [i32]) = match area {
             Area::Unstaged if entry.unstaged == Some(Kind::Untracked) => {
                 (patch::untracked_args(&path), &[0, 1])
@@ -782,6 +939,7 @@ impl RepoView {
         if self.changes.whole_file {
             patch::set_context(&mut args, patch::WHOLE_FILE);
         }
+        let plain = self.ws_plain(&channel, &mut args);
         // 同一个文件重读（比如暂存了几行）时沿用滚动位置
         let scroll = self
             .changes
@@ -794,12 +952,17 @@ impl RepoView {
         self.changes.diff_stale = true;
         self.changes.diff_task = Some(cx.spawn(async move |this, cx| {
             let result = request.await;
+            let plain = diff_tools::plain_out(plain).await;
             this.update(cx, |this, cx| {
                 // 选中的文件已经换了：这个结果作废
                 if this.changes.selected.as_ref() != Some(&(area, entry.path.clone())) {
                     return;
                 }
                 this.changes.diff_stale = false;
+                this.changes.ws_note = match (&plain, &result) {
+                    (Some(plain), Ok(out)) => Some(diff_tools::ws_note(plain, &out.stdout)),
+                    _ => None,
+                };
                 // 内容没变（比如别的文件触发的刷新）：沿用原来的，正在选的行不清掉
                 if let (Ok(out), Some(old)) = (&result, &mut this.changes.diff)
                     && out.code.is_some_and(|c| ok.contains(&c))
@@ -809,6 +972,15 @@ impl RepoView {
                     cx.notify();
                     return;
                 }
+                // 下面换了一份改动：搜索条开着的话按新的再找一遍（放在最后）
+                let research = cx.entity().downgrade();
+                cx.defer(move |cx| {
+                    research
+                        .update(cx, |this, cx| {
+                            this.update_diff_search(Where::Changes, false, cx)
+                        })
+                        .ok();
+                });
                 this.changes.diff = Some(match result {
                     Ok(out) if out.code.is_some_and(|c| ok.contains(&c)) => {
                         StageDiff::new(area, entry, &out.stdout, scroll)
@@ -821,6 +993,33 @@ impl RepoView {
             })
             .ok();
         }));
+    }
+
+    /// 右边是不是显示着一个文件的改动。
+    pub(super) fn changes_showing_diff(&self) -> bool {
+        self.changes.diff.is_some()
+    }
+
+    pub(super) fn changes_diff(&self) -> Option<&StageDiff> {
+        self.changes.diff.as_ref()
+    }
+
+    /// 现在是不是用组件库的并排视图在显示。
+    pub(super) fn changes_split_showing(&self, cx: &App) -> bool {
+        self.split_mode(cx)
+            && self
+                .changes
+                .diff
+                .as_ref()
+                .is_some_and(|diff| diff.editable())
+    }
+
+    pub(super) fn changes_split_state(&self) -> Entity<DiffState> {
+        self.changes.split.clone()
+    }
+
+    pub(super) fn focus_changes_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.changes.diff_focus.focus(window, cx);
     }
 
     /// 改动是不是并排着看（所有标签页共用的设置）。
@@ -961,12 +1160,16 @@ impl RepoView {
             .unstaged
             .iter()
             .any(|e| e.unstaged == Some(Kind::Conflicted));
+        // 藏起来的未跟踪文件也不跟着暂存：看不见的东西不该被加进去
+        let hide = self.hidden_untracked(cx) > 0;
         if conflicts {
-            let entries = self.changes.unstaged.clone();
+            let mut entries = self.changes.unstaged.clone();
+            entries.retain(|e| !(hide && e.unstaged == Some(Kind::Untracked)));
             self.stage_files(entries, window, cx);
             return;
         }
-        let args = vec!["add".into(), "-A".into()];
+        // `-u`：只暂存已跟踪的文件
+        let args = vec!["add".into(), if hide { "-u" } else { "-A" }.into()];
         self.run_op(tr("暂存"), args, None, window, cx, |_, _, _, _| {});
     }
 
@@ -982,7 +1185,8 @@ impl RepoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.changes.diff_stale {
+        // 忽略空白时显示的补丁和文件对不上，不能拿去暂存
+        if self.changes.diff_stale || self.ignore_ws {
             return;
         }
         let Some(diff) = &self.changes.diff else {
@@ -1014,7 +1218,7 @@ impl RepoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.changes.diff_stale {
+        if self.changes.diff_stale || self.ignore_ws {
             return;
         }
         let Some(diff) = &self.changes.diff else {
@@ -1230,6 +1434,9 @@ impl RepoView {
         self.changes.message.update(cx, |state, cx| {
             state.set_placeholder(tr("提交说明（首行为标题），按 Ctrl+Enter 提交"), window, cx)
         });
+        self.changes.filter.update(cx, |state, cx| {
+            state.set_placeholder(tr("过滤文件…"), window, cx)
+        });
     }
 
     pub(super) fn render_changes(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1245,6 +1452,7 @@ impl RepoView {
                     .flex_none()
                     .h_full()
                     .relative()
+                    .child(self.render_list_bar(c, cx))
                     .child(self.render_file_section(Area::Unstaged, c, cx))
                     .child(self.render_file_section(Area::Staged, c, cx))
                     .child(self.render_commit_box(c, cx))
@@ -1261,8 +1469,87 @@ impl RepoView {
             .into_any_element()
     }
 
+    /// 文件列表上面一行：过滤框、树形和平铺的切换、筛选（隐藏未跟踪的文件）。
+    fn render_list_bar(&mut self, c: Colors, cx: &mut Context<Self>) -> AnyElement {
+        let tree = self.app.read(cx).settings.file_tree;
+        let hide = self.hide_untracked(cx);
+        let (app, view) = (self.app.clone(), cx.entity().downgrade());
+        let (menu_app, menu_view) = (app.clone(), view.clone());
+        h_flex()
+            .flex_none()
+            .h(px(38.))
+            .px_2()
+            .gap(px(6.))
+            .border_b_1()
+            .border_color(c.border)
+            .child(
+                div().flex_1().min_w_0().child(
+                    Input::new(&self.changes.filter)
+                        .small()
+                        .cleanable(true)
+                        .prefix(ui::icon(IconName::Search).text_color(c.muted)),
+                ),
+            )
+            .child(file_tree::mode_toggle(
+                "changes-list-mode",
+                tree,
+                move |tree, _, cx| {
+                    app.update(cx, |app, cx| {
+                        app.update_settings(cx, |s| s.file_tree = tree)
+                    });
+                    view.update(cx, |_, cx| cx.notify()).ok();
+                },
+            ))
+            // 不加悬停提示：提示也出现在按钮下面，会把弹出的菜单盖住
+            .child(
+                Button::new("changes-list-filter")
+                    .xsmall()
+                    .ghost()
+                    .icon(ui::icon(IconName::Funnel))
+                    .selected(hide)
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                        let (app, view) = (menu_app.clone(), menu_view.clone());
+                        menu.item(
+                            PopupMenuItem::new(tr("隐藏未跟踪的文件"))
+                                .checked(hide)
+                                .on_click(move |_, _, cx| {
+                                    app.update(cx, |app, cx| {
+                                        app.update_settings(cx, |s| s.hide_untracked = !hide)
+                                    });
+                                    view.update(cx, |this, cx| this.hide_untracked_changed(cx))
+                                        .ok();
+                                }),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// 切换了「隐藏未跟踪的文件」：选中的文件要是被藏起来了，换一个。
+    fn hide_untracked_changed(&mut self, cx: &mut Context<Self>) {
+        self.changes.multi.clear();
+        let gone = match &self.changes.selected {
+            Some((area, _)) => !self
+                .shown_entries(*area, cx)
+                .contains(&self.changes.selected_ix),
+            None => true,
+        };
+        if gone && self.hide_untracked(cx) {
+            self.changes.selected = None;
+            self.changes.diff = None;
+            self.select_first_file(cx);
+        }
+        cx.notify();
+    }
+
     fn render_file_section(&mut self, area: Area, c: Colors, cx: &mut Context<Self>) -> AnyElement {
-        let count = self.changes.list(area).len();
+        let total = self.changes.list(area).len();
+        let count = self.shown_entries(area, cx).len();
+        let hidden = match area {
+            Area::Unstaged => self.hidden_untracked(cx),
+            Area::Staged => 0,
+        };
+        let rows = Rc::new(self.changes_rows(area, cx));
         let picked = self.changes.multi_count(area);
         let busy = self.op.is_some();
         let (title, action, empty, id) = match area {
@@ -1284,24 +1571,63 @@ impl RepoView {
             Area::Staged => self.changes.staged_scroll.clone(),
         };
         let body = if count == 0 {
+            // 有文件、只是都没列出来：过滤掉了，或者全是藏起来的未跟踪文件（下面另有一行说明）
+            let text = match (total, total == hidden) {
+                (0, _) => empty,
+                (_, true) => "",
+                (_, false) => tr("没有匹配的文件"),
+            };
             div()
                 .p_3()
                 .text_sm()
                 .text_color(c.muted)
-                .child(empty)
+                .child(text)
                 .into_any_element()
         } else {
+            let rows = rows.clone();
             uniform_list(
                 id,
-                count,
+                rows.len(),
                 cx.processor(move |this, range: Range<usize>, _window, cx| {
-                    this.render_file_rows(area, range, c, cx)
+                    this.render_file_rows(area, &rows, range, c, cx)
                 }),
             )
             .track_scroll(&scroll)
             .size_full()
             .into_any_element()
         };
+        // 藏起来了未跟踪的文件：列表下面说一声，旁边可以直接显示回来
+        let hidden_note = (hidden > 0).then(|| {
+            h_flex()
+                .flex_none()
+                .h(px(26.))
+                .px_2()
+                .gap_2()
+                .text_xs()
+                .text_color(c.muted)
+                .child(
+                    ui::clipped(
+                        "hidden-untracked",
+                        tf!("已隐藏 {n} 个未跟踪的文件", n = hidden),
+                    )
+                    .flex_shrink(1.),
+                )
+                .child(
+                    div()
+                        .id("show-untracked")
+                        .flex_none()
+                        .text_color(c.info)
+                        .cursor_pointer()
+                        .hover(|s| s.underline())
+                        .child(tr("显示"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.app.update(cx, |app, cx| {
+                                app.update_settings(cx, |s| s.hide_untracked = false)
+                            });
+                            this.hide_untracked_changed(cx);
+                        })),
+                )
+        });
         v_flex()
             .flex_1()
             .min_h_0()
@@ -1367,12 +1693,14 @@ impl RepoView {
                     }),
             )
             .child(div().flex_1().min_h_0().child(body))
+            .children(hidden_note)
             .into_any_element()
     }
 
     fn render_file_rows(
         &mut self,
         area: Area,
+        rows: &[ListRow],
         range: Range<usize>,
         c: Colors,
         cx: &mut Context<Self>,
@@ -1380,8 +1708,51 @@ impl RepoView {
         let list = self.changes.list(area);
         let selected = self.changes.selected.clone();
         let multi = self.changes.multi_count(area) > 1;
+        let tree = self.app.read(cx).settings.file_tree;
         range
-            .filter_map(|ix| {
+            .filter_map(|row_ix| {
+                let indent = |depth: usize| px(8. + depth as f32 * file_tree::INDENT);
+                let (ix, depth) = match rows.get(row_ix)? {
+                    ListRow::File { index, depth } => (*index, *depth),
+                    ListRow::Dir {
+                        path,
+                        label,
+                        depth,
+                        files,
+                        open,
+                    } => {
+                        let key = fold_key(area, path);
+                        let cells = file_tree::dir_cells(
+                            ("change-dir-name", row_ix),
+                            label,
+                            path,
+                            *files,
+                            *open,
+                            cx,
+                        );
+                        return Some(
+                            h_flex()
+                                .id(("change-dir", row_ix))
+                                .h(px(FILE_ROW_HEIGHT))
+                                .w_full()
+                                .pl(indent(*depth))
+                                .pr_2()
+                                .gap(px(5.))
+                                .text_sm()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(c.hover))
+                                .children(cells)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.changes.focus.focus(window, cx);
+                                    if !this.changes.folded.remove(&key) {
+                                        this.changes.folded.insert(key.clone());
+                                    }
+                                    cx.notify();
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                };
                 let entry = list.get(ix)?;
                 let kind = match area {
                     Area::Unstaged => entry.unstaged,
@@ -1405,7 +1776,7 @@ impl RepoView {
                 let menu_path = entry.path.clone();
                 Some(
                     h_flex()
-                        .id(ix)
+                        .id(("change-file", row_ix))
                         // 点右键先选中这个文件；点在多选的文件上就保持多选
                         .on_mouse_down(
                             MouseButton::Right,
@@ -1424,7 +1795,8 @@ impl RepoView {
                         )
                         .h(px(FILE_ROW_HEIGHT))
                         .w_full()
-                        .px_2()
+                        .pl(indent(depth))
+                        .pr_2()
                         .gap_2()
                         .text_sm()
                         .cursor_pointer()
@@ -1451,23 +1823,7 @@ impl RepoView {
                                 );
                             }
                         }))
-                        // 改动的种类：一个带底色的小方块，里面一个字母，颜色分新增、修改、删除
-                        .child({
-                            let color = kind_color(kind, c);
-                            div()
-                                .size(px(16.))
-                                .flex_none()
-                                .rounded(px(4.))
-                                .bg(color.opacity(0.16))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_size(px(10.5))
-                                .line_height(px(16.))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(color)
-                                .child(kind.letter())
-                        })
+                        .child(file_tree::kind_badge(kind.letter(), kind_color(kind, c)))
                         // 名字先占地方，放不下时省略中间：开头、结尾和扩展名都看得到。
                         // 目录用剩下的，至少留一点让人知道还有目录
                         .child(
@@ -1479,14 +1835,15 @@ impl RepoView {
                                 .text_ellipsis_middle()
                                 .child(name),
                         )
+                        // 树形里目录在上面的行里，这里不再写
                         .child(
                             div()
                                 .flex_1()
-                                .min_w(px(if dir.is_empty() { 0. } else { 36. }))
+                                .min_w(px(if tree || dir.is_empty() { 0. } else { 36. }))
                                 .truncate()
                                 .text_xs()
                                 .text_color(c.muted)
-                                .child(dir),
+                                .when(!tree, |cell| cell.child(dir)),
                         )
                         .tooltip({
                             let full: SharedString = match &entry.orig_path {
@@ -1633,7 +1990,7 @@ impl RepoView {
         {
             diff.highlight(&cx.theme().highlight_theme, dark);
         }
-        let Some(diff) = &self.changes.diff else {
+        if self.changes.diff.is_none() {
             let text = if self.changes.unstaged.is_empty() && self.changes.staged.is_empty() {
                 tr("工作区和暂存区均无改动")
             } else if self.changes.selected.is_some() {
@@ -1650,9 +2007,24 @@ impl RepoView {
                 .text_color(c.muted)
                 .child(text)
                 .into_any_element();
-        };
+        }
         let idle = self.op.is_none();
-        let line_ops = idle && !self.changes.diff_stale;
+        let ws = self.ignore_ws;
+        let line_ops = idle && !self.changes.diff_stale && !ws;
+        let ws_strip = self
+            .changes
+            .ws_note
+            .clone()
+            .filter(|_| ws)
+            .map(|note| diff_tools::info_strip("changes-ws-note", note, cx));
+        let ws_toggle = self.ws_toggle("diff-ignore-ws", cx);
+        let ws_toggle_alone = self.ws_toggle("diff-ignore-ws-alone", cx);
+        let search_toggle = self.search_toggle(Where::Changes, cx);
+        let search_bar = self.render_diff_search(Where::Changes, cx);
+        let search_marks = self.search_decorations(Where::Changes, cx);
+        let Some(diff) = &self.changes.diff else {
+            return div().into_any_element();
+        };
         let area = diff.area;
         let count = if diff.editable() {
             diff.selected_count()
@@ -1671,10 +2043,23 @@ impl RepoView {
         let error = diff.error.clone();
         let split = self.split_mode(cx) && diff.editable();
         let split_state = self.changes.split.clone();
+        // 图片不显示「二进制文件有差异」那一行，显示两张图
+        let image = self.changes.image.clone().filter(|_| !diff.editable());
+        let notice = notice.filter(|_| image.is_none());
+        // 只有空白不同的文件，忽略空白以后什么都不剩：说清楚是因为忽略了空白，并留着那个开关
+        let ws_empty = ws && !diff.editable() && image.is_none() && rows == 0 && error.is_none();
+        let notice = match notice {
+            Some(text) if ws_empty && text == tr("没有内容改动") => {
+                Some(tr("忽略空白后，此文件没有差异").into())
+            }
+            other => other,
+        };
         // 怎么看改动的两个开关，放在选行那一行的右边
         let toggles = h_flex()
             .flex_none()
             .gap_1()
+            .child(search_toggle)
+            .child(ws_toggle)
             .child(
                 Button::new("diff-whole-file")
                     .xsmall()
@@ -1739,6 +2124,7 @@ impl RepoView {
                 });
             if count == 0 {
                 let hint = match (area, split) {
+                    _ if ws => tr("已忽略空白：只能对整个文件操作，不能按块或按行操作"),
                     (Area::Unstaged, false) => {
                         tr("点击选择行，按住 Shift 连选；空格暂存，Delete 丢弃")
                     }
@@ -1763,6 +2149,7 @@ impl RepoView {
                         Button::new("stage-lines")
                             .xsmall()
                             .label(tr("暂存所选行"))
+                            .when(ws, |b| b.tooltip(diff_tools::ws_blocked()))
                             .disabled(!line_ops)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.apply_selection(None, window, cx)
@@ -1773,6 +2160,7 @@ impl RepoView {
                             .xsmall()
                             .ghost()
                             .label(tr("丢弃所选行…"))
+                            .when(ws, |b| b.tooltip(diff_tools::ws_blocked()))
                             .disabled(!line_ops)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.discard_selection(None, window, cx)
@@ -1782,6 +2170,7 @@ impl RepoView {
                     Button::new("unstage-lines")
                         .xsmall()
                         .label(tr("取消暂存所选行"))
+                        .when(ws, |b| b.tooltip(diff_tools::ws_blocked()))
                         .disabled(!line_ops)
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.apply_selection(None, window, cx)
@@ -1789,6 +2178,19 @@ impl RepoView {
                 ),
             };
             bar.child(toggles)
+        });
+        let select_bar = select_bar.or_else(|| {
+            ws_empty.then(|| {
+                h_flex()
+                    .h(px(30.))
+                    .flex_none()
+                    .px_3()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(c.border)
+                    .child(div().flex_1())
+                    .child(ws_toggle_alone)
+            })
         });
         bar = match area {
             Area::Unstaged => {
@@ -1855,10 +2257,12 @@ impl RepoView {
                 .text_color(c.danger)
                 .child(err)
                 .into_any_element(),
+            None if image.is_some() => div().size_full().children(image).into_any_element(),
             // 并排：组件库的改动视图，文件名那一条我们自己已经有了
             None if split => Diff::new(&split_state)
                 .line_number(true)
                 .syntax_highlight(true)
+                .decorations(search_marks)
                 .header_visible(false)
                 .size_full()
                 .into_any_element(),
@@ -1881,6 +2285,8 @@ impl RepoView {
             .on_key_down(cx.listener(Self::diff_key))
             .child(bar)
             .children(select_bar)
+            .children(search_bar)
+            .children(ws_strip)
             .when_some(notice, |d, notice| {
                 d.child(
                     div()
@@ -1904,12 +2310,17 @@ impl RepoView {
         c: Colors,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let line_ops = self.op.is_none() && !self.changes.diff_stale;
+        let ws = self.ignore_ws;
+        let line_ops = self.op.is_none() && !self.changes.diff_stale && !ws;
         let Some(diff) = &self.changes.diff else {
             return Vec::new();
         };
         let editable = diff.editable();
         let area = diff.area;
+        // 搜索到的字的底色，现在停着的那一处深一些
+        let warning = cx.theme().warning;
+        let (found_bg, current_bg) = (warning.opacity(0.35), warning.opacity(0.8));
+        let search = self.diff_search.at(Where::Changes);
         range
             .filter_map(|ix| {
                 let text = diff.texts.get(ix)?.clone();
@@ -1948,6 +2359,7 @@ impl RepoView {
                                         Button::new(("stage-hunk", h))
                                             .xsmall()
                                             .label(tr("暂存此块"))
+                                            .when(ws, |b| b.tooltip(diff_tools::ws_blocked()))
                                             .disabled(!line_ops)
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 this.apply_selection(Some(h), window, cx)
@@ -1958,6 +2370,7 @@ impl RepoView {
                                             .xsmall()
                                             .ghost()
                                             .label(tr("丢弃此块…"))
+                                            .when(ws, |b| b.tooltip(diff_tools::ws_blocked()))
                                             .disabled(!line_ops)
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 this.discard_selection(Some(h), window, cx)
@@ -1967,6 +2380,7 @@ impl RepoView {
                                     Button::new(("unstage-hunk", h))
                                         .xsmall()
                                         .label(tr("取消暂存此块"))
+                                        .when(ws, |b| b.tooltip(diff_tools::ws_blocked()))
                                         .disabled(!line_ops)
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.apply_selection(Some(h), window, cx)
@@ -1988,7 +2402,14 @@ impl RepoView {
                             diff.inline.get(ix).map_or(&[], |marks| marks.as_slice());
                         let syntax: &[(Range<usize>, HighlightStyle)] =
                             diff.highlights.get(ix).map_or(&[], |h| h.as_slice());
-                        let styles = super::inline_diff::merge(syntax, marks, mark);
+                        let mut styles = super::inline_diff::merge(syntax, marks, mark);
+                        let (found, current) = search.marks(ix);
+                        if !found.is_empty() {
+                            styles = super::inline_diff::merge(&styles, &found, found_bg);
+                        }
+                        if let Some(current) = current {
+                            styles = super::inline_diff::merge(&styles, &[current], current_bg);
+                        }
                         let bg = if diff.selected[ix] {
                             Some(c.picked)
                         } else {

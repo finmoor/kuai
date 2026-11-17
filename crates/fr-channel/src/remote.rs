@@ -37,8 +37,8 @@ use serde_json::{Value, json};
 
 use crate::binaries::{Binaries, Os};
 use crate::{
-    ChangeStream, GitOutput, GitStream, StateStream, StreamItem, TermItem, TermStream, UploadItem,
-    UploadSource, UploadStream,
+    ChangeStream, GitOutput, GitStream, StateStream, StreamItem, TermItem, TermListStream,
+    TermStream, UploadItem, UploadSource, UploadStream,
 };
 
 /// 启动脚本找到 kuaid 时先打这一行；前面的输出（比如 `.bashrc` 打印的东西）都跳过
@@ -86,6 +86,8 @@ enum Pending {
     Term(mpsc::UnboundedSender<Result<TermItem>>),
     /// `state_watch`：每次推来的整份
     State(mpsc::UnboundedSender<Result<Store>>),
+    /// `term_watch`：每次推来的整份终端列表
+    TermList(mpsc::UnboundedSender<Result<Vec<TermInfo>>>),
     /// `relay_open`：经这条连接连的另一台服务器，ssh 的输出交给那条连接
     Relay(RelaySink),
 }
@@ -814,6 +816,40 @@ impl Connection {
         )
     }
 
+    /// 只看指定编号的终端会话（协议 11）：不改它的大小，先收到按它现在的大小还原的屏幕，再是之后的
+    /// 输出。看的这一头不能往里写任何东西，包括终端仿真器回答程序的话。
+    pub fn term_view(&self, term: &str) -> TermStream {
+        self.term_stream("term_attach", json!({ "term": term, "watch": true }))
+    }
+
+    /// 订阅这台电脑上的终端列表（协议 11）：先给现在的整份，之后有变化再给。
+    pub fn term_watch(&self) -> TermListStream {
+        let (tx, rx) = mpsc::unbounded();
+        let id = self.inner.next_id();
+        self.inner
+            .pending
+            .lock()
+            .unwrap()
+            .insert(id, Pending::TermList(tx.clone()));
+        let request = Request {
+            id,
+            method: "term_watch".into(),
+            params: json!({}),
+            bytes: 0,
+        };
+        if let Err(err) = self.inner.send(request, Vec::new()) {
+            self.inner.pending.lock().unwrap().remove(&id);
+            let _ = tx.unbounded_send(Err(err));
+        }
+        TermListStream {
+            rx,
+            _cancel: Box::new(CancelOnDrop {
+                inner: Arc::downgrade(&self.inner),
+                id,
+            }),
+        }
+    }
+
     fn term_stream(&self, method: &str, params: Value) -> TermStream {
         let (tx, rx) = mpsc::unbounded();
         let id = self.inner.next_id();
@@ -1264,6 +1300,11 @@ impl Inner {
                         let _ = tx.unbounded_send(parsed(store));
                     }
                 }
+                Some(Pending::TermList(tx)) => {
+                    if let Some(mut result) = response.result.take() {
+                        let _ = tx.unbounded_send(parsed(result["terms"].take()));
+                    }
+                }
                 Some(Pending::Relay(sink)) => sink.chunk(response.err, payload),
                 _ => {}
             }
@@ -1311,6 +1352,11 @@ impl Inner {
                     let _ = tx.unbounded_send(Err(err));
                 }
             }
+            Pending::TermList(tx) => {
+                if let Err(err) = outcome {
+                    let _ = tx.unbounded_send(Err(err));
+                }
+            }
             Pending::Relay(sink) => sink.finish(outcome),
         }
     }
@@ -1336,6 +1382,9 @@ impl Inner {
                     let _ = tx.unbounded_send(Err(anyhow!(message.clone())));
                 }
                 Pending::State(tx) => {
+                    let _ = tx.unbounded_send(Err(anyhow!(message.clone())));
+                }
+                Pending::TermList(tx) => {
                     let _ = tx.unbounded_send(Err(anyhow!(message.clone())));
                 }
                 Pending::Relay(sink) => sink.finish(Err(anyhow!(message.clone()))),

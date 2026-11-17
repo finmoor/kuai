@@ -29,6 +29,7 @@ use std::rc::Rc;
 
 use fr_core::i18n::{self, tr, trc};
 use fr_core::tf;
+use futures::StreamExt as _;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
@@ -48,6 +49,9 @@ use crate::prompt::{self, Prompts};
 use crate::repo::{RepoEvent, RepoView};
 use crate::settings::RepoEntry;
 use crate::settings_page::SettingsPage;
+use crate::term_board::{Row as TermRow, Shown, Stopped, TermBoard, TermId};
+use crate::term_overview::{Go, TermOverview};
+use crate::toast::Toasts;
 use crate::tray::{Tray, TrayAction};
 use crate::ui;
 use crate::update::{self, UpdateEvent, Updater};
@@ -102,6 +106,16 @@ pub struct Workspace {
     parked: HashMap<WorkspaceKey, Parked>,
     /// 设置页开着；它盖在当前标签页上面，关掉回到原来那一页
     showing_settings: bool,
+    /// 所有工作区里的终端现在怎么样（见 `term_board`）
+    board: Entity<TermBoard>,
+    /// 终端总览页（标题栏上「仓库」右边的「终端」，Ctrl+Shift+A）
+    overview: Entity<TermOverview>,
+    /// 终端总览页开着；和设置页一样盖在当前标签页上面，再按一次回到原来那一页
+    showing_terms: bool,
+    /// 上一次告诉 `board` 的「正显示着哪个终端」
+    told_shown: Option<Shown>,
+    /// Kuai 不在前台时发的系统通知（终端停下了）
+    toasts: Toasts,
     /// 标签栏的横向滚动位置
     tab_scroll: ScrollHandle,
     /// 标签页多到放不下了（上一帧量出来的）：多显示一个「所有标签页」的按钮
@@ -127,6 +141,8 @@ impl Workspace {
     ) -> Self {
         let manager = cx.new(|cx| ManagerView::new(app.clone(), cx));
         let settings_page = cx.new(|cx| SettingsPage::new(app.clone(), updater.clone(), cx));
+        let board = cx.new(|cx| TermBoard::new(app.clone(), cx));
+        let overview = cx.new(|cx| TermOverview::new(app.clone(), board.clone(), cx));
         let quitting = Rc::new(Cell::new(false));
         let subscriptions = vec![
             cx.subscribe_in(&manager, window, |this, _, event, window, cx| match event {
@@ -157,11 +173,25 @@ impl Workspace {
             cx.observe_window_appearance(window, |this, window, cx| {
                 this.apply_settings(window, cx);
             }),
-            // 最小化到托盘：窗口失去焦点时看一眼是不是最小化了
+            // 最小化到托盘：窗口失去焦点时看一眼是不是最小化了。
+            // 窗口不在前台时，显示着的终端不算「正看着」：重画一遍，把这个告诉 `board`
             cx.observe_window_activation(window, |this, window, cx| {
                 if !window.is_window_active() {
                     this.hide_if_minimized(cx);
+                } else {
+                    // 回到 Kuai 了：系统通知都收回，哪些停下了看标题栏上的个数
+                    this.toasts.clear();
                 }
+                cx.notify();
+            }),
+            // 标题栏上「终端」那一项的个数跟着变；总览页里换了选中的，也要重新告诉 `board`
+            cx.observe(&board, |_, _, cx| cx.notify()),
+            cx.observe(&overview, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&overview, window, |this, _, event: &Go, window, cx| {
+                this.go_to_terminal(&event.0, window, cx)
+            }),
+            cx.subscribe_in(&board, window, |this, _, event: &Stopped, window, cx| {
+                this.terminal_stopped(&event.0, window, cx)
             }),
             // 升级：小牌跟着检查、下载的进度变；点了「重启完成升级」先问一下再重启
             cx.observe(&updater, |_, _, cx| cx.notify()),
@@ -171,6 +201,8 @@ impl Workspace {
             // 退出时先撤掉托盘图标：进程退出前没撤的话，托盘里会留一个点不开的图标，鼠标移过去才消失
             cx.on_app_quit(|this, cx| {
                 this.tray = None;
+                // 退出以后系统通知点不动了，都收回
+                this.toasts.clear();
                 // 映射到本机的目录都断开（等在路上的写入落到服务器）
                 this.app.update(cx, |app, _| app.unmount_all());
                 async {}
@@ -264,6 +296,19 @@ impl Workspace {
                 window.push_notification(notification, cx);
             });
         }
+        // 点了系统通知：回到 Kuai，前往那个终端
+        let (toasts, mut clicks) = Toasts::new();
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(tag) = clicks.next().await {
+                let alive = this.update_in(cx, |this, window, cx| {
+                    this.toast_clicked(&tag, window, cx);
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         let mut this = Self {
             app: app.clone(),
             updater,
@@ -274,6 +319,11 @@ impl Workspace {
             shown: app.read(cx).current().clone(),
             parked: HashMap::new(),
             showing_settings: false,
+            board,
+            overview,
+            showing_terms: false,
+            told_shown: None,
+            toasts,
             tab_scroll: ScrollHandle::new(),
             tabs_overflow: false,
             drafts: Vec::new(),
@@ -676,7 +726,7 @@ impl Workspace {
     /// 告诉每个仓库标签页它是不是当前显示的：切到哪一页，哪一页就刷新。
     fn update_visibility(&self, cx: &mut Context<Self>) {
         for (ix, tab) in self.tabs.iter().enumerate() {
-            let visible = self.active == ix + 1 && !self.showing_settings;
+            let visible = self.active == ix + 1 && !self.showing_settings && !self.showing_terms;
             tab.view
                 .update(cx, |view, cx| view.set_visible(visible, cx));
         }
@@ -694,6 +744,7 @@ impl Workspace {
             }
         }
         self.showing_settings = false;
+        self.leave_terms(cx);
         self.reveal_active_tab();
         self.persist(cx);
         cx.notify();
@@ -1007,6 +1058,7 @@ impl Workspace {
     fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.active = ix.min(self.tabs.len());
         self.showing_settings = false;
+        self.leave_terms(cx);
         self.reveal_active_tab();
         self.persist(cx);
         cx.notify();
@@ -1015,12 +1067,167 @@ impl Workspace {
     /// 打开设置页（Ctrl+,）；已经开着就关掉。
     pub fn toggle_settings(&mut self, cx: &mut Context<Self>) {
         self.showing_settings = !self.showing_settings;
+        self.leave_terms(cx);
         self.update_visibility(cx);
         cx.notify();
     }
 
+    /// 打开终端总览页（Ctrl+Shift+A，标题栏上的「终端」）；已经开着就关掉，回到原来那一页。
+    pub fn toggle_terms(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.showing_terms {
+            self.leave_terms(cx);
+            // 焦点还在看不见的总览页上：放回显示出来的终端里
+            if let Some(tab) = self.active_repo() {
+                tab.shown(cx)
+                    .update(cx, |view, cx| view.focus_shown_terminal(window, cx));
+            }
+        } else {
+            self.showing_terms = true;
+            self.showing_settings = false;
+            self.overview
+                .update(cx, |overview, cx| overview.shown(window, cx));
+        }
+        self.update_visibility(cx);
+        cx.notify();
+    }
+
+    /// 不在终端总览页上了。
+    fn leave_terms(&mut self, cx: &mut Context<Self>) {
+        if self.showing_terms {
+            self.showing_terms = false;
+            self.overview.update(cx, |overview, cx| overview.hidden(cx));
+        }
+    }
+
+    /// 从终端总览页前往一个终端：切到它所在的工作区，打开那个仓库的标签页，到终端页选中它。
+    fn go_to_terminal(&mut self, row: &TermRow, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = self
+            .board
+            .read(cx)
+            .groups(cx)
+            .into_iter()
+            .find(|group| group.rows.iter().any(|other| other.id == row.id))
+            .and_then(|group| group.workspace);
+        let moved = workspace.as_ref().is_some_and(|key| *key != self.shown);
+        log::info!(
+            "前往终端：{} 的第 {} 个，{}",
+            row.entry.path,
+            row.number,
+            if moved {
+                "要换工作区"
+            } else {
+                "不换工作区"
+            }
+        );
+        if let Some(key) = workspace.filter(|_| moved) {
+            self.switch_workspace(key, window, cx);
+        }
+        self.open(row.entry.clone(), window, cx);
+        if let Some(tab) = self.active.checked_sub(1).and_then(|ix| self.tabs.get(ix)) {
+            let number = row.number;
+            tab.view
+                .update(cx, |view, cx| view.show_terminal_number(number, window, cx));
+        }
+        self.board
+            .update(cx, |board, cx| board.mark_seen(&row.id, cx));
+        // 说它停下了的那条提醒用不着了
+        let key = stopped_note_key(&row.id);
+        self.toasts.remove(&key);
+        window.remove_notification1::<TerminalStopped>(key, cx);
+        if moved {
+            let name = {
+                let app = self.app.read(cx);
+                app.workspace_name(app.current())
+            };
+            let text = tf!("已切换到工作区「{name}」", name);
+            window.push_notification(Notification::info(text), cx);
+        }
+    }
+
+    /// 点了系统通知：把窗口叫到前面，前往那个终端（它已经不在了就只叫窗口）。
+    fn toast_clicked(&mut self, tag: &str, window: &mut Window, cx: &mut Context<Self>) {
+        log::info!("点了系统通知：{tag}");
+        self.show_window(cx);
+        let row = tag.rsplit_once('/').and_then(|(machine, term)| {
+            let id = TermId {
+                machine: machine.to_string(),
+                term: term.to_string(),
+            };
+            self.board.read(cx).row(&id, cx)
+        });
+        if let Some(row) = row {
+            self.go_to_terminal(&row, window, cx);
+        }
+    }
+
+    /// 一个不在眼前的终端停下了：右下角说一声，带「前往」；Kuai 不在前台时任务栏上的按钮闪，
+    /// 再发一条系统通知（设置里可以关）。
+    fn terminal_stopped(&mut self, row: &TermRow, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.app.read(cx).settings.notify_terminal_stopped {
+            return;
+        }
+        let repo = self.app.read(cx).repo_name(&row.entry);
+        let text = match &row.title {
+            Some(title) => tf!("{repo} 的终端已停下：{title}", repo, title),
+            None => tf!("{repo} 的终端已停下", repo),
+        };
+        // 系统通知：标题同右下角那条，正文是屏幕上最后一行（多半是程序在问什么）
+        let (toast_key, toast_title, toast_body) =
+            (stopped_note_key(&row.id), text.clone(), row.last.clone());
+        let (this, key, row) = (
+            cx.entity().downgrade(),
+            stopped_note_key(&row.id),
+            row.clone(),
+        );
+        // 同一个终端只留一条；带按钮的通知默认不会自己收起，这里要它几秒后收起（标题栏上的个数还在）
+        let note = Notification::info(text)
+            .id1::<TerminalStopped>(key)
+            .action(move |_, _, _| {
+                let (this, row) = (this.clone(), row.clone());
+                Button::new("terminal-go")
+                    .small()
+                    .primary()
+                    .label(tr("前往"))
+                    .on_click(move |_, window, cx| {
+                        this.update(cx, |this, cx| this.go_to_terminal(&row, window, cx))
+                            .ok();
+                    })
+            })
+            .autohide(true);
+        log::info!(
+            "提醒终端已停下：{repo}，窗口{}",
+            if window.is_window_active() {
+                "在前台"
+            } else {
+                "不在前台"
+            }
+        );
+        window.push_notification(note, cx);
+        if window.is_window_active() {
+            return;
+        }
+        if let Some(hwnd) = self.hwnd {
+            win::flash(hwnd);
+        }
+        if self.app.read(cx).settings.notify_terminal_system {
+            self.toasts.show(&toast_key, &toast_title, &toast_body);
+        }
+    }
+
+    /// 现在正显示着哪个终端：窗口在前台时，终端总览页里选中的，或者当前标签页的终端页上那个。
+    fn shown_terminal(&self, window: &Window, cx: &App) -> Option<Shown> {
+        if !window.is_window_active() {
+            return None;
+        }
+        if self.showing_terms {
+            return self.overview.read(cx).selected().cloned().map(Shown::Term);
+        }
+        let (entry, number) = self.active_repo()?.shown(cx).read(cx).shown_terminal()?;
+        Some(Shown::Repo(entry, number))
+    }
+
     fn active_repo(&self) -> Option<&RepoTab> {
-        if self.showing_settings {
+        if self.showing_settings || self.showing_terms {
             return None;
         }
         self.active.checked_sub(1).and_then(|ix| self.tabs.get(ix))
@@ -1037,6 +1244,8 @@ impl Workspace {
     pub fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.showing_settings {
             self.toggle_settings(cx);
+        } else if self.showing_terms {
+            self.toggle_terms(window, cx);
         } else if let Some(ix) = self.active.checked_sub(1) {
             // 在文件页上、有打开的文件：Ctrl+W 关的是那个文件，不是整个仓库标签页
             let closed_file = self.tabs.get(ix).is_some_and(|tab| {
@@ -1118,6 +1327,14 @@ impl Workspace {
                     view.show_history_view(window, cx);
                 }
             });
+        }
+    }
+
+    /// Ctrl+0：在当前仓库的提交列表里回到 HEAD。
+    pub fn go_to_head(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_repo() {
+            tab.shown(cx)
+                .update(cx, |view, cx| view.go_to_head(window, cx));
         }
     }
 
@@ -1209,6 +1426,7 @@ impl Workspace {
             }
         }
         self.showing_settings = false;
+        self.leave_terms(cx);
         self.reveal_active_tab();
         self.persist(cx);
         cx.notify();
@@ -1467,7 +1685,7 @@ impl Workspace {
             Some(sub) => format!("{} / {sub}", app.repo_title(&tab.entry)).into(),
             None => app.repo_title(&tab.entry),
         };
-        let selected = self.active == ix + 1 && !self.showing_settings;
+        let selected = self.active == ix + 1 && !self.showing_settings && !self.showing_terms;
         let (busy, changes) = {
             let view = tab.view.read(cx);
             (
@@ -1557,7 +1775,7 @@ impl Workspace {
             .iter()
             .map(|tab| app.repo_title(&tab.entry))
             .collect();
-        let active = (!self.showing_settings)
+        let active = (!self.showing_settings && !self.showing_terms)
             .then(|| self.active.checked_sub(1))
             .flatten();
         let this = cx.entity().downgrade();
@@ -1604,13 +1822,47 @@ impl Workspace {
             });
         }
         let theme = cx.theme();
-        let (border, muted) = (theme.border, theme.muted_foreground);
-        let home_selected = self.active == 0 && !self.showing_settings;
+        let (border, muted, warning) = (theme.border, theme.muted_foreground, theme.warning);
+        let home_selected = self.active == 0 && !self.showing_settings && !self.showing_terms;
         let home = tab_shell("tab-home", home_selected, cx)
             .flex_none()
             .on_click(cx.listener(|this, _, _, cx| this.select(0, cx)))
             .child(ui::icon(IconName::LayoutGrid).flex_none())
             .child(trc("页面", "仓库"));
+        // 所有工作区里的终端：已停下、还没看过的有几个就标几个
+        let waiting = self.board.read(cx).attention();
+        let terms = tab_shell("tab-terms", self.showing_terms, cx)
+            .flex_none()
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_terms(window, cx)))
+            .child(ui::icon(IconName::SquareTerminal).flex_none())
+            .child(trc("页面", "终端"))
+            .when(waiting > 0, |tab| {
+                tab.child(
+                    div()
+                        .flex_none()
+                        .px(px(5.))
+                        .h(px(16.))
+                        .min_w(px(16.))
+                        .rounded_full()
+                        .bg(warning)
+                        .text_color(gpui_kit::black())
+                        .text_size(px(10.5))
+                        .line_height(px(16.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_center()
+                        .child(waiting.to_string()),
+                )
+            })
+            .tooltip(move |window, cx| {
+                let text = match waiting {
+                    0 => tr("所有工作区中的终端（Ctrl+Shift+A）").to_string(),
+                    n => tf!(
+                        "所有工作区中的终端（Ctrl+Shift+A）：{n} 个已停下，尚未查看",
+                        n = n.to_string()
+                    ),
+                };
+                ui::tip(text, window, cx)
+            });
         let repo_tabs: Vec<AnyElement> = (0..self.tabs.len())
             .map(|ix| self.render_repo_tab(ix, cx))
             .collect();
@@ -1664,6 +1916,7 @@ impl Workspace {
                 .child(self.render_workspace_button(cx))
                 .child(div().flex_none().w(px(1.)).h(px(16.)).mx(px(4.)).bg(border))
                 .child(home)
+                .child(terms)
                 // 标签页那一段画在这个占位的块里面（绝对定位）。标题栏的宽度按里面内容的
                 // 最小宽度算，直接把标签页排在这一行里的话，开多了会把整行撑宽，
                 // 右边的设置和窗口按钮被挤出窗口
@@ -2160,13 +2413,29 @@ fn path_row(path: SharedString, cx: &App) -> impl IntoElement {
         )
 }
 
+/// 「终端已停下」那条提醒的类别（同一个终端只留一条，前往以后去掉）。
+struct TerminalStopped;
+
+fn stopped_note_key(id: &TermId) -> SharedString {
+    format!("{}/{}", id.machine, id.term).into()
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title_bar = self.render_title_bar(window, cx).into_any_element();
+        // 正显示着哪个终端变了：告诉 `board`（显示着的算看过，停下了不提醒）
+        let shown = self.shown_terminal(window, cx);
+        if shown != self.told_shown {
+            self.told_shown = shown.clone();
+            let board = self.board.clone();
+            cx.defer(move |cx| board.update(cx, |board, cx| board.set_shown(shown, cx)));
+        }
         let theme = cx.theme();
         let (bg, fg) = (theme.background, theme.foreground);
         let content = if self.showing_settings {
             self.settings_page.clone().into_any_element()
+        } else if self.showing_terms {
+            self.overview.clone().into_any_element()
         } else {
             match self.active {
                 0 => self.manager.clone().into_any_element(),

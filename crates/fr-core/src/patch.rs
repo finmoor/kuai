@@ -55,6 +55,32 @@ pub fn set_context(args: &mut [String], lines: u32) {
     }
 }
 
+/// 让 diff、show 不算空白的差别（`-w`）：只是缩进、行尾空格不同的行不当成改动。
+/// 这样取出来的补丁只能看，不能拿去按块、按行暂存（和文件对不上）。
+pub fn ignore_whitespace(args: &mut Vec<String>) {
+    // 放在 `-U3` 后面：它前面是子命令和别的开关，后面才是版本、`--` 和路径
+    if let Some(at) = args.iter().position(|arg| arg.starts_with("-U")) {
+        args.insert(at + 1, "-w".into());
+    }
+}
+
+/// 补丁里一共增加、删除了多少行。
+pub fn count_changed(out: &[u8]) -> (usize, usize) {
+    let (mut added, mut removed) = (0, 0);
+    for line in parse(out)
+        .iter()
+        .flat_map(|file| &file.hunks)
+        .flat_map(|hunk| &hunk.lines)
+    {
+        match line.kind {
+            LineKind::Added => added += 1,
+            LineKind::Removed => removed += 1,
+            LineKind::Context => {}
+        }
+    }
+    (added, removed)
+}
+
 /// 把补丁应用到暂存区：暂存（`reverse=false`）或取消暂存（`reverse=true`）。补丁从标准输入给。
 pub fn apply_cached_args(reverse: bool) -> Vec<String> {
     let mut args = apply_args(reverse);

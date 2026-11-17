@@ -120,6 +120,10 @@ impl Shared {
             session: Some(crate::win::session_id()),
             #[cfg(not(windows))]
             session: None,
+            #[cfg(windows)]
+            guarded: crate::win::redirect_guarded(),
+            #[cfg(not(windows))]
+            guarded: false,
         }
     }
 
@@ -253,6 +257,9 @@ struct TermParams {
     cols: u16,
     #[serde(default)]
     rows: u16,
+    /// 只看：不改会话的大小（协议 11 起）
+    #[serde(default)]
+    watch: bool,
 }
 
 /// 服务一个客户端，直到它断开（`reader` 读到头）。
@@ -286,6 +293,7 @@ pub fn serve(shared: &Arc<Shared>, reader: impl Read, writer: impl Write + Send 
     conn.kill_git();
     drop(watchers);
     shared.workspaces.unwatch(conn.id, None);
+    shared.terms.unwatch(conn.id, None);
     shared.terms.detach(conn.id, None);
     conn.asks.lock().unwrap().clear();
     shared.conns.lock().unwrap().remove(&conn.id);
@@ -315,6 +323,7 @@ fn handle(
                 }
                 watchers.remove(&target);
                 shared.workspaces.unwatch(conn.id, Some(target));
+                shared.terms.unwatch(conn.id, Some(target));
                 shared.terms.detach(conn.id, Some(target));
                 conn.relays.kill(target);
             }
@@ -345,6 +354,7 @@ fn handle(
             }
         }
         "state_watch" => shared.workspaces.watch(conn.id, id, &conn.out),
+        "term_watch" => shared.terms.watch(conn.id, id, &conn.out),
         "state_apply" => {
             let applied = serde_json::from_value::<StateApply>(request.params)
                 .context("state_apply 参数无效")
@@ -397,7 +407,9 @@ fn handle(
         "term_attach" => {
             let attached = term_params(&request).and_then(|params| {
                 let size = Size::new(params.cols, params.rows);
-                shared.terms.attach(&params.term, size, conn.id, id, &conn.out)
+                shared
+                    .terms
+                    .attach(&params.term, size, params.watch, conn.id, id, &conn.out)
             });
             if let Err(err) = attached {
                 conn.reply(id, Err(err));

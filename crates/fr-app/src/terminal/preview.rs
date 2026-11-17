@@ -7,7 +7,7 @@ use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::*;
 
 use super::colors::Palette;
-use super::{CursorDraw, Frame, Run, Style, glyphs, paint_frame, prefs};
+use super::{CursorDraw, Frame, Run, Style, glyphs, paint_frame, prefs, stands_alone};
 use crate::settings::TerminalCursor;
 
 /// 颜色：None 是默认的前景色，Some 是 16 色里的第几个
@@ -121,9 +121,13 @@ fn frame(bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) -> Frame {
                 }
                 let wide = is_wide(ch);
                 let width = if wide { 2 } else { 1 };
+                // 标点、符号一个一段，和真的终端里一样
+                let lone = stands_alone(ch, wide);
                 match runs.last_mut() {
                     Some(run)
-                        if run.row == row
+                        if !lone
+                            && !run.lone
+                            && run.row == row
                             && run.next == col
                             && run.wide == wide
                             && run.style == style =>
@@ -138,6 +142,7 @@ fn frame(bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) -> Frame {
                         text: ch.to_string(),
                         wide,
                         single: false,
+                        lone,
                         style,
                     }),
                 }

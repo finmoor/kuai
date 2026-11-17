@@ -28,11 +28,16 @@
 //!   响应是一个流：第一条 `chunk: true`、`result` 是 [`TermOpened`]；接着是还原屏幕用的输出
 //!   （接上已有会话时）和之后的输出，每条 `chunk: true` 带一块原始字节；程序结束时最后一条
 //!   `result` 是 [`TermExit`]。`cancel` 这个请求只是断开。
-//! - `term_attach`：参数 `{term, cols, rows}`，接上指定的会话，响应同上。
+//! - `term_attach`：参数 `{term, cols, rows}`，接上指定的会话，响应同上。带 `watch: true`（协议 11 起）
+//!   是只看：不改会话的大小，先收到按会话现在的大小还原的屏幕；看的人不往里写任何东西（包括终端
+//!   自己回答程序的话），程序结束时会话也不因为它看过就忘掉。
 //! - `term_input`：参数 `{term}`，请求带的字节写给程序。不回响应。
 //! - `term_resize`：参数 `{term, cols, rows}`。不回响应。
 //! - `term_close`：参数 `{term}`，结束会话里的程序并忘掉这个会话。
 //! - `term_list`：返回 `{terms: [TermInfo]}`。
+//! - `term_watch`（协议 11 起）：订阅终端列表。先回一条 `chunk: true`、`result` 是 `{terms: [TermInfo]}`，
+//!   之后列表有变化（开了、结束了、标题或最后一行变了、有输出变成没输出）时再回一条；有终端正在
+//!   输出时每隔几秒也回一条，客户端靠 [`TermInfo::idle_ms`] 知道它还在输出。`cancel` 这个请求就不订阅了。
 //!
 //! 传文件（协议 5 起）。往终端里发图片、文件用：终端那条路只能过文字，文件先传上来，
 //! 客户端再把它在服务器上的路径贴进终端：
@@ -104,7 +109,8 @@ use serde_json::Value;
 /// 9：把目录映射到本机用的 `fs_pwrite`、`fs_resize`、`fs_touch`、`fs_space`，和几个方法多出来的选项。
 /// 10：kuaid 保存仓库列表和工作区（`state_get`、`state_watch`、`state_apply`），经它连它配置的服务器
 /// （`relay_open`、`relay_input`）。
-pub const PROTOCOL_VERSION: u32 = 10;
+/// 11：`term_watch` 订阅终端列表；`term_attach` 可以只看（`watch`）；[`TermInfo`] 多了 `idle_ms`、`last`。
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// 一条消息后面跟多少字节的原始数据。
 pub trait Frame {
@@ -194,6 +200,10 @@ pub struct DaemonInfo {
     /// 常驻进程在哪个登录会话里（只有 Windows 上报）：0 是没有桌面的那个，经 ssh 拉起的在这里
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<u32>,
+    /// 常驻进程带着 Windows 的 Redirection Guard（只有 Windows 上报）：它起的终端进不了普通用户建的
+    /// 目录联接和符号链接。带着它的 Kuai 拉起来的才会这样，换一个不带的 Kuai 来起就没有了
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guarded: bool,
 }
 
 /// `term_open` 的参数。
@@ -254,6 +264,14 @@ pub struct TermInfo {
     /// 开了多久（秒）
     #[serde(default)]
     pub age: u64,
+    /// 距最近一次输出多久了（毫秒，协议 11 起）。空着是不知道：旧版 kuaid，或者 kuaid 升级换程序后
+    /// 还没有过输出。用毫秒：客户端拿它倒推「最近一次输出的时刻」，和「什么时候看过」比先后，
+    /// 整秒的话差一两秒就比错了
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_ms: Option<u64>,
+    /// 屏幕上最后一行有字的内容（协议 11 起），列表里给人看一眼用
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last: String,
 }
 
 /// `file_put` 的参数。

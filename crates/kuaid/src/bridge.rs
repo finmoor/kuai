@@ -125,14 +125,34 @@ fn should_replace(theirs: &str, mine: &str) -> bool {
     version(theirs) <= version(mine)
 }
 
-/// 常驻进程该不该搬个地方：它在会话 0（经 ssh 拉起的，没有桌面），我们在桌面上，这台电脑上还
-/// 运行着 Kuai（能替它在桌面上重新起一遍）。搬过去以后新开的终端才开得了带窗口的程序；已经开着的
-/// 终端留在原来的会话里，照常用。
+/// 常驻进程该不该由 Kuai 重新起一遍。两种情况，都要我们在桌面上、这台电脑上还运行着 Kuai
+/// （由它来起）：
+///
+/// - 它在会话 0（经 ssh 拉起的，没有桌面）。搬到桌面上以后新开的终端才开得了带窗口的程序。
+/// - 它带着 Redirection Guard（[`crate::win::redirect_guarded`]）而我们没带：它是带着防护的 Kuai
+///   起的，里面的终端进不了目录联接；我们是现在这个 Kuai 起的，没带，说明 Kuai 已经甩掉了，
+///   由它重新起的常驻进程也不带。我们自己也带着的话不动：重新起一遍还是带着，白折腾。
+///
+/// 已经开着的终端留在原来的进程里，照常用（防护甩不掉，要重开）。
 #[cfg(windows)]
 fn misplaced(paths: &Paths, info: &DaemonInfo) -> bool {
-    info.session == Some(0)
-        && crate::win::session_id() != 0
-        && crate::win::kuai_pipe_file(&paths.run).is_file()
+    should_move(
+        crate::win::session_id() != 0,
+        info.session == Some(0),
+        info.guarded,
+        crate::win::redirect_guarded(),
+    ) && crate::win::kuai_pipe_file(&paths.run).is_file()
+}
+
+/// [`misplaced`] 的判断：我们在不在桌面上、常驻进程在不在会话 0、常驻进程和我们各自带没带着防护。
+#[cfg(any(windows, test))]
+fn should_move(
+    on_desktop: bool,
+    daemon_in_session_0: bool,
+    daemon_guarded: bool,
+    guarded: bool,
+) -> bool {
+    on_desktop && (daemon_in_session_0 || (daemon_guarded && !guarded))
 }
 
 #[cfg(unix)]
@@ -346,7 +366,22 @@ pub fn stop() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::should_replace;
+    use super::{should_move, should_replace};
+
+    #[test]
+    fn 常驻进程什么时候让_kuai_重新起一遍() {
+        // 它在会话 0、我们在桌面上：搬过来
+        assert!(should_move(true, true, false, false));
+        // 它带着 Redirection Guard、我们没带（Kuai 已经甩掉了）：重新起一遍就不带了
+        assert!(should_move(true, false, true, false));
+        // 都带着：重新起一遍还是带着，不动
+        assert!(!should_move(true, false, true, true));
+        // 都好好的
+        assert!(!should_move(true, false, false, false));
+        // 我们自己在会话 0（经 ssh 来的）：不替桌面上的做主，哪种情况都不动
+        assert!(!should_move(false, true, false, false));
+        assert!(!should_move(false, false, true, false));
+    }
 
     #[test]
     fn 比自己旧或者一样新的才换() {

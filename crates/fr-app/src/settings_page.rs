@@ -501,6 +501,40 @@ impl SettingsPage {
                 "对新打开的终端生效。服务器上的仓库使用服务器的登录 shell。",
             ))
         };
+        let notify = {
+            let (get, set) = (app.clone(), app.clone());
+            SettingItem::new(
+                tr("终端停下时提醒"),
+                SettingField::switch(
+                    move |cx| get.read(cx).settings.notify_terminal_stopped,
+                    move |on, cx| {
+                        set.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| s.notify_terminal_stopped = on)
+                        })
+                    },
+                ),
+            )
+            .description(tr(
+                "未显示的终端超过 10 秒没有新输出时提醒；Kuai 不在前台时任务栏按钮闪烁。",
+            ))
+        };
+        let notify_system = {
+            let (get, set) = (app.clone(), app.clone());
+            SettingItem::new(
+                tr("发送 Windows 通知"),
+                SettingField::switch(
+                    move |cx| get.read(cx).settings.notify_terminal_system,
+                    move |on, cx| {
+                        set.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| s.notify_terminal_system = on)
+                        })
+                    },
+                ),
+            )
+            .description(tr(
+                "Kuai 不在前台时，终端停下同时发送 Windows 通知；点击通知前往该终端。需开启上一项。",
+            ))
+        };
         SettingPage::new(tr("终端"))
             .icon(Icon::new(IconName::SquareTerminal))
             .default_open(true)
@@ -527,6 +561,12 @@ impl SettingsPage {
                     .item(right_click),
             )
             .group(SettingGroup::new().title(tr("本机仓库")).item(shell))
+            .group(
+                SettingGroup::new()
+                    .title(tr("提醒"))
+                    .item(notify)
+                    .item(notify_system),
+            )
     }
 
     fn appearance(&self) -> SettingPage {

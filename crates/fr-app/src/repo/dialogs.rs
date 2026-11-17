@@ -39,7 +39,7 @@ pub(super) struct Ask {
     pub hint: SharedString,
     pub ok: &'static str,
     /// 勾选项：文字和默认是否勾上
-    pub checks: Vec<(&'static str, bool)>,
+    pub checks: Vec<(SharedString, bool)>,
     /// 第一个输入框可以不填
     pub allow_empty: bool,
     pub validate: Option<Validate>,
@@ -171,7 +171,7 @@ impl RepoView {
                 let states = states.clone();
                 body = body.child(
                     Checkbox::new(("ask-check", ix))
-                        .label(*label)
+                        .label(label.clone())
                         .checked(states[ix].get())
                         .on_click(move |checked, window, _| {
                             states[ix].set(*checked);
@@ -343,7 +343,7 @@ impl RepoView {
             placeholder: tr("分支名称，例如 feature/login").into(),
             hint: hint.into(),
             ok: tr("创建"),
-            checks: vec![(tr("创建后切换"), true)],
+            checks: vec![(tr("创建后切换").into(), true)],
             validate: Some(Box::new(|this, answer| {
                 ref_name_error(&answer.text).or_else(|| this.branch_exists_error(&answer.text))
             })),
@@ -389,16 +389,50 @@ impl RepoView {
         });
     }
 
-    /// 贮藏当前的改动。
+    /// 贮藏当前的改动。正在看本地修改、又多选了文件时，可以只贮藏选中的那几个（默认就是）。
     pub(super) fn stash_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked: Vec<fr_core::status::Entry> = match self.mode {
+            Mode::Changes => self
+                .changes_selected_entries()
+                .map(|(_, entries)| entries)
+                .filter(|entries| entries.len() > 1)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        self.stash_entries_dialog(picked, window, cx);
+    }
+
+    /// 贮藏的对话框；`picked` 不空时多一个勾选项「仅贮藏选中的 N 个文件」，默认勾上。
+    pub(super) fn stash_entries_dialog(
+        &mut self,
+        picked: Vec<fr_core::status::Entry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut checks = vec![(tr("包含未跟踪的文件").into(), false)];
+        if !picked.is_empty() {
+            let label = tf!("仅贮藏选中的 {n} 个文件", n = picked.len());
+            checks.push((label.into(), true));
+        }
+        let only_picked = !picked.is_empty();
         let ask = Ask {
             title: tr("贮藏改动").into(),
             placeholder: tr("说明（可选）").into(),
-            hint: tr("贮藏改动，使工作区恢复干净；可在侧栏的「贮藏」中恢复。").into(),
+            hint: match only_picked {
+                true => {
+                    tr("仅贮藏选中的文件时，其中未跟踪的文件会一并贮藏；其余改动保留在工作区。")
+                }
+                false => tr("贮藏改动，使工作区恢复干净；可在侧栏的「贮藏」中恢复。"),
+            }
+            .into(),
             ok: tr("贮藏"),
-            checks: vec![(tr("包含未跟踪的文件"), false)],
+            checks,
             allow_empty: true,
-            validate: Some(Box::new(|this, answer| {
+            validate: Some(Box::new(move |this, answer| {
+                // 只贮藏选中的：选中的总是有改动的
+                if only_picked && answer.checks.get(1).copied().unwrap_or(false) {
+                    return None;
+                }
                 let entries = this.status.as_ref().map(|s| s.entries.as_slice())?;
                 let untracked = answer.checks.first().copied().unwrap_or(false);
                 if entries.is_empty() {
@@ -415,20 +449,37 @@ impl RepoView {
             })),
             ..Default::default()
         };
-        self.ask(ask, window, cx, |this, answer, window, cx| {
+        self.ask(ask, window, cx, move |this, answer, window, cx| {
             let untracked = answer.checks.first().copied().unwrap_or(false);
-            let args = fr_core::stash::push_args(Some(&answer.text), untracked);
+            let partial = only_picked && answer.checks.get(1).copied().unwrap_or(false);
+            let args = match partial {
+                true => {
+                    // 改名的文件：原路径也要带上；选中的里有未跟踪的文件就连它们一起收
+                    let paths: Vec<&str> = picked
+                        .iter()
+                        .flat_map(|e| {
+                            std::iter::once(e.path.as_str()).chain(e.orig_path.as_deref())
+                        })
+                        .collect();
+                    let has_untracked = picked.iter().any(|e| e.unstaged == Some(Kind::Untracked));
+                    fr_core::stash::push_paths_args(Some(&answer.text), has_untracked, &paths)
+                }
+                false => fr_core::stash::push_args(Some(&answer.text), untracked),
+            };
+            let count = picked.len();
             this.run_op(
                 tr("贮藏"),
                 args,
                 None,
                 window,
                 cx,
-                |_, out, window, cx| {
+                move |_, out, window, cx| {
                     // 没有改动时 git 也是成功退出，只在输出里说一句
                     let said = String::from_utf8_lossy(&out.stdout);
                     let note = if said.contains("No local changes") {
                         Notification::warning(tr("没有可贮藏的改动"))
+                    } else if partial {
+                        Notification::success(tf!("已贮藏选中的 {count} 个文件", count))
                     } else {
                         Notification::success(tr("改动已贮藏，工作区已恢复干净"))
                     };

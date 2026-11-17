@@ -289,12 +289,27 @@ pub struct Settings {
     /// 改动并排着看（左边旧的、右边新的），不勾就是上下排在一栏里
     #[serde(default)]
     pub diff_split: bool,
+    /// 文件清单按目录排成树（本地修改、提交详情、比较三处共用），不勾就是平铺
+    #[serde(default)]
+    pub file_tree: bool,
+    /// 本地修改里不列未跟踪的文件
+    #[serde(default)]
+    pub hide_untracked: bool,
+    /// 图片的改动怎么对比：0 并排，1 滑动，2 叠加
+    #[serde(default)]
+    pub image_diff: u8,
     /// 工作区有改动时切换分支、拉取：先贮藏，做完再恢复
     #[serde(default)]
     pub stash_before_switch: bool,
     /// 标签页上显示关闭按钮；关了以后用中键、Ctrl+W 或右键菜单关，免得手滑点到
     #[serde(default = "default_true")]
     pub tab_close_button: bool,
+    /// 不在眼前的终端停下来（超过 10 秒没有新输出）时提醒
+    #[serde(default = "default_true")]
+    pub notify_terminal_stopped: bool,
+    /// 上面那项开着、Kuai 又不在前台时，再发一条 Windows 通知（见 `toast`）
+    #[serde(default = "default_true")]
+    pub notify_terminal_system: bool,
     /// 本机仓库的终端用哪个程序（`shell::local_shells` 里的 id）；空着自动挑
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub terminal_shell: String,
@@ -502,8 +517,13 @@ impl Default for Settings {
             close_to_tray: false,
             auto_fetch_minutes: default_auto_fetch(),
             diff_split: false,
+            file_tree: false,
+            image_diff: 0,
+            hide_untracked: false,
             stash_before_switch: false,
             tab_close_button: true,
+            notify_terminal_stopped: true,
+            notify_terminal_system: true,
             terminal_shell: String::new(),
             terminal: TerminalSettings::default(),
             layout: Layout::default(),

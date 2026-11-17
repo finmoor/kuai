@@ -145,6 +145,22 @@ impl Stream for StateStream {
     }
 }
 
+/// 一台电脑上的终端列表：先来现在的整份，之后有变化（开了、结束了、有输出变成没输出……）来一份
+/// 新的，有终端正在输出时每隔几秒也来一份（见 [`Connection::term_watch`]）。连接断了，流以一个
+/// 错误结束。丢弃就不订阅了。
+pub struct TermListStream {
+    rx: mpsc::UnboundedReceiver<Result<Vec<TermInfo>>>,
+    _cancel: Box<dyn Send>,
+}
+
+impl Stream for TermListStream {
+    type Item = Result<Vec<TermInfo>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.rx).poll_next(cx)
+    }
+}
+
 /// 要传到服务器上的东西从哪来。
 pub enum UploadSource {
     /// 本机的一个文件，边读边传

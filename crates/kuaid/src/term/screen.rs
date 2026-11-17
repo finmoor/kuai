@@ -20,6 +20,8 @@ use alacritty_terminal::vte::ansi::{Color, CursorShape, CursorStyle, NamedColor,
 
 /// 往回翻的内容留多少行。客户端接上时全部还原，所以不能太多
 const HISTORY: usize = 2000;
+/// [`Screen::last_text`] 最多给这么多个字
+const LAST_TEXT: usize = 200;
 /// 没写完的转义序列最多记这么长（剪贴板序列可以很长），再长就不管了
 const TAIL_LIMIT: usize = 256 * 1024;
 /// 画样式要看的那几位（其余的是换行、宽字符占位这些排版标记）
@@ -150,6 +152,27 @@ impl Screen {
             }
         }
         reply
+    }
+
+    /// 屏幕上最后一行有字的内容，终端列表里给人看一眼用：从下往上找，跳过空行和只有框线的行，
+    /// 去掉两头的空白和框线（全屏程序爱画框），最多 [`LAST_TEXT`] 个字。
+    pub fn last_text(&self) -> String {
+        let grid = self.term.grid();
+        // 制表线和方块字符
+        let edge = |c: char| c.is_whitespace() || ('\u{2500}'..='\u{259f}').contains(&c);
+        (0..grid.screen_lines())
+            .rev()
+            .find_map(|line| {
+                let row = &grid[Line(line as i32)];
+                let text: String = (0..grid.columns())
+                    .map(|col| &row[Column(col)])
+                    .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+                    .map(|cell| cell.c)
+                    .collect();
+                let text = text.trim_matches(edge);
+                (!text.is_empty()).then(|| text.chars().take(LAST_TEXT).collect())
+            })
+            .unwrap_or_default()
     }
 
     /// 屏幕上某一行的字（测试用）。
@@ -631,8 +654,24 @@ mod tests {
     }
 
     #[test]
+    fn 最后一行有字的内容() {
+        let mut screen = Screen::new(Size::new(40, 6));
+        assert_eq!(screen.last_text(), "");
+        // 全屏程序画的框：跳过只有框线的行，去掉两头的框线；宽字符中间不夹空格
+        screen.advance("第一行\r\n\u{256d}\u{2500}\u{2500}\u{256e}\r\n\u{2502} 需要提交吗？ \u{2502}\r\n\u{2570}\u{2500}\u{2500}\u{256f}\r\n".as_bytes());
+        assert_eq!(screen.last_text(), "需要提交吗？");
+        screen.advance(b"  ? for shortcuts  ");
+        assert_eq!(screen.last_text(), "? for shortcuts");
+    }
+
+    #[test]
     fn 普通的几行字() {
-        roundtrip(40, 6, b"$ ls\r\nCargo.toml  README.md\r\n$ ", b"git status\r\n");
+        roundtrip(
+            40,
+            6,
+            b"$ ls\r\nCargo.toml  README.md\r\n$ ",
+            b"git status\r\n",
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 pub mod askpass;
 pub mod blame;
+pub mod compare;
 pub mod dir;
 pub mod exec;
 pub mod files;

@@ -13,6 +13,7 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 
 use super::changes::Area;
+use super::compare::End;
 use super::dialogs::{Ask, ref_name_error};
 use super::history::Scope;
 use super::ops::{Step, args, failure};
@@ -91,6 +92,14 @@ fn merge_args(name: &str, flag: Option<&str>, no_commit: bool) -> Vec<String> {
     merge
 }
 
+/// `git tag` 的参数：填了说明是带说明的标签（`-a -m`），没填是轻量标签。
+fn tag_args(name: &str, message: &str, target: &str) -> Vec<String> {
+    match message.is_empty() {
+        true => args(&["tag", name, target]),
+        false => args(&["tag", "-a", "-m", message, name, target]),
+    }
+}
+
 /// 构建菜单的函数，交给组件库的 `context_menu`。
 pub(super) type MenuFn = Box<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>;
 
@@ -154,6 +163,29 @@ fn scope_items(
     }
 }
 
+/// 侧栏里分支、远程分支、标签菜单上的比较两项：和当前分支比（`current` 为空表示这一项就是
+/// 当前分支，不列），和本地修改比。点的这一项当基准。
+fn compare_items(menu: PopupMenu, view: &View, end: End, current: Option<End>) -> PopupMenu {
+    let menu = match current {
+        Some(current) => {
+            let label = match current {
+                End::Head => tr("与 HEAD 比较"),
+                _ => tr("与当前分支比较"),
+            };
+            let base = end.clone();
+            menu.item(item(view, label, move |this, w, cx| {
+                this.compare_ends(base.clone(), current.clone(), w, cx)
+            }))
+        }
+        None => menu,
+    };
+    menu.item(item(
+        view,
+        tr("与本地修改比较"),
+        move |this, w, cx| this.compare_ends(end.clone(), End::Worktree, w, cx),
+    ))
+}
+
 impl RepoView {
     /// 当前分支的名字；分离的 HEAD 时是「HEAD」。
     fn current_label(&self) -> String {
@@ -197,6 +229,8 @@ impl RepoView {
         let is_merge = commit.parents.len() > 1;
         let cur = self.current_label();
         let is_head = self.status.as_ref().and_then(|s| s.head.as_deref()) == Some(&*id);
+        // 「选中的提交」：点右键之前选中的那个（点右键会先选中这一行）
+        let marked = self.history.marked_for(ix).filter(|marked| *marked != id);
         let branches: Vec<String> = self
             .refs
             .branches
@@ -289,6 +323,31 @@ impl RepoView {
                     move |this, w, cx| this.interactive_rebase(base.clone(), w, cx),
                 ));
             }
+            menu = menu.separator();
+            if !is_head {
+                let base = id.clone();
+                menu = menu.item(item(&view, tr("与 HEAD 比较"), move |this, w, cx| {
+                    this.compare_ends(End::Commit(base.clone()), End::Head, w, cx)
+                }));
+            }
+            let base = id.clone();
+            menu = menu.item(item(
+                &view,
+                tr("与本地修改比较"),
+                move |this, w, cx| {
+                    this.compare_ends(End::Commit(base.clone()), End::Worktree, w, cx)
+                },
+            ));
+            if let Some(marked) = marked.clone() {
+                let this_one = id.clone();
+                menu = menu.item(item(
+                    &view,
+                    tf!("与选中的提交（{id}）比较", id = short(&marked)),
+                    move |this, w, cx| {
+                        this.compare_commits(marked.clone(), this_one.clone(), w, cx)
+                    },
+                ));
+            }
             menu.separator()
                 .item(copy_item(tr("复制哈希"), id.clone()))
                 .item(copy_item(tr("复制说明"), subject.clone()))
@@ -319,6 +378,7 @@ impl RepoView {
                     });
                 // 没在哪个工作树里检出的分支，可以另开一个工作树检出它
                 let spare = self.has_worktrees_item() && self.tree_holding(&branch.name).is_none();
+                let current = (!branch.current).then(|| self.current_end());
                 Some(Box::new(move |mut menu, _, _| {
                     let name = branch.name.clone();
                     if !branch.current {
@@ -388,6 +448,12 @@ impl RepoView {
                             this.delete_branch(d.clone(), w, cx)
                         }));
                     }
+                    menu = compare_items(
+                        menu.separator(),
+                        &view,
+                        End::Branch(name.clone()),
+                        current.clone(),
+                    );
                     menu = scope_items(
                         menu.separator(),
                         &view,
@@ -404,6 +470,7 @@ impl RepoView {
                 let name = self.refs.remotes.get(i)?.name.clone();
                 let full = format!("refs/remotes/{name}");
                 let (only, hidden) = (self.is_only(&full), self.hidden_refs(cx).contains(&full));
+                let current = self.current_end();
                 Some(Box::new(move |menu, _, _| {
                     let (a, b, c, d) = (name.clone(), name.clone(), name.clone(), name.clone());
                     let e = name.clone();
@@ -435,6 +502,12 @@ impl RepoView {
                             tr("删除远程分支…"),
                             move |this, w, cx| this.delete_remote_branch(d.clone(), w, cx),
                         ));
+                    let menu = compare_items(
+                        menu.separator(),
+                        &view,
+                        End::Remote(name.clone()),
+                        Some(current.clone()),
+                    );
                     scope_items(
                         menu.separator(),
                         &view,
@@ -452,6 +525,7 @@ impl RepoView {
                 let remote = self.default_remote();
                 let full = format!("refs/tags/{name}");
                 let (only, hidden) = (self.is_only(&full), self.hidden_refs(cx).contains(&full));
+                let current = self.current_end();
                 Some(Box::new(move |menu, _, _| {
                     let (a, b, c, d) = (name.clone(), name.clone(), name.clone(), name.clone());
                     let menu = menu
@@ -476,6 +550,12 @@ impl RepoView {
                             tf!("从 {remote} 删除…", remote),
                             move |this, w, cx| this.delete_tag(d.clone(), true, w, cx),
                         ));
+                    let menu = compare_items(
+                        menu.separator(),
+                        &view,
+                        End::Tag(name.clone()),
+                        Some(current.clone()),
+                    );
                     scope_items(
                         menu.separator(),
                         &view,
@@ -762,8 +842,8 @@ impl RepoView {
             .unwrap_or_default();
         let count = entries.len();
         Box::new(move |menu, _, _| {
-            let (a, b) = (entries.clone(), entries.clone());
-            match area {
+            let (a, b, c) = (entries.clone(), entries.clone(), entries.clone());
+            let menu = match area {
                 Area::Unstaged => menu
                     .item(item(
                         &view,
@@ -780,7 +860,12 @@ impl RepoView {
                     tf!("取消暂存选中的 {count} 个文件", count),
                     move |this, w, cx| this.unstage_files(a.clone(), w, cx),
                 )),
-            }
+            };
+            menu.separator().item(item(
+                &view,
+                tf!("贮藏选中的 {count} 个文件…", count),
+                move |this, w, cx| this.stash_entries_dialog(c.clone(), w, cx),
+            ))
         })
     }
 
@@ -1001,7 +1086,7 @@ impl RepoView {
                 .map(|mode| (tr(mode.label).into(), tr(mode.detail).into()))
                 .collect(),
             selected: 0,
-            checks: vec![(tr("合并后暂不提交，以便检查（--no-commit）"), false)],
+            checks: vec![(tr("合并后暂不提交，以便检查（--no-commit）").into(), false)],
             ok: tr("合并"),
         };
         self.choose(
@@ -1268,9 +1353,11 @@ impl RepoView {
             title: tr("新建标签").into(),
             placeholder: tr("标签名称，例如 v1.0.0").into(),
             value: String::new(),
+            // 填了说明就是带说明的标签（annotated），留空是轻量标签
+            second: Some(tr("说明（可选）：填写后创建带说明的标签").into()),
             hint: tf!("目标提交：{id} {subject}", id = short(&id), subject).into(),
             ok: tr("创建"),
-            checks: vec![(tr("创建后推送到远程"), false)],
+            checks: vec![(tr("创建后推送到远程").into(), false)],
             validate: Some(Box::new(|this, answer| {
                 ref_name_error(&answer.text).or_else(|| {
                     this.refs
@@ -1285,7 +1372,7 @@ impl RepoView {
         self.ask(ask, window, cx, move |this, answer, window, cx| {
             let name = answer.text;
             let push = answer.checks.first().copied().unwrap_or(false);
-            let mut steps = vec![Step::local(vec!["tag".into(), name.clone(), id.clone()])];
+            let mut steps = vec![Step::local(tag_args(&name, &answer.second, &id))];
             if push {
                 steps.push(Step::net(vec![
                     "push".into(),

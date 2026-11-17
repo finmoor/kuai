@@ -97,6 +97,30 @@ pub fn session_id() -> u32 {
     session
 }
 
+/// 这个进程带没带着 Windows 的 Redirection Guard（强制的那种）：带着就进不了普通用户建的目录联接
+/// 和符号链接（nvm 的 node、scoop、pnpm 的 node_modules……），报「untrusted mount point」。
+///
+/// 它是从父进程传下来的，开了关不掉：Inno Setup 的安装程序默认给自己开，1.14 及以前由它拉起的
+/// Kuai 带着，Kuai 起的常驻进程、常驻进程起的终端跟着带。甩掉的办法只有换一个不带的进程来起
+/// （见客户端的 `redirect_guard.rs` 和 `bridge.rs` 的 `misplaced`）。
+pub fn redirect_guarded() -> bool {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessMitigationPolicy, ProcessRedirectionTrustPolicy,
+    };
+    // `PROCESS_MITIGATION_REDIRECTION_TRUST_POLICY`：一个 DWORD，第 0 位是强制，第 1 位是只记录
+    let mut flags = 0u32;
+    // SAFETY: 只写进这个 4 字节的本地变量；不认这一项的旧系统返回失败，按没带算
+    let asked = unsafe {
+        GetProcessMitigationPolicy(
+            GetCurrentProcess(),
+            ProcessRedirectionTrustPolicy,
+            (&raw mut flags).cast(),
+            size_of::<u32>(),
+        )
+    };
+    asked != 0 && flags & 1 != 0
+}
+
 /// 请 Kuai 回话最多等这么久
 const ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 

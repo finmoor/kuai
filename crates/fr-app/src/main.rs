@@ -14,13 +14,17 @@ mod mapping;
 mod open_dir;
 mod palette;
 mod prompt;
+mod redirect_guard;
 mod repo;
 mod secrets;
 mod settings;
 mod settings_page;
 mod shell;
+mod term_board;
+mod term_overview;
 mod terminal;
 mod text;
+mod toast;
 mod tray;
 mod ui;
 mod update;
@@ -55,7 +59,9 @@ gpui_kit::actions!(
         ToggleSidebar,
         ShowFiles,
         SaveFile,
-        BackToRoot
+        BackToRoot,
+        ShowTerminals,
+        GoToHead
     ]
 );
 
@@ -64,7 +70,7 @@ gpui_kit::actions!(
 /// 留下的都是终端里的程序本来就收不到、或者收到了也和不按 Shift 时没有区别的组合键。
 /// F5、Ctrl+W、Ctrl+F、Ctrl+P、Ctrl+S 不在里面：它们是 shell 和程序要用的
 /// （删一个词、往前搜、上一条命令……）。新加的全局快捷键要在终端里也生效，得加到这里。
-const TERMINAL_KEEPS: [&str; 12] = [
+const TERMINAL_KEEPS: [&str; 14] = [
     // 切仓库标签页、重新打开刚关的
     "ctrl-tab",
     "ctrl-shift-tab",
@@ -72,6 +78,7 @@ const TERMINAL_KEEPS: [&str; 12] = [
     // 切页面：改动、历史、文件、终端，新开一个终端
     "ctrl-1",
     "ctrl-2",
+    "ctrl-0",
     "ctrl-shift-e",
     "ctrl-`",
     "ctrl-shift-`",
@@ -80,6 +87,8 @@ const TERMINAL_KEEPS: [&str; 12] = [
     "ctrl-,",
     "ctrl-shift-b",
     "ctrl-shift-f",
+    // 终端总览页：在终端里看着一个，要去看别的
+    "ctrl-shift-a",
 ];
 
 /// 焦点在终端里时，键位表里出现过的键除了 [`TERMINAL_KEEPS`] 一律不当快捷键。
@@ -185,7 +194,7 @@ pub(crate) fn with_main_window(cx: &mut App, f: impl FnOnce(&mut Window, &mut Ap
 /// 安装版的卸载程序在删文件之前调用（`tools/installer/kuai.iss`），不开窗口：
 /// - `--has-saved-passwords`：凭据管理器里存着 Kuai 的密码、口令时退出码 0，没有是 1；
 /// - `--uninstall`：开机自启指向这个程序的话删掉（指向别处的，比如另一份解压版，不动）；
-///   再带 `--forget-passwords` 时把存的密码、口令也删掉。
+///   再带 `--forget-passwords` 时把存的密码、口令也删掉；发系统通知用的标识和图标也删掉。
 fn uninstall_command() -> Option<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
@@ -198,6 +207,7 @@ fn uninstall_command() -> Option<i32> {
     if autostart::enabled() {
         let _ = autostart::set(false);
     }
+    toast::unregister();
     if has("--forget-passwords") {
         secrets::forget_all();
     }
@@ -205,6 +215,8 @@ fn uninstall_command() -> Option<i32> {
 }
 
 fn main() {
+    // 甩掉 Redirection Guard 后重新启动的：先把带过来的 FR_* 环境变量设上，后面的都照它们来
+    redirect_guard::restore_env();
     // 被 git 或 ssh 当作 askpass 启动时：去问已经开着的主程序，打出回答就退出
     if let Some(code) = fr_core::askpass::run_helper() {
         std::process::exit(code);
@@ -242,6 +254,12 @@ fn main() {
         instance::Claim::First(guard, incoming) => (guard, incoming),
         instance::Claim::Forwarded => return,
     };
+    // 带着 Windows 的 Redirection Guard 启动的（旧版本的安装程序拉起的、从带着它的终端里启动的）：
+    // 它会传给 kuaid 和终端里的所有程序，目录联接、符号链接都进不去。请资源管理器重新启动一遍，
+    // 这个进程退出（见 redirect_guard.rs）
+    if redirect_guard::relaunch_if_inherited(open_arg.as_deref()) {
+        return;
+    }
     // 上次下好了新版本、没点重启就退出了：先换上，拉起新版本，这个进程就不开窗口了
     if update::apply_staged_at_startup() {
         return;
@@ -272,6 +290,7 @@ fn main() {
                 KeyBinding::new("ctrl-p", QuickOpen, None),
                 KeyBinding::new("ctrl-1", ShowChanges, None),
                 KeyBinding::new("ctrl-2", ShowHistory, None),
+                KeyBinding::new("ctrl-0", GoToHead, None),
                 KeyBinding::new("ctrl-,", OpenSettings, None),
                 KeyBinding::new("ctrl-shift-t", ReopenTab, None),
                 KeyBinding::new("ctrl-`", OpenTerminal, None),
@@ -284,9 +303,12 @@ fn main() {
                 KeyBinding::new("ctrl-s", SaveFile, None),
                 // 从子仓库回到根仓库。焦点在终端、输入框里时归它们（往回一个词）
                 KeyBinding::new("alt-left", BackToRoot, None),
+                // 所有工作区里的终端（All terminals）。终端里的程序分不出它和 Ctrl+A，留给 Kuai
+                KeyBinding::new("ctrl-shift-a", ShowTerminals, None),
             ]);
             release_keys_to_terminal(cx);
             workspace_action::<OpenSettings>(cx, |ws, _, cx| ws.toggle_settings(cx));
+            workspace_action::<ShowTerminals>(cx, |ws, window, cx| ws.toggle_terms(window, cx));
             workspace_action::<Refresh>(cx, |ws, _, cx| ws.refresh_active(cx));
             workspace_action::<CloseTab>(cx, |ws, window, cx| ws.close_active(window, cx));
             workspace_action::<ShowChanges>(cx, |ws, window, cx| {
@@ -295,6 +317,7 @@ fn main() {
             workspace_action::<ShowHistory>(cx, |ws, window, cx| {
                 ws.show_in_active(false, window, cx)
             });
+            workspace_action::<GoToHead>(cx, |ws, window, cx| ws.go_to_head(window, cx));
             workspace_action::<NextTab>(cx, |ws, _, cx| ws.cycle_tab(1, cx));
             workspace_action::<PrevTab>(cx, |ws, _, cx| ws.cycle_tab(-1, cx));
             workspace_action::<FindCommit>(cx, |ws, window, cx| ws.find_commit(window, cx));

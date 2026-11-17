@@ -58,9 +58,21 @@ pub enum Scope {
 /// `refs/remotes/origin/old`、`refs/tags/v0.1`），只在列全部分支时起作用：这些引用不当起点，
 /// 只在它们上面的提交就不出现了。HEAD 总是列出来的，所以隐藏不了当前分支。
 pub fn scoped_log_args(scope: &Scope, hidden: &[String]) -> Vec<String> {
+    if *scope == Scope::All && hidden.is_empty() {
+        return log_args();
+    }
     let mut args: Vec<String> = vec!["log".into()];
+    args.extend(scope_refs(scope, hidden));
+    args.extend(["--date-order", "-z", FORMAT].map(String::from));
+    // 引用名和后面可能出现的路径分开：分支叫 `docs`、仓库里又有 `docs` 目录时不会有歧义
+    args.push("--".into());
+    args
+}
+
+/// 范围写成 `git log` 的起点：从哪些引用往回列。
+fn scope_refs(scope: &Scope, hidden: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
     match scope {
-        Scope::All if hidden.is_empty() => return log_args(),
         Scope::All => {
             // `--exclude` 只管它后面最近的一个 `--branches`、`--remotes` 或 `--tags`，
             // 而且写的是去掉 `refs/heads/` 这类前缀以后的名字
@@ -78,10 +90,77 @@ pub fn scoped_log_args(scope: &Scope, hidden: &[String]) -> Vec<String> {
         }
         Scope::Refs(refs) => args.extend(refs.iter().cloned()),
     }
-    args.extend(["--date-order", "-z", FORMAT].map(String::from));
-    // 引用名和后面可能出现的路径分开：分支叫 `docs`、仓库里又有 `docs` 目录时不会有歧义
-    args.push("--".into());
     args
+}
+
+/// 让 git 去找提交时按什么找（按说明、作者、哈希找的不用 git，列表里现成的字段就够）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Find {
+    /// 改动过路径里有这几个字的文件
+    Path,
+    /// 改动里增加或删除过这几个字（`git log -S`）
+    Content,
+}
+
+/// 在范围里找提交的参数，输出和 [`scoped_log_args`] 一样，用 [`parse`] 解析。都不分大小写。
+/// 找到的提交互相不一定是父子，画的时候连成一条线。
+pub fn find_log_args(scope: &Scope, hidden: &[String], find: Find, needle: &str) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    if find == Find::Path {
+        // 我们给 git 设了路径一律按字面理解，这里要通配，得先关掉
+        args.push("--no-literal-pathspecs".into());
+    }
+    args.push("log".into());
+    args.extend(scope_refs(scope, hidden));
+    args.extend(["--date-order", "-z", FORMAT].map(String::from));
+    match find {
+        Find::Path => {
+            // 不带 glob 的通配里 `*` 也匹配 `/`，所以前后各一个 `*` 就是「路径里有这几个字」；
+            // 要找的字里的通配符按字面算。Windows 上习惯写的反斜杠当成斜杠
+            let mut pattern = String::from(":(icase)*");
+            for ch in needle.chars() {
+                match ch {
+                    '\\' => pattern.push('/'),
+                    // 不用反斜杠转义：Windows 上的 git 会先把路径里的反斜杠换成斜杠
+                    '*' | '?' | '[' => {
+                        pattern.push('[');
+                        pattern.push(ch);
+                        pattern.push(']');
+                    }
+                    _ => pattern.push(ch),
+                }
+            }
+            pattern.push('*');
+            args.extend(["--".into(), pattern]);
+        }
+        Find::Content => {
+            args.extend(["-i".into(), format!("-S{needle}"), "--".into()]);
+        }
+    }
+    args
+}
+
+/// 当前分支和它的上游各多出哪些提交。`upstream` 是远程分支的名字（`origin/main`）。
+pub fn pending_args(upstream: &str) -> Vec<String> {
+    vec![
+        "rev-list".into(),
+        "--left-right".into(),
+        format!("HEAD...refs/remotes/{upstream}"),
+        "--".into(),
+    ]
+}
+
+/// 解析 [`pending_args`] 的输出：（本地有、上游还没有的，上游有、本地还没有的）。
+pub fn parse_pending(out: &[u8]) -> (Vec<Box<str>>, Vec<Box<str>>) {
+    let (mut ahead, mut behind) = (Vec::new(), Vec::new());
+    for line in String::from_utf8_lossy(out).lines() {
+        if let Some(id) = line.strip_prefix('<') {
+            ahead.push(id.trim().into());
+        } else if let Some(id) = line.strip_prefix('>') {
+            behind.push(id.trim().into());
+        }
+    }
+    (ahead, behind)
 }
 
 /// 文件历史的参数：从 HEAD 往回，只要改过这个文件的提交，跟着改名往回找。
@@ -277,6 +356,73 @@ mod tests {
             subjects(&Scope::Refs(vec!["refs/heads/wip/a".into()]), &[]),
             ["base", "only on wip"]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 按路径和改动内容找提交_标出两边各多的提交() {
+        let dir = std::env::temp_dir().join(format!("fr-log-find-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/Repo")).unwrap();
+        let git = |args: &[&str]| crate::git::run(&dir, args).unwrap();
+        let commit = |path: &str, text: &str, subject: &str| {
+            std::fs::write(dir.join(path), text).unwrap();
+            git(&["add", "-A"]);
+            git(&["commit", "-q", "-m", subject]);
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "user.email", "t@example.com"]);
+        commit("README.md", "hello\n", "readme");
+        commit("src/Repo/Diff.rs", "fn a() {}\n", "add diff");
+        commit(
+            "src/Repo/Diff.rs",
+            "fn a() {}\nlet ignore_whitespace = 1;\n",
+            "ignore blanks",
+        );
+        commit("src/new[1].txt", "x\n", "bracket");
+        commit("README.md", "hello\nIGNORE_WHITESPACE\n", "mention it");
+        git(&["checkout", "-q", "-b", "side", "HEAD~2"]);
+        commit("side.txt", "s\n", "on side");
+        git(&["checkout", "-q", "main"]);
+
+        let found = |scope: &Scope, find: Find, needle: &str| -> Vec<String> {
+            let args = find_log_args(scope, &[], find, needle);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = crate::git::run(&dir, &args).unwrap();
+            parse(&out).iter().map(|c| c.subject.to_string()).collect()
+        };
+        // 路径：不分大小写，隔着目录也算，反斜杠当斜杠
+        assert_eq!(
+            found(&Scope::All, Find::Path, "diff.rs"),
+            ["ignore blanks", "add diff"]
+        );
+        assert_eq!(
+            found(&Scope::All, Find::Path, "repo\\diff"),
+            ["ignore blanks", "add diff"]
+        );
+        // 通配符按字面算：`[1]` 不是「一个 1」，`*` 不是「随便什么」
+        assert_eq!(found(&Scope::All, Find::Path, "new[1]"), ["bracket"]);
+        assert!(found(&Scope::All, Find::Path, "new1").is_empty());
+        assert!(found(&Scope::All, Find::Path, "*").is_empty());
+        // 范围照样管用
+        assert_eq!(found(&Scope::All, Find::Path, "side"), ["on side"]);
+        assert!(found(&Scope::Refs(vec!["HEAD".into()]), Find::Path, "side").is_empty());
+        // 改动内容：增加或删除过这几个字的提交，不分大小写
+        assert_eq!(
+            found(&Scope::All, Find::Content, "ignore_whitespace"),
+            ["mention it", "ignore blanks"]
+        );
+        assert!(found(&Scope::All, Find::Content, "没有这几个字").is_empty());
+
+        // main 比 side 多 2 个、少 1 个
+        git(&["update-ref", "refs/remotes/origin/side", "refs/heads/side"]);
+        let args = pending_args("origin/side");
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (ahead, behind) = parse_pending(&crate::git::run(&dir, &args).unwrap());
+        assert_eq!((ahead.len(), behind.len()), (2, 1));
+        let head = String::from_utf8(git(&["rev-parse", "HEAD"])).unwrap();
+        assert!(ahead.iter().any(|id| **id == *head.trim()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

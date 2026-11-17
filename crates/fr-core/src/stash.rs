@@ -22,9 +22,28 @@ pub fn push_args(message: Option<&str>, include_untracked: bool) -> Vec<String> 
     args
 }
 
+/// 只贮藏这几个文件（`git stash push -- <路径>`），别的改动留在工作区。`include_untracked`
+/// 是这几个里有未跟踪的文件：不带它 git 不收它们。
+///
+/// 带未跟踪文件时关掉了「路径按字面理解」（原因见 [`push_args`]），所以每个路径自己标成
+/// 按字面理解（`:(literal)`），文件名里有 `*`、`[` 也不会被当成通配符。
+pub fn push_paths_args(
+    message: Option<&str>,
+    include_untracked: bool,
+    paths: &[&str],
+) -> Vec<String> {
+    let mut args = push_args(message, include_untracked);
+    args.push("--".into());
+    args.extend(paths.iter().map(|path| match include_untracked {
+        true => format!(":(literal){path}"),
+        false => path.to_string(),
+    }));
+    args
+}
+
 #[cfg(test)]
 mod tests {
-    use super::push_args;
+    use super::{push_args, push_paths_args};
 
     #[test]
     fn 参数() {
@@ -79,5 +98,57 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "2\n");
         assert!(git(&["stash", "list"]).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 只贮藏选中的文件() {
+        assert_eq!(
+            push_paths_args(Some("说明"), false, &["a.txt", "dir/b.txt"]),
+            ["stash", "push", "-m", "说明", "--", "a.txt", "dir/b.txt"]
+        );
+        let dir = std::env::temp_dir().join(format!("fr-stash-paths-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let git = |args: &[&str]| crate::git::run(&dir, args).unwrap();
+        let run = |args: Vec<String>| {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            crate::git::run(&dir, &args).unwrap()
+        };
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "core.autocrlf", "false"]);
+        for name in ["a.txt", "b.txt", "sub/c.txt"] {
+            std::fs::write(dir.join(name), "1\n").unwrap();
+        }
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        for name in ["a.txt", "b.txt", "sub/c.txt"] {
+            std::fs::write(dir.join(name), "2\n").unwrap();
+        }
+        // 只收已跟踪的两个：另一个的改动留着
+        run(push_paths_args(None, false, &["a.txt", "sub/c.txt"]));
+        assert_eq!(read("a.txt"), "1\n");
+        assert_eq!(read("sub/c.txt"), "1\n");
+        assert_eq!(read("b.txt"), "2\n");
+        git(&["stash", "pop", "-q"]);
+        assert_eq!(read("a.txt"), "2\n");
+        // 选中的里面有未跟踪的文件（名字里带方括号）：一起收走，别的未跟踪文件留着
+        std::fs::write(dir.join("new[1].txt"), "新的\n").unwrap();
+        std::fs::write(dir.join("other.txt"), "别的\n").unwrap();
+        run(push_paths_args(
+            Some("部分"),
+            true,
+            &["a.txt", "new[1].txt"],
+        ));
+        assert_eq!(read("a.txt"), "1\n");
+        assert!(!dir.join("new[1].txt").exists());
+        assert!(dir.join("other.txt").exists());
+        assert_eq!(read("b.txt"), "2\n");
+        git(&["stash", "pop", "-q"]);
+        assert_eq!(read("new[1].txt"), "新的\n");
+        assert_eq!(read("a.txt"), "2\n");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

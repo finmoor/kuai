@@ -69,6 +69,7 @@ fn section_of(item: SideItem) -> Option<SideSection> {
         | SideItem::History
         | SideItem::SubRepos
         | SideItem::Worktrees
+        | SideItem::Compare
         | SideItem::Folder(_) => None,
     }
 }
@@ -347,6 +348,16 @@ impl RepoView {
             .tooltip(tr("所有提交（Ctrl+2）"))
             .on_click(cx.listener(|this, _, window, cx| {
                 this.click_sidebar(SideItem::History, 1, window, cx)
+            }))
+            .into_any_element(),
+            rail_button(
+                "rail-compare",
+                IconName::GitCompare,
+                selected == SideItem::Compare,
+            )
+            .tooltip(tr("比较"))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.click_sidebar(SideItem::Compare, 1, window, cx)
             }))
             .into_any_element(),
         ];

@@ -20,11 +20,25 @@ mod imp {
         y: i32,
     }
 
+    /// `FLASHWINFO`
+    #[repr(C)]
+    struct FlashInfo {
+        size: u32,
+        hwnd: isize,
+        flags: u32,
+        count: u32,
+        timeout: u32,
+    }
+    /// 任务栏上的按钮闪，一直到窗口回到前台
+    const FLASHW_TRAY: u32 = 2;
+    const FLASHW_TIMERNOFG: u32 = 12;
+
     #[link(name = "user32")]
     unsafe extern "system" {
         fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
         fn IsIconic(hwnd: isize) -> i32;
         fn SetForegroundWindow(hwnd: isize) -> i32;
+        fn FlashWindowEx(info: *const FlashInfo) -> i32;
         fn GetCursorPos(point: *mut Point) -> i32;
         fn WindowFromPoint(point: Point) -> isize;
         fn GetAncestor(hwnd: isize, flags: u32) -> isize;
@@ -75,6 +89,17 @@ mod imp {
 
     pub fn is_minimized(hwnd: Hwnd) -> bool {
         unsafe { IsIconic(hwnd.0) != 0 }
+    }
+
+    pub fn flash(hwnd: Hwnd) {
+        let info = FlashInfo {
+            size: size_of::<FlashInfo>() as u32,
+            hwnd: hwnd.0,
+            flags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+            count: 0,
+            timeout: 0,
+        };
+        unsafe { FlashWindowEx(&info) };
     }
 
     pub fn cursor_on_taskbar() -> bool {
@@ -138,6 +163,7 @@ mod imp {
     pub fn is_minimized(_: Hwnd) -> bool {
         false
     }
+    pub fn flash(_: Hwnd) {}
     pub fn cursor_on_taskbar() -> bool {
         false
     }
@@ -162,6 +188,11 @@ pub fn show(hwnd: Hwnd) {
 
 pub fn is_minimized(hwnd: Hwnd) -> bool {
     imp::is_minimized(hwnd)
+}
+
+/// 让任务栏上的按钮闪，到窗口回到前台为止（窗口不在前台时有事要说）。
+pub fn flash(hwnd: Hwnd) {
+    imp::flash(hwnd)
 }
 
 /// 鼠标在任务栏上：刚才的最小化是点了任务栏上的按钮（系统把在前面的窗口最小化了）。

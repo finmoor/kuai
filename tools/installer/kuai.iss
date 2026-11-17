@@ -37,6 +37,12 @@ VersionInfoVersion={#AppVersion}
 ; 不要管理员权限时 {autopf} 就是 %LOCALAPPDATA%\Programs
 DefaultDirName={autopf}\Kuai
 PrivilegesRequired=lowest
+; 不要 Windows 的 Redirection Guard（Inno Setup 6.5 起默认给安装程序开）：它让进程不跟随普通用户建的
+; 目录联接和符号链接，而且会传给子进程、开了关不掉。下面 [Run] 拉起的 Kuai 带着它，再传给 kuaid、
+; 终端和终端里的所有程序：nvm 的 node、scoop、pnpm 的 node_modules、rustup 的 cargo 都进不去
+; （untrusted mount point）。这个安装程序不要管理员权限，这项防护对它没有用处。
+; Kuai 自己启动时也查一遍（crates/fr-app/src/redirect_guard.rs）：旧版本更新上来的那一次还带着
+RedirectionGuard=no
 DisableProgramGroupPage=yes
 DisableDirPage=auto
 DisableReadyPage=yes

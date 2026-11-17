@@ -22,12 +22,17 @@ mod activity;
 mod auto_fetch;
 mod blame;
 mod changes;
+mod compare;
 mod dialogs;
+mod diff_search;
+mod diff_tools;
 mod file_picker;
+mod file_tree;
 mod files;
 mod files_ops;
 mod files_view;
 mod history;
+mod image_diff;
 mod inline_diff;
 mod layout;
 mod menus;
@@ -80,6 +85,8 @@ enum Mode {
     Subs,
     /// 工作树总览，见 [`worktrees`]
     Worktrees,
+    /// 比较两端，见 [`compare`]
+    Compare,
 }
 
 /// 显示哪一页（侧栏里的切换，Ctrl+` 来回切）。
@@ -162,6 +169,12 @@ pub struct RepoView {
     subs: subs::Subs,
     /// 这个仓库的工作树
     worktrees: worktrees::Worktrees,
+    /// 比较：两端、文件清单、选中文件的改动
+    compare: compare::Compare,
+    /// 看改动时忽略空白（这个标签页里三处共用，不存盘），见 [`diff_tools`]
+    ignore_ws: bool,
+    /// 在改动中搜索：三处各一个搜索条，见 [`diff_search`]
+    diff_search: diff_search::DiffSearches,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -187,6 +200,10 @@ impl RepoView {
         subscriptions.push(files_subscription);
         let (subs, subs_subscription) = subs::Subs::new(window, cx);
         subscriptions.push(subs_subscription);
+        let (compare, compare_subscription) = compare::Compare::new(window, cx);
+        subscriptions.push(compare_subscription);
+        let (diff_search, search_subscriptions) = diff_search::DiffSearches::new(window, cx);
+        subscriptions.extend(search_subscriptions);
         let mut this = Self {
             entry,
             app,
@@ -225,6 +242,9 @@ impl RepoView {
             sub_of: None,
             subs,
             worktrees: worktrees::Worktrees::default(),
+            compare,
+            ignore_ws: false,
+            diff_search,
             _subscriptions: subscriptions,
         };
         // 测试开关：FR_TEST_VIEW=changes 打开仓库时直接显示本地修改
@@ -399,6 +419,7 @@ impl RepoView {
                 let old_refs =
                     std::mem::replace(&mut this.refs, refs::parse(&refs_out, &stash_out));
                 this.remap_sidebar_selection(&old_refs);
+                this.compare_refreshed(cx);
                 // 提交历史只含分支、远程分支、标签和 HEAD，这些都没变就不用重读
                 let mut key = refs_out;
                 key.extend_from_slice(head.as_bytes());
@@ -430,6 +451,7 @@ impl RepoView {
         self.retranslate_history(window, cx);
         self.retranslate_changes(window, cx);
         self.retranslate_subs(window, cx);
+        self.retranslate_compare(window, cx);
         cx.notify();
     }
 
@@ -438,8 +460,12 @@ impl RepoView {
         self.status.as_ref().map_or(0, |s| s.entries.len())
     }
 
-    /// 切到 Git 页的提交历史，把键盘焦点放到搜索框（Ctrl+F）。
+    /// Ctrl+F：正在看改动（本地修改里选了文件、比较，或者焦点在提交的改动里）就在改动里搜；
+    /// 不然切到 Git 页的提交历史，把键盘焦点放到搜索框。
     pub fn find_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page == Page::Git && self.find_in_diff(window, cx) {
+            return;
+        }
         self.show_page(Page::Git, window, cx);
         self.focus_search(window, cx);
     }
@@ -983,6 +1009,7 @@ impl RepoView {
                 Mode::Merge => self.render_merge(cx),
                 Mode::Subs => self.render_subs(cx),
                 Mode::Worktrees => self.render_worktrees(cx),
+                Mode::Compare => self.render_compare(cx),
             }
         };
         let banner = self

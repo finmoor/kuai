@@ -45,3 +45,16 @@ sha2 = "0.10"
 tray-icon = { version = "0.26", default-features = false }
 # 开机自启：写 HKCU 的 Run 键
 winreg = "0.56"
+# 请资源管理器重新启动 Kuai（redirect_guard.rs）：要调它的 COM 接口；发系统通知（toast.rs）。
+# 版本和 GPUI 用的一致，不多编一份
+windows = { version = "0.62", features = [
+    "Data_Xml_Dom",
+    "Foundation",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Shell",
+] }

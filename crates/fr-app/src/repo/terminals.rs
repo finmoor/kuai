@@ -468,6 +468,37 @@ impl RepoView {
         self.show_page(Page::Terminal, window, cx);
     }
 
+    /// 到终端页显示这个仓库的第 `number` 个终端（终端总览页的「前往」）。kuaid 里留着、这边还没接上的
+    /// 就接上：刚打开的标签页可能还没问到 kuaid 里留着哪几个，名字相同，接上的就是它。
+    pub fn show_terminal_number(
+        &mut self,
+        number: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.adopt_waiting(window, cx);
+        let at = self
+            .terminals
+            .tabs
+            .iter()
+            .position(|tab| tab.number == number);
+        let at = match at {
+            Some(at) => at,
+            None => self.add_terminal(number, true, window, cx),
+        };
+        self.terminals.active = at;
+        self.show_page(Page::Terminal, window, cx);
+    }
+
+    /// 终端页上正显示着的是第几个终端；不在终端页、这一页没显示出来时是 None。
+    pub fn shown_terminal(&self) -> Option<(RepoEntry, u32)> {
+        if !self.visible || self.page != Page::Terminal {
+            return None;
+        }
+        let tab = self.terminals.tabs.get(self.terminals.active)?;
+        Some((self.entry.clone(), tab.number))
+    }
+
     fn select_terminal(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index < self.terminals.tabs.len() {
             self.terminals.active = index;
@@ -486,6 +517,13 @@ impl RepoView {
     fn focus_terminal(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(view) = self.active_terminal() {
             view.focus_handle(cx).focus(window, cx);
+        }
+    }
+
+    /// 这一页显示的是终端页时，把焦点放进选中的终端（从终端总览页回来时用）。
+    pub fn focus_shown_terminal(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page == Page::Terminal {
+            self.focus_terminal(window, cx);
         }
     }
 

@@ -74,6 +74,8 @@ pub(super) enum SideItem {
     SubRepos,
     /// 工作树总览
     Worktrees,
+    /// 比较两端
+    Compare,
     Header(SideSection),
     /// 目录树里的文件夹；数字是它的键（`前缀/路径`）的哈希
     Folder(u64),
@@ -266,6 +268,14 @@ impl RepoView {
             },
             SideRow {
                 item: SideItem::History,
+                depth: 0,
+                label: String::new(),
+                key: None,
+                open: false,
+                count: 0,
+            },
+            SideRow {
+                item: SideItem::Compare,
                 depth: 0,
                 label: String::new(),
                 key: None,
@@ -915,6 +925,9 @@ impl RepoView {
                                 .text_color(muted),
                         )
                         .child(name(tr("所有提交").to_string())),
+                    SideItem::Compare => inner
+                        .child(ui::icon(IconName::GitCompare).flex_none().text_color(muted))
+                        .child(name(tr("比较").to_string())),
                     SideItem::SubRepos => inner
                         .child(ui::icon(IconName::FolderTree).flex_none().text_color(muted))
                         .child(name(tr("子仓库").to_string()))
@@ -1136,6 +1149,7 @@ impl RepoView {
             Mode::History | Mode::Blame => SideItem::History,
             Mode::Subs => SideItem::SubRepos,
             Mode::Worktrees => SideItem::Worktrees,
+            Mode::Compare => SideItem::Compare,
         });
     }
 
@@ -1294,6 +1308,7 @@ impl RepoView {
             SideItem::Changes => self.show_changes(cx),
             SideItem::SubRepos => self.show_subs(window, cx),
             SideItem::Worktrees => self.show_worktrees(window, cx),
+            SideItem::Compare => self.show_compare(window, cx),
             SideItem::History => {
                 self.sidebar.selected = item;
                 self.mode = Mode::History;

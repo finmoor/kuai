@@ -30,10 +30,12 @@ mod attach;
 mod colors;
 mod glyphs;
 mod keys;
+mod peek;
 mod prefs;
 mod preview;
 
 pub use attach::Attachment;
+pub use peek::TermPeek;
 pub use prefs::{font_choices, set_prefs, set_prefs_writer};
 pub use preview::preview;
 
@@ -105,6 +107,17 @@ pub fn session_number(repo: &str, key: &str) -> Option<u32> {
     }
     let number: u32 = rest.strip_prefix(KEY_SEPARATOR)?.parse().ok()?;
     (number >= 2).then_some(number)
+}
+
+/// 不知道是哪个仓库的终端时，把会话的名字拆成路径和序号（终端总览页列别处的终端用）。
+pub fn split_session_key(key: &str) -> (&str, u32) {
+    match key.rsplit_once(KEY_SEPARATOR) {
+        Some((path, number)) => match number.parse() {
+            Ok(number) if number >= 2 => (path, number),
+            _ => (key, 1),
+        },
+        None => (key, 1),
+    }
 }
 
 /// 开在 Kuai 进程里的本机程序：这台电脑上的 kuaid 用不了时才用。
@@ -1405,6 +1418,12 @@ impl EntityInputHandler for TerminalView {
         cx: &mut Context<Self>,
     ) {
         self.marked = (!new_text.is_empty()).then(|| new_text.to_string());
+        // 往回翻着时开始组字：和打字一样先回到最底下，光标（组的字画在那里）才看得见
+        if self.marked.is_some()
+            && let Some(session) = &self.session
+        {
+            session.term.lock().scroll_display(Scroll::Bottom);
+        }
         cx.notify();
     }
 
@@ -1525,7 +1544,44 @@ struct Run {
     wide: bool,
     /// 带组合符号的字：单独画，不强制每个字形一格
     single: bool,
+    /// 只有这一个字、后面不再接别的字（见 [`stands_alone`]）
+    lone: bool,
     style: Style,
+}
+
+/// 这个字要不要单独成一段。
+///
+/// 一段字交给界面库排，每个字形摆到「第几个字形 × 格宽」的位置上；它把排出来比前一个字形靠后不到
+/// 半格的字形当成组合符号，叠在前一个上面、不占位置。等宽字体里没有的字由别的字体补，那些字体里
+/// 有比半格还窄的字形：两格宽的「」【】在一些字体里只有半个字宽，后面的字就叠了上去，整段再往左
+/// 缩两格（1.15 以前「看改动」的前两个字叠在一起）。所以只有宽度靠得住的字连成段：一格宽的只连
+/// ASCII（等宽字体自己的），两格宽的只连文字（汉字、假名、谚文、全角字母，各种字体里都是一个字宽）；
+/// 标点、符号、表情和其余的字一个一段，摆在它自己的格子上。
+fn stands_alone(c: char, wide: bool) -> bool {
+    match wide {
+        true => !c.is_alphabetic(),
+        false => !c.is_ascii(),
+    }
+}
+
+/// 两格宽的前括号、前引号：字形只有半个字宽时靠右摆，贴着后面的字。
+fn opens(c: char) -> bool {
+    matches!(
+        c,
+        '「' | '『'
+            | '（'
+            | '［'
+            | '｛'
+            | '〈'
+            | '《'
+            | '【'
+            | '〔'
+            | '〖'
+            | '〘'
+            | '〚'
+            | '｟'
+            | '〝'
+    )
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1623,12 +1679,18 @@ fn prepaint(
     if this.blink_hidden && focused && this.marked.is_none() {
         frame.cursor = None;
     }
+    let moved = this.geometry.get().cursor != cursor_bounds;
     this.geometry.set(Geometry {
         origin: bounds.origin,
         cell,
         grid: Some(grid),
         cursor: cursor_bounds,
     });
+    // 正在组字时光标挪了地方（程序还在输出、刚翻回最底下）：让候选框跟过去。
+    // 界面库只在开始组字时问一次位置
+    if moved && this.marked.is_some() {
+        window.invalidate_character_coordinates();
+    }
     Some(frame)
 }
 
@@ -1698,7 +1760,9 @@ fn snapshot(term: &Term<Proxy>, palette: &Palette, selection_color: Hsla) -> Sna
                 _ => rects.push((row, col, width, bg)),
             }
         }
-        if point == cursor_at && cursor_shape != CursorShape::Hidden {
+        // 程序把光标藏起来时（Claude Code 自己画一个）也记下它在哪：输入法的候选框、正在组的字
+        // 都跟着真光标；画的时候形状是 Hidden，什么都不画
+        if point == cursor_at {
             cursor = Some(CursorDraw {
                 row,
                 col,
@@ -1724,6 +1788,7 @@ fn snapshot(term: &Term<Proxy>, palette: &Palette, selection_color: Hsla) -> Sna
                         && run.next == col
                         && !run.wide
                         && !run.single
+                        && !run.lone
                         && run.style.underline == underline
                         && run.style.strike == strike =>
                 {
@@ -1742,13 +1807,16 @@ fn snapshot(term: &Term<Proxy>, palette: &Palette, selection_color: Hsla) -> Sna
             strike,
         };
         let marks = cell.zerowidth().filter(|marks| !marks.is_empty());
-        let joins = current.as_ref().is_some_and(|run| {
-            run.row == row
-                && run.next == col
-                && run.wide == wide
-                && !run.single
-                && run.style == style
-        });
+        let lone = stands_alone(cell.c, wide);
+        let joins = !lone
+            && current.as_ref().is_some_and(|run| {
+                run.row == row
+                    && run.next == col
+                    && run.wide == wide
+                    && !run.single
+                    && !run.lone
+                    && run.style == style
+            });
         if joins && marks.is_none() {
             let run = current.as_mut().unwrap();
             run.text.push(cell.c);
@@ -1764,6 +1832,7 @@ fn snapshot(term: &Term<Proxy>, palette: &Palette, selection_color: Hsla) -> Sna
                 text,
                 wide,
                 single: marks.is_some(),
+                lone,
                 style,
             });
         }
@@ -1781,6 +1850,21 @@ impl Frame {
             ),
             size(self.cell.width * cols as f32, self.cell.height),
         )
+    }
+}
+
+/// 单独成段的字在它的格子里往右挪多少：`width` 是字形排出来的宽度。
+///
+/// - 一格宽、字形比格子窄的（别的字体补的间隔号、细的符号）居中。
+/// - 两格宽的前括号，字形只有半个字宽时靠右：汉字从格子左边起占一个字宽，它的右边和那里对齐，
+///   和整个字宽的前括号（笔画在右半边）看起来一样。
+/// - 其余的从格子左边起，和连成段的字一样。
+fn lone_shift(run: &Run, width: Pixels, cell_width: Pixels, font_size: Pixels) -> Pixels {
+    let first = run.text.chars().next().unwrap_or(' ');
+    match run.wide {
+        false if width < cell_width => (cell_width - width) / 2.,
+        true if opens(first) && width < font_size * 0.75 => font_size - width,
+        _ => px(0.),
     }
 }
 
@@ -1835,7 +1919,7 @@ fn paint_frame(frame: &Frame, bounds: Bounds<Pixels>, window: &mut Window, cx: &
             glyphs::paint(ch, frame.cell_bounds(row, col, 1), color, window);
         }
         for run in &frame.runs {
-            let force = match (run.single, run.wide) {
+            let force = match (run.single || run.lone, run.wide) {
                 (true, _) => None,
                 (false, true) => Some(frame.cell.width * 2.),
                 (false, false) => Some(frame.cell.width),
@@ -1847,17 +1931,21 @@ fn paint_frame(frame: &Frame, bounds: Bounds<Pixels>, window: &mut Window, cx: &
                 &[text_run(run.text.len(), run.style, &frame.font)],
                 force,
             );
-            let origin = frame.cell_bounds(run.row, run.col, 1).origin;
+            let mut origin = frame.cell_bounds(run.row, run.col, 1).origin;
+            if run.lone {
+                origin.x += lone_shift(run, line.width, frame.cell.width, font_size);
+            }
             let _ = line.paint(origin, frame.cell.height, TextAlign::Left, None, window, cx);
         }
         if let Some(cursor) = &frame.cursor {
             let cols = if cursor.wide { 2 } else { 1 };
             let area = frame.cell_bounds(cursor.row, cursor.col, cols);
             let color = frame.foreground;
-            let shape = if frame.focused {
-                cursor.shape
-            } else {
-                CursorShape::HollowBlock
+            // 藏起来的光标，焦点不在这里时也不画成空心块
+            let shape = match cursor.shape {
+                CursorShape::Hidden => CursorShape::Hidden,
+                shape if frame.focused => shape,
+                _ => CursorShape::HollowBlock,
             };
             match shape {
                 CursorShape::Block => {
@@ -1922,7 +2010,12 @@ fn paint_frame(frame: &Frame, bounds: Bounds<Pixels>, window: &mut Window, cx: &
                 &[text_run(text.len(), style, &frame.font)],
                 None,
             );
-            let origin = frame.cell_bounds(cursor.row, cursor.col, 1).origin;
+            let mut origin = frame.cell_bounds(cursor.row, cursor.col, 1).origin;
+            // 光标靠近右边、放不下时往左挪，不让正在组的字被裁掉
+            let right = bounds.origin.x + bounds.size.width;
+            if origin.x + line.width > right {
+                origin.x = (right - line.width).max(bounds.origin.x);
+            }
             let cover = Bounds::new(origin, size(line.width, frame.cell.height));
             window.paint_quad(fill(cover, frame.background));
             let _ = line.paint(origin, frame.cell.height, TextAlign::Left, None, window, cx);
@@ -1933,7 +2026,79 @@ fn paint_frame(frame: &Frame, bounds: Bounds<Pixels>, window: &mut Window, cx: &
 #[cfg(test)]
 mod tests {
     // 不能 `use super::*`：那样 `#[test]` 会变成界面库里同名的那个宏
-    use super::{session_key, session_number};
+    use super::{
+        CursorShape, Grid, Palette, Processor, Proxy, Term, session_key, session_number, snapshot,
+    };
+
+    /// 喂一段程序的输出，看光标记在哪、什么形状。
+    fn cursor_after(output: &[u8]) -> Option<(usize, usize, CursorShape)> {
+        let (tx, _rx) = futures::channel::mpsc::unbounded();
+        let grid = Grid { cols: 40, rows: 10 };
+        let mut term = Term::new(Default::default(), &grid, Proxy(tx));
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, output);
+        let white = gpui_kit::rgb(0xeeeeee).into();
+        let black = gpui_kit::rgb(0x111111).into();
+        let palette = Palette::new(white, black, true);
+        let (_, _, _, cursor) = snapshot(&term, &palette, white);
+        cursor.map(|cursor| (cursor.row, cursor.col, cursor.shape))
+    }
+
+    #[test]
+    fn 藏起来的光标也记位置() {
+        // Claude Code 把光标藏起来、自己画一个，真光标停在输入的地方。位置要照记：
+        // 输入法的候选框、正在组的字都跟着它（以前藏起来就不记，候选框落在别处、拼音不显示）
+        let hidden = cursor_after(b"\x1b[?25l\x1b[5;10H");
+        assert!(matches!(hidden, Some((4, 9, CursorShape::Hidden))));
+        // 再显示出来，位置不变、形状回来
+        let shown = cursor_after(b"\x1b[?25l\x1b[5;10H\x1b[?25h");
+        assert!(matches!(shown, Some((4, 9, shape)) if shape != CursorShape::Hidden));
+        // 备用屏上也一样（Claude Code 用的是备用屏）
+        let alt = cursor_after(b"\x1b[?1049h\x1b[?25l\x1b[3;7H");
+        assert!(matches!(alt, Some((2, 6, CursorShape::Hidden))));
+    }
+
+    /// 喂一段输出，看拍下来的文字段：第几列起、什么字。
+    fn runs_of(output: &str) -> Vec<(usize, String)> {
+        let (tx, _rx) = futures::channel::mpsc::unbounded();
+        let grid = Grid { cols: 40, rows: 10 };
+        let mut term = Term::new(Default::default(), &grid, Proxy(tx));
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, output.as_bytes());
+        let white = gpui_kit::rgb(0xeeeeee).into();
+        let black = gpui_kit::rgb(0x111111).into();
+        let palette = Palette::new(white, black, true);
+        let (_, _, runs, _) = snapshot(&term, &palette, white);
+        runs.into_iter().map(|run| (run.col, run.text)).collect()
+    }
+
+    #[test]
+    fn 标点和符号单独成段() {
+        // 两格宽的：汉字连成段，「」，各占自己的格子（有的字体里它们只有半个字宽，连在一段里
+        // 后面的字会叠上去）
+        let runs = runs_of("写「已停下」，好");
+        let expected = [
+            (0, "写"),
+            (2, "「"),
+            (4, "已停下"),
+            (10, "」"),
+            (12, "，"),
+            (14, "好"),
+        ];
+        let expected: Vec<(usize, String)> = expected
+            .iter()
+            .map(|(col, text)| (*col, text.to_string()))
+            .collect();
+        assert_eq!(runs, expected);
+        // 一格宽的：ASCII 连成段（中间的空格也在里面），别的字一个一段，后面的空格、字母不接上去
+        let runs = runs_of("ab cd→ef é");
+        let expected = [(0, "ab cd"), (5, "→"), (6, "ef"), (9, "é")];
+        let expected: Vec<(usize, String)> = expected
+            .iter()
+            .map(|(col, text)| (*col, text.to_string()))
+            .collect();
+        assert_eq!(runs, expected);
+    }
 
     #[test]
     fn 服务器上终端的名字_第一个就是仓库路径() {
@@ -1944,6 +2109,17 @@ mod tests {
         for number in [1, 2, 3, 10, 120] {
             assert_eq!(session_number(repo, &session_key(repo, number)), Some(number));
         }
+    }
+
+    #[test]
+    fn 会话的名字拆成路径和序号() {
+        use super::split_session_key;
+        assert_eq!(split_session_key("/data/kuai"), ("/data/kuai", 1));
+        assert_eq!(
+            split_session_key(&session_key("/data/kuai", 3)),
+            ("/data/kuai", 3)
+        );
+        assert_eq!(split_session_key(""), ("", 1));
     }
 
     #[test]
