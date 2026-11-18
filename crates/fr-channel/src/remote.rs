@@ -817,7 +817,8 @@ impl Connection {
     }
 
     /// 只看指定编号的终端会话（协议 11）：不改它的大小，先收到按它现在的大小还原的屏幕，再是之后的
-    /// 输出。看的这一头不能往里写任何东西，包括终端仿真器回答程序的话。
+    /// 输出。kuaid 不指望看的这一头回答程序的话（问光标位置、颜色），这一头的仿真器也不要答；用户敲的字
+    /// 照样用 [`Self::term_input`] 写。
     pub fn term_view(&self, term: &str) -> TermStream {
         self.term_stream("term_attach", json!({ "term": term, "watch": true }))
     }

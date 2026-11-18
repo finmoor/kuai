@@ -411,6 +411,20 @@ impl AppState {
         }
     }
 
+    /// 改终端页记的东西（固定的终端和仓库、收起的工作区），稍后存盘。
+    pub fn edit_term_hub(
+        &mut self,
+        cx: &mut Context<Self>,
+        edit: impl FnOnce(&mut crate::settings::TermHub),
+    ) {
+        let before = self.settings.term_hub.clone();
+        edit(&mut self.settings.term_hub);
+        if self.settings.term_hub != before {
+            self.save_soon(cx);
+            cx.notify();
+        }
+    }
+
     /// 改一个仓库记的东西（隐藏的分支、最近的提交说明）并存盘。
     pub fn edit_memo(
         &mut self,

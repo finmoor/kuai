@@ -10,6 +10,9 @@
 //! - 终端开在 kuaid 里，各有各的会话（名字见 [`crate::terminal::session_key`]）：服务器上的仓库
 //!   是服务器的 kuaid，本机仓库是这台电脑上的 kuaid。关标签页、退出 Kuai 以后接着跑；再打开这个
 //!   仓库时问一遍 kuaid，原来留着几个就接回几个。
+//! - 开着的时候跟着主窗口的那份实时终端列表走（[`TermBoard`]，1.16 起）：终端页（标题栏上的
+//!   「终端」）、别的电脑上的 Kuai 在这个仓库里开了、结束了、重启了终端，这里马上多一行、少一行、
+//!   接上新的，见 [`RepoView::board_changed`]。
 //! - 这台电脑上的 kuaid 用不了时，本机仓库的终端退回到开在 Kuai 进程里。关标签页时，程序还在
 //!   运行的交给 [`Parked`] 保管，再打开这个仓库、到终端页时接回来；退出 Kuai（包括重启以完成
 //!   更新）时才结束。
@@ -26,6 +29,7 @@ use gpui_kit::*;
 
 use super::{Page, RepoView, TOOLBAR_HEIGHT, tool_button};
 use crate::settings::RepoEntry;
+use crate::term_board::{BoardHandle, Row as TermRow, TermBoard, TermState, free_number};
 use crate::terminal::{self, TerminalView};
 use crate::ui;
 
@@ -37,6 +41,11 @@ struct TermTab {
     /// 侧栏那一行前面的数字：这个仓库的第几个终端。关掉的不补位，新开的用最小的空号
     number: u32,
     view: Entity<TerminalView>,
+    /// 终端列表里按这个编号列出过它（和它接着的那个编号一样时才记）。之后列表里没有这个位置了，
+    /// 就是在别处结束了；位置上换了别的编号，就是在别处重启了
+    listed_as: Option<String>,
+    /// kuaid 里留着、接回来的：还没接上（选中才接）时不知道编号，列表里没有它了也算结束了
+    adopted: bool,
     /// 里面的程序结束、断开时，切换上的数字要跟着变
     _observe: Subscription,
 }
@@ -50,6 +59,12 @@ pub(super) struct Terminals {
     active: usize,
     /// kuaid 里留着、这次还没接上的终端：序号，里面的程序还在不在跑
     waiting: Vec<(u32, bool)>,
+    /// 主窗口的那份实时终端列表（没有主窗口的地方是 None，只在打开时问一次 kuaid）
+    board: Option<Entity<TermBoard>>,
+    /// 这边说了要结束的终端的序号：列表里还有它的那一小会儿不当它是留着的
+    ending: Vec<u32>,
+    /// 显示着的终端在别处结束了，焦点可能跟着没了：下次画之前放到现在显示的那个上
+    refocus: bool,
 }
 
 /// 关掉的本机仓库标签页留下的、开在 Kuai 进程里的终端，里面的程序接着运行。再打开这个仓库、到终端页时接回去
@@ -107,11 +122,6 @@ pub fn end_parked_terminals(entry: &RepoEntry, cx: &mut App) {
     for terminal in ended {
         terminal.view.update(cx, |view, cx| view.kill(cx));
     }
-}
-
-/// 最小的、还没用上的序号。
-fn free_number(used: &[u32]) -> u32 {
-    (1..).find(|n| !used.contains(n)).unwrap_or(1)
 }
 
 /// 一个终端的右键菜单：发送文件、重启、结束。侧栏里那一行、图标栏上的序号都用它。
@@ -205,6 +215,89 @@ impl RepoView {
         .detach();
     }
 
+    /// 跟着主窗口的那份实时终端列表走。建视图时调用。
+    pub(super) fn follow_board(&mut self, cx: &mut Context<Self>) {
+        let Some(board) = cx
+            .try_global::<BoardHandle>()
+            .map(|handle| handle.0.clone())
+        else {
+            return;
+        };
+        let observe = cx.observe(&board, |this, _, cx| this.board_changed(cx));
+        self._subscriptions.push(observe);
+        self.terminals.board = Some(board);
+        self.board_changed(cx);
+    }
+
+    /// 这个仓库的终端现在有哪些（实时列表里的）。那台电脑的列表还没读到、没连着是 None。
+    fn board_rows(&self, cx: &App) -> Option<Vec<TermRow>> {
+        let board = self.terminals.board.as_ref()?;
+        board.read(cx).terms_of(&self.entry, cx)
+    }
+
+    /// 终端列表有变化：别处开的记到 `waiting` 里（到终端页时接上），别处结束了的把这边的那一行
+    /// 去掉，别处重启了的接上新的。开在 Kuai 进程里的终端不在列表里，不管。
+    fn board_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(rows) = self.board_rows(cx) else {
+            return;
+        };
+        let listed = |number: u32| rows.iter().find(|row| row.number == number);
+        let before = self.terminals.ending.len();
+        self.terminals
+            .ending
+            .retain(|number| listed(*number).is_some());
+        let mut changed = self.terminals.ending.len() != before;
+        let mut gone: Vec<usize> = Vec::new();
+        let mut restarted: Vec<Entity<TerminalView>> = Vec::new();
+        for (index, tab) in self.terminals.tabs.iter_mut().enumerate() {
+            let view = tab.view.read(cx);
+            if view.in_process() {
+                continue;
+            }
+            let mine = view.term_id();
+            match (listed(tab.number), &mine) {
+                (Some(row), Some(id)) if *id == row.id.term => tab.listed_as = mine,
+                // 位置上换了别的编号，手上这个已经结束：别处把它重启了
+                (Some(_), Some(_)) if tab.listed_as == mine && !view.is_alive() => {
+                    restarted.push(tab.view.clone());
+                }
+                (None, Some(_)) if tab.listed_as == mine => gone.push(index),
+                (None, None) if tab.adopted => gone.push(index),
+                _ => {}
+            }
+        }
+        for view in restarted {
+            view.update(cx, |view, cx| view.reattach(cx));
+            changed = true;
+        }
+        for index in gone.into_iter().rev() {
+            self.terminals.tabs.remove(index);
+            if index < self.terminals.active {
+                self.terminals.active -= 1;
+            } else if index == self.terminals.active {
+                self.terminals.refocus = true;
+            }
+            changed = true;
+        }
+        let last = self.terminals.tabs.len().saturating_sub(1);
+        self.terminals.active = self.terminals.active.min(last);
+        // 列表里有、这边还没开的：留着等接上
+        let opened: Vec<u32> = self.terminals.tabs.iter().map(|tab| tab.number).collect();
+        let waiting: Vec<(u32, bool)> = rows
+            .iter()
+            .filter(|row| !opened.contains(&row.number))
+            .filter(|row| !self.terminals.ending.contains(&row.number))
+            .map(|row| (row.number, row.alive))
+            .collect();
+        if waiting != self.terminals.waiting {
+            self.terminals.waiting = waiting;
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
     /// 标签页关掉了：程序还在运行的终端交给 [`Parked`]。已经结束的不留，用户看到过了
     /// （kuaid 里的会话也是这样）。
     fn park_terminals(&mut self, cx: &mut App) {
@@ -285,6 +378,10 @@ impl RepoView {
             found.sort();
             found.dedup_by_key(|(number, _)| *number);
             this.update(cx, |this, cx| {
+                // 实时列表读到了就以它为准（它一直跟着变，这里问到的只是这一刻的）
+                if this.board_rows(cx).is_some() {
+                    return;
+                }
                 // 已经开着的不用再接
                 let opened: Vec<u32> = this.terminals.tabs.iter().map(|tab| tab.number).collect();
                 found.retain(|(number, _)| !opened.contains(number));
@@ -342,6 +439,8 @@ impl RepoView {
         let tab = TermTab {
             number,
             view,
+            listed_as: None,
+            adopted: false,
             _observe: observe,
         };
         let at = self
@@ -365,7 +464,8 @@ impl RepoView {
         let before = self.terminals.tabs.len();
         self.adopt_parked(cx);
         for (number, alive) in std::mem::take(&mut self.terminals.waiting) {
-            self.add_terminal(number, alive, window, cx);
+            let at = self.add_terminal(number, alive, window, cx);
+            self.terminals.tabs[at].adopted = true;
         }
         if self.terminals.tabs.len() == before {
             return;
@@ -385,7 +485,16 @@ impl RepoView {
     pub(super) fn sync_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.page == Page::Terminal {
             self.adopt_waiting(window, cx);
+            // 显示着的那个在别处结束了：焦点放到换上来的这个上
+            if std::mem::take(&mut self.terminals.refocus) && window.focused(cx).is_none() {
+                self.focus_terminal(window, cx);
+            }
         }
+    }
+
+    /// 到终端页（终端总览页的「前往仓库」）。
+    pub fn show_terminal_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_page(Page::Terminal, window, cx);
     }
 
     /// 切到 Git、终端或文件页。到终端页时留着的都接回来，焦点放进终端；一个都没有就显示空的
@@ -484,7 +593,11 @@ impl RepoView {
             .position(|tab| tab.number == number);
         let at = match at {
             Some(at) => at,
-            None => self.add_terminal(number, true, window, cx),
+            None => {
+                let at = self.add_terminal(number, true, window, cx);
+                self.terminals.tabs[at].adopted = true;
+                at
+            }
         };
         self.terminals.active = at;
         self.show_page(Page::Terminal, window, cx);
@@ -532,10 +645,111 @@ impl RepoView {
             .is_some_and(|view| view.focus_handle(cx).is_focused(window))
     }
 
-    /// 结束第 `index` 个终端。显示的是它就换到旁边那个；一个都不剩时留在终端页，显示空的样子。
+    /// 第 `index` 个终端在实时列表里的那一行。
+    fn board_row(&self, index: usize, cx: &App) -> Option<TermRow> {
+        let number = self.terminals.tabs.get(index)?.number;
+        let rows = self.board_rows(cx)?;
+        rows.into_iter().find(|row| row.number == number)
+    }
+
+    /// 结束、重启第 `index` 个终端。里面还在输出的先问一句（2026-11-18 Feng：「要二次确认」），
+    /// 和终端总览页一样。
+    fn ask_first(
+        &mut self,
+        index: usize,
+        restart: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.terminals.tabs.get(index) else {
+            return;
+        };
+        let number = tab.number;
+        // 问的这一会儿列表可能变了：按序号再找一遍
+        let run = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+            let at = this
+                .terminals
+                .tabs
+                .iter()
+                .position(|tab| tab.number == number);
+            match (at, restart) {
+                (Some(at), true) => this.restart_terminal_now(at, window, cx),
+                (Some(at), false) => this.end_terminal_now(at, window, cx),
+                (None, _) => {}
+            }
+        };
+        let busy = self
+            .board_row(index, cx)
+            .is_some_and(|row| row.alive && row.state == TermState::Running);
+        if !busy {
+            return run(self, window, cx);
+        }
+        let repo = self.app.read(cx).repo_name(&self.entry);
+        let name: SharedString = tab
+            .view
+            .read(cx)
+            .title()
+            .unwrap_or_else(|| tf!("终端 {n}", n = number.to_string()).into());
+        match restart {
+            true => self.confirm(
+                tr("重启终端？"),
+                tf!(
+                    "将终止 {repo} 中的终端「{name}」里正在运行的程序，并重新启动。此操作无法撤销。",
+                    repo,
+                    name
+                ),
+                tr("重启"),
+                window,
+                cx,
+                run,
+            ),
+            false => self.confirm(
+                tr("结束终端？"),
+                tf!(
+                    "将结束 {repo} 中的终端「{name}」，其中正在运行的程序将终止。此操作无法撤销。",
+                    repo,
+                    name
+                ),
+                tr("结束"),
+                window,
+                cx,
+                run,
+            ),
+        }
+    }
+
+    /// 结束第 `index` 个终端。里面还在输出的先问。
     fn end_terminal(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.ask_first(index, false, window, cx);
+    }
+
+    /// 结束第 `index` 个终端。显示的是它就换到旁边那个；一个都不剩时留在终端页，显示空的样子。
+    fn end_terminal_now(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.terminals.tabs.len() {
             return;
+        }
+        // 留着、还没接上的（没选中过）不知道编号，`kill` 说不了：照实时列表里的编号去结束
+        let unattached = {
+            let view = self.terminals.tabs[index].view.read(cx);
+            (!view.in_process() && view.term_id().is_none())
+                .then(|| self.board_row(index, cx))
+                .flatten()
+        };
+        if self.board_row(index, cx).is_some() {
+            self.terminals
+                .ending
+                .push(self.terminals.tabs[index].number);
+        }
+        if let Some(row) = unattached
+            && let Some(board) = &self.terminals.board
+            && let Some(conn) = board.read(cx).conn(&row.id.machine)
+        {
+            let closing = conn.term_close(&row.id.term);
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = closing.await;
+                })
+                .detach();
         }
         let tab = self.terminals.tabs.remove(index);
         // 服务器上的终端不说一声的话会接着跑
@@ -554,11 +768,18 @@ impl RepoView {
         cx.notify();
     }
 
-    /// 结束第 `index` 个终端里的程序，重新开一个，并显示它。
+    /// 结束第 `index` 个终端里的程序，重新开一个，并显示它。里面还在输出的先问。
     fn restart_terminal(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(view) = self.terminals.tabs.get(index).map(|tab| tab.view.clone()) else {
+        self.ask_first(index, true, window, cx);
+    }
+
+    fn restart_terminal_now(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.terminals.tabs.get_mut(index) else {
             return;
         };
+        // 重开以后是新的终端，不再是「留着、接回来的」
+        tab.adopted = false;
+        let view = tab.view.clone();
         self.select_terminal(index, window, cx);
         view.update(cx, |view, cx| view.restart(cx));
     }

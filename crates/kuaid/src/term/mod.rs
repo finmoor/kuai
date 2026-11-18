@@ -83,7 +83,8 @@ struct Client {
     conn: u64,
     request: u64,
     out: Outbox,
-    /// 只看的（`term_attach` 带 `watch`）：不往里写，不算「有人接着」
+    /// 只看的（`term_attach` 带 `watch`）：不改大小、不回答程序的话，不算「有人接着」。用户在那一头
+    /// 敲的字照样经 `term_input` 写进来
     watch: bool,
 }
 

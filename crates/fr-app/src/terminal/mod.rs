@@ -30,12 +30,10 @@ mod attach;
 mod colors;
 mod glyphs;
 mod keys;
-mod peek;
 mod prefs;
 mod preview;
 
 pub use attach::Attachment;
-pub use peek::TermPeek;
 pub use prefs::{font_choices, set_prefs, set_prefs_writer};
 pub use preview::preview;
 
@@ -78,6 +76,9 @@ use keys::WheelTarget;
 
 /// 字和面板边缘之间留的空
 const PADDING: f32 = 8.;
+/// 按终端自己的行列数画（见 [`TerminalView::watch`]）时字最小缩到这么大，再小看不清；还放不下就只
+/// 显示左上角那一块
+const MIN_WATCH_FONT: f32 = 8.;
 
 /// 服务器上终端会话的名字里，仓库路径和序号之间的分隔符（路径里不会有的一个控制字符）
 const KEY_SEPARATOR: char = '\u{1f}';
@@ -309,6 +310,37 @@ impl Session {
         }
     }
 
+    /// 接上 kuaid 里编号是 `id` 的终端，用「只看」的接法（`term_attach` 带 `watch`）：不改它的大小，
+    /// 这里的仿真器按它现在的行列数 `grid` 建。敲的字照样写得进去（按编号写，和怎么接的无关）。
+    fn view(
+        conn: Arc<Connection>,
+        id: &str,
+        grid: Grid,
+        cell: Size<Pixels>,
+        cx: &mut Context<TerminalView>,
+    ) -> Self {
+        let (tx, rx) = mpsc::unbounded();
+        let term = Term::new(prefs::config(&prefs::get(cx)), &grid, Proxy(tx.clone()));
+        let term = Arc::new(FairMutex::new(term));
+        let stream = conn.term_view(id);
+        let executor = cx.background_executor().clone();
+        let pump = cx
+            .background_executor()
+            .spawn(pump(stream, term.clone(), tx, executor));
+        Self {
+            term,
+            grid,
+            cell,
+            link: Link::Remote {
+                local: conn.local,
+                conn,
+                term: RefCell::new(Some(id.to_string())),
+                _pump: pump,
+            },
+            _events: Self::deliver(rx, cx),
+        }
+    }
+
     /// 把后台送来的事交给界面线程上的视图。
     fn deliver(mut rx: mpsc::UnboundedReceiver<Feed>, cx: &mut Context<TerminalView>) -> Task<()> {
         cx.spawn(async move |this, cx| {
@@ -458,7 +490,10 @@ struct Sending {
 }
 
 pub struct TerminalView {
-    launcher: Launcher,
+    /// 按终端自己的行列数画的（见 [`Self::watch`]）没有：它不会自己开、重新开
+    launcher: Option<Launcher>,
+    /// 接的是别处开着的终端，不改它的大小：它是几行几列就按几行几列画
+    watch: Option<Grid>,
     session: Option<Session>,
     /// 正在等服务器的连接
     connecting: Option<Task<()>>,
@@ -513,6 +548,45 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::build(Some(Box::new(launcher)), window, cx)
+    }
+
+    /// 接上 `conn` 那台电脑上编号是 `term` 的终端，它现在是 `cols` 列 `rows` 行（终端总览页右边的
+    /// 画面）。和 [`Self::new`] 的区别：
+    ///
+    /// - 用「只看」的接法，不改那个终端的大小：按它自己的行列数画，地方不够就把字缩小。它改了大小
+    ///   要重新建一个（见 [`Self::size`]）。
+    /// - 键盘、输入法、粘贴、鼠标、发文件和平常一样，都写得进去。
+    /// - 仿真器要回答程序的话（问光标位置、颜色、终端大小）不发：那些由正经接着它的那一头或者
+    ///   kuaid 回答，这里再答就重了。
+    /// - 程序结束、连接断了只说一声，不能在这里重新开、重新接。
+    pub fn watch(
+        conn: &Arc<Connection>,
+        term: &str,
+        cols: u16,
+        rows: u16,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let grid = Grid {
+            cols: usize::from(cols).max(2),
+            rows: usize::from(rows).max(1),
+        };
+        let mut this = Self::build(None, window, cx);
+        this.watch = Some(grid);
+        this.local = conn.local;
+        // 每格多大画的时候才知道，这里只有回答程序「终端多大」时用得上，而那个不回答
+        let cell = size(px(0.), px(0.));
+        this.session = Some(Session::view(conn.clone(), term, grid, cell, cx));
+        this
+    }
+
+    /// [`Self::watch`] 建的时候那个终端是几列几行。
+    pub fn size(&self) -> Option<(u16, u16)> {
+        self.watch.map(|grid| (grid.cols as u16, grid.rows as u16))
+    }
+
+    fn build(launcher: Option<Launcher>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         let subscriptions = vec![
             cx.on_focus(&focus, window, |this, _, cx| this.focus_changed(true, cx)),
@@ -530,7 +604,8 @@ impl TerminalView {
             }
         });
         Self {
-            launcher: Box::new(launcher),
+            launcher,
+            watch: None,
             session: None,
             connecting: None,
             fitted: None,
@@ -631,6 +706,22 @@ impl TerminalView {
         }
     }
 
+    /// kuaid 给这个终端的编号：开在 Kuai 进程里的、还没接上的是 None。
+    pub fn term_id(&self) -> Option<String> {
+        match &self.session.as_ref()?.link {
+            Link::Remote { term, .. } => term.borrow().clone(),
+            Link::Local { .. } => None,
+        }
+    }
+
+    /// 别处把这个终端重启了（同一个名字，kuaid 里换了一个会话）：丢掉手上这个已经结束的，下一帧
+    /// 接上新的。
+    pub fn reattach(&mut self, cx: &mut Context<Self>) {
+        if self.launcher.is_some() {
+            self.reopen(cx);
+        }
+    }
+
     /// 结束里面的进程，重新开一个（下一帧知道大小了再启动）。
     pub fn restart(&mut self, cx: &mut Context<Self>) {
         self.kill(cx);
@@ -692,9 +783,12 @@ impl TerminalView {
     }
 
     fn start(&mut self, grid: Grid, cell: Size<Pixels>, cx: &mut Context<Self>) {
+        let Some(launcher) = &self.launcher else {
+            return;
+        };
         self.exited = None;
         self.lost = false;
-        let launch = match (self.launcher)(cx) {
+        let launch = match launcher(cx) {
             Ok(launch) => launch,
             Err(err) => {
                 self.error = Some(tf!("终端启动失败：{err}", err).into());
@@ -748,6 +842,8 @@ impl TerminalView {
     fn on_feed(&mut self, feed: Feed, cx: &mut Context<Self>) {
         match feed {
             Feed::Term(event) => return self.on_event(event, cx),
+            // 只看的不改那个终端的大小，编号也早就知道
+            Feed::Opened(_) if self.watch.is_some() => {}
             Feed::Opened(id) => {
                 if let Some(Session {
                     link: Link::Remote { conn, term, .. },
@@ -773,6 +869,11 @@ impl TerminalView {
 
     fn on_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {
         match event {
+            // 只看的不回答程序的话（见 [`Self::watch`]）
+            TermEvent::PtyWrite(_)
+            | TermEvent::ColorRequest(..)
+            | TermEvent::TextAreaSizeRequest(_)
+                if self.watch.is_some() => {}
             TermEvent::PtyWrite(text) => self.write(text.into_bytes()),
             TermEvent::Title(title) => self.title = Some(title.into()),
             TermEvent::ResetTitle => self.title = None,
@@ -1078,7 +1179,7 @@ impl TerminalView {
         }
         // Ctrl+加号、Ctrl+减号调字号，Ctrl+0 回到默认（和 Windows 终端一样）；不交给程序。
         // Ctrl+Shift+减号（Ctrl+_，有的程序用它撤销）照旧交给程序
-        if mods.control && !mods.alt && !mods.platform {
+        if mods.control && !mods.alt && !mods.platform && self.watch.is_none() {
             let step = match key {
                 "=" | "+" => Some(1.),
                 "-" if !mods.shift => Some(-1.),
@@ -1100,7 +1201,7 @@ impl TerminalView {
         }
         if !self.is_alive() {
             // 正在连的时候按回车不管；连接断了是重新接上，别的是重新开
-            if key == "enter" && self.connecting.is_none() {
+            if key == "enter" && self.connecting.is_none() && self.watch.is_none() {
                 self.reopen(cx);
                 cx.stop_propagation();
             }
@@ -1306,6 +1407,16 @@ impl TerminalView {
 
     /// 进程没在跑（或者够不着）时，盖在画面底下的一句话。
     fn notice(&self) -> Option<SharedString> {
+        // 只看的不能在这里重新开、重新接，只说一声
+        if self.watch.is_some() && (self.lost || self.exited.is_some()) {
+            return Some(match self.exited {
+                Some(Some(code)) => {
+                    tf!("程序已结束（退出码 {code}）", code = code.to_string()).into()
+                }
+                Some(None) => tr("程序已结束").into(),
+                None => tr("连接已断开").into(),
+            });
+        }
         if let Some(error) = &self.error {
             return Some(tf!("{error} 按 Enter 重试。", error).into());
         }
@@ -1629,24 +1740,45 @@ fn prepaint(
     cx: &mut App,
 ) -> Option<Frame> {
     let prefs = prefs::get(cx);
-    let font_size = px(prefs.font_size);
     let base_font = prefs::base_font(&prefs);
     let font_id = window.text_system().resolve_font(&base_font);
-    let cell_width = window
-        .text_system()
-        .advance(font_id, font_size, 'm')
-        .map(|advance| advance.width)
-        .unwrap_or(font_size * 0.55);
-    let cell = size(cell_width, px(prefs.cell_height()));
-    let grid = Grid {
-        cols: ((bounds.size.width / cell.width).floor() as usize).max(2),
-        rows: ((bounds.size.height / cell.height).floor() as usize).max(1),
+    let advance = |size: Pixels| {
+        window
+            .text_system()
+            .advance(font_id, size, 'm')
+            .map(|advance| advance.width)
+            .unwrap_or(size * 0.55)
+    };
+    // 按设置里的字号，一格多大
+    let full = size(advance(px(prefs.font_size)), px(prefs.cell_height()));
+    let watch = view.read(cx).watch;
+    let (grid, cell, font_size) = match watch {
+        // 行列数是那个终端定的：放不下就按比例把字缩小
+        Some(grid) => {
+            let (cols, rows) = (grid.cols as f32, grid.rows as f32);
+            let fit = (bounds.size.width / (full.width * cols))
+                .min(bounds.size.height / (full.height * rows))
+                .min(1.);
+            let font_size = px((prefs.font_size * fit).max(MIN_WATCH_FONT));
+            let scale = font_size / px(prefs.font_size);
+            let cell = size(advance(font_size), px(prefs.cell_height() * scale));
+            (grid, cell, font_size)
+        }
+        None => {
+            let grid = Grid {
+                cols: ((bounds.size.width / full.width).floor() as usize).max(2),
+                rows: ((bounds.size.height / full.height).floor() as usize).max(1),
+            };
+            (grid, full, px(prefs.font_size))
+        }
     };
     // 面板小得放不下几个字（正在收起、窗口极小）：不启动、不改大小
     if bounds.size.width < cell.width * 4. || bounds.size.height < cell.height {
         return None;
     }
-    view.update(cx, |this, cx| this.fit(grid, cell, cx));
+    if watch.is_none() {
+        view.update(cx, |this, cx| this.fit(grid, cell, cx));
+    }
 
     let theme = cx.theme();
     let palette = Palette::new(theme.foreground, theme.background, theme.is_dark());

@@ -47,6 +47,7 @@ mod sweep;
 mod terminals;
 mod worktrees;
 
+pub(crate) use layout::sidebar_open;
 pub(crate) use ops::explain;
 pub(crate) use terminals::{end_parked_terminals, parked_terminals_of, parked_terminals_running};
 
@@ -252,6 +253,7 @@ impl RepoView {
             this.show_changes(cx);
         }
         this.keep_local_terminals(cx);
+        this.follow_board(cx);
         this.connect(cx);
         this
     }
@@ -1028,7 +1030,7 @@ impl RepoView {
 
 /// 工具栏按钮：图标在上、字在下。`badge` 不是 0 时在图标旁边标一个数（拉取、推送有几个提交）。
 #[allow(clippy::too_many_arguments)]
-fn tool_button(
+pub(crate) fn tool_button(
     id: &'static str,
     icon: IconName,
     label: &'static str,

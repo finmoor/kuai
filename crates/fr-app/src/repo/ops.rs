@@ -385,6 +385,7 @@ impl RepoView {
         let (title, description) = (title.into(), description.into());
         let view = cx.entity().downgrade();
         let action = Rc::new(action);
+        crate::ui::cancel_pending_tip(window, cx);
         window.open_alert_dialog(cx, move |alert, _, _| {
             let (view, action) = (view.clone(), action.clone());
             let run = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {

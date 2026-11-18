@@ -157,23 +157,29 @@ pub fn tooltip_guard() -> impl IntoElement {
                 {
                     return;
                 }
-                let modifiers = window.modifiers();
-                // 等这次按下处理完再发，不在事件处理中间插一个事件
-                window.defer(cx, move |window, cx| {
-                    window.dispatch_event(
-                        PlatformInput::MouseMove(MouseMoveEvent {
-                            position: point(px(-1.), px(-1.)),
-                            pressed_button: None,
-                            modifiers,
-                        }),
-                        cx,
-                    );
-                });
+                cancel_pending_tip(window, cx);
             });
         },
     )
     .absolute()
     .size_0()
+}
+
+/// 取消排着队、还没弹出来的悬停提示：补发一次移到窗口外的鼠标移动（道理见 [`tooltip_guard`]）。
+/// 点一下按钮弹出了确认框时用：鼠标还停在那个按钮上，不取消的话半秒后提示会盖在确认框上。
+pub fn cancel_pending_tip(window: &mut Window, cx: &mut App) {
+    let modifiers = window.modifiers();
+    // 等这次点击处理完再发，不在事件处理中间插一个事件
+    window.defer(cx, move |window, cx| {
+        window.dispatch_event(
+            PlatformInput::MouseMove(MouseMoveEvent {
+                position: point(px(-1.), px(-1.)),
+                pressed_button: None,
+                modifiers,
+            }),
+            cx,
+        );
+    });
 }
 
 /// 有弹出菜单开着（右键菜单、下拉菜单）。这时不弹悬停提示：菜单贴着鼠标弹出来，鼠标稍微一动

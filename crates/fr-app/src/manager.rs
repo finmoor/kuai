@@ -1125,12 +1125,28 @@ pub(crate) fn confirm(
     cx: &mut App,
     action: impl Fn(&mut App) + 'static,
 ) {
+    confirm_in(title, description, ok, danger, window, cx, move |_, cx| {
+        action(cx)
+    });
+}
+
+/// 同 [`confirm`]，要做的事还用得到窗口（比如接着要建视图、放焦点）。
+pub(crate) fn confirm_in(
+    title: String,
+    description: String,
+    ok: &'static str,
+    danger: bool,
+    window: &mut Window,
+    cx: &mut App,
+    action: impl Fn(&mut Window, &mut App) + 'static,
+) {
     let action = Rc::new(action);
+    ui::cancel_pending_tip(window, cx);
     window.open_alert_dialog(cx, move |alert, _, _| {
         let action = action.clone();
         let run = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             window.close_dialog(cx);
-            action(cx);
+            action(window, cx);
         };
         let on_enter = run.clone();
         alert
@@ -1236,6 +1252,12 @@ impl ManagerView {
             .iter()
             .map(|r| self.render_repo(r, true, colors, cx))
             .collect();
+        // 本机的终端开在本机的 kuaid 里：连上了就写上它的版本（和服务器那张卡片一样）
+        let count = tf!("{n} 个仓库", n = local.len());
+        let status: SharedString = match self.app.read(cx).status(LOCAL) {
+            ConnStatus::Ready(conn) => format!("{count} · kuaid {}", conn.hello.version).into(),
+            _ => count.into(),
+        };
         card(
             card_header(
                 "local",
@@ -1243,12 +1265,7 @@ impl ManagerView {
                 tr("本机").into(),
                 Vec::new(),
                 None,
-                status_line(
-                    "local",
-                    None,
-                    tf!("{n} 个仓库", n = local.len()).into(),
-                    colors,
-                ),
+                status_line("local", None, status, colors),
                 vec![
                     Button::new("clone-local")
                         .small()
@@ -1322,13 +1339,17 @@ impl ManagerView {
             ConnStatus::Ready(conn) => (
                 Some(colors.success),
                 match &via {
+                    // kuaid 的版本是那台电脑上常驻的那个报的：和 Kuai 同一个版本号，连接时不是这一版
+                    // 的会被换掉，只有别的电脑上更新的 Kuai 升过它时才比这边新
                     Some(via) => tf!(
-                        "已连接 · 经由 {via} · {ms} ms",
+                        "已连接 · 经由 {via} · kuaid {version} · {ms} ms",
                         via = via,
+                        version = conn.hello.version,
                         ms = conn.connect_time.as_millis()
                     ),
                     None => tf!(
-                        "已连接 · git {git} · {ms} ms{installed}",
+                        "已连接 · kuaid {version} · git {git} · {ms} ms{installed}",
+                        version = conn.hello.version,
                         git = conn.hello.git.trim_start_matches("git version "),
                         ms = conn.connect_time.as_millis(),
                         installed = if conn.installed {

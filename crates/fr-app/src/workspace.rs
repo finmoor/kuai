@@ -30,6 +30,7 @@ use std::rc::Rc;
 use fr_core::i18n::{self, tr, trc};
 use fr_core::tf;
 use futures::StreamExt as _;
+use futures::channel::mpsc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
@@ -49,7 +50,7 @@ use crate::prompt::{self, Prompts};
 use crate::repo::{RepoEvent, RepoView};
 use crate::settings::RepoEntry;
 use crate::settings_page::SettingsPage;
-use crate::term_board::{Row as TermRow, Shown, Stopped, TermBoard, TermId};
+use crate::term_board::{BoardHandle, Row as TermRow, Shown, Stopped, TermBoard, TermId};
 use crate::term_overview::{Go, TermOverview};
 use crate::toast::Toasts;
 use crate::tray::{Tray, TrayAction};
@@ -115,7 +116,12 @@ pub struct Workspace {
     /// 上一次告诉 `board` 的「正显示着哪个终端」
     told_shown: Option<Shown>,
     /// Kuai 不在前台时发的系统通知（终端停下了）
-    toasts: Toasts,
+    /// 系统通知。发、收回都要跨进程调用系统，等的时候系统会接着给窗口派消息，窗口要画，所以不能在
+    /// 处理界面更新的半路上做（做了日志里就是几条 `RefCell already borrowed`，少画一帧；1.15 起
+    /// 就有，2026-11-18 查到）：都经 `toast_jobs` 交给主线程上的一个任务，一件一件做。这里留着的
+    /// 这一份只在退出时用
+    toasts: Rc<RefCell<Toasts>>,
+    toast_jobs: mpsc::UnboundedSender<ToastJob>,
     /// 标签栏的横向滚动位置
     tab_scroll: ScrollHandle,
     /// 标签页多到放不下了（上一帧量出来的）：多显示一个「所有标签页」的按钮
@@ -142,7 +148,8 @@ impl Workspace {
         let manager = cx.new(|cx| ManagerView::new(app.clone(), cx));
         let settings_page = cx.new(|cx| SettingsPage::new(app.clone(), updater.clone(), cx));
         let board = cx.new(|cx| TermBoard::new(app.clone(), cx));
-        let overview = cx.new(|cx| TermOverview::new(app.clone(), board.clone(), cx));
+        cx.set_global(BoardHandle(board.clone()));
+        let overview = cx.new(|cx| TermOverview::new(app.clone(), board.clone(), window, cx));
         let quitting = Rc::new(Cell::new(false));
         let subscriptions = vec![
             cx.subscribe_in(&manager, window, |this, _, event, window, cx| match event {
@@ -180,16 +187,21 @@ impl Workspace {
                     this.hide_if_minimized(cx);
                 } else {
                     // 回到 Kuai 了：系统通知都收回，哪些停下了看标题栏上的个数
-                    this.toasts.clear();
+                    this.toast_job(ToastJob::Clear);
                 }
                 cx.notify();
             }),
             // 标题栏上「终端」那一项的个数跟着变；总览页里换了选中的，也要重新告诉 `board`
             cx.observe(&board, |_, _, cx| cx.notify()),
             cx.observe(&overview, |_, _, cx| cx.notify()),
-            cx.subscribe_in(&overview, window, |this, _, event: &Go, window, cx| {
-                this.go_to_terminal(&event.0, window, cx)
-            }),
+            cx.subscribe_in(
+                &overview,
+                window,
+                |this, _, event: &Go, window, cx| match event {
+                    Go::Term(row) => this.go_to_terminal(row, window, cx),
+                    Go::Repo(entry) => this.go_to_repo_terminals(entry, window, cx),
+                },
+            ),
             cx.subscribe_in(&board, window, |this, _, event: &Stopped, window, cx| {
                 this.terminal_stopped(&event.0, window, cx)
             }),
@@ -201,8 +213,11 @@ impl Workspace {
             // 退出时先撤掉托盘图标：进程退出前没撤的话，托盘里会留一个点不开的图标，鼠标移过去才消失
             cx.on_app_quit(|this, cx| {
                 this.tray = None;
-                // 退出以后系统通知点不动了，都收回
-                this.toasts.clear();
+                // 退出以后系统通知点不动了，都收回。排队的任务这时不会再跑了，当场做；它正做到一半
+                // 就借不到，那一条留着也无妨
+                if let Ok(mut toasts) = this.toasts.try_borrow_mut() {
+                    toasts.clear();
+                }
                 // 映射到本机的目录都断开（等在路上的写入落到服务器）
                 this.app.update(cx, |app, _| app.unmount_all());
                 async {}
@@ -298,6 +313,24 @@ impl Workspace {
         }
         // 点了系统通知：回到 Kuai，前往那个终端
         let (toasts, mut clicks) = Toasts::new();
+        let toasts = Rc::new(RefCell::new(toasts));
+        let (toast_jobs, mut jobs) = mpsc::unbounded();
+        cx.spawn({
+            let toasts = toasts.clone();
+            async move |_, _| {
+                while let Some(job) = jobs.next().await {
+                    let Ok(mut toasts) = toasts.try_borrow_mut() else {
+                        continue;
+                    };
+                    match job {
+                        ToastJob::Show { key, title, body } => toasts.show(&key, &title, &body),
+                        ToastJob::Remove(key) => toasts.remove(&key),
+                        ToastJob::Clear => toasts.clear(),
+                    }
+                }
+            }
+        })
+        .detach();
         cx.spawn_in(window, async move |this, cx| {
             while let Some(tag) = clicks.next().await {
                 let alive = this.update_in(cx, |this, window, cx| {
@@ -324,6 +357,7 @@ impl Workspace {
             showing_terms: false,
             told_shown: None,
             toasts,
+            toast_jobs,
             tab_scroll: ScrollHandle::new(),
             tabs_overflow: false,
             drafts: Vec::new(),
@@ -1132,7 +1166,7 @@ impl Workspace {
             .update(cx, |board, cx| board.mark_seen(&row.id, cx));
         // 说它停下了的那条提醒用不着了
         let key = stopped_note_key(&row.id);
-        self.toasts.remove(&key);
+        self.toast_job(ToastJob::Remove(key.to_string()));
         window.remove_notification1::<TerminalStopped>(key, cx);
         if moved {
             let name = {
@@ -1141,6 +1175,30 @@ impl Workspace {
             };
             let text = tf!("已切换到工作区「{name}」", name);
             window.push_notification(Notification::info(text), cx);
+        }
+    }
+
+    /// 从终端总览页前往一个仓库的终端页：切到它所在的工作区，打开它的标签页。
+    fn go_to_repo_terminals(
+        &mut self,
+        entry: &RepoEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = self
+            .board
+            .read(cx)
+            .repos(cx)
+            .into_iter()
+            .find(|group| group.repos.iter().any(|(other, _)| other == entry))
+            .and_then(|group| group.workspace);
+        if let Some(key) = workspace.filter(|key| *key != self.shown) {
+            self.switch_workspace(key, window, cx);
+        }
+        self.open(entry.clone(), window, cx);
+        if let Some(tab) = self.active.checked_sub(1).and_then(|ix| self.tabs.get(ix)) {
+            tab.view
+                .update(cx, |view, cx| view.show_terminal_page(window, cx));
         }
     }
 
@@ -1206,21 +1264,37 @@ impl Workspace {
         if window.is_window_active() {
             return;
         }
+        // 闪任务栏上的按钮也会让系统当场给窗口发消息，同样放到这一轮更新之外（道理见 `toasts`）
         if let Some(hwnd) = self.hwnd {
-            win::flash(hwnd);
+            cx.spawn(async move |_, _| win::flash(hwnd)).detach();
         }
         if self.app.read(cx).settings.notify_terminal_system {
-            self.toasts.show(&toast_key, &toast_title, &toast_body);
+            self.toast_job(ToastJob::Show {
+                key: toast_key.to_string(),
+                title: toast_title.to_string(),
+                body: toast_body.to_string(),
+            });
         }
     }
 
-    /// 现在正显示着哪个终端：窗口在前台时，终端总览页里选中的，或者当前标签页的终端页上那个。
+    /// 交给发系统通知的那个任务去做（见 `toasts`）。
+    fn toast_job(&self, job: ToastJob) {
+        self.toast_jobs.unbounded_send(job).ok();
+    }
+
+    /// 现在正显示着哪个终端：窗口在前台时，终端总览页里选中的（正往里输入的另算），或者当前标签页的
+    /// 终端页上那个。
     fn shown_terminal(&self, window: &Window, cx: &App) -> Option<Shown> {
         if !window.is_window_active() {
             return None;
         }
         if self.showing_terms {
-            return self.overview.read(cx).selected().cloned().map(Shown::Term);
+            let overview = self.overview.read(cx);
+            let shown = match overview.typing(window, cx) {
+                true => Shown::Typing,
+                false => Shown::Term,
+            };
+            return overview.shown_id(cx).map(shown);
         }
         let (entry, number) = self.active_repo()?.shown(cx).read(cx).shown_terminal()?;
         Some(Shown::Repo(entry, number))
@@ -1295,6 +1369,12 @@ impl Workspace {
 
     /// Ctrl+Shift+`：当前仓库再开一个终端，切到终端页显示它。
     pub fn new_terminal_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 终端总览页上：开在那里选中的仓库里
+        if self.showing_terms {
+            self.overview
+                .update(cx, |overview, cx| overview.new_terminal_here(window, cx));
+            return;
+        }
         if let Some(tab) = self.active_repo() {
             tab.shown(cx)
                 .update(cx, |view, cx| view.new_terminal(window, cx));
@@ -2415,6 +2495,18 @@ fn path_row(path: SharedString, cx: &App) -> impl IntoElement {
 
 /// 「终端已停下」那条提醒的类别（同一个终端只留一条，前往以后去掉）。
 struct TerminalStopped;
+
+/// 交给发系统通知的那个任务做的事（见 `Workspace::toasts`）。
+enum ToastJob {
+    Show {
+        key: String,
+        title: String,
+        body: String,
+    },
+    /// 收回一条：已经去看过那个终端了
+    Remove(String),
+    Clear,
+}
 
 fn stopped_note_key(id: &TermId) -> SharedString {
     format!("{}/{}", id.machine, id.term).into()

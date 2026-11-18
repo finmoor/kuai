@@ -328,6 +328,9 @@ pub struct Settings {
     /// 各个仓库自己记的东西
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repo_memos: Vec<RepoMemo>,
+    /// 终端页（标题栏上的「终端」）里固定到顶上的终端和仓库、收起的工作区
+    #[serde(default, skip_serializing_if = "TermHub::is_empty")]
+    pub term_hub: TermHub,
     /// 上次关闭时窗口的位置和大小
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<WindowState>,
@@ -337,6 +340,34 @@ pub struct Settings {
     /// 点过「跳过这一版」的版本号：标题栏上不再提示它
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped_version: Option<String>,
+}
+
+/// 一个仓库的第几个终端（终端页里固定的终端按它认：终端重启以后编号换了，位置还是这个）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TermSlot {
+    #[serde(flatten)]
+    pub entry: RepoEntry,
+    pub number: u32,
+}
+
+/// 终端页（标题栏上的「终端」）在这台电脑上记的东西，不同步到别的电脑（2026-11-18 Feng 定）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TermHub {
+    /// 固定的终端，按固定的先后
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_terms: Vec<TermSlot>,
+    /// 固定的仓库，按固定的先后
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_repos: Vec<RepoEntry>,
+    /// 收起的工作区
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collapsed: Vec<WorkspaceKey>,
+}
+
+impl TermHub {
+    fn is_empty(&self) -> bool {
+        self.pinned_terms.is_empty() && self.pinned_repos.is_empty() && self.collapsed.is_empty()
+    }
 }
 
 /// 终端的外观和操作习惯：所有终端共用，改了马上生效。默认值就是 1.9 以前写死的那一套，
@@ -530,6 +561,7 @@ impl Default for Settings {
             collapsed_cards: Vec::new(),
             expanded_cards: Vec::new(),
             repo_memos: Vec::new(),
+            term_hub: TermHub::default(),
             window: None,
             check_updates: true,
             skipped_version: None,
@@ -1658,5 +1690,33 @@ mod tests {
         assert_eq!(old.theme, ThemeChoice::System);
         let light = super::parse(r#"{"theme":"light"}"#).unwrap();
         assert_eq!(light.theme, ThemeChoice::Light);
+    }
+
+    #[test]
+    fn 终端页的固定_没有就不写_终端的位置和仓库写在一层() {
+        // 什么都没固定、没收起：设置文件里没有这一项，旧的设置文件也读得进来
+        let text = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(!text.contains("term_hub"));
+        assert_eq!(super::parse(&text).unwrap().term_hub, TermHub::default());
+        let slot = TermSlot {
+            entry: RepoEntry {
+                server: Some("s1".into()),
+                path: "/data/kuai".into(),
+            },
+            number: 2,
+        };
+        let json = serde_json::to_value(&slot).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"server": "s1", "path": "/data/kuai", "number": 2})
+        );
+        assert_eq!(serde_json::from_value::<TermSlot>(json).unwrap(), slot);
+        let mut settings = Settings::default();
+        settings.term_hub.pinned_terms.push(slot.clone());
+        let text = serde_json::to_string(&settings).unwrap();
+        assert_eq!(
+            super::parse(&text).unwrap().term_hub.pinned_terms,
+            vec![slot]
+        );
     }
 }

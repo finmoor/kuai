@@ -28,7 +28,7 @@ use gpui_kit::*;
 
 use crate::app_state::AppState;
 use crate::machines::{LOCAL, WorkspaceKey, machine_of};
-use crate::settings::RepoEntry;
+use crate::settings::{RepoEntry, TermSlot};
 use crate::terminal;
 
 /// 这么久没有新输出就算停下了
@@ -71,6 +71,8 @@ pub enum Shown {
     Repo(RepoEntry, u32),
     /// 总览页里选中的
     Term(TermId),
+    /// 总览页里正往里输入的：和终端页上显示着的一样，一直算看过
+    Typing(TermId),
 }
 
 /// 读到的一个终端。
@@ -100,6 +102,29 @@ pub struct Row {
     pub last_output: Option<Instant>,
 }
 
+impl Row {
+    /// 哪个仓库的第几个终端：终端重启以后编号换了，这个不变。
+    pub fn slot(&self) -> TermSlot {
+        TermSlot {
+            entry: self.entry.clone(),
+            number: self.number,
+        }
+    }
+}
+
+/// 最小的、还没用上的终端序号。
+pub fn free_number(used: &[u32]) -> u32 {
+    (1..).find(|n| !used.contains(n)).unwrap_or(1)
+}
+
+/// 一个工作区里的仓库和各自的终端（终端页的侧栏按它画）。
+pub struct RepoGroup {
+    /// 不在任何工作区里的仓库归到最后一组，这里是 None
+    pub workspace: Option<WorkspaceKey>,
+    /// 按工作区里的先后；没有终端的仓库也在
+    pub repos: Vec<(RepoEntry, Vec<Row>)>,
+}
+
 /// 一个工作区里的终端。
 pub struct Group {
     /// 不在任何工作区里的仓库的终端归到最后一组，这里是 None
@@ -124,6 +149,12 @@ pub struct TermBoard {
 }
 
 impl EventEmitter<Stopped> for TermBoard {}
+
+/// 主窗口的那一份 [`TermBoard`]：各个仓库页（包括进到子模块、工作树里的）从这里拿，跟着同一份
+/// 终端列表走。
+pub struct BoardHandle(pub Entity<TermBoard>);
+
+impl Global for BoardHandle {}
 
 impl TermBoard {
     pub fn new(app: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -282,9 +313,9 @@ impl TermBoard {
     fn recompute(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
         let shown = self.shown_id();
-        // 终端页上正显示着的一直算看过。总览页里选中的那个先不记：它在列表里还得写着「已停下」，
-        // 选到别的、离开这一页时才记（见 `set_shown`）
-        if let (Some(id), Some(Shown::Repo(..))) = (&shown, &self.shown) {
+        // 终端页上正显示着的、总览页里正往里输入的一直算看过。总览页里只是选中的那个先不记：它在
+        // 列表里还得写着「已停下」，选到别的、离开这一页时才记（见 `set_shown`）
+        if let (Some(id), Some(Shown::Repo(..) | Shown::Typing(_))) = (&shown, &self.shown) {
             self.seen.insert(id.clone(), now);
         }
         let mut changed = false;
@@ -331,7 +362,7 @@ impl TermBoard {
     pub fn set_shown(&mut self, shown: Option<Shown>, cx: &mut Context<Self>) {
         if self.shown != shown {
             // 总览页里刚才选中的那个：看过了
-            if let Some(Shown::Term(id)) = &self.shown {
+            if let Some(Shown::Term(id) | Shown::Typing(id)) = &self.shown {
                 self.seen.insert(id.clone(), Instant::now());
             }
             self.shown = shown;
@@ -341,6 +372,9 @@ impl TermBoard {
                     log::info!("正显示的终端：{} 的第 {number} 个", entry.path)
                 }
                 Some(Shown::Term(id)) => log::info!("正显示的终端：总览页里选中的 {}", id.term),
+                Some(Shown::Typing(id)) => {
+                    log::info!("正显示的终端：总览页里正在输入的 {}", id.term)
+                }
             }
             self.recompute(cx);
             // 状态没变，标题栏上的个数也可能变了（正选中的那个不算）
@@ -350,7 +384,7 @@ impl TermBoard {
 
     fn shown_id(&self) -> Option<TermId> {
         match self.shown.as_ref()? {
-            Shown::Term(id) => Some(id.clone()),
+            Shown::Term(id) | Shown::Typing(id) => Some(id.clone()),
             Shown::Repo(entry, number) => {
                 let machine = machine_of(entry);
                 let term = self.lists.get(machine)?.iter().find(|listed| {
@@ -423,17 +457,7 @@ impl TermBoard {
     /// 一个仓库在几个工作区里时，它的终端只列在第一个里（先看现在用的）。
     pub fn groups(&self, cx: &App) -> Vec<Group> {
         let app = self.app.read(cx);
-        let mut machines: Vec<&String> = self.lists.keys().collect();
-        machines.sort();
-        let mut rows: Vec<Row> = Vec::new();
-        for machine in machines {
-            let mut list: Vec<Row> = self.lists[machine]
-                .iter()
-                .map(|listed| self.make_row(machine, listed, app))
-                .collect();
-            list.sort_by(|a, b| (&a.entry.path, a.number).cmp(&(&b.entry.path, b.number)));
-            rows.extend(list);
-        }
+        let mut rows = self.all_rows(app);
         let mut groups: Vec<Group> = Vec::new();
         for key in workspace_order(app) {
             let members = app.members(&key);
@@ -452,6 +476,83 @@ impl TermBoard {
             groups.push(Group {
                 workspace: None,
                 rows,
+            });
+        }
+        groups
+    }
+}
+
+impl TermBoard {
+    /// 全部终端：一台电脑一台电脑地排，同一台里按仓库、序号。
+    fn all_rows(&self, app: &AppState) -> Vec<Row> {
+        let mut machines: Vec<&String> = self.lists.keys().collect();
+        machines.sort();
+        let mut rows: Vec<Row> = Vec::new();
+        for machine in machines {
+            let mut list: Vec<Row> = self.lists[machine]
+                .iter()
+                .map(|listed| self.make_row(machine, listed, app))
+                .collect();
+            list.sort_by(|a, b| (&a.entry.path, a.number).cmp(&(&b.entry.path, b.number)));
+            rows.extend(list);
+        }
+        rows
+    }
+
+    /// 这个仓库的终端，按序号。那台电脑的终端列表还没读到是 None。
+    pub fn terms_of(&self, entry: &RepoEntry, cx: &App) -> Option<Vec<Row>> {
+        let machine = machine_of(entry);
+        let app = self.app.read(cx);
+        let mut rows: Vec<Row> = self
+            .lists
+            .get(machine)?
+            .iter()
+            .map(|listed| self.make_row(machine, listed, app))
+            .filter(|row| row.entry == *entry)
+            .collect();
+        rows.sort_by_key(|row| row.number);
+        Some(rows)
+    }
+
+    /// 全部工作区里的仓库和各自的终端：现在用的工作区在最前，不在任何工作区里、却有终端的仓库在
+    /// 最后。一个仓库在几个工作区里时只列在第一个里。没连着的服务器上的仓库不列：上面的终端不知道，
+    /// 也开不了。
+    pub fn repos(&self, cx: &App) -> Vec<RepoGroup> {
+        let app = self.app.read(cx);
+        let mut rows = self.all_rows(app);
+        let mut seen: Vec<RepoEntry> = Vec::new();
+        let mut groups: Vec<RepoGroup> = Vec::new();
+        for key in workspace_order(app) {
+            let mut repos: Vec<(RepoEntry, Vec<Row>)> = Vec::new();
+            for entry in app.members(&key) {
+                let reachable = entry.server.is_none() || self.watching(machine_of(&entry));
+                if seen.contains(&entry) || !reachable {
+                    continue;
+                }
+                let (mine, rest): (Vec<Row>, Vec<Row>) =
+                    rows.into_iter().partition(|row| row.entry == entry);
+                rows = rest;
+                seen.push(entry.clone());
+                repos.push((entry, mine));
+            }
+            if !repos.is_empty() {
+                groups.push(RepoGroup {
+                    workspace: Some(key),
+                    repos,
+                });
+            }
+        }
+        let mut repos: Vec<(RepoEntry, Vec<Row>)> = Vec::new();
+        for row in rows {
+            match repos.iter_mut().find(|(entry, _)| *entry == row.entry) {
+                Some((_, list)) => list.push(row),
+                None => repos.push((row.entry.clone(), vec![row])),
+            }
+        }
+        if !repos.is_empty() {
+            groups.push(RepoGroup {
+                workspace: None,
+                repos,
             });
         }
         groups
@@ -503,7 +604,7 @@ fn owner(app: &AppState, machine: &str, key: &str) -> (RepoEntry, u32) {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{TermState, state_of};
+    use super::{TermState, free_number, state_of};
 
     #[test]
     fn 终端的三种状态() {
@@ -521,5 +622,14 @@ mod tests {
         // 停下以后看过：空闲
         assert_eq!(state_of(ago(30), ago(20), now), TermState::Idle);
         assert_eq!(state_of(ago(30), ago(30), now), TermState::Idle);
+    }
+
+    #[test]
+    fn 新终端用最小的空号() {
+        assert_eq!(free_number(&[]), 1);
+        assert_eq!(free_number(&[1, 2]), 3);
+        // 前面的结束了，空出来的号先用
+        assert_eq!(free_number(&[2, 3]), 1);
+        assert_eq!(free_number(&[1, 3]), 2);
     }
 }

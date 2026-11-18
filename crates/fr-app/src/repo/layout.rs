@@ -51,6 +51,17 @@ const HISTORY_CHROME: f32 = 38. + 52. + 40. + 24. + 26.;
 /// 提交列表至少留这么高（三行）
 const COMMIT_LIST_MIN: f32 = 78.;
 
+/// 侧栏展开着时多宽（窗口宽 `vw`）：右边至少留 560 给提交列表或文件列表加改动。
+///
+/// 终端总览页左边的列表也用它，右边的画面才和仓库的终端页一样大。
+pub(crate) fn sidebar_open(layout: &Layout, vw: f32) -> f32 {
+    let max = (vw - 560.).min(480.);
+    layout
+        .sidebar
+        .unwrap_or(SIDEBAR_DEFAULT)
+        .clamp(160., max.max(160.))
+}
+
 /// 各块现在实际用的大小（逻辑像素）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Sizes {
@@ -65,14 +76,10 @@ pub(super) struct Sizes {
 pub(super) fn sizes(layout: &Layout, viewport: Size<Pixels>) -> Sizes {
     let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
     let fit = |value: f32, min: f32, max: f32| value.clamp(min, max.max(min));
-    // 侧栏：右边至少留 560 给提交列表或文件列表加改动；收着时是图标栏
+    // 侧栏：收着时是图标栏
     let sidebar = match layout.sidebar_collapsed {
         true => RAIL_WIDTH,
-        false => fit(
-            layout.sidebar.unwrap_or(SIDEBAR_DEFAULT),
-            160.,
-            (vw - 560.).min(480.),
-        ),
+        false => sidebar_open(layout, vw),
     };
     let main = vw - sidebar;
     // 文件列表：右边至少留 300 看改动
