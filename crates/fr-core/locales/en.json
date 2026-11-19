@@ -1499,5 +1499,8 @@
   "测试连接": "Test connection",
   "正在测试连接…": "Testing connection…",
   "连接成功 · {os} {arch}": "Connected · {os} {arch}",
-  "连接测试失败：{err}": "Connection test failed: {err}"
+  "连接测试失败：{err}": "Connection test failed: {err}",
+  "切换服务器": "Switch server",
+  "尚未连接此服务器，连接后显示其终端。": "Not connected to this server. Its terminals appear once connected.",
+  "只列出所选服务器上的工作区；已固定的不受影响": "Lists only workspaces on the selected server. Pinned items are not affected"
 }

@@ -1533,7 +1533,8 @@ impl Workspace {
     /// 建好了切过去。
     fn new_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let app = self.app.read(cx);
-        let current = app.current().machine.clone();
+        // 菜单里正看着哪台电脑，就默认建在哪台
+        let current = app.menu_machine();
         let default = match app.writable(&current) {
             true => current,
             false => LOCAL.to_string(),
@@ -1752,7 +1753,9 @@ impl Workspace {
                             .child(machine),
                     )
                 })
-                .dropdown_menu(move |menu, _, cx| workspace_menu(menu, &app, &this, cx)),
+                .dropdown_menu(move |menu, _, cx| {
+                    workspace_menu(menu, MenuPage::Workspaces, &app, &this, cx)
+                }),
         )
     }
 
@@ -1993,10 +1996,11 @@ impl Workspace {
                 .flex_1()
                 .min_w_0()
                 .gap(px(4.))
-                .child(self.render_workspace_button(cx))
-                .child(div().flex_none().w(px(1.)).h(px(16.)).mx(px(4.)).bg(border))
+                // 仓库、终端这两页是所有工作区共用的，排在前面；工作区按钮挨着它管的那一排标签页
                 .child(home)
                 .child(terms)
+                .child(div().flex_none().w(px(1.)).h(px(16.)).mx(px(4.)).bg(border))
+                .child(self.render_workspace_button(cx))
                 // 标签页那一段画在这个占位的块里面（绝对定位）。标题栏的宽度按里面内容的
                 // 最小宽度算，直接把标签页排在这一行里的话，开多了会把整行撑宽，
                 // 右边的设置和窗口按钮被挤出窗口
@@ -2083,24 +2087,179 @@ fn tab_close(id: impl Into<ElementId>, selected: bool, cx: &App) -> Stateful<Div
         .child(ui::icon_small(IconName::X))
 }
 
-/// 工作区按钮的下拉菜单：按电脑分组列出工作区（本机在前，再是用过上面工作区的服务器），当前的
-/// 打勾；这次还没连上的服务器那一组只有「连接」。下面是新建、改名、删除。
-fn workspace_menu(
-    mut menu: PopupMenu,
+/// 工作区菜单里画着哪一页。
+#[derive(Clone, Copy, PartialEq)]
+enum MenuPage {
+    /// 一台电脑上的工作区
+    Workspaces,
+    /// 挑一台电脑
+    Servers,
+}
+
+/// 把开着的工作区菜单换成另一页，菜单不关。
+fn show_menu_page(
+    menu: &WeakEntity<PopupMenu>,
+    page: MenuPage,
     app: &Entity<AppState>,
     this: &WeakEntity<Workspace>,
-    cx: &App,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (app, this) = (app.clone(), this.clone());
+    menu.update(cx, |menu, cx| {
+        menu.rebuild(window, cx, move |menu, _, cx| {
+            workspace_menu(menu, page, &app, &this, cx)
+        });
+    })
+    .ok();
+}
+
+/// 菜单里点了不关菜单的一行。界面库的条目一点就关菜单，这一行算作不能点的条目，点击自己接；
+/// 代价是方向键选不到它。
+fn stay_item(
+    id: impl Into<ElementId>,
+    checked: bool,
+    content: impl Fn(&App) -> AnyElement + 'static,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+) -> PopupMenuItem {
+    let (id, on_click) = (id.into(), Rc::new(on_click));
+    PopupMenuItem::element(move |_, cx| {
+        let on_click = on_click.clone();
+        let theme = cx.theme();
+        let (fg, hover) = (theme.popover_foreground, theme.accent);
+        h_flex()
+            .id(id.clone())
+            .w_full()
+            .h(px(26.))
+            .px(px(6.))
+            .gap(px(8.))
+            .rounded(px(4.))
+            .text_color(fg)
+            .cursor_pointer()
+            .hover(|s| s.bg(hover))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(move |_, window, cx| on_click(window, cx))
+            .child(content(cx))
+    })
+    .checked(checked)
+    .disabled(true)
+}
+
+/// 工作区按钮的下拉菜单。只列一台电脑上的工作区（默认是当前工作区所在的那台），当前的打勾；
+/// 配置了服务器时最上面一行写着是哪台，点它换一台（菜单不关，原处换成电脑的列表）。这次还没
+/// 连上的服务器只有「连接」。下面是新建、改名、删除。
+fn workspace_menu(
+    mut menu: PopupMenu,
+    page: MenuPage,
+    app: &Entity<AppState>,
+    this: &WeakEntity<Workspace>,
+    cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
+    let popup = cx.entity().downgrade();
     let state = app.read(cx);
     let current = state.current().clone();
-    let mut machines = vec![LOCAL.to_string()];
-    machines.extend(state.menu_machines());
-    for (ix, machine) in machines.iter().enumerate() {
-        if ix > 0 {
-            menu = menu.separator();
+    let machine = state.menu_machine();
+    let muted = cx.theme().muted_foreground;
+    menu = menu.min_w(px(248.));
+    if page == MenuPage::Servers {
+        let mut machines = vec![LOCAL.to_string()];
+        machines.extend(
+            state
+                .settings
+                .servers
+                .iter()
+                .map(|server| server.id.clone()),
+        );
+        menu = menu.label(tr("切换服务器"));
+        for (ix, id) in machines.into_iter().enumerate() {
+            let name = state.machine_name(&id);
+            let note: SharedString = match state.workspaces_on(&id) {
+                Some(list) => tf!("{n} 个工作区", n = list.len()).into(),
+                None => machine_status(state, &id, cx).0,
+            };
+            let icon = match id == LOCAL {
+                true => IconName::Monitor,
+                false => IconName::Server,
+            };
+            let (popup, app, this) = (popup.clone(), app.clone(), this.clone());
+            menu = menu.item(stay_item(
+                ("menu-server", ix),
+                id == machine,
+                move |_| {
+                    h_flex()
+                        .w_full()
+                        .gap(px(8.))
+                        .child(ui::icon_small(icon.clone()).flex_none())
+                        .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(note.clone()),
+                        )
+                        .into_any_element()
+                },
+                move |window, cx| {
+                    app.update(cx, |app, _| app.menu_machine = Some(id.clone()));
+                    show_menu_page(&popup, MenuPage::Workspaces, &app, &this, window, cx);
+                },
+            ));
         }
-        menu = menu.item(machine_header(state, machine, cx));
-        let Some(list) = state.workspaces_on(machine) else {
+        return menu;
+    }
+    if state.settings.servers.is_empty() {
+        menu = menu.item(machine_header(state, &machine, cx));
+    } else {
+        let name = state.machine_name(&machine);
+        let status = (machine != LOCAL).then(|| machine_status(state, &machine, cx));
+        let icon = match machine == LOCAL {
+            true => IconName::Monitor,
+            false => IconName::Server,
+        };
+        let (popup, app, this) = (popup.clone(), app.clone(), this.clone());
+        menu = menu
+            .item(stay_item(
+                "menu-switch-server",
+                false,
+                move |_| {
+                    h_flex()
+                        .w_full()
+                        .gap(px(8.))
+                        .child(ui::icon_small(icon.clone()).flex_none())
+                        .child(
+                            div()
+                                .flex_shrink(1.)
+                                .min_w_0()
+                                .truncate()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(name.clone()),
+                        )
+                        .children(
+                            status.clone().map(|(_, dot)| {
+                                div().flex_none().size(px(6.)).rounded_full().bg(dot)
+                            }),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            h_flex()
+                                .flex_none()
+                                .gap(px(4.))
+                                .text_xs()
+                                .text_color(muted)
+                                .child(tr("切换服务器"))
+                                .child(ui::icon_small(IconName::ChevronRight)),
+                        )
+                        .into_any_element()
+                },
+                move |window, cx| {
+                    show_menu_page(&popup, MenuPage::Servers, &app, &this, window, cx);
+                },
+            ))
+            .separator();
+    }
+    match state.workspaces_on(&machine) {
+        None => {
             let (app, machine) = (app.clone(), machine.clone());
             let label = tf!("连接 {name}", name = state.machine_name(&machine));
             menu = menu.item(
@@ -2110,20 +2269,21 @@ fn workspace_menu(
                         app.update(cx, |app, cx| drop(app.connect(&machine, cx)));
                     }),
             );
-            continue;
-        };
-        for (key, name, count) in list {
-            let this = this.clone();
-            let checked = key == current;
-            // 括号里是这个工作区有几个仓库，不是开着几个标签页：全关了它也不是空的
-            let label = tf!("{name}（{n}）", name, n = count);
-            menu = menu.item(PopupMenuItem::new(label).checked(checked).on_click(
-                move |_, window, cx| {
-                    let key = key.clone();
-                    this.update(cx, |this, cx| this.switch_workspace(key, window, cx))
-                        .ok();
-                },
-            ));
+        }
+        Some(list) => {
+            for (key, name, count) in list {
+                let this = this.clone();
+                let checked = key == current;
+                // 括号里是这个工作区有几个仓库，不是开着几个标签页：全关了它也不是空的
+                let label = tf!("{name}（{n}）", name, n = count);
+                menu = menu.item(PopupMenuItem::new(label).checked(checked).on_click(
+                    move |_, window, cx| {
+                        let key = key.clone();
+                        this.update(cx, |this, cx| this.switch_workspace(key, window, cx))
+                            .ok();
+                    },
+                ));
+            }
         }
     }
     let (new, rename, delete) = (this.clone(), this.clone(), this.clone());
@@ -2156,16 +2316,8 @@ fn machine_header(state: &AppState, machine: &str, cx: &App) -> PopupMenuItem {
     if machine == LOCAL {
         return PopupMenuItem::label(name);
     }
-    let theme = cx.theme();
-    let (status, dot): (SharedString, Hsla) = match state.machine(machine) {
-        Some(loaded) if loaded.live => (tr("已连接").into(), theme.success),
-        Some(_) => (tr("已断开").into(), theme.muted_foreground),
-        None => match state.status(machine) {
-            crate::app_state::ConnStatus::Connecting => (tr("正在连接…").into(), theme.primary),
-            _ => (tr("未连接").into(), theme.muted_foreground),
-        },
-    };
-    let muted = theme.muted_foreground;
+    let (status, dot) = machine_status(state, machine, cx);
+    let muted = cx.theme().muted_foreground;
     PopupMenuItem::element(move |_, _| {
         h_flex()
             .w_full()
@@ -2177,6 +2329,19 @@ fn machine_header(state: &AppState, machine: &str, cx: &App) -> PopupMenuItem {
             .child(status.clone())
     })
     .disabled(true)
+}
+
+/// 服务器连没连上：一句话和圆点的颜色。
+fn machine_status(state: &AppState, machine: &str, cx: &App) -> (SharedString, Hsla) {
+    let theme = cx.theme();
+    match state.machine(machine) {
+        Some(loaded) if loaded.live => (tr("已连接").into(), theme.success),
+        Some(_) => (tr("已断开").into(), theme.muted_foreground),
+        None => match state.status(machine) {
+            crate::app_state::ConnStatus::Connecting => (tr("正在连接…").into(), theme.primary),
+            _ => (tr("未连接").into(), theme.muted_foreground),
+        },
+    }
 }
 
 /// 标签页的右键菜单。

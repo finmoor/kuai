@@ -798,34 +798,6 @@ impl AppState {
         repos
     }
 
-    /// 工作区菜单里列哪几台服务器（本机另列），按「仓库」页上卡片的顺序：读到了而且上面有工作区的
-    /// （连着的、这次连过的），用过上面的工作区的（这次还没连上的在菜单里只有「连接」），和现在用的
-    /// 工作区所在的那台。
-    ///
-    /// 1.16 以前只列用过的：连上一台新的服务器，它的工作区不进菜单，得先到「仓库」页的卡片上点
-    /// 一次（2026-11-19 Feng 当成 bug 报的）。
-    pub fn menu_machines(&self) -> Vec<String> {
-        let current = &self.settings.current.machine;
-        let has_workspaces = |id: &String| {
-            self.machines
-                .get(id)
-                .is_some_and(|machine| !machine.store.workspaces.is_empty())
-        };
-        let mut list: Vec<String> = self
-            .settings
-            .servers
-            .iter()
-            .map(|server| server.id.clone())
-            .filter(|id| {
-                has_workspaces(id) || self.settings.used_machines.contains(id) || id == current
-            })
-            .collect();
-        if current != LOCAL && !list.contains(current) {
-            list.push(current.clone());
-        }
-        list
-    }
-
     // ---- 工作区 ----
 
     /// 换到一个工作区。
@@ -840,8 +812,18 @@ impl AppState {
             self.settings.used_machines.push(key.machine.clone());
         }
         self.settings.current = key;
+        // 工作区菜单跟回当前工作区所在的那台电脑
+        self.menu_machine = None;
         self.save();
         cx.notify();
+    }
+
+    /// 工作区菜单列哪台电脑上的工作区：菜单里换过就是换到的那台（它还在的话），不然是当前
+    /// 工作区所在的那台。
+    pub fn menu_machine(&self) -> String {
+        let known = |id: &String| id == LOCAL || self.settings.servers.iter().any(|s| s.id == *id);
+        let chosen = self.menu_machine.clone().filter(known);
+        chosen.unwrap_or_else(|| self.settings.current.machine.clone())
     }
 
     /// 现在用的工作区不在了（别的电脑删了、还没定）：换一个。那台电脑还连着就换成它上面的第一个，

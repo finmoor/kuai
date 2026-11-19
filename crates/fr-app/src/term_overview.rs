@@ -15,6 +15,9 @@
 //!   就不再固定；重启不算结束（按「哪个仓库的第几个」认，见 [`TermSlot`]）。
 //! - 仓库：排在「已固定」里固定的终端后面，原来的工作区里不再列它。
 //!
+//! 「已固定」下面有一个下拉，选只列哪台服务器上的工作区（全部、本机、各台服务器；没有配置服务器
+//! 时没有它）。固定的不受它影响，右边显示着的终端也不动。设计见 `design/machine-switch/`（方向 A）。
+//!
 //! 画面有两种接法。平常是「只看」（[`TerminalView::watch`]）：不改终端的大小，敲的字照样写得进去。
 //! 这一页自己开的（新建、重启）是正经接着的（[`TerminalView::new`]），大小跟着这一页的画面，也就和
 //! 仓库的终端页一样大；选到别的终端再回来，就换成只看。
@@ -32,14 +35,16 @@ use fr_core::i18n::{tr, trc};
 use fr_core::tf;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::app_state::AppState;
-use crate::machines::{WorkspaceKey, machine_of, split_relay};
+use crate::machines::{LOCAL, WorkspaceKey, machine_of, split_relay};
 use crate::repo::tool_button;
 use crate::settings::{RepoEntry, TermSlot};
 use crate::term_board::{RepoGroup, Row, TermBoard, TermId, TermState, free_number};
@@ -119,7 +124,12 @@ struct Side {
     pinned_terms: Vec<Row>,
     pinned_repos: Vec<SideRepo>,
     groups: Vec<SideGroup>,
-    /// 没筛之前：一共几个终端，几个已停下，几个运行中
+    /// 只列哪台电脑上的工作区（没有是全部）
+    scope: Option<String>,
+    /// 选的那台服务器这次还没连上
+    offline: bool,
+    /// 没筛「已停下」「运行中」之前，侧栏里看得到的（选的那台电脑上的，加上固定的）：一共几个
+    /// 终端，几个已停下，几个运行中
     total: usize,
     stopped: usize,
     running: usize,
@@ -197,6 +207,19 @@ fn row_in<'a>(hub: &'a [RepoGroup], slot: &TermSlot) -> Option<&'a Row> {
 }
 
 /// 一个仓库的终端分成两段：固定的（按固定的先后）、没固定的。标签栏和侧栏都是这个顺序。
+/// 仓库算不算在 `scope` 那台电脑上（没选是都算）：看它所在的工作区在哪台，不在任何工作区里的看它
+/// 自己在哪台。经别的电脑连的算那台电脑的：156 的工作区里 91 的仓库是 156 的。
+fn within(scope: Option<&str>, group: &RepoGroup, entry: &RepoEntry) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    let machine = match &group.workspace {
+        Some(key) => key.machine.as_str(),
+        None => machine_of(entry),
+    };
+    split_relay(machine).map_or(machine, |(via, _)| via) == scope
+}
+
 fn ordered(rows: &[Row], pins: &[TermSlot]) -> (Vec<Row>, Vec<Row>) {
     let slots: Vec<TermSlot> = rows.iter().map(Row::slot).collect();
     let at = |slot: &TermSlot| slots.iter().position(|other| other == slot);
@@ -397,10 +420,36 @@ impl TermOverview {
         hub.collapsed_repos.contains(entry)
     }
 
-    /// 侧栏里要画的：最上面固定的终端、固定的仓库，下面各个工作区里的仓库，仓库下面是它的终端。
-    /// 筛「已停下」「运行中」时只留那种终端和有那种终端的仓库。
+    /// 侧栏只列哪台电脑上的工作区：没有是全部，空的是本机。选的服务器已经移除了就当没选。
+    fn scope(&self, cx: &App) -> Option<String> {
+        let app = self.app.read(cx);
+        let scope = app.settings.term_hub.scope.clone()?;
+        let known = scope == LOCAL || app.settings.servers.iter().any(|server| server.id == scope);
+        known.then_some(scope)
+    }
+
+    /// 侧栏里看得到的终端：选的那台电脑上的，加上固定的终端、固定的仓库里的。
+    fn seen<'a>(&self, hub: &'a [RepoGroup], cx: &App) -> Vec<&'a Row> {
+        let scope = self.scope(cx);
+        let pins = &self.app.read(cx).settings.term_hub;
+        let mut seen = Vec::new();
+        for group in hub {
+            for (entry, rows) in &group.repos {
+                let whole =
+                    within(scope.as_deref(), group, entry) || pins.pinned_repos.contains(entry);
+                let pinned = |row: &&Row| whole || pins.pinned_terms.contains(&row.slot());
+                seen.extend(rows.iter().filter(pinned));
+            }
+        }
+        seen
+    }
+
+    /// 侧栏里要画的：最上面固定的终端、固定的仓库，下面是选的那台电脑上各个工作区里的仓库，仓库
+    /// 下面是它的终端。筛「已停下」「运行中」时只留那种终端和有那种终端的仓库。
     fn side(&self, hub: &[RepoGroup], cx: &App) -> Side {
         let pins = &self.app.read(cx).settings.term_hub;
+        let scope = self.scope(cx);
+        let here = scope.as_deref();
         let wanted =
             |rows: &[Row]| self.filter == Filter::All || rows.iter().any(|row| self.matches(row));
         let repo = |(entry, rows): &Repo| {
@@ -435,6 +484,7 @@ impl TermOverview {
                 let repos: Vec<SideRepo> = group
                     .repos
                     .iter()
+                    .filter(|(entry, _)| within(here, group, entry))
                     .filter(|(entry, rows)| !pins.pinned_repos.contains(entry) && wanted(rows))
                     .map(repo)
                     .collect();
@@ -449,14 +499,18 @@ impl TermOverview {
                 })
             })
             .collect();
-        let count = |state| rows_in(hub).filter(|row| row.state == state).count();
+        let seen = self.seen(hub, cx);
+        let count = |state| seen.iter().filter(|row| row.state == state).count();
+        let offline = here.is_some_and(|id| id != LOCAL && !self.board.read(cx).watching(id));
         Side {
             pinned_terms,
             pinned_repos,
             groups,
-            total: rows_in(hub).count(),
+            offline,
+            total: seen.len(),
             stopped: count(TermState::Stopped),
             running: count(TermState::Running),
+            scope,
         }
     }
 
@@ -507,9 +561,11 @@ impl TermOverview {
             .as_ref()
             .is_some_and(|slot| row_in(&hub, slot).is_some());
         if !still && self.opening.is_none() {
-            let first = rows_in(&hub)
-                .find(|row| row.state == TermState::Stopped)
-                .or(rows_in(&hub).next());
+            // 侧栏里看得到的优先（选了只看一台服务器时，别的服务器上的不在侧栏里）
+            let seen = self.seen(&hub, cx);
+            let stopped = |row: &&Row| row.state == TermState::Stopped;
+            let first = seen.iter().copied().find(stopped).or(seen.first().copied());
+            let first = first.or(rows_in(&hub).next());
             self.shown = first.map(Row::slot);
             if let Some(row) = first {
                 self.repo = Some(row.entry.clone());
@@ -519,8 +575,16 @@ impl TermOverview {
         // 选中的仓库不在了（从工作区里移走了，或者那台服务器断开了）：换成第一个
         let listed = |entry: &RepoEntry| repo_in(&hub, entry).is_some();
         if !self.repo.as_ref().is_some_and(listed) {
-            let first = hub.iter().flat_map(|group| &group.repos).next();
-            self.repo = first.map(|(entry, _)| entry.clone());
+            let scope = self.scope(cx);
+            let all: Vec<(&RepoGroup, &RepoEntry)> = hub
+                .iter()
+                .flat_map(|group| group.repos.iter().map(move |(entry, _)| (group, entry)))
+                .collect();
+            let first = all
+                .iter()
+                .find(|(group, entry)| within(scope.as_deref(), group, entry))
+                .or(all.first());
+            self.repo = first.map(|(_, entry)| (*entry).clone());
         }
         self.sync(window, cx);
         self.focus.focus(window, cx);
@@ -701,6 +765,13 @@ impl TermOverview {
 
     fn set_filter(&mut self, filter: Filter, cx: &mut Context<Self>) {
         self.filter = filter;
+        cx.notify();
+    }
+
+    /// 换一台服务器看（没有是全部）。右边显示着的终端不动。
+    fn set_scope(&mut self, scope: Option<String>, cx: &mut Context<Self>) {
+        self.app
+            .update(cx, |app, cx| app.edit_term_hub(cx, |hub| hub.scope = scope));
         cx.notify();
     }
 
@@ -1539,6 +1610,7 @@ impl TermOverview {
         &self,
         index: usize,
         group: &SideGroup,
+        scoped: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
@@ -1550,9 +1622,9 @@ impl TermOverview {
             None => tr("其他").into(),
         };
         let current = workspace.is_some_and(|key| key == app.current());
-        // 服务器上的工作区标出是哪台
+        // 服务器上的工作区标出是哪台；只列着一台的时候不用标
         let machine = workspace
-            .filter(|key| !key.is_local())
+            .filter(|key| !key.is_local() && !scoped)
             .map(|key| app.machine_name(&key.machine));
         let chip = |text: SharedString| {
             div()
@@ -1677,6 +1749,148 @@ impl TermOverview {
             }))
     }
 
+    /// 「已固定」下面的那个下拉：只列哪台服务器上的工作区。没有配置服务器时不显示。
+    fn render_scope(&self, side: &Side, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let app = self.app.read(cx);
+        if app.settings.servers.is_empty() {
+            return None;
+        }
+        let muted = cx.theme().muted_foreground;
+        // 右边那一句：连着的写有几个工作区，没连着的写状态
+        let note = |machine: &str| -> SharedString {
+            match app.workspaces_on(machine) {
+                Some(list) => tf!("{n} 个工作区", n = list.len()).into(),
+                None => match app.status(machine) {
+                    crate::app_state::ConnStatus::Connecting => tr("正在连接…").into(),
+                    _ => tr("未连接").into(),
+                },
+            }
+        };
+        let mut choices: Vec<(Option<String>, IconName, SharedString, SharedString)> = vec![
+            (None, IconName::Layers, tr("全部").into(), "".into()),
+            (
+                Some(LOCAL.to_string()),
+                IconName::Monitor,
+                app.machine_name(LOCAL),
+                note(LOCAL),
+            ),
+        ];
+        for server in &app.settings.servers {
+            choices.push((
+                Some(server.id.clone()),
+                IconName::Server,
+                app.machine_name(&server.id),
+                note(&server.id),
+            ));
+        }
+        let now = side.scope.clone();
+        let (icon, name) = choices
+            .iter()
+            .find(|choice| choice.0 == now)
+            .map(|choice| (choice.1.clone(), choice.2.clone()))?;
+        let this = cx.entity().downgrade();
+        let button = Button::new("hub-scope")
+            .outline()
+            .small()
+            .w_full()
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(6.))
+                    .child(ui::icon_small(icon).flex_none().text_color(muted))
+                    .child(ui::clipped("hub-scope-name", name).flex_shrink(1.)),
+            )
+            .dropdown_caret(true)
+            .tooltip(tr("只列出所选服务器上的工作区；已固定的不受影响"))
+            .dropdown_menu(move |mut menu, _, _| {
+                menu = menu.min_w(px(232.));
+                for (at, (scope, icon, name, note)) in choices.iter().enumerate() {
+                    // 「全部」和各台电脑之间隔一条线
+                    if at == 1 {
+                        menu = menu.separator();
+                    }
+                    let (this, to) = (this.clone(), scope.clone());
+                    let (icon, name, note) = (icon.clone(), name.clone(), note.clone());
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, _| {
+                            h_flex()
+                                .w_full()
+                                .gap(px(8.))
+                                .child(ui::icon_small(icon.clone()).flex_none())
+                                .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(note.clone()),
+                                )
+                        })
+                        .checked(*scope == now)
+                        .on_click(move |_, _, cx| {
+                            let to = to.clone();
+                            this.update(cx, |this, cx| this.set_scope(to, cx)).ok();
+                        }),
+                    );
+                }
+                menu
+            });
+        Some(
+            div()
+                .flex_none()
+                .mx(px(10.))
+                .mt(px(8.))
+                .child(button)
+                .into_any_element(),
+        )
+    }
+
+    /// 选的那台服务器还没连上：说一声，给一个「连接」。
+    fn render_connect(&self, side: &Side, cx: &mut Context<Self>) -> AnyElement {
+        let (muted, danger) = (cx.theme().muted_foreground, cx.theme().danger);
+        let app = self.app.read(cx);
+        let id = side.scope.clone().unwrap_or_default();
+        let status = app.status(&id);
+        let connecting = matches!(status, crate::app_state::ConnStatus::Connecting);
+        // 刚才连过、没连上：把原因写出来，不然点了「连接」像没反应
+        let failed = match status {
+            crate::app_state::ConnStatus::Failed(err) => Some(err),
+            _ => None,
+        };
+        let label = tf!("连接 {name}", name = app.machine_name(&id));
+        let app = self.app.clone();
+        v_flex()
+            .px(px(14.))
+            .py(px(24.))
+            .gap(px(12.))
+            .items_center()
+            .text_size(px(12.))
+            .text_color(muted)
+            .child(tr("尚未连接此服务器，连接后显示其终端。"))
+            .children(failed.map(|err| {
+                v_flex()
+                    .w_full()
+                    .gap(px(2.))
+                    .text_color(danger)
+                    .child(tr("连接失败"))
+                    .child(div().w_full().text_size(px(11.)).child(err))
+            }))
+            .child(
+                Button::new("hub-connect")
+                    .outline()
+                    .small()
+                    .icon(ui::icon(IconName::Plug))
+                    .label(label)
+                    .loading(connecting)
+                    .disabled(connecting)
+                    .on_click(move |_, _, cx| {
+                        app.update(cx, |app, cx| drop(app.connect(&id, cx)));
+                    }),
+            )
+            .into_any_element()
+    }
+
     /// 侧栏里一个仓库的那一行，下面是它的终端（没收起的话）。
     fn push_repo(
         &self,
@@ -1719,10 +1933,13 @@ impl TermOverview {
         };
         let on = self.highlight(side);
         let is_on = |pick: Pick| on.as_ref() == Some(&pick);
+        // 「已固定」单独一块，不跟着下面的树滚动，也不受换服务器影响
+        let mut pinned: Vec<AnyElement> = Vec::new();
         let mut items: Vec<AnyElement> = Vec::new();
         let mut index = 0;
-        if !side.pinned_terms.is_empty() || !side.pinned_repos.is_empty() {
-            items.push(
+        let has_pinned = !side.pinned_terms.is_empty() || !side.pinned_repos.is_empty();
+        if has_pinned {
+            pinned.push(
                 h_flex()
                     .h(px(26.))
                     .mt(px(6.))
@@ -1737,23 +1954,16 @@ impl TermOverview {
             );
             for row in &side.pinned_terms {
                 let on = is_on(Pick::Pinned(row.slot()));
-                items.push(self.render_pinned_term(index, row, on, cx));
+                pinned.push(self.render_pinned_term(index, row, on, cx));
                 index += 1;
             }
             for repo in &side.pinned_repos {
-                self.push_repo(repo, &on, &mut index, &mut items, cx);
+                self.push_repo(repo, &on, &mut index, &mut pinned, cx);
             }
-            items.push(
-                div()
-                    .h(px(1.))
-                    .mx(px(10.))
-                    .mt(px(8.))
-                    .bg(border)
-                    .into_any_element(),
-            );
         }
+        let scoped = side.scope.is_some();
         for (at, group) in side.groups.iter().enumerate() {
-            items.push(self.render_group_head(at, group, cx));
+            items.push(self.render_group_head(at, group, scoped, cx));
             if group.collapsed {
                 continue;
             }
@@ -1761,14 +1971,16 @@ impl TermOverview {
                 self.push_repo(repo, &on, &mut index, &mut items, cx);
             }
         }
-        let empty =
-            side.groups.is_empty() && side.pinned_terms.is_empty() && side.pinned_repos.is_empty();
-        // 没连着的服务器上的终端不知道，也不为了看它去连：说一声
+        // 树是空的：列着全部电脑、上面又有固定的时候不用说（没有的已经在上面了）
+        let empty = side.groups.is_empty() && !side.offline && (scoped || !has_pinned);
+        let switcher = self.render_scope(side, cx);
+        let connect = side.offline.then(|| self.render_connect(side, cx));
+        // 没连着的服务器上的终端不知道，也不为了看它去连：说一声。只看一台的时候不用说别的
         let offline: Vec<String> = {
             let (app, board) = (self.app.read(cx), self.board.read(cx));
             let servers = app.settings.servers.iter();
             servers
-                .filter(|server| !board.watching(&server.id))
+                .filter(|server| !scoped && !board.watching(&server.id))
                 .map(|server| server.name.clone())
                 .collect()
         };
@@ -1830,6 +2042,21 @@ impl TermOverview {
                     ),
             )
             .child(self.render_filter(side, cx))
+            .when(has_pinned, |side| {
+                side.child(
+                    v_flex()
+                        .id("overview-pinned")
+                        .flex_none()
+                        // 固定得再多也给下面的树留一半
+                        .max_h(relative(0.45))
+                        .pb(px(8.))
+                        .border_b_1()
+                        .border_color(border)
+                        .overflow_y_scroll()
+                        .children(pinned),
+                )
+            })
+            .children(switcher)
             .child(
                 v_flex()
                     .id("overview-rows")
@@ -1838,6 +2065,7 @@ impl TermOverview {
                     .pb(px(10.))
                     .overflow_y_scroll()
                     .children(items)
+                    .children(connect)
                     .when(empty, |list| {
                         list.child(
                             div()
@@ -2228,7 +2456,8 @@ impl Render for TermOverview {
 #[cfg(test)]
 mod tests {
     // 不整个引进来：界面库里也有一个叫 test 的属性宏，会顶掉标准的 #[test]
-    use super::{RepoEntry, Row, TermId, TermSlot, TermState, ordered};
+    use super::{RepoEntry, RepoGroup, Row, TermId, TermSlot, TermState, WorkspaceKey};
+    use super::{ordered, within};
 
     fn row(number: u32) -> Row {
         Row {
@@ -2271,5 +2500,40 @@ mod tests {
         let (pinned, own) = ordered(&rows[..1], &pins);
         assert!(pinned.is_empty());
         assert_eq!(numbers(own), [1]);
+    }
+    #[test]
+    fn 只看一台服务器_按工作区所在的电脑算_不在工作区里的按仓库算() {
+        let entry = |server: Option<&str>| RepoEntry {
+            server: server.map(str::to_string),
+            path: "/repo".into(),
+        };
+        let group = |machine: Option<&str>| RepoGroup {
+            workspace: machine.map(|machine| WorkspaceKey {
+                machine: machine.into(),
+                id: "w1".into(),
+            }),
+            repos: Vec::new(),
+        };
+        // 没选：都算
+        assert!(within(None, &group(Some("s1")), &entry(Some("s1"))));
+        // 本机的工作区、服务器的工作区
+        assert!(within(Some(""), &group(Some("")), &entry(None)));
+        assert!(!within(Some("s1"), &group(Some("")), &entry(None)));
+        assert!(within(Some("s1"), &group(Some("s1")), &entry(Some("s1"))));
+        // s1 的工作区里有它经手连的 s2 的仓库：算 s1 的，不算本机配置的 s2 的
+        assert!(within(
+            Some("s1"),
+            &group(Some("s1")),
+            &entry(Some("s1>s2"))
+        ));
+        assert!(!within(
+            Some("s2"),
+            &group(Some("s1")),
+            &entry(Some("s1>s2"))
+        ));
+        // 不在任何工作区里的：看仓库自己在哪台
+        assert!(within(Some(""), &group(None), &entry(None)));
+        assert!(within(Some("s1"), &group(None), &entry(Some("s1>s2"))));
+        assert!(!within(Some(""), &group(None), &entry(Some("s1"))));
     }
 }

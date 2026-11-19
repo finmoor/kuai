@@ -44,6 +44,9 @@ pub struct AppState {
     pub(crate) watches: HashMap<String, Task<()>>,
     /// 断开以后自动重连的任务
     pub(crate) reconnects: HashMap<String, Task<()>>,
+    /// 工作区菜单里换到了哪台电脑看（没换过是当前工作区所在的那台）。只在这次运行里记着，
+    /// 换了工作区就跟回去
+    pub(crate) menu_machine: Option<String>,
 }
 
 impl AppState {
@@ -59,6 +62,7 @@ impl AppState {
             pending: HashMap::new(),
             watches: HashMap::new(),
             reconnects: HashMap::new(),
+            menu_machine: None,
         };
         this.start_machines(cx);
         this

@@ -365,6 +365,9 @@ pub struct TermHub {
     /// 收起的仓库：下面不列它的终端
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collapsed_repos: Vec<RepoEntry>,
+    /// 侧栏只列哪台电脑上的工作区：没有是全部，空的是本机，别的是服务器的 id。固定的不受它影响
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 impl TermHub {
@@ -373,6 +376,7 @@ impl TermHub {
             && self.pinned_repos.is_empty()
             && self.collapsed.is_empty()
             && self.collapsed_repos.is_empty()
+            && self.scope.is_none()
     }
 }
 
@@ -1749,6 +1753,14 @@ mod tests {
         assert_eq!(
             super::parse(&text).unwrap().term_hub.collapsed_repos,
             vec![slot.entry]
+        );
+        // 只选了看哪台服务器也要存下来；选的是本机（空的）和没选不是一回事
+        let mut settings = Settings::default();
+        settings.term_hub.scope = Some(String::new());
+        let text = serde_json::to_string(&settings).unwrap();
+        assert_eq!(
+            super::parse(&text).unwrap().term_hub.scope,
+            Some(String::new())
         );
     }
 }
