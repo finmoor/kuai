@@ -445,6 +445,20 @@ pub struct ConnectOptions {
     /// 经跳板机连接时报告走到哪了：参数是已经登录上的台数（跳板机按顺序算，最后是目标服务器）。
     /// 在后台线程里调用
     pub on_stage: Option<StageHandler>,
+    /// 要密码、口令、确认主机密钥时不弹窗，存着的答不了就当作取消（启动时自动连接用：没人点它，
+    /// 突然弹窗问密码不合适）。跳板机也一样
+    pub no_prompt: bool,
+}
+
+/// 测试连接的结果（见 [`Connection::probe`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    /// 服务器的系统：`Linux`、`Windows`，别的是它自己报的名字（`Darwin`…）
+    pub os: String,
+    /// 处理器架构，服务器自己报的（`x86_64`、`AMD64`、`aarch64`…）
+    pub arch: String,
+    /// 这种系统上装不装得了 kuaid
+    pub supported: bool,
 }
 
 /// 报告连接进度的函数，见 [`ConnectOptions::on_stage`]。
@@ -470,6 +484,7 @@ impl std::fmt::Debug for ConnectOptions {
             .field("identity_file", &self.identity_file)
             .field("password_auth", &self.password_auth)
             .field("secret", &self.secret.as_ref().map(|_| "…"))
+            .field("no_prompt", &self.no_prompt)
             .field(
                 "jumps",
                 &self
@@ -509,6 +524,49 @@ impl Connection {
             );
         }
         Self::connect_on(Route::Via { via, server }, destination, options)
+    }
+
+    /// 测试连接：只登录上去问一句是什么系统。不装、不启动 kuaid，服务器上什么都不留。
+    /// 登录不了、连不上时的报错和 [`Self::connect`] 一样。会阻塞，放在后台线程里调用。
+    pub fn probe(destination: &str, options: &ConnectOptions) -> Result<Probe> {
+        // 和连接时一样：先按 Linux 的写法问（已经知道是 Windows 的先按 Windows），跑不了再换另一种
+        let mut windows = known_windows(destination);
+        let (mut tried_sh, mut tried_cmd) = (false, false);
+        let mut refused: Option<String> = None;
+        loop {
+            let script = match windows {
+                true => windows_probe_script(),
+                false => probe_script(),
+            };
+            let (pipes, _saved) = Route::Direct.run(destination, &script, options, false)?;
+            match start(pipes, true, destination, Some(options))? {
+                Started::Missing { os, arch } => {
+                    let kind = server_os(&os);
+                    return Ok(Probe {
+                        os: match kind {
+                            Some(Os::Linux) => "Linux".into(),
+                            Some(Os::Windows) => "Windows".into(),
+                            None => os,
+                        },
+                        arch,
+                        supported: kind.is_some(),
+                    });
+                }
+                Started::Refused(message) => {
+                    match windows {
+                        true => tried_cmd = true,
+                        false => tried_sh = true,
+                    }
+                    let first = refused.get_or_insert(message).clone();
+                    if tried_sh && tried_cmd {
+                        bail!("{first}");
+                    }
+                    windows = !windows;
+                }
+                // 这两条脚本不启动 kuaid，不会走到握手
+                Started::Ready(..) => bail!(tr("连接失败")),
+            }
+        }
     }
 
     fn connect_on(route: Route, destination: &str, options: &ConnectOptions) -> Result<Connection> {
@@ -1817,7 +1875,7 @@ fn forward_hint(stderr: &str, timed_out: bool) -> &'static str {
 }
 
 /// 登录一台服务器用的那部分 ssh 选项和环境变量：转发 ssh-agent、私钥、密码登录、要密码时怎么问。
-/// `jump` 是跳板机的名字（登录的是目标服务器时为 None）。
+/// `jump` 是跳板机的名字（登录的是目标服务器时为 None）；`silent`：存着的答不了时不弹窗。
 /// 第三项要留到登录完成：留着它，这个 ssh 要密码、口令时才会用存着的自动回答、弹窗里才写得出是哪台跳板机。
 fn login(
     identity_file: Option<&str>,
@@ -1825,6 +1883,7 @@ fn login(
     secret: Option<&str>,
     jump: Option<&str>,
     forward_agent: bool,
+    silent: bool,
 ) -> (
     Vec<String>,
     Vec<(String, String)>,
@@ -1843,13 +1902,13 @@ fn login(
     let mut saved = None;
     if let Some(askpass) = askpass {
         env.extend(askpass.iter().cloned());
-        if secret.is_some() || jump.is_some() {
+        if secret.is_some() || jump.is_some() || silent {
             let kind = if password_auth {
                 crate::PromptKind::Password
             } else {
                 crate::PromptKind::Passphrase
             };
-            let entry = crate::SavedSecret::register_for(secret, kind, jump);
+            let entry = crate::SavedSecret::register_for(secret, kind, jump, silent);
             env.push((
                 fr_core::askpass::TAG_ENV.to_string(),
                 entry.tag().to_string(),
@@ -1875,6 +1934,7 @@ fn ssh(
         options.secret.as_deref(),
         None,
         forward_agent,
+        options.no_prompt,
     );
     let mut held: Vec<crate::SavedSecret> = saved.into_iter().collect();
     cmd.args(args);
@@ -1891,6 +1951,7 @@ fn ssh(
                 jump.secret.as_deref(),
                 Some(&jump.name),
                 false,
+                options.no_prompt,
             );
             args.extend(STAGE_OPTIONS.iter().map(|item| item.to_string()));
             let tag = env
@@ -1922,6 +1983,16 @@ fn bootstrap_script(dir: &str) -> String {
     format!(
         r#"sh -c 'A="$HOME/.kuai/{dir}/kuaid"; if [ -x "$A" ]; then echo {START_MARKER}; exec "$A" --connect; fi; echo "{MISSING_MARKER} $(uname -s) $(uname -m)"'"#
     )
+}
+
+/// 测试连接用的脚本：只报告系统和架构，报法和 [`bootstrap_script`] 没装 kuaid 时一样。
+fn probe_script() -> String {
+    format!(r#"sh -c 'echo "{MISSING_MARKER} $(uname -s) $(uname -m)"'"#)
+}
+
+/// Windows 服务器上测试连接用的脚本，报法和 [`windows_bootstrap_script`] 没装 kuaid 时一样。
+fn windows_probe_script() -> String {
+    format!(r#"cmd /c "echo {MISSING_MARKER} Windows %PROCESSOR_ARCHITECTURE%""#)
 }
 
 /// 服务器报的系统名是哪种系统。Windows 上经 Git 带的 sh 问到的是 `MINGW64_NT-10.0-…` 这类。
@@ -2099,6 +2170,19 @@ mod tests {
         for script in [&boot, &install] {
             assert_eq!(script.matches('\'').count(), 2, "{script}");
         }
+    }
+
+    #[test]
+    fn 测试连接的脚本只报告系统_不碰_kuaid() {
+        let (sh, cmd) = (probe_script(), windows_probe_script());
+        for script in [&sh, &cmd] {
+            assert!(script.contains(MISSING_MARKER), "{script}");
+            assert!(!script.contains("kuai"), "{script}");
+        }
+        assert_eq!(sh.matches('\'').count(), 2, "{sh}");
+        // 交给 cmd 的那一条：外面一对双引号，里面没有会被 PowerShell 改掉的字符
+        assert_eq!(cmd.matches('"').count(), 2, "{cmd}");
+        assert!(!cmd.contains('$') && !cmd.contains('`'), "{cmd}");
     }
 
     #[test]

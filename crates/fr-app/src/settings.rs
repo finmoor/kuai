@@ -862,6 +862,10 @@ pub struct Server {
     /// 映射到本机的目录（见 `mapping`）。不在服务器的表单里：加、改、删各是各的，马上存
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mappings: Vec<Mapping>,
+    /// 启动 Kuai 时不自动连接这台（表单里是「启动时自动连接」，默认勾着，所以存的是反过来的：
+    /// 旧的设置文件里没有这一项，也就是自动连）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub manual_connect: bool,
 }
 
 /// 把服务器上的一个目录映射成本机的盘符或文件夹。
@@ -1696,6 +1700,20 @@ mod tests {
         assert_eq!(old.theme, ThemeChoice::System);
         let light = super::parse(r#"{"theme":"light"}"#).unwrap();
         assert_eq!(light.theme, ThemeChoice::Light);
+    }
+
+    #[test]
+    fn 服务器默认启动时自动连接_不连的才写进设置() {
+        // 旧的设置文件里没有这一项：自动连
+        let old = r#"{"servers":[{"id":"s1","name":"dev","destination":"u@h"}]}"#;
+        let mut settings = super::parse(old).unwrap();
+        assert!(!settings.servers[0].manual_connect);
+        assert!(!serde_json::to_string(&settings).unwrap().contains("manual_connect"));
+        // 去掉了「启动时自动连接」的勾：存下来，读回来还是不连
+        settings.servers[0].manual_connect = true;
+        let text = serde_json::to_string(&settings).unwrap();
+        assert!(text.contains(r#""manual_connect":true"#));
+        assert!(super::parse(&text).unwrap().servers[0].manual_connect);
     }
 
     #[test]

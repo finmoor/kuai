@@ -40,7 +40,7 @@ pub use fr_core::protocol::{
     DirEntry, DirListing, FsEntry, FsExpect, FsSpace, FsStat, FsWrite, FsWritten, Hello, SubRepos,
     TermInfo,
 };
-pub use remote::{ConnectOptions, Connection, Jump, StageHandler, local_kuai_root};
+pub use remote::{ConnectOptions, Connection, Jump, Probe, StageHandler, local_kuai_root};
 
 /// 一次 git 调用的结果。
 #[derive(Debug, Clone, Default)]
@@ -237,6 +237,10 @@ pub fn init_prompts(
         if let Some(answer) = saved_answer(tag, prompt) {
             return Some(answer);
         }
+        // 这次连接说了不许弹窗（启动时自动连接）：当作取消
+        if silent(tag) {
+            return None;
+        }
         // 等用户回答的这段时间不算连接超时
         let _asking = Asking::start();
         handler(prompt, jump_of(tag).as_deref())
@@ -286,6 +290,8 @@ struct Saved {
     used: bool,
     /// 这个 ssh 连的是跳板机时，跳板机的名字：弹窗里写明是哪一台在要密码
     jump: Option<String>,
+    /// 存着的答不了（没存、答过一次还问）时不弹窗，当作取消
+    silent: bool,
 }
 
 /// 标记（ssh 进程环境变量 `FR_ASKPASS_TAG` 的值）→ 它可以用的密码、口令
@@ -299,14 +305,16 @@ pub(crate) struct SavedSecret {
 impl SavedSecret {
     #[cfg(test)]
     pub(crate) fn register(secret: &str, kind: PromptKind) -> SavedSecret {
-        Self::register_for(Some(secret), kind, None)
+        Self::register_for(Some(secret), kind, None, false)
     }
 
-    /// `secret` 是存着的密码或口令（`kind` 说是哪一种）；`jump` 是跳板机的名字（连的是目标服务器时为 None）。
+    /// `secret` 是存着的密码或口令（`kind` 说是哪一种）；`jump` 是跳板机的名字（连的是目标服务器时为 None）；
+    /// `silent`：存着的答不了时不弹窗，当作取消。
     pub(crate) fn register_for(
         secret: Option<&str>,
         kind: PromptKind,
         jump: Option<&str>,
+        silent: bool,
     ) -> SavedSecret {
         let tag = fr_core::askpass::random_token();
         let saved = Saved {
@@ -314,6 +322,7 @@ impl SavedSecret {
             kind,
             used: false,
             jump: jump.map(str::to_string),
+            silent,
         };
         SAVED.lock().unwrap().insert(tag.clone(), saved);
         SavedSecret { tag }
@@ -341,6 +350,13 @@ fn saved_answer(tag: Option<&str>, prompt: &str) -> Option<String> {
     let secret = entry.secret.clone()?;
     entry.used = true;
     Some(secret)
+}
+
+/// 带着这个标记的 ssh 要密码时是不是不许弹窗。
+fn silent(tag: Option<&str>) -> bool {
+    let saved = SAVED.lock().unwrap();
+    tag.and_then(|tag| saved.get(tag))
+        .is_some_and(|entry| entry.silent)
 }
 
 /// 带着这个标记的 ssh 连的是哪台跳板机（不是跳板机就是 None）。
@@ -725,7 +741,7 @@ mod tests {
 
     #[test]
     fn 跳板机的标记带着它的名字_没存密码就不自动回答() {
-        let jump = SavedSecret::register_for(None, PromptKind::Password, Some("bastion"));
+        let jump = SavedSecret::register_for(None, PromptKind::Password, Some("bastion"), false);
         let tag = jump.tag().to_string();
         assert_eq!(jump_of(Some(&tag)).as_deref(), Some("bastion"));
         assert_eq!(saved_answer(Some(&tag), "u@h's password: "), None);
@@ -735,5 +751,28 @@ mod tests {
         assert_eq!(jump_of(None), None);
         drop(jump);
         assert_eq!(jump_of(Some(&tag)), None);
+    }
+
+    #[test]
+    fn 不许弹窗的连接_存着的照样答_答不了的不问() {
+        // 平常的连接、没有标记：可以弹窗
+        let plain = SavedSecret::register("pw", PromptKind::Password);
+        assert!(!silent(Some(plain.tag())));
+        assert!(!silent(None));
+        // 启动时自动连接的：存着密码的先用存着的答，答过了还问（密码不对）就不再弹窗
+        let auto = SavedSecret::register_for(Some("pw"), PromptKind::Password, None, true);
+        let tag = auto.tag().to_string();
+        assert!(silent(Some(&tag)));
+        assert_eq!(
+            saved_answer(Some(&tag), "u@h's password: ").as_deref(),
+            Some("pw")
+        );
+        assert_eq!(saved_answer(Some(&tag), "u@h's password: "), None);
+        // 没存的也登记着：不然不知道它不许弹窗
+        let bare = SavedSecret::register_for(None, PromptKind::Passphrase, None, true);
+        assert!(silent(Some(bare.tag())));
+        // 连接完了撤掉
+        drop(auto);
+        assert!(!silent(Some(&tag)));
     }
 }

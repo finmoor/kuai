@@ -110,6 +110,8 @@ impl ManagerView {
     ///
     /// 主机、端口、用户名分开填，存的时候拼成 ssh 的目标；登录方式选密钥或密码。
     /// 填了的密码、私钥口令存进系统的凭据管理器（见 `secrets`），不进设置文件。
+    ///
+    /// 「测试连接」拿表单里现在填的去登录一次（不保存，不装 kuaid），结果写在对话框里。
     fn server_dialog(&mut self, edit: Option<Server>, window: &mut Window, cx: &mut Context<Self>) {
         let editing = edit.is_some();
         let old = edit.unwrap_or_default();
@@ -195,26 +197,34 @@ impl ManagerView {
         let first_build = Cell::new(true);
         let auth = Rc::new(Cell::new(old.auth));
         let forward_agent = Rc::new(Cell::new(old.forward_agent));
+        // 新加的默认勾着
+        let auto_connect = Rc::new(Cell::new(!old.manual_connect));
         // 点了「清除」：存着的密码、口令不要了
         let forget = Rc::new(Cell::new(false));
         // 没填对时的提示，显示在对话框里
         let problem: Rc<RefCell<Option<SharedString>>> = Rc::default();
+        let test: Rc<RefCell<TestState>> = Rc::default();
+        // 第几次测试：改了表单再测时，上一次晚到的结果不算
+        let test_run = Rc::new(Cell::new(0u64));
         window.open_dialog(cx, move |dialog, window, cx| {
             if first_build.replace(false) {
                 host.focus_handle(cx).focus(window, cx);
             }
-            let (muted, danger) = (cx.theme().muted_foreground, cx.theme().danger);
-            let submit = {
+            let (muted, danger, success) = (
+                cx.theme().muted_foreground,
+                cx.theme().danger,
+                cx.theme().success,
+            );
+            // 把表单里填的读成一台服务器，连同这次填的密码或口令；没填对就是该提示的那句话
+            let collect = {
                 let (host, port, user, key) =
                     (host.clone(), port.clone(), user.clone(), key.clone());
                 let (passphrase, password, name) =
                     (passphrase.clone(), password.clone(), name.clone());
                 let start_dir = start_dir.clone();
-                let (app, auth, forward_agent) =
-                    (app.clone(), auth.clone(), forward_agent.clone());
-                let (forget, problem, old) = (forget.clone(), problem.clone(), old.clone());
-                let jump = jump.clone();
-                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                let (auth, forward_agent) = (auth.clone(), forward_agent.clone());
+                let (auto_connect, jump, id) = (auto_connect.clone(), jump.clone(), old.id.clone());
+                move |cx: &App| -> Result<(Server, String), &'static str> {
                     let read = |input: &Entity<InputState>| input.read(cx).value().to_string();
                     let (host, user, port) = (read(&host), read(&user), read(&port));
                     let (key, name) = (read(&key), read(&name));
@@ -225,10 +235,6 @@ impl ManagerView {
                         Auth::Key => read(&passphrase),
                         Auth::Password => read(&password),
                     };
-                    let fail = |message: &'static str, window: &mut Window| {
-                        *problem.borrow_mut() = Some(message.into());
-                        window.refresh();
-                    };
                     // 主机那一格里贴进整个 user@host:端口 的也认；单独填了的用户名、端口优先
                     let mut target = Target::parse(&host);
                     if !user.trim().is_empty() {
@@ -238,19 +244,19 @@ impl ManagerView {
                         target.port = port.trim().to_string();
                     }
                     if target.host.is_empty() {
-                        return fail(tr("请填写主机"), window);
+                        return Err(tr("请填写主机"));
                     }
                     if !target.port.is_empty() && !target.port_ok() {
-                        return fail(tr("端口须为 1～65535 之间的数字"), window);
+                        return Err(tr("端口须为 1～65535 之间的数字"));
                     }
                     let key = key.trim();
                     if auth == Auth::Key && !key.is_empty() {
                         if key.to_lowercase().ends_with(".pub") {
-                            return fail(tr("这是公钥文件，请选择不带 .pub 后缀的私钥文件"), window);
+                            return Err(tr("这是公钥文件，请选择不带 .pub 后缀的私钥文件"));
                         }
                         // ~ 开头的由 ssh 自己展开，这里不查
                         if !key.starts_with('~') && !std::path::Path::new(key).is_file() {
-                            return fail(tr("未找到私钥文件"), window);
+                            return Err(tr("未找到私钥文件"));
                         }
                     }
                     let mut label = name.trim().to_string();
@@ -258,7 +264,7 @@ impl ManagerView {
                         label = target.host.clone();
                     }
                     let server = Server {
-                        id: old.id.clone(),
+                        id: id.clone(),
                         name: label,
                         destination: target.compose(),
                         forward_agent: forward_agent.get(),
@@ -271,7 +277,24 @@ impl ManagerView {
                         last_dir: None,
                         // 映射不在这张表单里，`update_server` 留着原来的
                         mappings: Vec::new(),
+                        manual_connect: !auto_connect.get(),
                     };
+                    Ok((server, secret))
+                }
+            };
+            let submit = {
+                let (collect, app) = (collect.clone(), app.clone());
+                let (forget, problem, old) = (forget.clone(), problem.clone(), old.clone());
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    let (server, secret) = match collect(cx) {
+                        Ok(read) => read,
+                        Err(message) => {
+                            *problem.borrow_mut() = Some(message.into());
+                            window.refresh();
+                            return;
+                        }
+                    };
+                    let auth = server.auth;
                     // 存着的密码、口令：填了新的就换；没填、登录方式没变、也没点清除，就留着
                     let keep = had_secret && auth == old.auth && !forget.get();
                     let secret_changed = !secret.is_empty() || (had_secret && !keep);
@@ -309,6 +332,77 @@ impl ManagerView {
                     }
                 }
             };
+            // 测试连接：拿表单里现在填的登录一次，不保存。密码、口令用这次填的；没填、存着的又还作数
+            // 就用存着的；都没有就照常弹窗问。跳板机照它们自己存着的设置登录
+            let run_test = {
+                let (collect, app, forget) = (collect.clone(), app.clone(), forget.clone());
+                let (problem, test, test_run) = (problem.clone(), test.clone(), test_run.clone());
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    let (server, secret) = match collect(cx) {
+                        Ok(read) => read,
+                        Err(message) => {
+                            *problem.borrow_mut() = Some(message.into());
+                            *test.borrow_mut() = TestState::Idle;
+                            window.refresh();
+                            return;
+                        }
+                    };
+                    *problem.borrow_mut() = None;
+                    let keep = had_secret && server.auth == old_auth && !forget.get();
+                    let mut options = crate::app_state::connect_options(&server);
+                    options.forward_agent = false;
+                    options.secret = match secret.is_empty() {
+                        false => Some(secret),
+                        true => options.secret.filter(|_| keep),
+                    };
+                    options.jumps = {
+                        let settings = &app.read(cx).settings;
+                        let last = server.jump.as_deref().and_then(|id| settings.server(id));
+                        let before = last.map(|jump| settings.route(&jump.id));
+                        let route = before.into_iter().flatten().chain(last);
+                        route.map(crate::app_state::jump_options).collect()
+                    };
+                    let run = test_run.get() + 1;
+                    test_run.set(run);
+                    *test.borrow_mut() = TestState::Running;
+                    window.refresh();
+                    let destination = server.destination.clone();
+                    let probing = cx.background_executor().spawn(async move {
+                        fr_channel::Connection::probe(&destination, &options)
+                    });
+                    let (test, test_run) = (test.clone(), test_run.clone());
+                    window
+                        .spawn(cx, async move |cx| {
+                            let result = probing.await;
+                            if test_run.get() != run {
+                                return;
+                            }
+                            *test.borrow_mut() = match result {
+                                // 不写用了多久：中间可能停下来等人填密码
+                                Ok(probe) if probe.supported => TestState::Passed(
+                                    tf!(
+                                        "连接成功 · {os} {arch}",
+                                        os = probe.os,
+                                        arch = probe.arch
+                                    )
+                                    .into(),
+                                ),
+                                Ok(probe) => TestState::Failed(
+                                    tf!(
+                                        "目前仅支持 Linux 和 Windows 服务器，该服务器为 {os}",
+                                        os = probe.os
+                                    )
+                                    .into(),
+                                ),
+                                Err(err) => TestState::Failed(format!("{err:#}").into()),
+                            };
+                            cx.update(|window, _| window.refresh()).ok();
+                        })
+                        .detach();
+                }
+            };
+            let test_now = test.borrow().clone();
+            let testing = matches!(test_now, TestState::Running);
             let auth_now = auth.get();
             let pick_auth = |to: Auth| {
                 let auth = auth.clone();
@@ -574,8 +668,44 @@ impl ManagerView {
                                     }
                                 }),
                         )
+                        .child(
+                            Checkbox::new("auto-connect")
+                                .label(tr("启动时自动连接"))
+                                .checked(auto_connect.get())
+                                .on_click({
+                                    let auto_connect = auto_connect.clone();
+                                    move |checked, window, _| {
+                                        auto_connect.set(*checked);
+                                        window.refresh();
+                                    }
+                                }),
+                        )
                         .when_some(problem.borrow().clone(), |body, found| {
                             body.child(div().text_sm().text_color(danger).child(found))
+                        })
+                        // 测试连接的结果：报错可能很长（带着 ssh 的原话），让它折行
+                        .map(|body| match test_now {
+                            TestState::Idle => body,
+                            TestState::Running => body.child(
+                                div()
+                                    .text_sm()
+                                    .text_color(muted)
+                                    .child(tr("正在测试连接…")),
+                            ),
+                            TestState::Passed(text) => body.child(
+                                h_flex()
+                                    .gap(px(6.))
+                                    .text_sm()
+                                    .text_color(success)
+                                    .child(ui::icon(IconName::Check).flex_none())
+                                    .child(text),
+                            ),
+                            TestState::Failed(text) => body.child(
+                                div()
+                                    .text_sm()
+                                    .text_color(danger)
+                                    .child(tf!("连接测试失败：{err}", err = text)),
+                            ),
                         })
                         // 这句说的是上面的登录信息，紧跟着它们；映射是单独的一节，放在最后
                         .child(div().text_xs().text_color(muted).child(if jump_now.is_some() {
@@ -591,6 +721,13 @@ impl ManagerView {
                 )
                 .footer(
                     DialogFooter::new()
+                        .child(
+                            Button::new("test")
+                                .label(tr("测试连接"))
+                                .loading(testing)
+                                .disabled(testing)
+                                .on_click(run_test),
+                        )
                         .child(
                             Button::new("cancel")
                                 .label(tr("取消"))
@@ -1181,6 +1318,16 @@ pub(crate) fn confirm_in(
 
 fn field(label: &'static str, input: impl IntoElement) -> impl IntoElement {
     field_with(label, None, input)
+}
+
+/// 「测试连接」走到哪了。
+#[derive(Clone, Default)]
+enum TestState {
+    #[default]
+    Idle,
+    Running,
+    Passed(SharedString),
+    Failed(SharedString),
 }
 
 /// 选了跳板机以后，主机那一格的提示

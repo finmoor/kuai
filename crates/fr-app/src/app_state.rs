@@ -151,6 +151,17 @@ impl AppState {
     /// 连接服务器；已经连上或正在连就沿用。返回等连接结果的 future。
     /// `id` 可以是经别的电脑连的服务器（`156的id>91的id`，见 `machines`）：先连那台，再请它的 kuaid 转接。
     pub fn connect(&mut self, id: &str, cx: &mut Context<Self>) -> Connecting {
+        self.connect_with(id, false, cx)
+    }
+
+    /// 同 [`Self::connect`]。`no_prompt`：要密码、口令、确认主机密钥时不弹窗，存着的答不了这一次就算
+    /// 连不上（启动时自动连接用）。已经在连的沿用它原来的连法。
+    pub(crate) fn connect_with(
+        &mut self,
+        id: &str,
+        no_prompt: bool,
+        cx: &mut Context<Self>,
+    ) -> Connecting {
         if let Some(existing) = self.conns.get(id) {
             match existing.peek() {
                 None => return existing.clone(),
@@ -216,6 +227,7 @@ impl AppState {
                         let mut options = connect_options(&server);
                         options.jumps = route.iter().map(jump_options).collect();
                         options.on_stage = (!route.is_empty()).then_some(on_stage);
+                        options.no_prompt = no_prompt;
                         Connection::connect(&server.destination, &options)
                             .map(Arc::new)
                             .map_err(|err| SharedString::from(format!("{err:#}")))
@@ -474,7 +486,7 @@ pub(crate) fn connect_options(server: &Server) -> ConnectOptions {
 }
 
 /// 把这台服务器当跳板机时怎么登录它：沿用它自己的设置。ssh-agent 不往跳板机上转发。
-fn jump_options(server: &Server) -> Jump {
+pub(crate) fn jump_options(server: &Server) -> Jump {
     Jump {
         name: server.name.clone(),
         destination: server.destination.clone(),

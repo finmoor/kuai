@@ -1494,5 +1494,10 @@
   "结束终端？": "End the terminal?",
   "将结束 {repo} 中的终端「{name}」，其中正在运行的程序将终止。此操作无法撤销。": "Terminal “{name}” in {repo} will be ended and the program running in it terminated. This cannot be undone.",
   "重启终端？": "Restart the terminal?",
-  "将终止 {repo} 中的终端「{name}」里正在运行的程序，并重新启动。此操作无法撤销。": "The program running in terminal “{name}” in {repo} will be terminated and the terminal restarted. This cannot be undone."
+  "将终止 {repo} 中的终端「{name}」里正在运行的程序，并重新启动。此操作无法撤销。": "The program running in terminal “{name}” in {repo} will be terminated and the terminal restarted. This cannot be undone.",
+  "启动时自动连接": "Connect automatically at startup",
+  "测试连接": "Test connection",
+  "正在测试连接…": "Testing connection…",
+  "连接成功 · {os} {arch}": "Connected · {os} {arch}",
+  "连接测试失败：{err}": "Connection test failed: {err}"
 }

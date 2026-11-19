@@ -288,6 +288,29 @@ impl AppState {
         self.resolve_current(cx);
         self.save();
         drop(self.connect_local(cx));
+        self.auto_connect(cx);
+    }
+
+    /// 启动时连上设了「启动时自动连接」的服务器（默认都设着），它们的仓库、工作区、终端不用等人去点
+    /// 「连接」才有。不弹窗：存着密码、用得了密钥的连得上；要问密码的这一次算连不上，卡片上有「重试」。
+    /// 用密码登录又没存密码的肯定要问，不去连。现在用的工作区所在的那台不在这里连：它本来就会连，
+    /// 要密码时照常弹窗。
+    fn auto_connect(&mut self, cx: &mut Context<Self>) {
+        let current = self.settings.current.machine.clone();
+        let ids: Vec<String> = self
+            .settings
+            .servers
+            .iter()
+            .filter(|server| !server.manual_connect && server.id != current)
+            .filter(|server| {
+                server.auth != Auth::Password || crate::secrets::get(&server.id).is_some()
+            })
+            .map(|server| server.id.clone())
+            .collect();
+        for id in ids {
+            log::info!("启动时自动连接服务器 {id}");
+            drop(self.connect_with(&id, true, cx));
+        }
     }
 
     /// 本机配置的服务器交给本机时的样子（不含密码）；和本机记着的一样就不用交。
@@ -775,10 +798,28 @@ impl AppState {
         repos
     }
 
-    /// 工作区菜单里列哪几台服务器（本机另列）：用过上面的工作区的，和现在用的工作区所在的那台。
+    /// 工作区菜单里列哪几台服务器（本机另列），按「仓库」页上卡片的顺序：读到了而且上面有工作区的
+    /// （连着的、这次连过的），用过上面的工作区的（这次还没连上的在菜单里只有「连接」），和现在用的
+    /// 工作区所在的那台。
+    ///
+    /// 1.16 以前只列用过的：连上一台新的服务器，它的工作区不进菜单，得先到「仓库」页的卡片上点
+    /// 一次（2026-11-19 Feng 当成 bug 报的）。
     pub fn menu_machines(&self) -> Vec<String> {
-        let mut list = self.settings.used_machines.clone();
         let current = &self.settings.current.machine;
+        let has_workspaces = |id: &String| {
+            self.machines
+                .get(id)
+                .is_some_and(|machine| !machine.store.workspaces.is_empty())
+        };
+        let mut list: Vec<String> = self
+            .settings
+            .servers
+            .iter()
+            .map(|server| server.id.clone())
+            .filter(|id| {
+                has_workspaces(id) || self.settings.used_machines.contains(id) || id == current
+            })
+            .collect();
         if current != LOCAL && !list.contains(current) {
             list.push(current.clone());
         }

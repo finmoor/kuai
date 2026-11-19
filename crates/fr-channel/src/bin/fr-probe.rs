@@ -20,6 +20,8 @@
 //!     --jump-password            跳板机用密码登录
 //!     --jump-secret-env <环境变量名>  跳板机的密码或私钥口令放在这个环境变量里
 //!     --jump2 <ssh 目标>          第二台跳板机：经第一台连它，再经它连目标
+//!     --test-login <ssh 目标>     只做界面上「测试连接」做的事：登录上去问一句是什么系统，打出来就退出。
+//!                                不装、不启动 kuaid；不用给 `--repo`
 //!
 //! 连服务器时测终端（开在 kuaid 里，名字用 `--repo` 给的路径，和客户端里那个仓库的终端是同一个）：
 //!     --term <命令>              开（或者接上）终端，敲这条命令，把之后几秒的输出打出来，然后断开；
@@ -95,7 +97,24 @@ fn main() -> Result<()> {
             })
             .collect(),
         on_stage: Some(Arc::new(|n| println!("已登录 {n} 台"))),
+        no_prompt: false,
     };
+    if let Some(destination) = value("--test-login") {
+        let started = Instant::now();
+        let probe = Connection::probe(&destination, &options)?;
+        println!(
+            "登录成功：{} {}，{}，{} ms",
+            probe.os,
+            probe.arch,
+            if probe.supported {
+                "可以安装 kuaid"
+            } else {
+                "不支持的系统"
+            },
+            started.elapsed().as_millis()
+        );
+        return Ok(());
+    }
     let ask = password_auth || options.secret.is_some() || jump_password;
     let usage = "用法：fr-probe --repo <仓库路径> (local | <ssh 目标> | --kuaid <kuaid 程序>)";
     let repo = args

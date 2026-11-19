@@ -1,6 +1,7 @@
 """测试用的 SSH 服务：只听 127.0.0.1，客户端要执行的命令一律不执行，回一行 KUAID-START 以后
 把通道接到 `<kuaid 程序> --stdio` 上。客户端就能一路走到「已连接」，目录浏览、打开仓库、git 操作
-看到的都是那个 kuaid 那边的东西。见 README.md「登录服务器的各种情况」。
+看到的都是那个 kuaid 那边的东西。见 README.md「登录服务器的各种情况」。命令里没有 `--connect` 的
+（「测试连接」只问系统的那一条）不接 kuaid，答一行 `KUAID-MISSING Linux x86_64` 就结束。
 
 用法：python fake-sshd.py <主目录> <kuaid 程序> <端口> [--password-env 变量名] [--kbd] [--forward]
 设置文件里服务器的地址写 ssh://tester@127.0.0.1:<端口>。要装 paramiko。
@@ -107,6 +108,13 @@ class Server(paramiko.ServerInterface):
 
 def bridge(channel, command):
     log('执行', command[:60])
+    # 「测试连接」只问一句是什么系统，不启动 kuaid：照没装 kuaid 时的报法答一句就结束
+    text = command.decode('utf-8', 'replace') if isinstance(command, bytes) else command
+    if '--connect' not in text:
+        channel.sendall(b'KUAID-MISSING Linux x86_64\n')
+        channel.send_exit_status(0)
+        channel.close()
+        return
     # kuaid 把这个目录当主目录，它自己的东西（~/.kuai）也放在这下面，不碰真的
     env = dict(os.environ, USERPROFILE=HOME, HOME=HOME, FR_KUAID_HOME=HOME)
     proc = subprocess.Popen([KUAID, '--stdio'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
