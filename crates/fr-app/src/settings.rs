@@ -362,11 +362,17 @@ pub struct TermHub {
     /// 收起的工作区
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collapsed: Vec<WorkspaceKey>,
+    /// 收起的仓库：下面不列它的终端
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collapsed_repos: Vec<RepoEntry>,
 }
 
 impl TermHub {
     fn is_empty(&self) -> bool {
-        self.pinned_terms.is_empty() && self.pinned_repos.is_empty() && self.collapsed.is_empty()
+        self.pinned_terms.is_empty()
+            && self.pinned_repos.is_empty()
+            && self.collapsed.is_empty()
+            && self.collapsed_repos.is_empty()
     }
 }
 
@@ -1716,7 +1722,15 @@ mod tests {
         let text = serde_json::to_string(&settings).unwrap();
         assert_eq!(
             super::parse(&text).unwrap().term_hub.pinned_terms,
-            vec![slot]
+            vec![slot.clone()]
+        );
+        // 只收起了一个仓库也要存下来
+        let mut settings = Settings::default();
+        settings.term_hub.collapsed_repos.push(slot.entry.clone());
+        let text = serde_json::to_string(&settings).unwrap();
+        assert_eq!(
+            super::parse(&text).unwrap().term_hub.collapsed_repos,
+            vec![slot.entry]
         );
     }
 }

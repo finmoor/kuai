@@ -3,13 +3,15 @@
 //! 仓库标签页里的终端页是它只看一个仓库的样子：两边是同一批终端（都在各台电脑的 kuaid 里，数据
 //! 在 [`TermBoard`]）。设计见 `design/terminal-hub/`（方向 C，带固定）。
 //!
-//! 左边一行一个仓库，按工作区分组，行尾写着这个仓库有几个终端停下了、在跑、空着；右边顶上是
-//! 选中的仓库的终端，排成标签，下面是选中那个的画面。新建、重启、结束都在这一页：行尾和标签栏上的
-//! +、标签上的 ×、工具栏的「重启」、右键菜单。里面还在输出的终端，结束、重启前先问一句。
+//! 左边是一棵树：工作区、里面的仓库、仓库的终端，工作区和仓库都可以收起（收着时行尾写里面有几个
+//! 终端停下了、在跑、空着）。右边顶上是选中的仓库的终端，排成标签，下面是选中那个的画面。新建、
+//! 重启、结束都在这一页：行尾的按钮、标签栏上的 +、标签上的 ×、工具栏的「重启」、右键菜单。里面还在
+//! 输出的终端，结束、重启前先问一句。
 //!
 //! 固定（只记在这台电脑上）：
 //!
-//! - 终端：侧栏最上面「已固定」一组里一行，同时常驻在标签栏最前面，换到哪个仓库都在。它结束了
+//! - 终端：侧栏最上面「已固定」一组里一行；在它自己的仓库里排在最前面（侧栏和标签栏都是）。别的
+//!   仓库的标签栏里没有它（2026-11-19 Feng：「只有当前项目的固定终端才会展示在前面」）。它结束了
 //!   就不再固定；重启不算结束（按「哪个仓库的第几个」认，见 [`TermSlot`]）。
 //! - 仓库：排在「已固定」里固定的终端后面，原来的工作区里不再列它。
 //!
@@ -18,7 +20,7 @@
 //! 仓库的终端页一样大；选到别的终端再回来，就换成只看。
 //!
 //! 焦点：打开这一页时在侧栏上（↑↓ 选一行，Enter 前往，→ 进到终端里）；点画面、点标签、新开一个
-//! 终端时进到终端里，之后的键都归里面的程序，只留 Ctrl+Shift+↑、↓ 沿着标签栏换终端。输入时画面
+//! 终端时进到终端里，之后的键都归里面的程序，只留 Ctrl+Shift+↑、↓ 沿着侧栏换终端。输入时画面
 //! 带一圈主色的边框：Enter 在侧栏上是前往、在终端里是回车，得一眼看得出焦点在哪。
 //!
 //! 侧栏和仓库页的侧栏一样宽、一样的底色和字号，右边上面一条和终端页的工具栏一样高，下面全是画面：
@@ -77,29 +79,62 @@ struct Peek {
 /// 侧栏里能选中的一行。
 #[derive(Clone, PartialEq)]
 enum Pick {
-    /// 固定的终端
-    Term(TermSlot),
+    /// 「已固定」里的终端
+    Pinned(TermSlot),
     Repo(RepoEntry),
+    /// 仓库下面的终端
+    Term(TermSlot),
+}
+
+/// 侧栏里上一次选的是哪种行。固定的终端在侧栏里有两行（「已固定」里一行、仓库下面一行），仓库
+/// 选中时右边显示的也是它的某个终端：只看右边显示着谁，分不出该高亮哪一行。
+#[derive(Clone, Copy, PartialEq)]
+enum Cursor {
+    Pinned,
+    Repo,
+    Term,
 }
 
 type Repo = (RepoEntry, Vec<Row>);
+
+/// 侧栏里的一个仓库。
+struct SideRepo {
+    entry: RepoEntry,
+    /// 它的全部终端，固定的在前（和标签栏一个顺序）
+    all: Vec<Row>,
+    /// 下面列出来的那些（筛过了）
+    listed: Vec<Row>,
+    collapsed: bool,
+}
 
 /// 侧栏里一个工作区的那一组。
 struct SideGroup {
     workspace: Option<WorkspaceKey>,
     collapsed: bool,
-    repos: Vec<Repo>,
+    repos: Vec<SideRepo>,
 }
 
 /// 侧栏里要画的东西（筛过了）。
 struct Side {
     pinned_terms: Vec<Row>,
-    pinned_repos: Vec<Repo>,
+    pinned_repos: Vec<SideRepo>,
     groups: Vec<SideGroup>,
     /// 没筛之前：一共几个终端，几个已停下，几个运行中
     total: usize,
     stopped: usize,
     running: usize,
+}
+
+impl Side {
+    /// 从上到下的仓库，带着它在侧栏里是不是看得见（所在的工作区没收起）。
+    fn repos(&self) -> impl Iterator<Item = (bool, &SideRepo)> {
+        let pinned = self.pinned_repos.iter().map(|repo| (true, repo));
+        let listed = self.groups.iter().flat_map(|group| {
+            let seen = !group.collapsed;
+            group.repos.iter().map(move |repo| (seen, repo))
+        });
+        pinned.chain(listed)
+    }
 }
 
 pub struct TermOverview {
@@ -109,9 +144,8 @@ pub struct TermOverview {
     repo: Option<RepoEntry>,
     /// 右边显示的终端
     shown: Option<TermSlot>,
-    /// 侧栏里选的是仓库那一行（不是「已固定」里的终端）。仓库里的终端都固定了的时候，选中它右边
-    /// 显示的就是固定着的终端；高亮要留在仓库上，不然用 ↑↓ 走到这里会跳回「已固定」，过不去
-    by_repo: bool,
+    /// 侧栏里上一次选的是哪种行：高亮落在哪一行靠它定
+    cursor: Cursor,
     filter: Filter,
     peek: Option<Peek>,
     /// 这一页正在开（新建、重启）的终端：等它出现在列表里
@@ -162,7 +196,19 @@ fn row_in<'a>(hub: &'a [RepoGroup], slot: &TermSlot) -> Option<&'a Row> {
     rows.iter().find(|row| row.number == slot.number)
 }
 
-/// 终端的右键菜单（标签上、侧栏里固定的那一行上）。
+/// 一个仓库的终端分成两段：固定的（按固定的先后）、没固定的。标签栏和侧栏都是这个顺序。
+fn ordered(rows: &[Row], pins: &[TermSlot]) -> (Vec<Row>, Vec<Row>) {
+    let slots: Vec<TermSlot> = rows.iter().map(Row::slot).collect();
+    let at = |slot: &TermSlot| slots.iter().position(|other| other == slot);
+    let pinned = pins.iter().filter_map(at).map(|at| rows[at].clone());
+    let own = rows
+        .iter()
+        .zip(&slots)
+        .filter(|(_, slot)| !pins.contains(slot));
+    (pinned.collect(), own.map(|(row, _)| row.clone()).collect())
+}
+
+/// 终端的右键菜单（标签上、侧栏里终端的那一行上）。
 fn term_menu(
     view: WeakEntity<TermOverview>,
     slot: TermSlot,
@@ -287,7 +333,7 @@ impl TermOverview {
             board,
             repo: None,
             shown: None,
-            by_repo: false,
+            cursor: Cursor::Term,
             filter: Filter::All,
             peek: None,
             opening: None,
@@ -346,12 +392,28 @@ impl TermOverview {
         hub.pinned_repos.contains(entry)
     }
 
-    /// 侧栏里要画的：最上面固定的终端、固定的仓库，下面各个工作区里的仓库。筛「已停下」「运行中」时
-    /// 只留有那种终端的。
+    fn collapsed_repo(&self, entry: &RepoEntry, cx: &App) -> bool {
+        let hub = &self.app.read(cx).settings.term_hub;
+        hub.collapsed_repos.contains(entry)
+    }
+
+    /// 侧栏里要画的：最上面固定的终端、固定的仓库，下面各个工作区里的仓库，仓库下面是它的终端。
+    /// 筛「已停下」「运行中」时只留那种终端和有那种终端的仓库。
     fn side(&self, hub: &[RepoGroup], cx: &App) -> Side {
         let pins = &self.app.read(cx).settings.term_hub;
         let wanted =
             |rows: &[Row]| self.filter == Filter::All || rows.iter().any(|row| self.matches(row));
+        let repo = |(entry, rows): &Repo| {
+            let (pinned, own) = ordered(rows, &pins.pinned_terms);
+            let all: Vec<Row> = pinned.into_iter().chain(own).collect();
+            let listed = all.iter().filter(|row| self.matches(row));
+            SideRepo {
+                entry: entry.clone(),
+                listed: listed.cloned().collect(),
+                collapsed: pins.collapsed_repos.contains(entry),
+                all,
+            }
+        };
         let pinned_terms = pins
             .pinned_terms
             .iter()
@@ -364,17 +426,17 @@ impl TermOverview {
             .iter()
             .filter_map(|entry| repo_in(hub, entry))
             .filter(|(_, rows)| wanted(rows))
-            .cloned()
+            .map(repo)
             .collect();
         let groups = hub
             .iter()
             .filter_map(|group| {
                 // 固定了的仓库已经在上面，这里不再列
-                let repos: Vec<Repo> = group
+                let repos: Vec<SideRepo> = group
                     .repos
                     .iter()
                     .filter(|(entry, rows)| !pins.pinned_repos.contains(entry) && wanted(rows))
-                    .cloned()
+                    .map(repo)
                     .collect();
                 let collapsed = group
                     .workspace
@@ -398,53 +460,42 @@ impl TermOverview {
         }
     }
 
-    /// 侧栏里从上到下能选的行（收起的工作区里的不算）。
+    /// 侧栏里从上到下能选的行（收起的工作区、收起的仓库里的不算）。
     fn picks(side: &Side) -> Vec<Pick> {
-        let terms = side.pinned_terms.iter().map(|row| Pick::Term(row.slot()));
-        let pinned = side.pinned_repos.iter();
-        let listed = side
-            .groups
-            .iter()
-            .filter(|group| !group.collapsed)
-            .flat_map(|group| &group.repos);
-        let repos = pinned
-            .chain(listed)
-            .map(|(entry, _)| Pick::Repo(entry.clone()));
-        terms.chain(repos).collect()
-    }
-
-    /// 侧栏里高亮哪一行：显示着的是固定的终端（而且不是选仓库选出来的），就是「已固定」里它
-    /// 那一行；不然是选中的仓库。
-    fn highlight(&self, side: &Side) -> Option<Pick> {
-        if !self.by_repo
-            && let Some(slot) = &self.shown
-            && side.pinned_terms.iter().any(|row| row.slot() == *slot)
-        {
-            return Some(Pick::Term(slot.clone()));
+        let pinned = side.pinned_terms.iter();
+        let mut picks: Vec<Pick> = pinned.map(|row| Pick::Pinned(row.slot())).collect();
+        for (_, repo) in side.repos().filter(|(seen, _)| *seen) {
+            picks.push(Pick::Repo(repo.entry.clone()));
+            if !repo.collapsed {
+                picks.extend(repo.listed.iter().map(|row| Pick::Term(row.slot())));
+            }
         }
-        self.repo.clone().map(Pick::Repo)
+        picks
     }
 
-    /// 标签栏：固定的终端在前（换到哪个仓库都在），后面是选中的仓库里没固定的。
+    /// 侧栏里高亮哪一行：上一次选的是终端，就是显示着的那个终端的那一行（「已固定」里的，或者
+    /// 仓库下面的）；那一行没列着（仓库收起了、筛掉了、取消固定了），或者选的是仓库，就是选中的仓库。
+    fn highlight(&self, side: &Side) -> Option<Pick> {
+        let picks = Self::picks(side);
+        let listed = |pick: Pick| picks.contains(&pick).then_some(pick);
+        let term = || self.shown.clone().map(Pick::Term).and_then(listed);
+        let on = match self.cursor {
+            Cursor::Repo => None,
+            Cursor::Pinned => {
+                let pinned = self.shown.clone().map(Pick::Pinned);
+                pinned.and_then(listed).or_else(term)
+            }
+            Cursor::Term => term(),
+        };
+        on.or(self.repo.clone().map(Pick::Repo))
+    }
+
+    /// 标签栏：选中的仓库的终端，固定的在前，后面是没固定的。
     fn tabs(&self, hub: &[RepoGroup], cx: &App) -> (Vec<Row>, Vec<Row>) {
         let pins = &self.app.read(cx).settings.term_hub.pinned_terms;
-        let pinned = pins
-            .iter()
-            .filter_map(|slot| row_in(hub, slot))
-            .cloned()
-            .collect();
-        let own = self
-            .repo
-            .as_ref()
-            .and_then(|entry| repo_in(hub, entry))
-            .map(|(_, rows)| {
-                rows.iter()
-                    .filter(|row| !pins.contains(&row.slot()))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        (pinned, own)
+        let repo = self.repo.as_ref().and_then(|entry| repo_in(hub, entry));
+        repo.map(|(_, rows)| ordered(rows, pins))
+            .unwrap_or_default()
     }
 
     /// 这一页显示出来了：先选中一个要看的（已停下的优先），焦点放到侧栏上。
@@ -462,6 +513,7 @@ impl TermOverview {
             self.shown = first.map(Row::slot);
             if let Some(row) = first {
                 self.repo = Some(row.entry.clone());
+                self.cursor = Cursor::Term;
             }
         }
         // 选中的仓库不在了（从工作区里移走了，或者那台服务器断开了）：换成第一个
@@ -574,22 +626,22 @@ impl TermOverview {
         });
     }
 
-    /// 选中的仓库里先显示哪个终端：没固定的第一个；都固定了就是第一个。
+    /// 选中的仓库里先显示哪个终端：标签栏里的第一个。
     fn first_in_repo(&self, hub: &[RepoGroup], cx: &App) -> Option<TermSlot> {
-        let (_, rows) = repo_in(hub, self.repo.as_ref()?)?;
-        let free = rows.iter().find(|row| !self.pinned_term(&row.slot(), cx));
-        free.or(rows.first()).map(Row::slot)
+        let (pinned, own) = self.tabs(hub, cx);
+        pinned.first().or(own.first()).map(Row::slot)
     }
 
     /// 在侧栏里选中一个仓库：右边换成它的终端。
     fn select_repo(&mut self, entry: RepoEntry, window: &mut Window, cx: &mut Context<Self>) {
         let hub = self.hub(cx);
-        // 已经显示着这个仓库里没固定的终端：不动
-        let keep = self.shown.as_ref().is_some_and(|slot| {
-            slot.entry == entry && !self.pinned_term(slot, cx) && row_in(&hub, slot).is_some()
-        });
+        // 已经显示着这个仓库里的终端：不动
+        let keep = self
+            .shown
+            .as_ref()
+            .is_some_and(|slot| slot.entry == entry && row_in(&hub, slot).is_some());
         self.repo = Some(entry);
-        self.by_repo = true;
+        self.cursor = Cursor::Repo;
         if !keep {
             self.opening = None;
             self.shown = self.first_in_repo(&hub, cx);
@@ -598,20 +650,27 @@ impl TermOverview {
         cx.notify();
     }
 
-    /// 显示一个终端（点标签、点侧栏里固定的那一行）。
+    /// 显示一个终端（点标签、点侧栏里仓库下面它那一行）。
     fn select_term(&mut self, slot: TermSlot, window: &mut Window, cx: &mut Context<Self>) {
         if self.opening.as_ref() != Some(&slot) {
             self.opening = None;
         }
         self.repo = Some(slot.entry.clone());
-        self.by_repo = false;
+        self.cursor = Cursor::Term;
         self.shown = Some(slot);
         self.sync(window, cx);
         cx.notify();
     }
 
+    /// 显示一个固定的终端（点「已固定」里它那一行）：高亮留在那一行上。
+    fn select_pinned(&mut self, slot: TermSlot, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_term(slot, window, cx);
+        self.cursor = Cursor::Pinned;
+    }
+
     fn pick(&mut self, pick: Pick, window: &mut Window, cx: &mut Context<Self>) {
         match pick {
+            Pick::Pinned(slot) => self.select_pinned(slot, window, cx),
             Pick::Term(slot) => self.select_term(slot, window, cx),
             Pick::Repo(entry) => self.select_repo(entry, window, cx),
         }
@@ -650,6 +709,17 @@ impl TermOverview {
             app.edit_term_hub(cx, |hub| match hub.collapsed.contains(&key) {
                 true => hub.collapsed.retain(|other| *other != key),
                 false => hub.collapsed.push(key),
+            })
+        });
+        cx.notify();
+    }
+
+    /// 收起、展开一个仓库下面的终端。
+    fn toggle_repo(&mut self, entry: &RepoEntry, cx: &mut Context<Self>) {
+        self.app.update(cx, |app, cx| {
+            app.edit_term_hub(cx, |hub| match hub.collapsed_repos.contains(entry) {
+                true => hub.collapsed_repos.retain(|other| other != entry),
+                false => hub.collapsed_repos.push(entry.clone()),
             })
         });
         cx.notify();
@@ -764,7 +834,12 @@ impl TermOverview {
 
     /// 开（或者重新开）这个位置上的终端，显示它，焦点进去。
     fn open(&mut self, slot: TermSlot, window: &mut Window, cx: &mut Context<Self>) {
+        // 仓库收着的话展开：新开的终端要在侧栏里看得见
+        if self.collapsed_repo(&slot.entry, cx) {
+            self.toggle_repo(&slot.entry, cx);
+        }
         self.repo = Some(slot.entry.clone());
+        self.cursor = Cursor::Term;
         self.shown = Some(slot.clone());
         self.opening = Some(slot.clone());
         if self.visible {
@@ -889,9 +964,12 @@ impl TermOverview {
         let Some(row) = row_in(&hub, slot).cloned() else {
             return;
         };
-        // 显示的是它：换到同一个仓库里旁边那个
+        // 显示的是它：换到同一个仓库里旁边那个（按标签栏的顺序）
         let next = (self.shown.as_ref() == Some(slot)).then(|| {
             let (_, rows) = repo_in(&hub, &slot.entry)?;
+            let pins = &self.app.read(cx).settings.term_hub.pinned_terms;
+            let (pinned, own) = ordered(rows, pins);
+            let rows: Vec<Row> = pinned.into_iter().chain(own).collect();
             let at = rows.iter().position(|other| other.number == slot.number)?;
             let beside = rows
                 .get(at + 1)
@@ -956,8 +1034,8 @@ impl TermOverview {
         }
     }
 
-    /// 正往终端里输入时，抢在终端前面看一眼按键：Ctrl+Shift+↑、↓ 沿着标签栏换到上一个、下一个
-    /// 终端，接着输入。
+    /// 正往终端里输入时，抢在终端前面看一眼按键：Ctrl+Shift+↑、↓ 沿着侧栏换到上一个、下一个
+    /// 终端，接着输入，能跨仓库。收起的工作区、收起的仓库里的跳过（正显示着的那个仓库除外）。
     fn on_key_first(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let mods = &event.keystroke.modifiers;
         let hop = mods.control && mods.shift && !mods.alt && !mods.platform;
@@ -970,8 +1048,14 @@ impl TermOverview {
             return;
         }
         cx.stop_propagation();
-        let (pinned, own) = self.tabs(&self.hub(cx), cx);
-        let order: Vec<TermSlot> = pinned.iter().chain(&own).map(Row::slot).collect();
+        let side = self.side(&self.hub(cx), cx);
+        let here = self.shown.as_ref().map(|slot| &slot.entry);
+        let order: Vec<TermSlot> = side
+            .repos()
+            .filter(|(seen, repo)| (*seen && !repo.collapsed) || Some(&repo.entry) == here)
+            .flat_map(|(_, repo)| &repo.listed)
+            .map(Row::slot)
+            .collect();
         let at = self
             .shown
             .as_ref()
@@ -1182,7 +1266,7 @@ impl TermOverview {
                 this.focus.focus(window, cx);
                 match event.click_count() >= 2 {
                     true => this.go_term(&for_go, cx),
-                    false => this.select_term(for_click.clone(), window, cx),
+                    false => this.select_pinned(for_click.clone(), window, cx),
                 }
             }))
             .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
@@ -1228,14 +1312,114 @@ impl TermOverview {
             .into_any_element()
     }
 
-    /// 一个仓库的那一行：名字，行尾几个停下了、在跑、空着；鼠标移上去行尾换成固定和新建。
+    /// 仓库下面一个终端的那一行：状态、名字，行尾是停下、空闲了多久（固定着的是图钉）；鼠标移上去
+    /// 行尾换成固定和结束。比仓库那一行缩进一级，圆点对着仓库的名字。
+    fn render_term(&self, index: usize, row: &Row, on: bool, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (fg, muted, accent) = (
+            theme.sidebar_foreground,
+            theme.muted_foreground,
+            theme.primary,
+        );
+        let unseen = row.state == TermState::Stopped;
+        let slot = row.slot();
+        let pinned = self.pinned_term(&slot, cx);
+        let (for_click, for_go, for_pin, for_end) =
+            (slot.clone(), slot.clone(), slot.clone(), slot.clone());
+        let tip = self.term_tip(row, cx);
+        let since = row
+            .last_output
+            .filter(|_| row.alive && row.state != TermState::Running)
+            .map(ago);
+        let pin_tip = if pinned {
+            tr("取消固定")
+        } else {
+            tr("固定")
+        };
+        let pin_icon = if pinned {
+            IconName::PinOff
+        } else {
+            IconName::Pin
+        };
+        let pin = Self::row_button(("hub-pin-term", index), pin_icon, cx)
+            .tooltip(move |window, cx| ui::tip(pin_tip, window, cx))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_pin_term(&for_pin, cx);
+            }));
+        let end = Self::row_button(("hub-end-term", index), IconName::X, cx)
+            .tooltip(|window, cx| ui::tip(tr("结束此终端"), window, cx))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.end(&for_end, window, cx);
+            }));
+        let tail = h_flex()
+            .flex_none()
+            .min_w(px(46.))
+            .justify_end()
+            .pr(px(4.))
+            .text_size(px(11.))
+            .text_color(muted)
+            .group_hover("hub-row", |s| s.invisible());
+        let tail = match pinned {
+            true => tail.child(
+                Icon::new(IconName::Pin)
+                    .size(px(11.))
+                    .text_color(accent.opacity(0.8)),
+            ),
+            false => tail.children(since),
+        };
+        let (outer, inner) = Self::row_shell(("hub-term", index), on, cx);
+        outer
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                this.focus.focus(window, cx);
+                match event.click_count() >= 2 {
+                    true => this.go_term(&for_go, cx),
+                    false => this.select_term(for_click.clone(), window, cx),
+                }
+            }))
+            .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
+            .child(
+                inner
+                    .pl(px(36.))
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .w(px(12.))
+                            .justify_center()
+                            .child(Self::dot(row.state, 8., cx)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(if row.alive { fg } else { muted })
+                            .when(unseen, |el| el.font_weight(FontWeight::SEMIBOLD))
+                            .child(Self::term_name(row)),
+                    )
+                    .child(tail)
+                    .child(Self::row_actions().child(pin).child(end)),
+            )
+            .context_menu(term_menu(
+                cx.entity().downgrade(),
+                slot,
+                pinned,
+                self.app.read(cx).repo_name(&row.entry),
+            ))
+            .into_any_element()
+    }
+
+    /// 一个仓库的那一行：有终端的最前面是收起、展开的箭头，然后是名字；收着时行尾写几个停下了、
+    /// 在跑、空着；鼠标移上去行尾换成固定和新建。
     fn render_repo(
         &self,
         index: usize,
-        (entry, rows): &Repo,
+        repo: &SideRepo,
         on: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let (entry, rows) = (&repo.entry, &repo.all);
         let theme = cx.theme();
         let (fg, muted, accent) = (
             theme.sidebar_foreground,
@@ -1250,8 +1434,43 @@ impl TermOverview {
             true => format!("{}（{}）", entry.path, Self::place(app, entry)),
             false => entry.path.clone(),
         };
-        let (for_click, for_go, for_pin, for_new) =
-            (entry.clone(), entry.clone(), entry.clone(), entry.clone());
+        let (for_click, for_go, for_pin, for_new, for_fold) = (
+            entry.clone(),
+            entry.clone(),
+            entry.clone(),
+            entry.clone(),
+            entry.clone(),
+        );
+        // 箭头放在名字前面空着的那一块上，不占排版的位置：没有终端的仓库名字照样对得齐
+        let fold = (!repo.listed.is_empty()).then(|| {
+            let arrow = match repo.collapsed {
+                true => IconName::ChevronRight,
+                false => IconName::ChevronDown,
+            };
+            div()
+                .id(("hub-fold", index))
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .w(px(16.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(muted)
+                .hover(|s| s.text_color(fg))
+                .child(Icon::new(arrow).size(px(12.)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.focus.focus(window, cx);
+                    this.toggle_repo(&for_fold, cx);
+                }))
+        });
+        // 展开着时终端就列在下面，行尾不用再写个数；位置留着，鼠标移上去按钮才不压着名字
+        let counts = match repo.collapsed {
+            true => Self::counts(rows, cx),
+            false => h_flex().flex_none(),
+        };
         let pin_tip = if pinned {
             tr("取消固定")
         } else {
@@ -1302,12 +1521,13 @@ impl TermOverview {
                             .text_color(if empty { muted } else { fg }),
                     )
                     .child(
-                        Self::counts(rows, cx)
+                        counts
                             .min_w(px(46.))
                             .justify_end()
                             .pr(px(4.))
                             .group_hover("hub-row", |s| s.invisible()),
                     )
+                    .children(fold)
                     .child(Self::row_actions().child(pin).child(new)),
             )
             .context_menu(repo_menu(cx.entity().downgrade(), entry.clone(), pinned))
@@ -1350,7 +1570,7 @@ impl TermOverview {
         let all: Vec<Row> = group
             .repos
             .iter()
-            .flat_map(|(_, rows)| rows.iter().cloned())
+            .flat_map(|repo| repo.all.iter().cloned())
             .collect();
         let arrow = match group.collapsed {
             true => IconName::ChevronRight,
@@ -1457,6 +1677,29 @@ impl TermOverview {
             }))
     }
 
+    /// 侧栏里一个仓库的那一行，下面是它的终端（没收起的话）。
+    fn push_repo(
+        &self,
+        repo: &SideRepo,
+        on: &Option<Pick>,
+        index: &mut usize,
+        items: &mut Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) {
+        let is_on = |pick: Pick| on.as_ref() == Some(&pick);
+        let lit = is_on(Pick::Repo(repo.entry.clone()));
+        items.push(self.render_repo(*index, repo, lit, cx));
+        *index += 1;
+        if repo.collapsed {
+            return;
+        }
+        for row in &repo.listed {
+            let lit = is_on(Pick::Term(row.slot()));
+            items.push(self.render_term(*index, row, lit, cx));
+            *index += 1;
+        }
+    }
+
     /// 左边的侧栏。和仓库页的侧栏一样宽、一样的底色和字号：右边的画面才和仓库的终端页一样大。
     fn render_side(&self, width: f32, side: &Side, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
@@ -1493,14 +1736,12 @@ impl TermOverview {
                     .into_any_element(),
             );
             for row in &side.pinned_terms {
-                let on = is_on(Pick::Term(row.slot()));
+                let on = is_on(Pick::Pinned(row.slot()));
                 items.push(self.render_pinned_term(index, row, on, cx));
                 index += 1;
             }
             for repo in &side.pinned_repos {
-                let on = is_on(Pick::Repo(repo.0.clone()));
-                items.push(self.render_repo(index, repo, on, cx));
-                index += 1;
+                self.push_repo(repo, &on, &mut index, &mut items, cx);
             }
             items.push(
                 div()
@@ -1517,9 +1758,7 @@ impl TermOverview {
                 continue;
             }
             for repo in &group.repos {
-                let on = is_on(Pick::Repo(repo.0.clone()));
-                items.push(self.render_repo(index, repo, on, cx));
-                index += 1;
+                self.push_repo(repo, &on, &mut index, &mut items, cx);
             }
         }
         let empty =
@@ -1686,7 +1925,7 @@ impl TermOverview {
             .group("hub-tab")
             .h(px(30.))
             .min_w(px(60.))
-            .max_w(px(if pinned { 260. } else { 220. }))
+            .max_w(px(220.))
             .flex_shrink(1.)
             .pl(px(if pinned { 8. } else { 10. }))
             .pr(px(6.))
@@ -1713,20 +1952,6 @@ impl TermOverview {
                     .truncate()
                     .child(Self::term_name(row)),
             )
-            // 固定的标签换到哪个仓库都在：写上它是哪个仓库的，不然几个「终端 1」分不出来
-            .when(pinned, |el| {
-                el.child(
-                    div()
-                        .flex_shrink(2.)
-                        .min_w_0()
-                        .max_w(px(96.))
-                        .truncate()
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::NORMAL)
-                        .text_color(muted)
-                        .child(repo.clone()),
-                )
-            })
             .child(close)
             .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -1997,5 +2222,54 @@ impl Render for TermOverview {
             .on_key_down(cx.listener(Self::on_key))
             .child(self.render_side(width, &side, cx))
             .child(self.render_main(&hub, window, cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // 不整个引进来：界面库里也有一个叫 test 的属性宏，会顶掉标准的 #[test]
+    use super::{RepoEntry, Row, TermId, TermSlot, TermState, ordered};
+
+    fn row(number: u32) -> Row {
+        Row {
+            id: TermId {
+                machine: String::new(),
+                term: number.to_string(),
+            },
+            entry: RepoEntry {
+                server: None,
+                path: "/repo".into(),
+            },
+            number,
+            title: None,
+            last: String::new(),
+            cols: 80,
+            rows: 24,
+            alive: true,
+            state: TermState::Idle,
+            last_output: None,
+        }
+    }
+
+    #[test]
+    fn 仓库里的终端_固定的在前_别的仓库的固定不算() {
+        let rows = [row(1), row(2), row(3)];
+        let numbers = |rows: Vec<Row>| rows.iter().map(|row| row.number).collect::<Vec<_>>();
+        let other = TermSlot {
+            entry: RepoEntry {
+                server: None,
+                path: "/other".into(),
+            },
+            number: 1,
+        };
+        // 按固定的先后排，不是按序号；别的仓库里固定着的「终端 1」不影响这个仓库
+        let pins = [rows[2].slot(), other, rows[1].slot()];
+        let (pinned, own) = ordered(&rows, &pins);
+        assert_eq!(numbers(pinned), [3, 2]);
+        assert_eq!(numbers(own), [1]);
+        // 固定的终端不在了（列表里没有它）：不出现
+        let (pinned, own) = ordered(&rows[..1], &pins);
+        assert!(pinned.is_empty());
+        assert_eq!(numbers(own), [1]);
     }
 }
