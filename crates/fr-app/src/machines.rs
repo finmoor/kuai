@@ -15,7 +15,13 @@
 //!   （见 `fr_channel::Connection::connect_via`）。服务器的 id 是 `s` 加毫秒数，不会带 `>`。
 //! - Windows 服务器自己的仓库：它的文件里是反斜杠（和它上面的 Kuai 自己加的一样），这边和别的
 //!   服务器上的仓库一样用正斜杠（kuaid 给出来的路径也是这样）。
+//!
+//! 同一台电脑只用一个键（[`Identities`]）：经 156 连的那台认出来就是本机、就是 156 自己或者就是本机
+//! 直接配置的某一台时，一律换成那一台的键，不重复列、不绕路连。认电脑靠 kuaid 握手时报的标识
+//! （`fr_core::store::machine_id`），本机配置的服务器连上时记下它的（`Server::machine`），随服务器
+//! 列表交给本机的 kuaid，连上本机的电脑也就认得本机配置的服务器各是哪台。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,7 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app_state::{AppState, ConnStatus};
 use crate::mapping::Notice;
-use crate::settings::{Auth, RepoEntry, Settings, View};
+use crate::settings::{Auth, Front, RepoEntry, Settings, Tabs, TermSlot};
 
 /// 本机在各处当作「哪台电脑」的键：本机是空串，服务器是它的 id。
 pub const LOCAL: &str = "";
@@ -148,6 +154,167 @@ pub fn member_ref(machine: &str, entry: &RepoEntry) -> Option<RepoRef> {
     }
 }
 
+/// 认电脑用的：各台电脑是哪台（kuaid 握手时报的标识，见 `fr_core::store::machine_id`）。
+///
+/// 同一台电脑只用一个键：经别的电脑连的那台（`s156>sX`）认出来就是本机、就是它经由的那台，或者
+/// 就是本机直接配置的某一台时，一律换成那一台的键（[`Identities::canonical`]）。服务器页不重复列，
+/// 工作区里的仓库直接按那一台打开（不绕路），终端也只有一份。还没有谁连上过、认不出来的照常列着。
+pub struct Identities<'a> {
+    /// 本机的
+    pub local: Option<&'a str>,
+    /// 这次运行里连上的各台握手时报的
+    pub live: &'a HashMap<String, String>,
+    /// 本机配置的服务器（记着上次连上时报的）
+    pub servers: &'a [crate::settings::Server],
+    /// 各台电脑保存的东西：它们配置的服务器也记着各是哪台
+    pub machines: &'a HashMap<String, Machine>,
+}
+
+impl Identities<'_> {
+    /// 电脑 `key` 是哪台；不知道是 None。连着的以握手时报的为准。
+    pub fn of(&self, key: &str) -> Option<&str> {
+        if key == LOCAL {
+            return self.local;
+        }
+        if let Some(id) = self.live.get(key) {
+            return Some(id);
+        }
+        match split_relay(key) {
+            Some((via, server)) => self
+                .machines
+                .get(via)?
+                .store
+                .server(server)?
+                .machine
+                .as_deref(),
+            None => self
+                .servers
+                .iter()
+                .find(|server| server.id == key)?
+                .machine
+                .as_deref(),
+        }
+    }
+
+    /// 同一台电脑只用一个键：经别的电脑连的那台是本机、是它经由的那台，或者是本机直接配置的一台
+    /// （配置了几次的话第一个）时，换成那一台的键。别的原样。
+    pub fn canonical(&self, key: &str) -> String {
+        let (Some((via, _)), Some(id)) = (split_relay(key), self.of(key)) else {
+            return key.to_string();
+        };
+        if self.local == Some(id) {
+            return LOCAL.to_string();
+        }
+        if self.of(via) == Some(id) {
+            return via.to_string();
+        }
+        self.servers
+            .iter()
+            .find(|server| self.of(&server.id) == Some(id))
+            .map_or_else(|| key.to_string(), |server| server.id.clone())
+    }
+
+    /// 经别的电脑连的这台其实是另一个键（见 [`Self::canonical`]）。
+    pub fn duplicate(&self, key: &str) -> bool {
+        self.canonical(key) != key
+    }
+
+    /// 仓库换到它所在的那台电脑的键下（见 [`Self::canonical`]），路径换成那一台的写法。
+    pub fn entry(&self, entry: RepoEntry) -> RepoEntry {
+        let key = machine_of(&entry);
+        let canonical = self.canonical(key);
+        if canonical == key {
+            return entry;
+        }
+        let path = self.path_on(&canonical, &entry.path);
+        RepoEntry {
+            server: (canonical != LOCAL).then_some(canonical),
+            path,
+        }
+    }
+
+    /// 电脑 `key` 上的一个仓库这边怎么写：它的列表里有就用列表里的写法（Windows 上大小写、斜杠
+    /// 不同也认作同一个）；没有的话，本机是 Windows 时换成反斜杠（本机的仓库这样写），服务器上的原样。
+    fn path_on(&self, key: &str, path: &str) -> String {
+        if let Some(machine) = self.machines.get(key)
+            && let Some(listed) = machine.store.listed(path, machine.windows)
+        {
+            return own_entry(key, machine.windows, listed).path;
+        }
+        match key == LOCAL && cfg!(windows) {
+            true => path.replace('/', "\\"),
+            false => path.to_string(),
+        }
+    }
+
+    /// 电脑 `machine` 的工作区里的一个仓库，这边怎么写（[`member_entry`]，再换到它所在的那台下）。
+    pub fn member(&self, machine: &str, repo: &RepoRef) -> RepoEntry {
+        let windows = self
+            .machines
+            .get(machine)
+            .is_some_and(|loaded| loaded.windows);
+        self.entry(member_entry(machine, windows, repo))
+    }
+
+    /// 反过来：这个仓库放进电脑 `machine` 的工作区时怎么写。那台的工作区里已经有它（哪种写法都算）
+    /// 就用那一种；那台访问不到的是 None。经由那台连得到的也算访问得到：本机的仓库放进 156 的
+    /// 工作区，156 配置了本机的话，写成 156 配置的那台服务器上的。
+    pub fn member_ref(&self, machine: &str, entry: &RepoEntry) -> Option<RepoRef> {
+        let loaded = self.machines.get(machine);
+        let written = loaded.and_then(|loaded| {
+            loaded
+                .store
+                .workspaces
+                .iter()
+                .flat_map(|workspace| &workspace.repos)
+                .find(|repo| self.member(machine, repo) == *entry)
+        });
+        if let Some(repo) = written {
+            return Some(repo.clone());
+        }
+        if let Some(repo) = member_ref(machine, entry) {
+            return Some(repo);
+        }
+        if machine == LOCAL {
+            return None;
+        }
+        let id = self.of(machine_of(entry))?;
+        let server = loaded?
+            .store
+            .servers
+            .iter()
+            .find(|server| server.machine.as_deref() == Some(id))?;
+        // 本机的仓库到了别的电脑那里，和别的服务器上的一样写正斜杠
+        let path = match entry.server.is_none() && cfg!(windows) {
+            true => entry.path.replace('\\', "/"),
+            false => entry.path.clone(),
+        };
+        Some(RepoRef {
+            server: Some(server.id.clone()),
+            path,
+        })
+    }
+
+    /// 服务器页左边列的电脑：本机、本机配置的各台服务器；连着的服务器上配置的服务器（经由它连接）
+    /// 跟在它下面，认出来是本机、是它自己或者本机直接配置了的那台的不列。
+    pub fn machine_keys(&self) -> Vec<String> {
+        let mut keys = vec![LOCAL.to_string()];
+        for server in self.servers {
+            keys.push(server.id.clone());
+            let Some(loaded) = self.machines.get(&server.id) else {
+                continue;
+            };
+            for relayed in &loaded.store.servers {
+                let key = relay_key(&server.id, &relayed.id);
+                if !self.duplicate(&key) {
+                    keys.push(key);
+                }
+            }
+        }
+        keys
+    }
+}
+
 /// 名字去掉首尾空白；空的话叫「工作区」；和已有的重了就加上 2、3……
 pub fn unique_name<'a>(name: &str, existing: impl Iterator<Item = &'a str>) -> String {
     let base = match name.trim() {
@@ -227,6 +394,11 @@ pub(crate) fn migration_ops(settings: &mut Settings, local: &Store) -> Vec<Op> {
     if let Some(current) = current {
         settings.current = current;
     }
+    // 1.13 以前的设置：开着的标签页这时才挪进各个工作区的记法，再带到全局的那一份里
+    if settings.tabs().repos.is_empty() {
+        settings.tabs = None;
+        settings.migrate_tabs();
+    }
     ops
 }
 
@@ -268,6 +440,11 @@ impl AppState {
         let store = fr_core::store::load(&fr_core::store::path());
         self.machines
             .insert(LOCAL.to_string(), Machine::new(store, cfg!(windows)));
+        // 本机是哪台：先读文件，连上的服务器、经它们连的服务器是不是本机马上就认得出来
+        match fr_core::store::machine_id(&fr_core::store::path()) {
+            Ok(id) => self.local_machine = Some(id),
+            Err(err) => log::warn!("读不了本机的标识：{err:#}"),
+        }
         let mut ops = Vec::new();
         if !self.settings.store_migrated {
             ops = migration_ops(&mut self.settings, &self.machines[LOCAL].store);
@@ -293,15 +470,14 @@ impl AppState {
 
     /// 启动时连上设了「启动时自动连接」的服务器（默认都设着），它们的仓库、工作区、终端不用等人去点
     /// 「连接」才有。不弹窗：存着密码、用得了密钥的连得上；要问密码的这一次算连不上，卡片上有「重试」。
-    /// 用密码登录又没存密码的肯定要问，不去连。现在用的工作区所在的那台不在这里连：它本来就会连，
-    /// 要密码时照常弹窗。
+    /// 用密码登录又没存密码的肯定要问，不去连。1.16 以前现在用的工作区所在的那台不在这里连（标签页
+    /// 跟着它，要密码时弹窗）；现在标签页不跟工作区走，它和别的服务器一样。
     fn auto_connect(&mut self, cx: &mut Context<Self>) {
-        let current = self.settings.current.machine.clone();
         let ids: Vec<String> = self
             .settings
             .servers
             .iter()
-            .filter(|server| !server.manual_connect && server.id != current)
+            .filter(|server| !server.manual_connect)
             .filter(|server| {
                 server.auth != Auth::Password || crate::secrets::get(&server.id).is_some()
             })
@@ -327,6 +503,7 @@ impl AppState {
                 password_auth: server.auth == Auth::Password,
                 identity_file: server.key_file().map(str::to_string),
                 jump: server.jump.clone(),
+                machine: server.machine.clone(),
             })
             .collect();
         let same = self
@@ -341,6 +518,93 @@ impl AppState {
         if let Some(op) = self.servers_op() {
             self.apply(LOCAL, vec![op], cx);
         }
+    }
+
+    // ---- 认电脑 ----
+
+    /// 认电脑用的（见 [`Identities`]）。
+    pub fn ids(&self) -> Identities<'_> {
+        Identities {
+            local: self.local_machine.as_deref(),
+            live: &self.machine_ids,
+            servers: &self.settings.servers,
+            machines: &self.machines,
+        }
+    }
+
+    /// 记下连上的电脑 `key` 是哪台（握手时报的）。本机配置的服务器记进设置、交给本机的 kuaid，
+    /// 别的电脑经本机连它时也认得；经别的电脑连着的那几台里认出重复的，不再单独订阅。
+    pub(crate) fn learn_machine(&mut self, key: &str, machine: &str, cx: &mut Context<Self>) {
+        match key == LOCAL {
+            true => self.local_machine = Some(machine.to_string()),
+            false => drop(
+                self.machine_ids
+                    .insert(key.to_string(), machine.to_string()),
+            ),
+        }
+        if split_relay(key).is_none()
+            && let Some(server) = self.settings.servers.iter_mut().find(|s| s.id == key)
+            && server.machine.as_deref() != Some(machine)
+        {
+            server.machine = Some(machine.to_string());
+            self.save();
+            self.push_servers(cx);
+        }
+        self.drop_duplicates(cx);
+    }
+
+    /// 经别的电脑连着的那几台里认出是重复的（就是本机或者别的某一台）：不再订阅它的仓库列表和
+    /// 终端，读到的也不留（各一份就够）。连接本身留着，正用着它的标签页换过去以前照样能用。
+    fn drop_duplicates(&mut self, cx: &mut Context<Self>) {
+        let duplicates: Vec<String> = {
+            let ids = self.ids();
+            self.machines
+                .keys()
+                .chain(self.links.keys())
+                .filter(|key| ids.duplicate(key))
+                .cloned()
+                .collect()
+        };
+        if duplicates.is_empty() {
+            return;
+        }
+        for key in duplicates {
+            let target = self.ids().canonical(&key);
+            log::info!(
+                "{key} 和 {} 是同一台电脑，不再单独订阅",
+                self.machine_name(&target)
+            );
+            self.machines.remove(&key);
+            self.links.remove(&key);
+            self.watches.remove(&key);
+        }
+        cx.notify();
+    }
+
+    /// 经别的电脑连上的这台认出来就是本机或者已有的一台：说一声（它从服务器页上收起来了）。
+    /// 服务器页上那一行要读到经由的那台的服务器列表才有；还没读到时（恢复标签页时自动连的）
+    /// 那一行没出现过，名字也查不到，不说。
+    pub(crate) fn note_duplicate(&mut self, key: &str, cx: &mut Context<Self>) {
+        let target = self.ids().canonical(key);
+        log::info!("{key} 和 {} 是同一台电脑", self.machine_name(&target));
+        let (Some((via, _)), Some(name)) = (
+            split_relay(key),
+            self.relayed_server(key).map(|server| server.name.clone()),
+        ) else {
+            return;
+        };
+        let text = tf!(
+            "经由 {via} 连接的「{name}」与「{target}」是同一台电脑，不再单独列出。",
+            via = self.machine_name(via),
+            name,
+            target = self.machine_name(&target)
+        );
+        cx.emit(Notice::Info(text.into()));
+    }
+
+    /// 服务器页左边列的电脑（见 [`Identities::machine_keys`]）。
+    pub fn machine_keys(&self) -> Vec<String> {
+        self.ids().machine_keys()
     }
 
     // ---- 改动和订阅 ----
@@ -690,6 +954,14 @@ impl AppState {
         }
     }
 
+    /// 这个仓库在列表里哪个仓库的目录下面（同一台电脑的列表里、不是它自己）。子仓库的标签页、
+    /// 标签上同名时写的说明用；不是子仓库是 None。
+    pub fn root_of(&self, entry: &RepoEntry) -> Option<RepoEntry> {
+        self.repos_on(machine_of(entry))?
+            .into_iter()
+            .find(|root| root != entry && root.contains(entry))
+    }
+
     /// 悬停提示里的名字：经服务器连的写明经由哪台。
     pub fn repo_tip(&self, entry: &RepoEntry) -> SharedString {
         let title = self.repo_title(entry);
@@ -729,29 +1001,41 @@ impl AppState {
         }
     }
 
-    /// 工作区里的仓库（这边的写法），按加进来的先后；没读到是空的。
+    /// 工作区里的仓库（这边的写法，同一台电脑只用一个键），按加进来的先后；没读到是空的。
+    /// 两种写法指的是同一个仓库（比如 156 自己的和经 156 配置的「156」的）只列一次。
     pub fn members(&self, key: &WorkspaceKey) -> Vec<RepoEntry> {
-        let Some(machine) = self.machines.get(&key.machine) else {
-            return Vec::new();
-        };
-        self.workspace(key)
-            .map(|workspace| {
-                workspace
-                    .repos
-                    .iter()
-                    .map(|repo| member_entry(&key.machine, machine.windows, repo))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let ids = self.ids();
+        let mut members: Vec<RepoEntry> = Vec::new();
+        for repo in self.workspace(key).map_or(&[][..], |w| &w.repos) {
+            let entry = ids.member(&key.machine, repo);
+            if !members.contains(&entry) {
+                members.push(entry);
+            }
+        }
+        members
     }
 
-    /// 当前工作区在这台电脑上记的标签页。
-    pub fn view(&self) -> View {
-        let key = &self.settings.current;
-        self.settings
-            .view(key)
-            .cloned()
-            .unwrap_or_else(|| View::new(key.clone()))
+    /// 标题栏上开着的标签页（全局一份）。
+    pub fn tabs(&self) -> &Tabs {
+        self.settings.tabs()
+    }
+
+    /// 包含这个仓库的第一个工作区（读到了的电脑上，本机的在前）。子仓库算它所在的仓库的。
+    /// 标签页右键的「在工作区页中显示」用。
+    pub fn workspace_of(&self, entry: &RepoEntry) -> Option<WorkspaceKey> {
+        let mut machines: Vec<&String> = self.machines.keys().collect();
+        machines.sort_by(|a, b| (a.as_str() != LOCAL, a).cmp(&(b.as_str() != LOCAL, b)));
+        let keys: Vec<WorkspaceKey> = machines
+            .into_iter()
+            .flat_map(|machine| self.workspaces_on(machine).unwrap_or_default())
+            .map(|(key, _, _)| key)
+            .collect();
+        let find = |wanted: &dyn Fn(&RepoEntry) -> bool| {
+            keys.iter()
+                .find(|key| self.members(key).iter().any(wanted))
+                .cloned()
+        };
+        find(&|member| member == entry).or_else(|| find(&|member| member.contains(entry)))
     }
 
     /// 一台电脑上的全部工作区：键、名字、有几个仓库。没读到是 None。
@@ -774,33 +1058,38 @@ impl AppState {
     }
 
     /// 站在电脑 `machine` 上看得到的仓库：它自己的，和它配置的服务器上的（读到了的才有）。
-    /// 本机的工作区能放的就是这些（「仓库」页、快速打开里列的）。
+    /// 那台电脑的工作区能放的就是这些（工作区页的「添加仓库…」里列的）。它配置的服务器认出来是
+    /// 本机或者本机直接配置的一台时，列那一台的（同一台电脑只用一个键）；是它自己的不重复列。
     pub fn perspective_repos(&self, machine: &str) -> Vec<RepoEntry> {
-        let mut repos = self.repos_on(machine).unwrap_or_default();
-        let servers: Vec<String> = match machine == LOCAL {
-            true => self.settings.servers.iter().map(|s| s.id.clone()).collect(),
-            false => self
-                .machines
-                .get(machine)
-                .map(|loaded| {
-                    loaded
-                        .store
-                        .servers
-                        .iter()
-                        .map(|s| relay_key(machine, &s.id))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        };
-        for key in servers {
-            repos.extend(self.repos_on(&key).unwrap_or_default());
+        let mut keys: Vec<String> = vec![machine.to_string()];
+        match machine == LOCAL {
+            true => keys.extend(self.settings.servers.iter().map(|s| s.id.clone())),
+            false => {
+                let ids = self.ids();
+                if let Some(loaded) = self.machines.get(machine) {
+                    for server in &loaded.store.servers {
+                        let key = ids.canonical(&relay_key(machine, &server.id));
+                        if !keys.contains(&key) {
+                            keys.push(key);
+                        }
+                    }
+                }
+            }
+        }
+        let mut repos: Vec<RepoEntry> = Vec::new();
+        for key in keys {
+            for entry in self.repos_on(&key).unwrap_or_default() {
+                if !repos.contains(&entry) {
+                    repos.push(entry);
+                }
+            }
         }
         repos
     }
 
     // ---- 工作区 ----
 
-    /// 换到一个工作区。
+    /// 工作区页上选中一个工作区（下次打开这一页还是它）。只是选中，标签页不动。
     pub fn set_current(&mut self, key: WorkspaceKey, cx: &mut Context<Self>) {
         let name = self.workspace(&key).map(|w| w.name.clone());
         let view = self.settings.view_mut(&key);
@@ -811,14 +1100,13 @@ impl AppState {
         if !key.is_local() && !self.settings.used_machines.contains(&key.machine) {
             self.settings.used_machines.push(key.machine.clone());
         }
+        self.menu_machine = Some(key.machine.clone());
         self.settings.current = key;
-        // 工作区菜单跟回当前工作区所在的那台电脑
-        self.menu_machine = None;
         self.save();
         cx.notify();
     }
 
-    /// 工作区菜单列哪台电脑上的工作区：菜单里换过就是换到的那台（它还在的话），不然是当前
+    /// 工作区页列哪台电脑上的工作区：页面上的下拉里换过就是换到的那台（它还在的话），不然是选中的
     /// 工作区所在的那台。
     pub fn menu_machine(&self) -> String {
         let known = |id: &String| id == LOCAL || self.settings.servers.iter().any(|s| s.id == *id);
@@ -949,19 +1237,6 @@ impl AppState {
         }
     }
 
-    /// 在当前工作区里打开了一个仓库：它成了这个工作区的仓库，也进它所在那台电脑的列表。
-    pub fn adopt(&mut self, entry: &RepoEntry, cx: &mut Context<Self>) {
-        let key = self.settings.current.clone();
-        if let Some(repo) = member_ref(&key.machine, entry)
-            && self.writable(&key.machine)
-            && !self.members(&key).contains(entry)
-        {
-            let id = key.id.clone();
-            self.apply(&key.machine, vec![Op::AddToWorkspace { id, repo }], cx);
-        }
-        self.add_repo(entry.clone(), cx);
-    }
-
     /// 从它所在那台电脑的列表里去掉仓库（仓库本身不动）；各台电脑的工作区里有它的也去掉。
     pub fn remove_repo(&mut self, entry: &RepoEntry, cx: &mut Context<Self>) {
         let machine = machine_of(entry).to_string();
@@ -969,23 +1244,26 @@ impl AppState {
         if !self.apply(&machine, vec![Op::RemoveRepo { path }], cx) {
             return;
         }
-        // 别的电脑上的工作区里放着它的（比如本机的工作区里有 91 上的这个仓库）
+        // 别的电脑上的工作区里放着它的（比如本机的工作区里有 91 上的这个仓库，156 的工作区里有
+        // 经 156 配置的「本机」放进去的本机的这个仓库）
         let mut elsewhere: Vec<(String, Vec<Op>)> = Vec::new();
+        let ids = self.ids();
         for (key, loaded) in &self.machines {
             if *key == machine || !loaded.live {
                 continue;
             }
-            let Some(repo) = member_ref(key, entry) else {
-                continue;
-            };
             let ops: Vec<Op> = loaded
                 .store
                 .workspaces
                 .iter()
-                .filter(|w| w.repos.contains(&repo))
-                .map(|w| Op::RemoveFromWorkspace {
-                    id: w.id.clone(),
-                    repo: repo.clone(),
+                .flat_map(|w| {
+                    w.repos
+                        .iter()
+                        .filter(|repo| ids.member(key, repo) == *entry)
+                        .map(|repo| Op::RemoveFromWorkspace {
+                            id: w.id.clone(),
+                            repo: repo.clone(),
+                        })
                 })
                 .collect();
             if !ops.is_empty() {
@@ -1007,92 +1285,120 @@ impl AppState {
         self.apply(machine_of(entry), vec![Op::RenameRepo { path, name }], cx);
     }
 
-    /// 把仓库从当前工作区去掉（它还在列表里，别的工作区里的也不动）。
-    pub fn remove_from_workspace(&mut self, entry: &RepoEntry, cx: &mut Context<Self>) -> bool {
-        let key = self.settings.current.clone();
-        let Some(repo) = member_ref(&key.machine, entry) else {
+    /// 把仓库放进工作区 `key`（已经在了不动）。那台电脑访问不到这个仓库的（本机的仓库放进没有配置
+    /// 本机的服务器的工作区）放不进，返回假。
+    pub fn add_to_workspace(
+        &mut self,
+        key: &WorkspaceKey,
+        entry: &RepoEntry,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(repo) = self.ids().member_ref(&key.machine, entry) else {
             return false;
         };
+        if self.members(key).contains(entry) {
+            return true;
+        }
         let id = key.id.clone();
-        let removed = self.apply(&key.machine, vec![Op::RemoveFromWorkspace { id, repo }], cx);
-        if removed {
-            self.settings.view_mut(&key).forget(entry);
-            self.save();
-        }
-        removed
+        self.apply(&key.machine, vec![Op::AddToWorkspace { id, repo }], cx)
     }
 
-    /// 把仓库放进同一台电脑上的另一个工作区，在那边开着（标签页移过去时用）。
-    pub fn push_tab_to_workspace(
+    /// 把仓库从工作区 `key` 去掉（它还在列表里，别的工作区里的也不动，开着的标签页也不关）。
+    /// 工作区里几种写法指的都是它的，一起去掉。
+    pub fn remove_from_workspace(
         &mut self,
-        to: &WorkspaceKey,
-        entry: RepoEntry,
+        key: &WorkspaceKey,
+        entry: &RepoEntry,
         cx: &mut Context<Self>,
-    ) {
-        if let Some(repo) = member_ref(&to.machine, &entry) {
-            let id = to.id.clone();
-            self.apply(&to.machine, vec![Op::AddToWorkspace { id, repo }], cx);
+    ) -> bool {
+        let ops: Vec<Op> = {
+            let ids = self.ids();
+            self.workspace(key)
+                .map_or(&[][..], |w| &w.repos)
+                .iter()
+                .filter(|repo| ids.member(&key.machine, repo) == *entry)
+                .map(|repo| Op::RemoveFromWorkspace {
+                    id: key.id.clone(),
+                    repo: repo.clone(),
+                })
+                .collect()
+        };
+        if ops.is_empty() {
+            return false;
         }
-        let view = self.settings.view_mut(to);
-        view.closed.retain(|e| *e != entry);
-        if !view.tabs.contains(&entry) {
-            view.tabs.push(entry);
-        }
-        self.save();
-        cx.notify();
+        self.apply(&key.machine, ops, cx)
     }
 
-    // ---- 当前工作区的标签页（只记在这台电脑上） ----
+    // ---- 标签页（全局一份，只记在这台电脑上） ----
 
-    /// 记下当前工作区开着的标签页和选中的那一个。
-    pub fn set_open_tabs(&mut self, tabs: Vec<RepoEntry>, active: usize) {
-        let key = self.settings.current.clone();
-        let view = self.settings.view_mut(&key);
-        if view.tabs != tabs || view.active != active {
+    /// 记下开着的标签页和显示着的那一页。
+    pub fn set_tabs(&mut self, repos: Vec<RepoEntry>, terms: Vec<TermSlot>, front: Front) {
+        let tabs = self.settings.tabs_mut();
+        if tabs.repos != repos || tabs.terms != terms || tabs.front != front {
             // 重新打开了的不算「关掉的」了
-            view.closed.retain(|e| !tabs.contains(e));
-            view.pinned.retain(|e| tabs.contains(e));
-            view.tabs = tabs;
-            view.active = active;
+            tabs.closed.retain(|e| !repos.contains(e));
+            tabs.pinned.retain(|e| repos.contains(e));
+            tabs.repos = repos;
+            tabs.terms = terms;
+            tabs.front = front;
             self.save();
         }
     }
 
-    /// 固定、取消固定当前工作区里的一个标签页；返回现在是不是固定的。
+    /// 固定、取消固定一个仓库标签页；返回现在是不是固定的。
     pub fn toggle_pinned(&mut self, entry: &RepoEntry, cx: &mut Context<Self>) -> bool {
-        let key = self.settings.current.clone();
-        let view = self.settings.view_mut(&key);
-        let pinned = !view.is_pinned(entry);
-        view.pinned.retain(|e| e != entry);
+        let tabs = self.settings.tabs_mut();
+        let pinned = !tabs.is_pinned(entry);
+        tabs.pinned.retain(|e| e != entry);
         if pinned {
-            view.pinned.push(entry.clone());
+            tabs.pinned.push(entry.clone());
         }
-        view.pinned_first();
+        tabs.pinned_first();
         self.save();
         cx.notify();
         pinned
     }
 
-    /// 记下当前工作区刚关掉的一个标签页（Ctrl+Shift+T 和快速打开里能找回来）。
-    pub fn note_closed_tab(&mut self, entry: RepoEntry) {
-        let key = self.settings.current.clone();
-        self.settings.view_mut(&key).note_closed(entry);
+    /// 标签页换了一种写法（经别的电脑连的那台认出来是哪一台了）：固定着的照样固定。
+    pub fn repin(&mut self, from: &RepoEntry, to: &RepoEntry) {
+        let tabs = self.settings.tabs_mut();
+        if tabs.is_pinned(from) && !tabs.is_pinned(to) {
+            tabs.pinned.push(to.clone());
+        }
     }
 
-    /// 当前工作区最近关掉的标签页，最近的在前。已经移出工作区的不算（读到了才看得出）。
+    /// 记下刚关掉的一个仓库标签页（Ctrl+Shift+T 和快速打开里能找回来）。
+    pub fn note_closed_tab(&mut self, entry: RepoEntry) {
+        self.settings.tabs_mut().note_closed(entry);
+    }
+
+    /// 最近关掉的仓库标签页，最近的在前。
     pub fn closed_tabs(&self) -> Vec<RepoEntry> {
-        let key = &self.settings.current;
-        let members = self
+        self.tabs().closed.iter().rev().cloned().collect()
+    }
+
+    /// 各台电脑列表里的仓库（读到了的），本机的在前，再是本机配置的服务器、经服务器连的。
+    /// 快速打开里列的就是这些。经服务器连的那台认出来是重复的不列（见 [`Identities`]）。
+    pub fn all_repos(&self) -> Vec<RepoEntry> {
+        let ids = self.ids();
+        let mut machines: Vec<&String> = self
             .machines
-            .contains_key(&key.machine)
-            .then(|| self.members(key));
-        self.view()
-            .closed
-            .iter()
-            .rev()
-            .filter(|e| members.as_ref().is_none_or(|members| members.contains(e)))
-            .cloned()
-            .collect()
+            .keys()
+            .filter(|key| !ids.duplicate(key))
+            .collect();
+        machines.sort_by(|a, b| {
+            let rank = |key: &str| (key != LOCAL, split_relay(key).is_some());
+            (rank(a), a).cmp(&(rank(b), b))
+        });
+        let mut repos: Vec<RepoEntry> = Vec::new();
+        for machine in machines {
+            for entry in self.repos_on(machine).unwrap_or_default() {
+                if !repos.contains(&entry) {
+                    repos.push(entry);
+                }
+            }
+        }
+        repos
     }
 }
 
@@ -1111,11 +1417,212 @@ pub fn new_workspace_id(store: &Store) -> String {
 mod tests {
     // 不能 `use super::*`：gpui_kit 里也有个叫 test 的属性宏，会盖住标准库的 #[test]
     use super::{
-        LOCAL, WorkspaceKey, machine_of, member_entry, member_ref, merge_ops, migration_ops,
-        new_workspace_id, split_relay, unique_name,
+        Identities, LOCAL, Machine, WorkspaceKey, machine_of, member_entry, member_ref, merge_ops,
+        migration_ops, new_workspace_id, split_relay, unique_name,
     };
-    use crate::settings::{RepoEntry, Settings};
-    use fr_core::store::{Op, RepoRef, Store};
+    use crate::settings::{Front, RepoEntry, Settings};
+    use fr_core::store::{Op, RepoRef, Store, Workspace};
+    use std::collections::HashMap;
+
+    const L: &str = "1111aaaa1111aaaa1111aaaa1111aaaa";
+    const A: &str = "2222bbbb2222bbbb2222bbbb2222bbbb";
+    const B: &str = "3333cccc3333cccc3333cccc3333cccc";
+    const X: &str = "4444dddd4444dddd4444dddd4444dddd";
+
+    /// 本机（Windows，标识 L）配置了 sA（A）、sB（B）、sC（还没连上过）。sA 配置了 s1 = B、s2 = 本机、
+    /// s3 = sA 自己（换了个用户名）、s4（sA 也没连上过，不知道是哪台）、s5 = 一台本机没配置的 X；
+    /// 它的工作区里有自己的仓库、经 s2 放进去的本机仓库（大小写和斜杠不一样）、经 s1 放进去的 sB 的。
+    struct World {
+        servers: Vec<crate::settings::Server>,
+        machines: HashMap<String, Machine>,
+        live: HashMap<String, String>,
+    }
+
+    impl World {
+        fn new() -> World {
+            let server = |id: &str, machine: Option<&str>| crate::settings::Server {
+                id: id.into(),
+                name: id.into(),
+                destination: format!("u@{id}"),
+                machine: machine.map(str::to_string),
+                ..Default::default()
+            };
+            let relayed = |id: &str, machine: Option<&str>| fr_core::store::Server {
+                id: id.into(),
+                name: id.into(),
+                destination: format!("u@{id}"),
+                machine: machine.map(str::to_string),
+                ..Default::default()
+            };
+            let on = |server: Option<&str>, path: &str| RepoRef {
+                server: server.map(str::to_string),
+                path: path.into(),
+            };
+            let local = Store {
+                repos: vec![r"C:\src\erp".into(), r"C:\src\web".into()],
+                ..Store::default()
+            };
+            let a = Store {
+                repos: vec!["/srv/a".into()],
+                servers: vec![
+                    relayed("s1", Some(B)),
+                    relayed("s2", Some(L)),
+                    relayed("s3", Some(A)),
+                    relayed("s4", None),
+                    relayed("s5", Some(X)),
+                ],
+                workspaces: vec![Workspace {
+                    id: "w".into(),
+                    name: "交付".into(),
+                    repos: vec![
+                        on(None, "/srv/a"),
+                        on(Some("s2"), "c:/src/ERP"),
+                        on(Some("s1"), "/srv/b"),
+                        on(Some("s3"), "/srv/a"),
+                        on(Some("s4"), "/srv/d"),
+                    ],
+                }],
+                ..Store::default()
+            };
+            let b = Store {
+                repos: vec!["/srv/b".into()],
+                ..Store::default()
+            };
+            World {
+                servers: vec![
+                    server("sA", Some(A)),
+                    server("sB", Some(B)),
+                    server("sC", None),
+                ],
+                machines: HashMap::from([
+                    (LOCAL.to_string(), Machine::new(local, true)),
+                    ("sA".to_string(), Machine::new(a, false)),
+                    ("sB".to_string(), Machine::new(b, false)),
+                ]),
+                live: HashMap::new(),
+            }
+        }
+
+        fn ids(&self) -> Identities<'_> {
+            Identities {
+                local: Some(L),
+                live: &self.live,
+                servers: &self.servers,
+                machines: &self.machines,
+            }
+        }
+    }
+
+    #[test]
+    fn 经由别的电脑连的那台_认出来是谁就换成谁的键() {
+        let mut world = World::new();
+        let ids = world.ids();
+        assert_eq!(ids.canonical("sA>s1"), "sB", "本机直接配置了的那台");
+        assert_eq!(ids.canonical("sA>s2"), LOCAL, "就是本机");
+        assert_eq!(ids.canonical("sA>s3"), "sA", "就是它经由的那台");
+        assert_eq!(ids.canonical("sA>s4"), "sA>s4", "认不出来的照常");
+        assert_eq!(ids.canonical("sA>s5"), "sA>s5", "别的电脑，本机没配置");
+        assert_eq!(ids.canonical("sB"), "sB");
+        assert_eq!(ids.canonical(LOCAL), LOCAL);
+        assert!(ids.duplicate("sA>s2") && !ids.duplicate("sA>s4") && !ids.duplicate("sA"));
+        // 服务器页：重复的不列，认不出来的、别的电脑照常挂在 sA 下面
+        assert_eq!(
+            ids.machine_keys(),
+            [LOCAL, "sA", "sA>s4", "sA>s5", "sB", "sC"]
+        );
+        // 经 sA 连上 s4 以后握手报的是本机：也认出来了
+        world.live.insert("sA>s4".into(), L.into());
+        assert_eq!(world.ids().canonical("sA>s4"), LOCAL);
+        assert_eq!(
+            world.ids().machine_keys(),
+            [LOCAL, "sA", "sA>s5", "sB", "sC"]
+        );
+        // 本机配置了两次同一台：换成第一个
+        world.servers.push(crate::settings::Server {
+            id: "sB2".into(),
+            machine: Some(B.into()),
+            ..Default::default()
+        });
+        assert_eq!(world.ids().canonical("sA>s1"), "sB");
+    }
+
+    #[test]
+    fn 工作区里的仓库按它所在的那台写_反过来也写得回去() {
+        let world = World::new();
+        let ids = world.ids();
+        let entry = |server: Option<&str>, path: &str| RepoEntry {
+            server: server.map(str::to_string),
+            path: path.into(),
+        };
+        let on = |server: Option<&str>, path: &str| RepoRef {
+            server: server.map(str::to_string),
+            path: path.into(),
+        };
+        // 经 s2（本机）放进去的：就是本机的那个仓库，用本机列表里的写法
+        assert_eq!(
+            ids.member("sA", &on(Some("s2"), "c:/src/ERP")),
+            entry(None, r"C:\src\erp")
+        );
+        // 不在本机列表里的（子仓库）：本机是 Windows 时换成反斜杠
+        let sub = ids.member("sA", &on(Some("s2"), "C:/src/erp/libs/sdk"));
+        let expected = match cfg!(windows) {
+            true => r"C:\src\erp\libs\sdk",
+            false => "C:/src/erp/libs/sdk",
+        };
+        assert_eq!(sub, entry(None, expected));
+        assert_eq!(
+            ids.member("sA", &on(Some("s1"), "/srv/b")),
+            entry(Some("sB"), "/srv/b")
+        );
+        assert_eq!(
+            ids.member("sA", &on(Some("s3"), "/srv/a")),
+            entry(Some("sA"), "/srv/a")
+        );
+        assert_eq!(
+            ids.member("sA", &on(None, "/srv/a")),
+            entry(Some("sA"), "/srv/a")
+        );
+        assert_eq!(
+            ids.member("sA", &on(Some("s4"), "/srv/d")),
+            entry(Some("sA>s4"), "/srv/d")
+        );
+
+        // 反过来：工作区里已经有的，用它原来的写法（移出时才对得上）
+        assert_eq!(
+            ids.member_ref("sA", &entry(None, r"C:\src\erp")),
+            Some(on(Some("s2"), "c:/src/ERP"))
+        );
+        // 还没放进去的本机仓库：经 sA 配置的本机，写正斜杠（本机是 Windows 时）
+        let web = match cfg!(windows) {
+            true => "C:/src/web",
+            false => r"C:\src\web",
+        };
+        assert_eq!(
+            ids.member_ref("sA", &entry(None, r"C:\src\web")),
+            Some(on(Some("s2"), web))
+        );
+        assert_eq!(
+            ids.member_ref("sA", &entry(Some("sB"), "/srv/b")),
+            Some(on(Some("s1"), "/srv/b"))
+        );
+        assert_eq!(
+            ids.member_ref("sA", &entry(Some("sB"), "/srv/b2")),
+            Some(on(Some("s1"), "/srv/b2"))
+        );
+        assert_eq!(
+            ids.member_ref("sA", &entry(Some("sA"), "/srv/a")),
+            Some(on(None, "/srv/a"))
+        );
+        // 访问不到的：sA 没配置 sC；本机的工作区放不进经 sA 连的；sB 没配置本机
+        assert_eq!(ids.member_ref("sA", &entry(Some("sC"), "/x")), None);
+        assert_eq!(ids.member_ref(LOCAL, &entry(Some("sA>s4"), "/srv/d")), None);
+        assert_eq!(ids.member_ref("sB", &entry(None, r"C:\src\erp")), None);
+        // 本机的工作区里写法和以前一样
+        assert_eq!(
+            ids.member_ref(LOCAL, &entry(Some("sB"), "/srv/b")),
+            Some(on(Some("sB"), "/srv/b"))
+        );
+    }
 
     fn entry(server: Option<&str>, path: &str) -> RepoEntry {
         RepoEntry {
@@ -1245,11 +1752,27 @@ mod tests {
             [entry(None, "C:/a"), entry(Some("s156"), "/srv/x")]
         );
         assert_eq!(view.active, 2);
-        assert!(view.is_pinned(&entry(None, "C:/a")));
+        assert!(view.pinned.contains(&entry(None, "C:/a")));
         assert_eq!(
             settings.current,
             WorkspaceKey::new(LOCAL, &local.workspaces[1].id)
         );
+        // 标题栏上的标签页（全局一份）只带现在用的工作区那一份：「空的」里什么都没开
+        assert!(settings.tabs().repos.is_empty());
+        // 现在用的是「日常」的话，它开着的、选中的、固定的都带过来
+        let mut daily_first: Settings = serde_json::from_str(
+            &text.replace("\"active_workspace\": 1", "\"active_workspace\": 0"),
+        )
+        .unwrap();
+        daily_first.normalize();
+        migration_ops(&mut daily_first, &Store::default());
+        let tabs = daily_first.tabs();
+        assert_eq!(
+            tabs.repos,
+            [entry(None, "C:/a"), entry(Some("s156"), "/srv/x")]
+        );
+        assert_eq!(tabs.front, Front::Repo(entry(Some("s156"), "/srv/x")));
+        assert_eq!(tabs.pinned, [entry(None, "C:/a")]);
 
         // 服务器上的：第一次连上时并进它的列表，起的名字一起；并过了、本机、经别台连的都不并
         let mut remote = Store::default();

@@ -44,9 +44,12 @@ pub struct AppState {
     pub(crate) watches: HashMap<String, Task<()>>,
     /// 断开以后自动重连的任务
     pub(crate) reconnects: HashMap<String, Task<()>>,
-    /// 工作区菜单里换到了哪台电脑看（没换过是当前工作区所在的那台）。只在这次运行里记着，
-    /// 换了工作区就跟回去
+    /// 工作区页的下拉里选的是哪台电脑（没选过是选中的工作区所在的那台）。只在这次运行里记着
     pub(crate) menu_machine: Option<String>,
+    /// 本机的标识（`fr_core::store::machine_id`）：启动时读文件，本机的 kuaid 握手时报的为准
+    pub(crate) local_machine: Option<String>,
+    /// 这次运行里连上的各台电脑握手时报的标识（直接配置的、经别的电脑连的都记）
+    pub(crate) machine_ids: HashMap<String, String>,
 }
 
 impl AppState {
@@ -63,6 +66,8 @@ impl AppState {
             watches: HashMap::new(),
             reconnects: HashMap::new(),
             menu_machine: None,
+            local_machine: None,
+            machine_ids: HashMap::new(),
         };
         this.start_machines(cx);
         this
@@ -143,7 +148,10 @@ impl AppState {
             }
             // 本机的仓库列表和工作区经它读写；连不上就直接读写状态文件
             this.update(cx, |this, cx| match result {
-                Ok(conn) => this.machine_connected(LOCAL, conn, cx),
+                Ok(conn) => {
+                    this.learn_machine(LOCAL, &conn.hello.machine, cx);
+                    this.machine_connected(LOCAL, conn, cx)
+                }
                 Err(_) => this.local_unavailable(cx),
             })
             .ok();
@@ -259,14 +267,20 @@ impl AppState {
                 Err(err) => log::warn!("连接服务器 {id} 失败：{err}"),
             }
             this.update(cx, |this, cx| {
-                // 连上了：这台服务器的映射换到新连接上，设了自动映射的映射上；
+                // 连上了：记下它是哪台；这台服务器的映射换到新连接上，设了自动映射的映射上；
                 // 订阅它的仓库列表和工作区
                 if let Some(Ok(conn)) = this.conns.get(&id).and_then(|c| c.peek()) {
                     let conn = conn.clone();
-                    if split_relay(&id).is_none() {
-                        this.mappings_connected(&id, &conn, cx);
+                    this.learn_machine(&id, &conn.hello.machine, cx);
+                    // 经别的电脑连的这台认出来就是本机或者已有的一台：不单独列，也不订阅
+                    if this.ids().duplicate(&id) {
+                        this.note_duplicate(&id, cx);
+                    } else {
+                        if split_relay(&id).is_none() {
+                            this.mappings_connected(&id, &conn, cx);
+                        }
+                        this.machine_connected(&id, conn, cx);
                     }
-                    this.machine_connected(&id, conn, cx);
                 }
                 cx.notify();
             })
@@ -334,9 +348,16 @@ impl AppState {
         };
         // 映射不在表单里，留着
         let mappings = std::mem::take(&mut old.mappings);
+        // 它是哪台电脑也不在表单里：地址、跳板机没改就还是那台，改了等下次连上再认
+        let same_target = old.destination == server.destination && old.jump == server.jump;
+        let machine = old.machine.take().filter(|_| same_target);
         *old = server;
         old.last_dir = last_dir;
         old.mappings = mappings;
+        old.machine = machine;
+        if !same_target {
+            self.machine_ids.remove(&id);
+        }
         if reconnect {
             self.conns.remove(&id);
         }
@@ -366,6 +387,7 @@ impl AppState {
         self.machines.retain(|key, _| !gone(key));
         self.pending.retain(|key, _| !gone(key));
         self.reconnects.retain(|key, _| !gone(key));
+        self.machine_ids.retain(|key, _| !gone(key));
         // 存着的密码、口令跟着删掉
         crate::secrets::delete(id);
         self.save();
@@ -388,23 +410,6 @@ impl AppState {
             self.save();
             cx.notify();
         }
-    }
-
-    /// 收起、展开仓库页「全部仓库」里的一张卡片（本机是 `settings::LOCAL_CARD`，服务器是它的 id）。
-    /// 本机的记收起了的，服务器的（默认收起）记展开了的。
-    pub fn toggle_card(&mut self, key: &str, cx: &mut Context<Self>) {
-        let cards = match key == crate::settings::LOCAL_CARD {
-            true => &mut self.settings.collapsed_cards,
-            false => &mut self.settings.expanded_cards,
-        };
-        match cards.iter().position(|card| card == key) {
-            Some(at) => {
-                cards.remove(at);
-            }
-            None => cards.push(key.to_string()),
-        }
-        self.save();
-        cx.notify();
     }
 
     /// 改设置里的几项（语言、主题、托盘……）并存盘。

@@ -2,10 +2,10 @@
 //!
 //! 所有客户端共用一份：`state_apply` 一次执行一串改动，改完存盘，再把整份推给每个
 //! `state_watch` 着的客户端（包括改的那一个）。几台电脑同时改，按到达的先后依次执行。
-//! 第一次用到时才读文件，不用它的客户端不碰它。
+//! 第一次用到时才读文件，不用它的客户端不碰它。这台电脑的标识和状态文件放在一起，也在这里取。
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
 use fr_core::protocol::Response;
@@ -25,6 +25,7 @@ pub struct Workspaces {
     /// 还没读文件时是 None
     store: Mutex<Option<Store>>,
     watchers: Mutex<Vec<Watcher>>,
+    machine: OnceLock<String>,
 }
 
 impl Workspaces {
@@ -33,12 +34,24 @@ impl Workspaces {
             path,
             store: Mutex::new(None),
             watchers: Mutex::default(),
+            machine: OnceLock::new(),
         }
     }
 
     /// 平时用的那个文件（见 `fr_core::store::path`）。
     pub fn default_file() -> Workspaces {
         Self::new(store::path())
+    }
+
+    /// 这台电脑的标识（`fr_core::store::machine_id`），第一次握手时才取。存不下（配置目录写不进去）
+    /// 就用这次运行现生成的：别的电脑这次照样认得出它，重启以后要重新认。
+    pub fn machine(&self) -> &str {
+        self.machine.get_or_init(|| {
+            store::machine_id(&self.path).unwrap_or_else(|err| {
+                eprintln!("kuaid: {err:#}");
+                store::new_machine_id()
+            })
+        })
     }
 
     pub fn get(&self) -> Store {

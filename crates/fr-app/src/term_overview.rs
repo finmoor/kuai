@@ -23,9 +23,9 @@
 //! 这一页自己开的（新建、重启）是正经接着的（[`TerminalView::new`]），大小跟着这一页的画面，也就和
 //! 仓库的终端页一样大；选到别的终端再回来，就换成只看。
 //!
-//! 焦点：打开这一页时在侧栏上（↑↓ 选一行，Enter 前往，→ 进到终端里）；点画面、点标签、新开一个
-//! 终端时进到终端里，之后的键都归里面的程序，只留 Ctrl+Shift+↑、↓ 沿着侧栏换终端。输入时画面
-//! 带一圈主色的边框：Enter 在侧栏上是前往、在终端里是回车，得一眼看得出焦点在哪。
+//! 焦点：打开这一页时在侧栏上（↑↓ 选一行，Enter 把终端开成标签页，→ 进到终端里）；点画面、点
+//! 标签、新开一个终端时进到终端里，之后的键都归里面的程序，只留 Ctrl+Shift+↑、↓ 沿着侧栏换终端。
+//! 输入时画面带一圈主色的边框：Enter 在侧栏上是开标签页、在终端里是回车，得一眼看得出焦点在哪。
 //!
 //! 侧栏和仓库页的侧栏一样宽、一样的底色和字号，右边上面一条和终端页的工具栏一样高，下面全是画面：
 //! 这样画面和仓库的终端页一样大，终端是几行几列就正好放得下，字不用缩小。
@@ -180,7 +180,7 @@ impl Focusable for TermOverview {
 }
 
 /// 多久以前，粗略地说。
-fn ago(at: Instant) -> String {
+pub(crate) fn ago(at: Instant) -> String {
     let secs = at.elapsed().as_secs();
     match secs {
         0..60 => tr("刚刚").to_string(),
@@ -242,9 +242,11 @@ fn term_menu(
             at(&view),
             at(&view),
         );
-        menu.item(PopupMenuItem::new(tr("前往")).on_click(move |_, _, cx| {
-            go.0.update(cx, |this, cx| this.go_term(&go.1, cx)).ok();
-        }))
+        menu.item(
+            PopupMenuItem::new(tr("在标签页中打开")).on_click(move |_, _, cx| {
+                go.0.update(cx, |this, cx| this.go_term(&go.1, cx)).ok();
+            }),
+        )
         .item(
             PopupMenuItem::new(if pinned {
                 tr("取消固定")
@@ -735,6 +737,19 @@ impl TermOverview {
         cx.notify();
     }
 
+    /// 别处要看一个仓库的终端（工作区页上点了终端个数）：侧栏选中它，右边显示它的终端。
+    pub fn reveal_repo(&mut self, entry: &RepoEntry, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_repo(entry.clone(), window, cx);
+        self.focus.focus(window, cx);
+    }
+
+    /// 别处要在这一页看一个终端（终端标签页的「在终端页中显示」、没开成标签页的终端停下了点
+    /// 「前往」）：右边显示它，焦点在侧栏上。
+    pub fn reveal_term(&mut self, slot: &TermSlot, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_term(slot.clone(), window, cx);
+        self.focus.focus(window, cx);
+    }
+
     /// 显示一个终端（点标签、点侧栏里仓库下面它那一行）。
     fn select_term(&mut self, slot: TermSlot, window: &mut Window, cx: &mut Context<Self>) {
         if self.opening.as_ref() != Some(&slot) {
@@ -775,7 +790,7 @@ impl TermOverview {
         }
     }
 
-    /// 前往显示着的终端；没有就前往选中的仓库的终端页。
+    /// 把显示着的终端开成标签页（标题栏右边那一排）；没有显示着的就前往选中的仓库的终端页。
     fn go(&mut self, cx: &mut Context<Self>) {
         match (self.shown.clone(), self.repo.clone()) {
             (Some(slot), _) => self.go_term(&slot, cx),
@@ -964,9 +979,11 @@ impl TermOverview {
         });
     }
 
-    fn term_name(row: &Row) -> SharedString {
+    /// 列表、标签上写的终端名字：程序设的标题（完整路径只留程序名，见
+    /// [`crate::terminal::short_title`]），没有标题的写「终端 N」。
+    pub(crate) fn term_name(row: &Row) -> SharedString {
         match &row.title {
-            Some(title) => title.clone().into(),
+            Some(title) => crate::terminal::short_title(title),
             None => tf!("终端 {n}", n = row.number.to_string()).into(),
         }
     }
@@ -1197,7 +1214,7 @@ impl TermOverview {
     }
 
     /// 状态前面的圆点：运行中是实心的主色，已停下是带一圈的警示色，空闲是空心的。
-    fn dot(state: TermState, size: f32, cx: &App) -> Div {
+    pub(crate) fn dot(state: TermState, size: f32, cx: &App) -> Div {
         let theme = cx.theme();
         let dot = div().flex_none().size(px(size)).rounded_full();
         match state {
@@ -1207,7 +1224,7 @@ impl TermOverview {
         }
     }
 
-    fn state_text(row: &Row) -> SharedString {
+    pub(crate) fn state_text(row: &Row) -> SharedString {
         match (row.alive, row.state) {
             (false, _) => tr("已结束").into(),
             (true, TermState::Running) => tr("运行中").into(),
@@ -1234,7 +1251,7 @@ impl TermOverview {
     }
 
     /// 它在哪台电脑上：经别的电脑连的写成「91，经由 156」。
-    fn place(app: &AppState, entry: &RepoEntry) -> SharedString {
+    pub(crate) fn place(app: &AppState, entry: &RepoEntry) -> SharedString {
         let machine = machine_of(entry);
         match split_relay(machine) {
             Some((via, _)) => tf!(
@@ -1642,7 +1659,6 @@ impl TermOverview {
             Some(key) => app.workspace_name(key),
             None => tr("其他").into(),
         };
-        let current = workspace.is_some_and(|key| key == app.current());
         // 服务器上的工作区标出是哪台；只列着一台的时候不用标
         let machine = workspace
             .filter(|key| !key.is_local() && !scoped)
@@ -1693,7 +1709,6 @@ impl TermOverview {
             .child(ui::icon_small(IconName::Layers).flex_none())
             .child(ui::clipped(("hub-group-name", index), name).flex_shrink(1.))
             .children(machine.map(chip))
-            .when(current, |el| el.child(chip(tr("当前").into())))
             .child(div().flex_1())
             .when(group.collapsed, |el| el.child(Self::counts(&all, cx)))
             .into_any_element()
@@ -2123,7 +2138,7 @@ impl TermOverview {
                     .text_size(px(11.))
                     .text_color(muted)
                     .child(hint("↑ ↓", tr("选择")))
-                    .child(hint("Enter", tr("前往")))
+                    .child(hint("Enter", tr("打开标签页")))
                     .child(hint("→", tr("输入"))),
             )
     }
@@ -2358,8 +2373,8 @@ impl TermOverview {
                         .small()
                         .flex_none()
                         .ml(px(6.))
-                        .label(tr("前往"))
-                        .tooltip(tr("切换到此终端所在的工作区和仓库（Enter）"))
+                        .label(tr("在标签页中打开"))
+                        .tooltip(tr("在标题栏右侧打开此终端的标签页（Enter）"))
                         .on_click(cx.listener(|this, _, _, cx| this.go(cx))),
                 )
             })

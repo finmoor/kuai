@@ -85,6 +85,18 @@ const KEY_SEPARATOR: char = '\u{1f}';
 
 /// 仓库的第 `number` 个终端在 kuaid 里的会话名字。第 1 个就是仓库路径（1.5 只有一个终端时
 /// 用的就是它，升上来以后接得上），之后的在后面加分隔符和序号。
+/// 显示终端的标题：Windows 上 shell 刚启动时标题是它自己的完整路径
+/// （`C:\Program Files\PowerShell\7\pwsh.exe`），只留程序名（`pwsh`，不带 `.exe`），别的照原样。
+/// 仓库的终端页、终端页、终端标签页、停下的提醒都这样写。
+pub fn short_title(title: &str) -> SharedString {
+    let is_program_path = title.to_lowercase().ends_with(".exe") && title.contains(['\\', '/']);
+    match title.rsplit(['\\', '/']).next() {
+        // 结尾的 .exe 是 ASCII，按字节截不会截到半个字
+        Some(name) if is_program_path => name[..name.len() - 4].to_string().into(),
+        _ => title.to_string().into(),
+    }
+}
+
 pub fn session_key(repo: &str, number: u32) -> String {
     match number {
         0 | 1 => repo.to_string(),
@@ -718,17 +730,9 @@ impl TerminalView {
         self.session.as_ref().is_some_and(Session::in_process)
     }
 
-    /// 程序自己设的标题。Windows 上 shell 刚启动时标题是它自己的完整路径，只留程序名
-    /// （`pwsh`，不带 `.exe`）。
+    /// 程序自己设的标题（见 [`short_title`]）。
     pub fn title(&self) -> Option<SharedString> {
-        let title = self.title.as_ref()?;
-        let is_program_path =
-            title.to_lowercase().ends_with(".exe") && title.contains(['\\', '/']);
-        match title.rsplit(['\\', '/']).next() {
-            // 结尾的 .exe 是 ASCII，按字节截不会截到半个字
-            Some(name) if is_program_path => Some(name[..name.len() - 4].to_string().into()),
-            _ => Some(title.clone()),
-        }
+        self.title.as_deref().map(short_title)
     }
 
     /// kuaid 给这个终端的编号：开在 Kuai 进程里的、还没接上的是 None。
@@ -2198,8 +2202,25 @@ fn paint_frame(frame: &Frame, bounds: Bounds<Pixels>, window: &mut Window, cx: &
 mod tests {
     // 不能 `use super::*`：那样 `#[test]` 会变成界面库里同名的那个宏
     use super::{
-        CursorShape, Grid, Palette, Processor, Proxy, Term, session_key, session_number, snapshot,
+        CursorShape, Grid, Palette, Processor, Proxy, Term, session_key, session_number,
+        short_title, snapshot,
     };
+
+    #[test]
+    fn 标题是程序的完整路径时只留程序名() {
+        assert_eq!(
+            short_title(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            "pwsh"
+        );
+        assert_eq!(short_title(r"C:\WINDOWS\system32\cmd.EXE"), "cmd");
+        // 不是路径、路径后面还跟着别的：照原样
+        assert_eq!(short_title("✳ Claude Code"), "✳ Claude Code");
+        assert_eq!(short_title("feng@dev: ~/src"), "feng@dev: ~/src");
+        assert_eq!(
+            short_title(r"C:\WINDOWS\system32\cmd.exe - git status"),
+            r"C:\WINDOWS\system32\cmd.exe - git status"
+        );
+    }
 
     /// 喂一段程序的输出，看光标记在哪、什么形状。
     fn cursor_after(output: &[u8]) -> Option<(usize, usize, CursorShape)> {

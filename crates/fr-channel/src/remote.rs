@@ -1556,19 +1556,24 @@ fn start(
     if let Some(err) = response.error {
         bail!("{}", tf!("kuaid 握手失败：{err}", err));
     }
-    let hello: Hello = serde_json::from_value(response.result.unwrap_or_default())
-        .context(tr("kuaid 握手响应格式错误"))?;
-    // 常驻的 kuaid 可以比客户端新（别的电脑上的客户端把它升上去了），它认得旧客户端；比客户端旧不行
-    if hello.protocol < PROTOCOL_VERSION {
+    let result = response.result.unwrap_or_default();
+    // 常驻的 kuaid 可以比客户端新（别的电脑上的客户端把它升上去了），它认得旧客户端；比客户端旧不行。
+    // 先看版本再按这一版的格式读：旧的 kuaid 回的少几项，读不成也该报这一句
+    let protocol = result
+        .get("protocol")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    if protocol < u64::from(PROTOCOL_VERSION) {
         bail!(
             "{}",
             tf!(
                 "服务器上的 kuaid 过旧（协议 {protocol}，客户端 {PROTOCOL_VERSION}），无法自动替换。请在服务器上运行 ~/.kuai/*/kuaid --stop 后重新连接",
-                protocol = hello.protocol,
+                protocol,
                 PROTOCOL_VERSION
             )
         );
     }
+    let hello: Hello = serde_json::from_value(result).context(tr("kuaid 握手响应格式错误"))?;
 
     let (tx, rx) = std::sync::mpsc::channel::<(Request, Vec<u8>)>();
     let inner = Arc::new(Inner {

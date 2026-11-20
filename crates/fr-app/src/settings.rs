@@ -30,14 +30,10 @@ fn default_true() -> bool {
     true
 }
 
-/// 仓库页「全部仓库」里本机那张卡片的名字（收起的卡片记在 [`Settings::collapsed_cards`] 里）。
-pub const LOCAL_CARD: &str = "local";
-
 /// 可以选的自动获取间隔（分钟）；0 是不自动获取。
 pub const AUTO_FETCH_CHOICES: [u32; 6] = [0, 5, 10, 15, 30, 60];
 
 /// 各块的大小（逻辑像素），拖分隔条改的。没拖过的是空，按默认值或窗口大小算。
-/// 仓库页上「全部仓库」展没展开也记在这里。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Layout {
     /// 仓库页侧栏的宽度
@@ -56,10 +52,8 @@ pub struct Layout {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details_width: Option<f32>,
     // 1.3～1.6 还有 terminal_height（仓库页底下终端的高度）。1.7 起终端单独一页、占满，
-    // 不再要它；旧设置文件里的这一项读的时候忽略，下次保存就没了
-    /// 仓库页上「全部仓库」展开着（工作区里还没有仓库时不看这一项，一直展开）
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub all_repos: bool,
+    // 不再要它；旧设置文件里的这一项读的时候忽略，下次保存就没了。1.16 以前的 all_repos
+    // （仓库页上「全部仓库」展开着）也一样，改成服务器页以后不要了
 }
 
 /// 一个仓库自己记的东西：起的名字、隐藏了哪些分支、最近用过的提交说明。
@@ -139,18 +133,6 @@ impl View {
         }
     }
 
-    /// 记下刚关掉的标签页。
-    pub fn note_closed(&mut self, entry: RepoEntry) {
-        self.closed.retain(|e| *e != entry);
-        self.closed.push(entry);
-        let extra = self.closed.len().saturating_sub(TabGroup::MAX_CLOSED);
-        self.closed.drain(..extra);
-    }
-
-    pub fn is_pinned(&self, entry: &RepoEntry) -> bool {
-        self.pinned.contains(entry)
-    }
-
     /// 仓库移出了工作区：不再算刚关掉的、固定的。开着的标签页由调用方关。
     pub fn forget(&mut self, entry: &RepoEntry) {
         self.closed.retain(|e| e != entry);
@@ -181,6 +163,105 @@ impl View {
         self.closed.retain(|e| !tabs.contains(e));
         self.pinned.retain(|e| tabs.contains(e));
         self.pinned_first();
+    }
+}
+
+/// 标题栏上显示着的是哪一页。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Front {
+    /// 服务器页
+    Servers,
+    /// 终端页
+    Terms,
+    /// 工作区页
+    #[default]
+    Workspaces,
+    /// 一个仓库（或子仓库）的标签页
+    Repo(RepoEntry),
+    /// 一个终端的标签页
+    Term(TermSlot),
+}
+
+/// 标题栏上开着的标签页：全局一份，和选了哪台服务器、哪个工作区都无关，像 VS Code 的编辑器标签
+/// （2026-11-19 Feng：「我打开哪个就是哪个……跟选择的服务器、工作区都无关」）。只记在这台电脑上。
+/// 1.16 以前是每个工作区各记一份（[`View`]），见 [`Settings::migrate_tabs`]。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tabs {
+    /// 仓库和子仓库的标签页，按打开的先后；固定的排在最前
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<RepoEntry>,
+    /// 终端的标签页（标题栏右边那一段），按打开的先后
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub terms: Vec<TermSlot>,
+    /// 显示着的那一页
+    #[serde(default)]
+    pub front: Front,
+    /// 最近关掉的仓库标签页，新的在后；重新打开了就从这里去掉
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub closed: Vec<RepoEntry>,
+    /// 固定的仓库标签页：排在最前面，没有关闭按钮，Ctrl+W 和中键也关不掉
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned: Vec<RepoEntry>,
+}
+
+/// 设置文件里还没有 [`Tabs`]（还没迁过来）时读到的那一份。
+static NO_TABS: Tabs = Tabs {
+    repos: Vec::new(),
+    terms: Vec::new(),
+    front: Front::Workspaces,
+    closed: Vec::new(),
+    pinned: Vec::new(),
+};
+
+impl Tabs {
+    /// 记下刚关掉的仓库标签页。
+    pub fn note_closed(&mut self, entry: RepoEntry) {
+        self.closed.retain(|e| *e != entry);
+        self.closed.push(entry);
+        let extra = self.closed.len().saturating_sub(TabGroup::MAX_CLOSED);
+        self.closed.drain(..extra);
+    }
+
+    pub fn is_pinned(&self, entry: &RepoEntry) -> bool {
+        self.pinned.contains(entry)
+    }
+
+    /// 固定的排到最前面，各自内部的先后不变。
+    pub fn pinned_first(&mut self) {
+        let pinned = &self.pinned;
+        self.repos.sort_by_key(|tab| !pinned.contains(tab));
+    }
+
+    /// 理一遍：同一个只留一份；服务器移除了的不留；关掉的不含开着的；显示着的那一页不在了就回到
+    /// 工作区页。
+    fn normalize(&mut self, servers: &[Server]) {
+        let known = |entry: &RepoEntry| match entry.server.as_deref() {
+            None => true,
+            Some(id) => {
+                let direct = crate::machines::split_relay(id).map_or(id, |(via, _)| via);
+                known_machine(servers, direct)
+            }
+        };
+        let mut seen = std::collections::HashSet::new();
+        self.repos.retain(|e| known(e) && seen.insert(e.clone()));
+        let mut seen = std::collections::HashSet::new();
+        self.terms
+            .retain(|slot| known(&slot.entry) && seen.insert(slot.clone()));
+        let repos = &self.repos;
+        self.closed.retain(|e| known(e) && !repos.contains(e));
+        let extra = self.closed.len().saturating_sub(TabGroup::MAX_CLOSED);
+        self.closed.drain(..extra);
+        self.pinned.retain(|e| repos.contains(e));
+        self.pinned_first();
+        let open = match &self.front {
+            Front::Repo(entry) => self.repos.contains(entry),
+            Front::Term(slot) => self.terms.contains(slot),
+            _ => true,
+        };
+        if !open {
+            self.front = Front::Workspaces;
+        }
     }
 }
 
@@ -254,12 +335,16 @@ pub struct Settings {
     /// 旧设置里各台服务器上的仓库（和起的名字）已经并进那台服务器的列表了：服务器的 id
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merged_servers: Vec<String>,
-    /// 现在用的工作区
+    /// 工作区页上选中的工作区（1.16 以前是「现在用的工作区」，标题栏的标签页跟着它换）
     #[serde(default)]
     pub current: WorkspaceKey,
-    /// 各个工作区在这台电脑上记的标签页
+    /// 1.16 以前各个工作区在这台电脑上记的标签页。现在只用来记工作区的名字、最近一次选它的时间；
+    /// 开着的标签页在 [`Self::tabs`]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub views: Vec<View>,
+    /// 标题栏上开着的标签页（全局一份）。没有是还没从 [`Self::views`] 迁过来
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tabs: Option<Tabs>,
     /// 用过上面的工作区的服务器（工作区菜单里列出它们），按第一次用的先后
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub used_machines: Vec<String>,
@@ -318,13 +403,14 @@ pub struct Settings {
     pub terminal: TerminalSettings,
     #[serde(default)]
     pub layout: Layout,
-    /// 仓库页「全部仓库」里本机那张卡片收起了：记 [`LOCAL_CARD`]。1.13 以前服务器收起了也记在
-    /// 这里，现在服务器的卡片默认收起，读的时候去掉，见 [`Settings::expanded_cards`]
+    // 1.16 以前仓库页「全部仓库」里卡片的收起、展开记在 collapsed_cards、expanded_cards 里；
+    // 改成服务器页以后不要了，旧设置文件里的这两项读的时候忽略，下次保存就没了
+    /// 工作区页里收起了子仓库的仓库（那一页默认展开）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub collapsed_cards: Vec<String>,
-    /// 「全部仓库」里展开了的服务器卡片（服务器的 id）。服务器的卡片默认收起（2026-11-15 Feng 定）
+    pub folded_subs: Vec<RepoEntry>,
+    /// 服务器页里展开了子仓库的仓库（那一页默认收着：列的是整台的仓库，全展开太长）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub expanded_cards: Vec<String>,
+    pub unfolded_subs: Vec<RepoEntry>,
     /// 各个仓库自己记的东西
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repo_memos: Vec<RepoMemo>,
@@ -546,6 +632,7 @@ impl Default for Settings {
             merged_servers: Vec::new(),
             current: WorkspaceKey::default(),
             views: Vec::new(),
+            tabs: None,
             used_machines: Vec::new(),
             language: Language::default(),
             // 新装的默认深色（2026-11-13 Feng 定）。设置文件里没有这一项（1.1 以前的）
@@ -568,8 +655,8 @@ impl Default for Settings {
             terminal_shell: String::new(),
             terminal: TerminalSettings::default(),
             layout: Layout::default(),
-            collapsed_cards: Vec::new(),
-            expanded_cards: Vec::new(),
+            folded_subs: Vec::new(),
+            unfolded_subs: Vec::new(),
             repo_memos: Vec::new(),
             term_hub: TermHub::default(),
             window: None,
@@ -636,18 +723,21 @@ impl Settings {
                 self.servers[index].jump = None;
             }
         }
-        // 收起的卡片只记本机那张（服务器的默认收起，旧设置里记的去掉）；展开的服务器已经不在了的不用记。
-        // 经服务器连的那几台（`156>91`）的卡片跟着那台服务器
+        // 服务器移除了，记的它上面的东西就不留。经服务器连的那几台（`156>91`）跟着那台服务器
         let servers = &self.servers;
         let known = |key: &str| {
             let direct = crate::machines::split_relay(key).map_or(key, |(via, _)| via);
             servers.iter().any(|server| server.id == direct)
         };
-        self.collapsed_cards.retain(|key| key == LOCAL_CARD);
-        self.expanded_cards.retain(|key| known(key));
         // 仓库记的东西：空的不留，服务器移除了它上面的仓库的也不留。仓库从列表里移除时另外清掉
         self.repo_memos
             .retain(|memo| !memo.is_empty() && memo.repo.server.as_deref().is_none_or(known));
+        let mut seen = std::collections::HashSet::new();
+        self.folded_subs
+            .retain(|e| e.server.as_deref().is_none_or(known) && seen.insert(e.clone()));
+        let mut seen = std::collections::HashSet::new();
+        self.unfolded_subs
+            .retain(|e| e.server.as_deref().is_none_or(known) && seen.insert(e.clone()));
         // 各个工作区在这台电脑上记的标签页：同一个只留一份，服务器移除了它上面的不留
         let mut seen = std::collections::HashSet::new();
         self.views.retain(|view| {
@@ -664,6 +754,42 @@ impl Settings {
         if !known_machine(servers, &self.current.machine) {
             self.current = WorkspaceKey::default();
         }
+        self.migrate_tabs();
+        let servers = &self.servers;
+        if let Some(tabs) = &mut self.tabs {
+            tabs.normalize(servers);
+        }
+    }
+
+    /// 1.16 以前开着的标签页是每个工作区各记一份（[`View`]）。改成全局一份时只带上现在用的工作区
+    /// 那一份（2026-11-19 Feng 同意），别的工作区的不自动开出来，免得一升级标题栏就堆满。
+    /// 迁过了（[`Self::tabs`] 有了）就不再动。
+    pub(crate) fn migrate_tabs(&mut self) {
+        if self.tabs.is_some() {
+            return;
+        }
+        let mut tabs = Tabs::default();
+        if let Some(view) = self.view(&self.current).cloned() {
+            // 0 是原来的「仓库」页，现在是服务器页
+            tabs.front = match view.active.checked_sub(1).and_then(|ix| view.tabs.get(ix)) {
+                Some(entry) => Front::Repo(entry.clone()),
+                None if view.active == 0 && !view.tabs.is_empty() => Front::Servers,
+                None => Front::Workspaces,
+            };
+            tabs.repos = view.tabs;
+            tabs.closed = view.closed;
+            tabs.pinned = view.pinned;
+        }
+        self.tabs = Some(tabs);
+    }
+
+    /// 标题栏上开着的标签页。
+    pub fn tabs(&self) -> &Tabs {
+        self.tabs.as_ref().unwrap_or(&NO_TABS)
+    }
+
+    pub fn tabs_mut(&mut self) -> &mut Tabs {
+        self.tabs.get_or_insert_with(Tabs::default)
     }
 
     /// 这个工作区在这台电脑上记的标签页；没记过就是空的。
@@ -685,14 +811,6 @@ impl Settings {
 
     pub fn server(&self, id: &str) -> Option<&Server> {
         self.servers.iter().find(|server| server.id == id)
-    }
-
-    /// 「全部仓库」里的这张卡片收起着没有：本机的默认展开，服务器的默认收起。
-    pub fn card_collapsed(&self, key: &str) -> bool {
-        match key == LOCAL_CARD {
-            true => self.collapsed_cards.iter().any(|card| card == key),
-            false => !self.expanded_cards.iter().any(|card| card == key),
-        }
     }
 
     /// 盘符映射的共享名（网络路径 `\\kuai\<共享名>`，资源管理器里也显示它）：服务器名加目录名。
@@ -801,6 +919,9 @@ impl Settings {
         for view in &mut self.views {
             view.forget(entry);
         }
+        if let Some(tabs) = &mut self.tabs {
+            tabs.closed.retain(|e| e != entry);
+        }
     }
 }
 
@@ -870,6 +991,10 @@ pub struct Server {
     /// 旧的设置文件里没有这一项，也就是自动连）
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub manual_connect: bool,
+    /// 它是哪台电脑：连上时它的 kuaid 报的标识（`fr_core::store::machine_id`），随服务器列表交给本机的
+    /// kuaid，别的电脑经本机连它时也认得。不在表单里；改了地址、跳板机就清掉，下次连上再记
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
 /// 把服务器上的一个目录映射成本机的盘符或文件夹。
@@ -1543,29 +1668,16 @@ mod tests {
     }
 
     #[test]
-    fn 服务器的卡片默认收起_本机的默认展开() {
-        let mut settings = Settings::default();
-        for id in ["s1", "s2"] {
-            settings.servers.push(Server {
-                id: id.into(),
-                ..Server::default()
-            });
-        }
-        assert!(!settings.card_collapsed(LOCAL_CARD));
-        assert!(settings.card_collapsed("s1"));
-        // 旧设置里记的「收起的服务器」去掉（现在本来就收起）；展开的服务器不在了就不记
-        settings.collapsed_cards = vec![LOCAL_CARD.into(), "s1".into(), "gone".into()];
-        settings.expanded_cards = vec!["s2".into(), "gone".into()];
-        settings.normalize();
-        assert_eq!(settings.collapsed_cards, [LOCAL_CARD]);
-        assert_eq!(settings.expanded_cards, ["s2"]);
-        assert!(settings.card_collapsed(LOCAL_CARD));
-        assert!(settings.card_collapsed("s1"));
-        assert!(!settings.card_collapsed("s2"));
-        // 都是默认的不写进文件
-        let text = serde_json::to_string(&Settings::default()).unwrap();
+    fn 旧的仓库页卡片收起记录读的时候忽略() {
+        // 1.16 以前仓库页「全部仓库」里卡片的收起、展开和「全部仓库」展没展开记在这几项里，
+        // 改成服务器页以后不要了：照样能读，存的时候不再写
+        let old = r#"{"collapsed_cards":["local"],"expanded_cards":["s1"],
+            "layout":{"all_repos":true,"sidebar":300.0}}"#;
+        let settings: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(settings.layout.sidebar, Some(300.0));
+        let text = serde_json::to_string(&settings).unwrap();
         assert!(
-            !text.contains("collapsed_cards") && !text.contains("expanded_cards"),
+            !text.contains("_cards") && !text.contains("all_repos"),
             "{text}"
         );
     }
@@ -1762,5 +1874,70 @@ mod tests {
             super::parse(&text).unwrap().term_hub.scope,
             Some(String::new())
         );
+    }
+
+    #[test]
+    fn 开着的标签页改成全局一份_只带现在用的工作区那一份() {
+        let repo = |path: &str| RepoEntry {
+            server: None,
+            path: path.into(),
+        };
+        let text = r#"{
+            "current": {"id": "w2"},
+            "views": [
+                {"id": "w1", "tabs": [{"path": "C:/a"}], "active": 1},
+                {"id": "w2", "tabs": [{"path": "C:/b"}, {"path": "C:/c"}], "active": 1,
+                 "closed": [{"path": "C:/d"}, {"path": "C:/b"}], "pinned": [{"path": "C:/c"}]}
+            ]
+        }"#;
+        let settings = super::parse(text).unwrap();
+        let tabs = settings.tabs();
+        // 别的工作区（w1）的不带；固定的排在最前，选中的还是原来那个
+        assert_eq!(tabs.repos, [repo("C:/c"), repo("C:/b")]);
+        assert_eq!(tabs.front, Front::Repo(repo("C:/b")));
+        assert_eq!(tabs.pinned, [repo("C:/c")]);
+        // 开着的不算刚关掉的
+        assert_eq!(tabs.closed, [repo("C:/d")]);
+        // 迁过一次就不再动：存下来再读还是这一份
+        let saved = serde_json::to_string(&settings).unwrap();
+        assert_eq!(super::parse(&saved).unwrap().tabs(), tabs);
+        // 原来选中的是「仓库」页（0）：现在是服务器页；什么都没开：工作区页
+        let servers = text.replace("\"active\": 1,\n", "\"active\": 0,\n");
+        assert_eq!(super::parse(&servers).unwrap().tabs().front, Front::Servers);
+        let fresh = super::parse("{}").unwrap();
+        assert_eq!(fresh.tabs(), &Tabs::default());
+        assert_eq!(fresh.tabs().front, Front::Workspaces);
+    }
+
+    #[test]
+    fn 标签页里服务器移除了的不留_显示着的不在了回到工作区页() {
+        let entry = |server: Option<&str>, path: &str| RepoEntry {
+            server: server.map(str::to_string),
+            path: path.into(),
+        };
+        let mut settings = Settings::default();
+        settings.servers.push(Server {
+            id: "s1".into(),
+            ..Server::default()
+        });
+        let gone = entry(Some("s9"), "/x");
+        let relayed = entry(Some("s1>s7"), "/y");
+        let tabs = settings.tabs_mut();
+        tabs.repos = vec![
+            entry(None, "C:/a"),
+            gone.clone(),
+            relayed.clone(),
+            gone.clone(),
+        ];
+        tabs.front = Front::Repo(gone.clone());
+        tabs.terms = vec![TermSlot {
+            entry: gone,
+            number: 1,
+        }];
+        settings.normalize();
+        let tabs = settings.tabs();
+        assert_eq!(tabs.repos, [entry(None, "C:/a"), relayed]);
+        assert!(tabs.terms.is_empty());
+        assert_eq!(tabs.front, Front::Workspaces);
     }
 }

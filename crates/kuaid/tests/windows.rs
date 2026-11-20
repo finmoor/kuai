@@ -377,6 +377,10 @@ fn 拉起常驻进程_终端在客户端走了以后还在() {
     first.leave();
     let mut second = home.connect(&exe);
     assert_eq!(second.info().pid, daemon_pid, "常驻进程不该换");
+    // 这台电脑的标识：存在状态文件旁边（主目录下的 kuai\），每次握手都是它
+    let store = home.dir.join("kuai").join("workspaces.json");
+    assert_eq!(hello.machine, fr_core::store::machine_id(&store).unwrap());
+    assert_eq!(second.hello().machine, hello.machine);
     let terms = second.terms();
     assert_eq!(terms.len(), 1);
     assert!(terms[0].alive);

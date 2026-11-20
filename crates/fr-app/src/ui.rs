@@ -99,6 +99,30 @@ pub fn clipped_with_tip(
         })
 }
 
+/// 一段文字画出来多宽（逻辑像素）：按窗口现在的字体，`family` 给了就换成它。标题栏排标签页时
+/// 用（先量出每个标签不挤时多宽，再决定怎么缩，见 `tab_fit`）。
+pub fn text_width(
+    window: &Window,
+    text: &str,
+    size: f32,
+    family: Option<&'static str>,
+    weight: FontWeight,
+) -> f32 {
+    if text.is_empty() {
+        return 0.;
+    }
+    let mut run = window.text_style().to_run(text.len());
+    if let Some(family) = family {
+        run.font.family = family.into();
+    }
+    run.font.weight = weight;
+    window
+        .text_system()
+        .shape_line(text.to_string().into(), px(size), &[run], None)
+        .width
+        .as_f32()
+}
+
 /// 显示全文的提示：太长就折行，不撑出窗口。
 pub fn full_text_tip(text: SharedString, window: &mut Window, cx: &mut App) -> AnyView {
     if menu_is_open(window) {

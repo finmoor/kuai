@@ -110,7 +110,8 @@ use serde_json::Value;
 /// 10：kuaid 保存仓库列表和工作区（`state_get`、`state_watch`、`state_apply`），经它连它配置的服务器
 /// （`relay_open`、`relay_input`）。
 /// 11：`term_watch` 订阅终端列表；`term_attach` 可以只看（`watch`）；[`TermInfo`] 多了 `idle_ms`、`last`。
-pub const PROTOCOL_VERSION: u32 = 11;
+/// 12：[`Hello`] 多了 `machine`（这台电脑的标识，见 [`crate::store::machine_id`]）。
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// 一条消息后面跟多少字节的原始数据。
 pub trait Frame {
@@ -179,6 +180,8 @@ pub struct Hello {
     /// 是常驻进程：终端会话在客户端断开后还留着
     #[serde(default)]
     pub daemon: bool,
+    /// 这台电脑的标识（[`crate::store::machine_id`]）：经不同的路连到的是不是同一台电脑，靠它认
+    pub machine: String,
 }
 
 /// `info` 的结果：常驻进程现在的情况。

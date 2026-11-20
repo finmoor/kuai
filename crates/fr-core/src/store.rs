@@ -9,6 +9,9 @@
 //! 和这台电脑上的 Kuai 配置的服务器（不含密码，连上来的电脑经这台连接它们）。开着哪些标签页、
 //! 选中哪个、固定的、刚关掉的，各台电脑自己记，不在这里。
 //!
+//! 同一个目录里还有这台电脑的标识（[`machine_id`]）：别的电脑靠它认出「经由某台配置的服务器其实
+//! 就是我」「其实就是我也直接配置了的那台」，同一台电脑在界面上只出现一次。
+//!
 //! 文件的格式只加字段：新旧版本的 kuaid 都可能读到它。
 
 use std::collections::BTreeMap;
@@ -25,6 +28,8 @@ use crate::tf;
 const FILE: &str = "workspaces.json";
 /// 写入前留着的上一份：这一份坏了（写到一半断电）就读它
 const BACKUP: &str = "workspaces.json.bak";
+/// 这台电脑的标识（[`machine_id`]），和状态文件放在一起
+const MACHINE_FILE: &str = "machine-id";
 
 /// 一台电脑保存的东西。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +88,9 @@ pub struct Server {
     /// 跳板机：另一台服务器的 id
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jump: Option<String>,
+    /// 它是哪台电脑：它的 kuaid 握手时报的标识（[`machine_id`]）。这台电脑的 Kuai 连上过它才知道
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -311,7 +319,15 @@ impl Store {
 
     /// 这台电脑的仓库列表里有没有这个仓库。
     pub fn has_repo(&self, path: &str, windows: bool) -> bool {
-        self.repos.iter().any(|p| same_path(p, path, windows))
+        self.listed(path, windows).is_some()
+    }
+
+    /// 列表里这个仓库的写法（Windows 上大小写、斜杠不同也认作同一个）；不在列表里是 None。
+    pub fn listed(&self, path: &str, windows: bool) -> Option<&str> {
+        self.repos
+            .iter()
+            .find(|p| same_path(p, path, windows))
+            .map(String::as_str)
     }
 
     pub fn server(&self, id: &str) -> Option<&Server> {
@@ -450,6 +466,75 @@ pub fn save(path: &Path, store: &Store) -> Result<()> {
         let _ = std::fs::copy(path, path.with_file_name(BACKUP));
     }
     std::fs::rename(&temp, path).with_context(|| tf!("无法写入 {path}", path = path.display()))
+}
+
+/// 这台电脑的标识：32 个十六进制字符，第一次用时随机生成，存在状态文件旁边，之后一直是它。
+/// 准确说是「这个用户的这一套状态」：同一台电脑上的别的用户、设了 `FR_KUAID_HOME` 的测试是另一个。
+/// kuaid 握手时报出来（[`crate::protocol::Hello::machine`]），连上它的 Kuai 记进自己的服务器配置
+/// （[`Server::machine`]），别的电脑据此认出同一台电脑。`store` 是状态文件的路径（平时是 [`path`]）。
+pub fn machine_id(store: &Path) -> Result<String> {
+    use std::io::Write as _;
+    let dir = store.parent().context(tr("状态文件的路径无效"))?;
+    let file = dir.join(MACHINE_FILE);
+    // 几个进程同时第一次用（Kuai 和 kuaid 一起启动）时只有一个建得成，别的读它写下的；
+    // 刚建好、还没写完时读到的是空的或者半截，等一下再读
+    for _ in 0..25 {
+        match std::fs::read_to_string(&file) {
+            Ok(text) if is_machine_id(text.trim()) => return Ok(text.trim().to_string()),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| tf!("无法创建 {path}", path = dir.display()))?;
+                let id = new_machine_id();
+                let created = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&file);
+                match created {
+                    Ok(mut created) => {
+                        created
+                            .write_all(id.as_bytes())
+                            .with_context(|| tf!("无法写入 {path}", path = file.display()))?;
+                        return Ok(id);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(err) => {
+                        return Err(err)
+                            .with_context(|| tf!("无法写入 {path}", path = file.display()));
+                    }
+                }
+            }
+            Err(err) => {
+                return Err(err).with_context(|| tf!("无法读取 {path}", path = file.display()));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // 一直不对：被改坏了，或者建它的进程没写完就没了
+    replace_machine_id(&file)
+}
+
+/// 换一个新的标识写进去（先写临时文件再改名），返回写下的。
+fn replace_machine_id(file: &Path) -> Result<String> {
+    let id = new_machine_id();
+    let temp = file.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temp, &id).with_context(|| tf!("无法写入 {path}", path = temp.display()))?;
+    std::fs::rename(&temp, file).with_context(|| tf!("无法写入 {path}", path = file.display()))?;
+    Ok(id)
+}
+
+/// 一个新的机器标识：128 位随机数。随机数取自标准库给哈希表用的随机种子（向操作系统要的，
+/// 每用一次换一个），不为它另外引一个库。
+pub fn new_machine_id() -> String {
+    use std::hash::{BuildHasher as _, RandomState};
+    let seed = (std::process::id(), std::time::SystemTime::now());
+    let high = RandomState::new().hash_one(seed);
+    let low = RandomState::new().hash_one((seed, high));
+    format!("{high:016x}{low:016x}")
+}
+
+fn is_machine_id(text: &str) -> bool {
+    text.len() == 32 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 #[cfg(test)]
@@ -698,5 +783,53 @@ mod tests {
         std::fs::write(&path, r#"{"version":3,"repos":["/x"],"以后加的":1}"#).unwrap();
         assert_eq!(load(&path).repos, ["/x"]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn 机器标识_第一次生成_之后一直是它_同时要的拿到同一个() {
+        let dir = std::env::temp_dir().join(format!("fr-machine-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = dir.join("kuai").join(FILE);
+        // 几个线程同时第一次要：只建一份，拿到的都一样
+        let ids: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| machine_id(&store).unwrap()))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(is_machine_id(&ids[0]), "{}", ids[0]);
+        assert!(ids.iter().all(|id| *id == ids[0]), "{ids:?}");
+        assert_eq!(machine_id(&store).unwrap(), ids[0]);
+        // 另一套状态（别的用户、测试）是另一台
+        assert_ne!(machine_id(&dir.join("other").join(FILE)).unwrap(), ids[0]);
+        // 被改坏了：等一会儿还是不对就换一个新的，之后一直是新的
+        let file = dir.join("kuai").join(MACHINE_FILE);
+        std::fs::write(&file, "不是标识").unwrap();
+        let fresh = machine_id(&store).unwrap();
+        assert!(is_machine_id(&fresh));
+        assert_ne!(fresh, ids[0]);
+        assert_eq!(machine_id(&store).unwrap(), fresh);
+        // 建它的进程没写进去就没了（一直是空的）：同样换一个
+        std::fs::write(&file, "").unwrap();
+        let refilled = machine_id(&store).unwrap();
+        assert!(is_machine_id(&refilled));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), refilled);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // 每次生成的都不一样
+        assert_ne!(new_machine_id(), new_machine_id());
+    }
+
+    #[test]
+    fn 服务器是哪台电脑_知道了才写() {
+        let mut server = Server {
+            id: "s1".into(),
+            name: "91".into(),
+            destination: "root@91".into(),
+            ..Server::default()
+        };
+        assert!(!serde_json::to_string(&server).unwrap().contains("machine"));
+        server.machine = Some("0123456789abcdef0123456789abcdef".into());
+        let text = serde_json::to_string(&server).unwrap();
+        assert_eq!(serde_json::from_str::<Server>(&text).unwrap(), server);
     }
 }

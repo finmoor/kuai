@@ -70,9 +70,11 @@ impl Home {
 
     fn command(&self, exe: &Path) -> Command {
         let mut cmd = Command::new(exe);
+        // 状态文件和机器标识也在临时主目录下（~/.config/kuai/），不碰跑测试的人自己的
         cmd.env("HOME", &self.dir)
             .env("SHELL", "/bin/sh")
             .env_remove("SSH_AUTH_SOCK")
+            .env_remove("XDG_CONFIG_HOME")
             .current_dir(&self.dir);
         cmd
     }
@@ -360,6 +362,10 @@ fn 拉起常驻进程_终端在客户端走了以后还在() {
     first.leave();
     let mut second = home.connect(&exe);
     assert_eq!(second.info().pid, daemon_pid, "常驻进程不该换");
+    // 这台电脑的标识：存在状态文件旁边（~/.config/kuai/），每次握手都是它
+    let store = home.dir.join(".config/kuai/workspaces.json");
+    assert_eq!(hello.machine, fr_core::store::machine_id(&store).unwrap());
+    assert_eq!(second.hello().machine, hello.machine);
     let terms = second.terms();
     assert_eq!(terms.len(), 1);
     assert!(terms[0].alive);

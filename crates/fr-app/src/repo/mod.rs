@@ -49,6 +49,7 @@ mod worktrees;
 
 pub(crate) use layout::sidebar_open;
 pub(crate) use ops::explain;
+pub(crate) use subs::{PARALLEL, Summary, summarize};
 pub(crate) use terminals::{end_parked_terminals, parked_terminals_of, parked_terminals_running};
 
 use fr_channel::Channel;

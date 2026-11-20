@@ -39,7 +39,7 @@ use crate::settings::RepoEntry;
 use crate::ui;
 
 /// 同时对几个子仓库执行 git（读状态、获取、拉取）。服务器上每条命令是一个 git 进程。
-pub(super) const PARALLEL: usize = 6;
+pub(crate) const PARALLEL: usize = 6;
 /// 总览表一行的高度
 pub(super) const ROW_HEIGHT: f32 = 44.;
 
@@ -72,7 +72,7 @@ impl Child {
 
 /// 总览表里一个子仓库（或者工作树）的情况。
 #[derive(Clone, Default)]
-pub(super) struct Summary {
+pub(crate) struct Summary {
     pub branch: Option<String>,
     pub head: Option<String>,
     pub upstream: bool,
@@ -162,7 +162,7 @@ fn folder(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
 
-pub(super) async fn summarize(channel: Channel, repo: String) -> Summary {
+pub(crate) async fn summarize(channel: Channel, repo: String) -> Summary {
     let read_status = channel.git(&repo, status::args());
     let last = ["log", "-1", "--format=%ct%x09%s"]
         .map(String::from)

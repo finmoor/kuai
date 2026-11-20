@@ -577,31 +577,8 @@ impl RepoView {
         self.show_page(Page::Terminal, window, cx);
     }
 
-    /// 到终端页显示这个仓库的第 `number` 个终端（终端总览页的「前往」）。kuaid 里留着、这边还没接上的
-    /// 就接上：刚打开的标签页可能还没问到 kuaid 里留着哪几个，名字相同，接上的就是它。
-    pub fn show_terminal_number(
-        &mut self,
-        number: u32,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.adopt_waiting(window, cx);
-        let at = self
-            .terminals
-            .tabs
-            .iter()
-            .position(|tab| tab.number == number);
-        let at = match at {
-            Some(at) => at,
-            None => {
-                let at = self.add_terminal(number, true, window, cx);
-                self.terminals.tabs[at].adopted = true;
-                at
-            }
-        };
-        self.terminals.active = at;
-        self.show_page(Page::Terminal, window, cx);
-    }
+    // 1.16 以前终端总览页的「前往」经 show_terminal_number 到仓库的终端页显示那个终端；第二版改成
+    // 「在标签页中打开」（终端标签页，见 `term_tab`），不再用它
 
     /// 终端页上正显示着的是第几个终端；不在终端页、这一页没显示出来时是 None。
     pub fn shown_terminal(&self) -> Option<(RepoEntry, u32)> {

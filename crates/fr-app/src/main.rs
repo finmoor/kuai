@@ -16,12 +16,16 @@ mod palette;
 mod prompt;
 mod redirect_guard;
 mod repo;
+mod repo_rows;
+mod repo_scan;
 mod secrets;
 mod settings;
 mod settings_page;
 mod shell;
+mod tab_fit;
 mod term_board;
 mod term_overview;
+mod term_tab;
 mod terminal;
 mod text;
 mod toast;
@@ -31,6 +35,7 @@ mod update;
 mod update_view;
 mod win;
 mod workspace;
+mod workspace_page;
 
 use std::path::PathBuf;
 
@@ -314,7 +319,7 @@ fn main() {
                 KeyBinding::new("ctrl-shift-a", ShowTerminals, None),
             ]);
             release_keys_to_terminal(cx);
-            workspace_action::<OpenSettings>(cx, |ws, _, cx| ws.toggle_settings(cx));
+            workspace_action::<OpenSettings>(cx, |ws, window, cx| ws.toggle_settings(window, cx));
             workspace_action::<ShowTerminals>(cx, |ws, window, cx| ws.toggle_terms(window, cx));
             workspace_action::<Refresh>(cx, |ws, _, cx| ws.refresh_active(cx));
             workspace_action::<CloseTab>(cx, |ws, window, cx| ws.close_active(window, cx));
@@ -325,8 +330,8 @@ fn main() {
                 ws.show_in_active(false, window, cx)
             });
             workspace_action::<GoToHead>(cx, |ws, window, cx| ws.go_to_head(window, cx));
-            workspace_action::<NextTab>(cx, |ws, _, cx| ws.cycle_tab(1, cx));
-            workspace_action::<PrevTab>(cx, |ws, _, cx| ws.cycle_tab(-1, cx));
+            workspace_action::<NextTab>(cx, |ws, window, cx| ws.cycle_tab(1, window, cx));
+            workspace_action::<PrevTab>(cx, |ws, window, cx| ws.cycle_tab(-1, window, cx));
             workspace_action::<FindCommit>(cx, |ws, window, cx| ws.find_commit(window, cx));
             workspace_action::<QuickOpen>(cx, |ws, window, cx| ws.quick_open(window, cx));
             workspace_action::<ReopenTab>(cx, |ws, window, cx| ws.reopen_closed(window, cx));

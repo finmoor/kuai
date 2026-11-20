@@ -67,7 +67,7 @@ pub struct TermId {
 /// 正显示在窗口里的终端。
 #[derive(Clone, PartialEq)]
 pub enum Shown {
-    /// 仓库标签页的终端页上：哪个仓库的第几个终端
+    /// 仓库标签页的终端页上、终端标签页里：哪个仓库的第几个终端
     Repo(RepoEntry, u32),
     /// 总览页里选中的
     Term(TermId),
@@ -123,13 +123,6 @@ pub struct RepoGroup {
     pub workspace: Option<WorkspaceKey>,
     /// 按工作区里的先后；没有终端的仓库也在
     pub repos: Vec<(RepoEntry, Vec<Row>)>,
-}
-
-/// 一个工作区里的终端。
-pub struct Group {
-    /// 不在任何工作区里的仓库的终端归到最后一组，这里是 None
-    pub workspace: Option<WorkspaceKey>,
-    pub rows: Vec<Row>,
 }
 
 /// 一个不在眼前的终端从运行中变成了已停下。
@@ -452,34 +445,6 @@ impl TermBoard {
             .find(|listed| listed.info.term == id.term)?;
         Some(self.make_row(&id.machine, listed, self.app.read(cx)))
     }
-
-    /// 全部终端，按工作区分组：现在用的工作区在最前，不在任何工作区里的在最后。
-    /// 一个仓库在几个工作区里时，它的终端只列在第一个里（先看现在用的）。
-    pub fn groups(&self, cx: &App) -> Vec<Group> {
-        let app = self.app.read(cx);
-        let mut rows = self.all_rows(app);
-        let mut groups: Vec<Group> = Vec::new();
-        for key in workspace_order(app) {
-            let members = app.members(&key);
-            let (mine, rest): (Vec<Row>, Vec<Row>) = rows
-                .into_iter()
-                .partition(|row| members.contains(&row.entry));
-            rows = rest;
-            if !mine.is_empty() {
-                groups.push(Group {
-                    workspace: Some(key),
-                    rows: mine,
-                });
-            }
-        }
-        if !rows.is_empty() {
-            groups.push(Group {
-                workspace: None,
-                rows,
-            });
-        }
-        groups
-    }
 }
 
 impl TermBoard {
@@ -598,21 +563,16 @@ fn group_by_workspace(
     (groups, rows)
 }
 
-/// 全部读到了的工作区：现在用的在最前，然后是本机的，再是各台服务器的。
+/// 全部读到了的工作区：本机的在前，再是各台服务器的。1.16 以前现在用的工作区排最前；现在没有
+/// 「现在用的」了（标签页不跟工作区走）。
 fn workspace_order(app: &AppState) -> Vec<WorkspaceKey> {
     let mut machines: Vec<&String> = app.machines.keys().collect();
     machines.sort_by(|a, b| (a.as_str() != LOCAL, a).cmp(&(b.as_str() != LOCAL, b)));
-    let mut keys: Vec<WorkspaceKey> = machines
+    machines
         .into_iter()
         .flat_map(|machine| app.workspaces_on(machine).unwrap_or_default())
         .map(|(key, _, _)| key)
-        .collect();
-    let current = app.current();
-    if let Some(at) = keys.iter().position(|key| key == current) {
-        let key = keys.remove(at);
-        keys.insert(0, key);
-    }
-    keys
+        .collect()
 }
 
 /// 这个终端是哪个仓库的第几个：会话的名字是仓库路径加序号（见 [`terminal::session_key`]）。

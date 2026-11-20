@@ -498,6 +498,7 @@ fn simple(shared: &Shared, request: &Request) -> Result<Value> {
             home: crate::dirs::home(),
             build: shared.build.clone(),
             daemon: shared.control.is_some(),
+            machine: shared.workspaces.machine().to_string(),
         })?),
         "info" => Ok(serde_json::to_value(shared.info())?),
         "state_get" => Ok(serde_json::to_value(shared.workspaces.get())?),
@@ -745,13 +746,26 @@ mod tests {
 
     #[test]
     fn 握手和未知方法() {
+        let dir = files::tests::TempDir::new();
+        let file = dir.0.join("kuai").join("workspaces.json");
         let (terms, _) = fake_registry();
-        let shared = Shared::new(terms, None, "1.0.0-abc".into());
+        let shared = Shared::with_dirs(
+            terms,
+            None,
+            "1.0.0-abc".into(),
+            dir.0.clone(),
+            Workspaces::new(file.clone()),
+        );
         let mut client = connect(&shared);
         let hello: Hello = serde_json::from_value(client.call("hello", json!({}))).unwrap();
         assert_eq!(hello.protocol, PROTOCOL_VERSION);
         assert_eq!(hello.build, "1.0.0-abc");
         assert!(!hello.daemon);
+        // 这台电脑的标识：和状态文件放在一起的那个，再握手一次还是它
+        assert_eq!(hello.machine, fr_core::store::machine_id(&file).unwrap());
+        let again: Hello =
+            serde_json::from_value(connect(&shared).call("hello", json!({}))).unwrap();
+        assert_eq!(again.machine, hello.machine);
         let id = client.send("没有这个方法", json!({}), &[]);
         let (response, _) = client.next();
         assert_eq!(response.id, id);
