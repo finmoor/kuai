@@ -172,7 +172,13 @@ mod imp {
             windows,
             label,
         };
-        let mount = Box::new(Mount::new(channel, settings, &api, Box::new(on_error))?);
+        let add_dir_info = api.FspFileSystemAddDirInfo;
+        let mount = Box::new(Mount::new(
+            channel,
+            settings,
+            add_dir_info,
+            Box::new(on_error),
+        )?);
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

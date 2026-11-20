@@ -1,7 +1,11 @@
 //! 盘上的读写怎么变成 kuaid 的 `fs_*` 请求。
 //!
-//! - 读：按块（1 MiB）向服务器要，每个打开的文件留着最近读过的 16 块。连着往后读时预先把后面几块
-//!   也要了（请求一发出去就在路上，不占线程），读到那里时多半已经回来。
+//! - 读：按格（64 KiB）向服务器要，要多少拉多少：只看开头的（资源管理器认文件类型、取缩略图）
+//!   不会多拉。连着往后读时把后面一段也要了，读得越多要得越多，一个请求最多 1 MiB。在路上的读请求
+//!   合起来大约 0.3 秒能传完（线路速度边用边量，见 [`Pace`]）：连接是一根管子，先发的先回，在路上的
+//!   多了，列目录、别的文件、终端的输出都得排在后面。等回音时不锁着文件，同一个文件别的读、查属性、
+//!   再打开都不用等；回音由一个线程收（[`collect`]），放进那个文件的缓存，再叫醒等着的读。每个打开
+//!   的文件最多留 16 MiB。
 //! - 写：直接按偏移写到服务器上（`fs_pwrite`），不等回音就告诉系统写好了，同一个文件在路上的写入
 //!   最多 8 MiB，满了才等。写坏了（磁盘满、没权限）在下一次写、Flush、关文件时报出来，同时经
 //!   `on_error` 告诉界面。和在路上的写入重叠的写、读、截断、改名都先等它们落地：服务器上每个请求
@@ -13,12 +17,13 @@
 //!
 //! 同一个文件被打开几次，共用一个 [`Node`]。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -26,17 +31,30 @@ use fr_channel::Channel;
 use fr_core::i18n::tr;
 use fr_core::protocol::{FsEntry, FsSpace, FsStat};
 use fr_core::tf;
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::executor::block_on;
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, poll_fn};
+use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::winfsp::*;
 
-/// 一次向服务器读这么多字节。
-const BLOCK: u64 = 1 << 20;
-/// 每个打开的文件留着最近读过的几块。
-const CACHE_BLOCKS: usize = 16;
-/// 连着往后读时，预先要好后面的几块。
-const AHEAD: u64 = 4;
+/// 缓存和向服务器要数据都按格算，一格这么多字节。
+const UNIT: u64 = 64 << 10;
+/// 一个读请求最多要这么多格（1 MiB）。
+const FETCH_UNITS: u64 = 16;
+/// 每个打开的文件最多留这么多格（16 MiB）。
+const CACHE_UNITS: usize = 256;
+/// 在路上的读请求合起来大约这么多秒能传完。
+const AHEAD_SECS: f64 = 0.3;
+/// 在路上的读请求合起来最少、最多这么多字节。
+const AHEAD_MIN: u64 = 2 * UNIT;
+const AHEAD_MAX: u64 = 8 << 20;
+/// 线路还没量过时，当它每秒能传这么多：往慢了猜，读回来一两次就准了。
+const FIRST_RATE: f64 = 256.0 * 1024.0;
+/// 量出来的速度不往上记了：在路上的已经到了上限，再快也一样；记得太高，线路变慢时要好久才降下来。
+const MAX_RATE: f64 = 2.0 * AHEAD_MAX as f64 / AHEAD_SECS;
+/// 一个文件同时认几路连着往后读的：几个程序、几个线程可能在读同一个文件的不同地方。
+const STREAMS: usize = 4;
 /// 一次写请求最多带这么多字节。
 const CHUNK: usize = 1 << 20;
 /// 同一个文件在路上（发出去了、服务器还没回音）的写入最多这么多字节。
@@ -57,6 +75,8 @@ type Listed = (Instant, Arc<Vec<FsEntry>>);
 /// 列目录时的一行：名字（UTF-16，排序和翻页用）和它的情况。
 type Row = (Vec<u16>, FsEntry);
 type Reading = BoxFuture<'static, Result<(FsStat, Vec<u8>)>>;
+/// WinFsp 的 `FspFileSystemAddDirInfo`：列目录时往系统给的缓冲区里加一行。
+pub(crate) type AddDirInfo = unsafe extern "C" fn(*mut DirInfo, *mut c_void, u32, *mut u32) -> u8;
 
 #[derive(Default)]
 pub struct Counters {
@@ -94,7 +114,7 @@ pub(crate) struct Mount {
     windows: bool,
     label: Vec<u16>,
     security: Vec<u8>,
-    add_dir_info: unsafe extern "C" fn(*mut DirInfo, *mut c_void, u32, *mut u32) -> u8,
+    add_dir_info: AddDirInfo,
     /// 挂载的时刻：服务器没给修改时间的（根目录）用它
     started: u64,
     dirs: Mutex<HashMap<String, Listed>>,
@@ -102,10 +122,14 @@ pub(crate) struct Mount {
     nodes: Mutex<HashMap<String, Weak<Node>>>,
     space: Mutex<Option<(Instant, FsSpace)>>,
     pending: Mutex<mpsc::Sender<Pending>>,
+    /// 发出去的读请求交给收回音的线程（[`collect`]）
+    fetches: Mutex<UnboundedSender<Fetch>>,
+    next_fetch: AtomicU64,
+    pace: Arc<Mutex<Pace>>,
     sink: Arc<Sink>,
     /// 打开着的文件（不算目录）有几个：退出前拿来问「还有文件开着」
     pub(crate) open_files: AtomicUsize,
-    pub(crate) counters: Counters,
+    pub(crate) counters: Arc<Counters>,
 }
 
 /// 一个打开着的文件或目录。
@@ -113,18 +137,16 @@ pub(crate) struct Node {
     state: Mutex<NodeState>,
     /// 在路上的写入有回音了
     landed: Condvar,
+    /// 读请求有回音了，或者缓存换了代：等数据的读再看一眼
+    arrived: Condvar,
 }
 
 struct NodeState {
     /// 相对映射目录的路径，`/` 分隔，根目录是空字符串
     path: String,
     stat: FsStat,
-    blocks: VecDeque<(u64, Arc<Vec<u8>>)>,
-    /// 预先要了、还没用上的块，按块号从小到大
-    ahead: VecDeque<(u64, Reading)>,
-    last_block: Option<u64>,
-    /// 连着往后读了几块
-    run: u64,
+    /// 读回来的、正在要的数据
+    cache: Cache,
     /// 在路上的写入：偏移和长度
     flying: Vec<(u64, u64)>,
     flying_bytes: u64,
@@ -136,6 +158,304 @@ struct NodeState {
     dirty: bool,
     /// 这次列目录用的那一份，按名字排好；翻页时要前后一致
     listing: Option<Arc<Vec<Row>>>,
+}
+
+impl NodeState {
+    /// 一个读请求带着数据回来了。文件这期间变了（这边写了、截断了）就不要；服务器上的大小、时间
+    /// 和这边记的不一样（别人改过），之前留着的、在路上的都不要了，用这一次的。
+    fn arrived(&mut self, asked: &Asked, stat: FsStat, bytes: Vec<u8>) {
+        if asked.generation != self.cache.generation {
+            return;
+        }
+        if stat.mtime != self.stat.mtime || stat.size != self.stat.size {
+            self.cache.renew();
+            self.stat = stat;
+        }
+        self.cache.fill(asked.first, asked.count, bytes);
+    }
+}
+
+/// 一个打开的文件读回来的数据，按格（[`UNIT`]）存。
+#[derive(Default)]
+struct Cache {
+    units: HashMap<u64, Unit>,
+    /// 第几代：文件变了（这边写了、截断了，别处改了）就换一代，之前发出去的读回来了也不要
+    generation: u64,
+    /// 连着往后读的几路
+    streams: Vec<Stream>,
+    /// 越来越大的数：记每格、每路最后用到的先后
+    tick: u64,
+}
+
+enum Unit {
+    /// 正在向服务器要：第几个读请求
+    Wanted(u64),
+    /// 读回来了，是 `bytes[at..at + len]`：文件末尾那格不满，过了末尾的是空的
+    Ready {
+        bytes: Arc<Vec<u8>>,
+        at: usize,
+        len: usize,
+        used: u64,
+    },
+    /// 要的时候出错了：等着这个请求的读都报这个错，之后的读重新要
+    Failed(u64, NTSTATUS),
+}
+
+/// 一路连着往后读的。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Stream {
+    /// 下一次接着读该从哪开始
+    next: u64,
+    /// 这一路已经读了多少字节
+    run: u64,
+    /// 接着读了几次，头一次不算
+    hits: u32,
+    used: u64,
+}
+
+impl Cache {
+    /// 换一代：留着的都不要了，在路上的回来了也不要。
+    fn renew(&mut self) {
+        self.generation += 1;
+        self.units.clear();
+    }
+
+    /// 这一格既没读回来，也没在要。
+    fn missing(&self, unit: u64) -> bool {
+        !matches!(
+            self.units.get(&unit),
+            Some(Unit::Wanted(_) | Unit::Ready { .. })
+        )
+    }
+
+    /// 这次读的 `offset..end` 是哪一路接着往后读的：从上次停下的地方（前后差一两格以内，系统的
+    /// 预读会稍微打乱先后）往后读。接不上的另开一路，顶掉最久没用的那一路。
+    fn follow(&mut self, offset: u64, end: u64) -> Stream {
+        self.tick += 1;
+        let tick = self.tick;
+        let near = |stream: &Stream| {
+            end > stream.next && offset + UNIT >= stream.next && offset <= stream.next + 2 * UNIT
+        };
+        if let Some(stream) = self.streams.iter_mut().find(|stream| near(stream)) {
+            stream.run += end - offset;
+            stream.next = end;
+            stream.hits += 1;
+            stream.used = tick;
+            return *stream;
+        }
+        let stream = Stream {
+            next: end,
+            run: end - offset,
+            hits: 0,
+            used: tick,
+        };
+        match self.streams.len() < STREAMS {
+            true => self.streams.push(stream),
+            false => {
+                if let Some(oldest) = self.streams.iter_mut().min_by_key(|stream| stream.used) {
+                    *oldest = stream;
+                }
+            }
+        }
+        stream
+    }
+
+    /// 从第 `first` 格起的 `count` 格读回来了。
+    fn fill(&mut self, first: u64, count: u64, bytes: Vec<u8>) {
+        self.tick += 1;
+        let (bytes, used) = (Arc::new(bytes), self.tick);
+        for index in 0..count {
+            let at = ((index * UNIT) as usize).min(bytes.len());
+            let len = (bytes.len() - at).min(UNIT as usize);
+            let unit = Unit::Ready {
+                bytes: bytes.clone(),
+                at,
+                len,
+                used,
+            };
+            self.units.insert(first + index, unit);
+        }
+        self.trim();
+    }
+
+    /// 这个请求出错了：还在等它的格记下错误。
+    fn fail(&mut self, asked: &Asked, status: NTSTATUS) {
+        for unit in asked.first..asked.first + asked.count {
+            if let Some(slot) = self.units.get_mut(&unit)
+                && matches!(slot, Unit::Wanted(id) if *id == asked.id)
+            {
+                *slot = Unit::Failed(asked.id, status);
+            }
+        }
+    }
+
+    /// 超过上限时扔掉最久没用的（在要的不扔）。
+    fn trim(&mut self) {
+        let extra = self.units.len().saturating_sub(CACHE_UNITS);
+        if extra == 0 {
+            return;
+        }
+        let mut done: Vec<(u64, u64)> = self
+            .units
+            .iter()
+            .filter_map(|(unit, slot)| match slot {
+                Unit::Ready { used, .. } => Some((*used, *unit)),
+                Unit::Failed(..) => Some((0, *unit)),
+                Unit::Wanted(_) => None,
+            })
+            .collect();
+        done.sort_unstable();
+        for (_, unit) in done.into_iter().take(extra) {
+            self.units.remove(&unit);
+        }
+    }
+}
+
+/// 线路有多快，现在有多少读请求在路上。一个盘一个。
+///
+/// 连接是一根管子，先发的先回：在路上的读请求合起来不超过 [`AHEAD_SECS`] 秒能传完的量，别的请求
+/// 就最多排这么久。速度是边读边量的：读请求回来的字节数除以它在管子里占的时间。
+struct Pace {
+    /// 每秒多少字节，近几次的加权平均
+    rate: f64,
+    /// 量准过（不是猜的）
+    measured: bool,
+    /// 上一个读请求回来的时刻
+    last: Option<Instant>,
+    /// 在路上的读请求一共要了多少字节
+    flying: u64,
+}
+
+impl Pace {
+    fn new() -> Pace {
+        Pace {
+            rate: FIRST_RATE,
+            measured: false,
+            last: None,
+            flying: 0,
+        }
+    }
+
+    /// 换了连接：速度重新量。
+    fn reset(&mut self) {
+        self.rate = FIRST_RATE;
+        self.measured = false;
+        self.last = None;
+    }
+
+    /// 在路上的读请求最多合起来这么多字节。
+    fn budget(&self) -> u64 {
+        ((self.rate * AHEAD_SECS) as u64).clamp(AHEAD_MIN, AHEAD_MAX)
+    }
+
+    /// 要了 `wanted` 字节的一个读请求在 `at` 回来了，带回 `got` 字节。回音一个接一个地到：发出时
+    /// 前一个还没回来的，前一个到了它才开始传，从那时算起，量得准（头一次量准的直接用，之后取
+    /// 平均）；线路本来空着的，从发出时算起，多算了一个往返，量出来只会比真的慢，只拿来往上调。
+    fn landed(&mut self, wanted: u64, got: usize, issued: Instant, at: Instant) {
+        self.flying = self.flying.saturating_sub(wanted);
+        let queued = self.last.filter(|last| *last > issued);
+        self.last = Some(at);
+        if got == 0 {
+            return;
+        }
+        let start = queued.unwrap_or(issued);
+        let secs = at.saturating_duration_since(start).as_secs_f64().max(1e-4);
+        let sample = got as f64 / secs;
+        let rate = match queued {
+            Some(_) if !self.measured => sample,
+            Some(_) => self.rate + (sample - self.rate) * 0.5,
+            None => self.rate.max(sample),
+        };
+        self.measured |= queued.is_some();
+        self.rate = rate.min(MAX_RATE);
+    }
+}
+
+/// 在路上的上限是 `budget` 时，一个读请求最多要几格：上限的四分之一，线路慢时请求小，别的请求
+/// 插得进来；在路上同时有好几个，前一个到了后一个还在路上。
+fn fetch_units(budget: u64) -> u64 {
+    (budget / 4 / UNIT).clamp(1, FETCH_UNITS)
+}
+
+/// 发出去的一个读请求：从第 `first` 格起要 `count` 格。
+struct Asked {
+    id: u64,
+    node: Arc<Node>,
+    /// 发出时那个文件的缓存是第几代：回来时换了代就不要了
+    generation: u64,
+    first: u64,
+    count: u64,
+    issued: Instant,
+}
+
+struct Fetch {
+    asked: Asked,
+    reading: Reading,
+}
+
+/// 收读请求回音的线程：哪个先回来先放进那个文件的缓存，再叫醒等着的读。盘卸载了（发请求的
+/// 那一头没了）就退出，没回来的不要了。
+fn collect(
+    mut incoming: UnboundedReceiver<Fetch>,
+    pace: Arc<Mutex<Pace>>,
+    counters: Arc<Counters>,
+    windows: bool,
+) {
+    let mut running = FuturesUnordered::new();
+    let mut closed = false;
+    block_on(poll_fn(|cx| {
+        while !closed {
+            match incoming.poll_next_unpin(cx) {
+                Poll::Ready(Some(Fetch { asked, reading })) => {
+                    running.push(async move { (asked, reading.await, Instant::now()) })
+                }
+                Poll::Ready(None) => closed = true,
+                Poll::Pending => break,
+            }
+        }
+        while let Poll::Ready(Some((asked, result, at))) = running.poll_next_unpin(cx) {
+            let landing = || land(&asked, result, at, &pace, &counters, windows);
+            // 出了意外这个线程也不能没了，不然等数据的读会一直等下去：让等这个请求的读报错
+            if catch_unwind(AssertUnwindSafe(landing)).is_err() {
+                lock(&asked.node.state)
+                    .cache
+                    .fail(&asked, STATUS_UNEXPECTED_IO_ERROR);
+                asked.node.arrived.notify_all();
+            }
+        }
+        match closed {
+            true => Poll::Ready(()),
+            false => Poll::Pending,
+        }
+    }));
+}
+
+/// 一个读请求回来了：放进那个文件的缓存，叫醒等着的读。
+fn land(
+    asked: &Asked,
+    result: Result<(FsStat, Vec<u8>)>,
+    at: Instant,
+    pace: &Mutex<Pace>,
+    counters: &Counters,
+    windows: bool,
+) {
+    let got = result.as_ref().map_or(0, |(_, bytes)| bytes.len());
+    lock(pace).landed(asked.count * UNIT, got, asked.issued, at);
+    counters.down.fetch_add(got as u64, Relaxed);
+    let mut state = lock(&asked.node.state);
+    match result {
+        Ok((stat, bytes)) => state.arrived(asked, stat, bytes),
+        Err(err) => {
+            let message = format!("{err:#}");
+            let status = status_of(&message, windows);
+            if status != STATUS_OBJECT_NAME_NOT_FOUND {
+                log::warn!("fs_read /{} 失败：{message}", state.path);
+            }
+            state.cache.fail(asked, status);
+        }
+    }
+    drop(state);
+    asked.node.arrived.notify_all();
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -250,7 +570,7 @@ fn settle(incoming: mpsc::Receiver<Pending>, sink: Arc<Sink>) {
                 let message = format!("{err:#}");
                 log::warn!("写入 /{} 失败：{message}", state.path);
                 state.resync = true;
-                state.blocks.clear();
+                state.cache.renew();
                 // 只记第一个错：后面的多半是它引出来的
                 if state.failed.is_none() {
                     let status = status_of(&message, sink.windows);
@@ -262,6 +582,7 @@ fn settle(incoming: mpsc::Receiver<Pending>, sink: Arc<Sink>) {
         }
         drop(state);
         pending.node.landed.notify_all();
+        pending.node.arrived.notify_all();
     }
 }
 
@@ -302,7 +623,7 @@ impl Mount {
     pub(crate) fn new(
         channel: Channel,
         settings: Settings,
-        api: &Api,
+        add_dir_info: AddDirInfo,
         on_error: Box<dyn Fn(String) + Send + Sync>,
     ) -> Result<Mount> {
         let (tx, rx) = mpsc::channel();
@@ -315,6 +636,13 @@ impl Mount {
         std::thread::Builder::new()
             .name("mount-settle".into())
             .spawn(move || settle(rx, settling))?;
+        let (fetches, incoming) = unbounded();
+        let pace = Arc::new(Mutex::new(Pace::new()));
+        let counters = Arc::new(Counters::default());
+        let collecting = (pace.clone(), counters.clone(), settings.windows);
+        std::thread::Builder::new()
+            .name("mount-fetch".into())
+            .spawn(move || collect(incoming, collecting.0, collecting.1, collecting.2))?;
         Ok(Mount {
             channel: Mutex::new(Some(channel)),
             root: settings.root,
@@ -322,24 +650,29 @@ impl Mount {
             windows: settings.windows,
             label: settings.label.encode_utf16().take(32).collect(),
             security: open_security_descriptor()?,
-            add_dir_info: api.FspFileSystemAddDirInfo,
+            add_dir_info,
             started: filetime(now_millis()),
             dirs: Mutex::default(),
             stats: Mutex::default(),
             nodes: Mutex::default(),
             space: Mutex::default(),
             pending: Mutex::new(tx),
+            fetches: Mutex::new(fetches),
+            next_fetch: AtomicU64::new(0),
+            pace,
             sink,
             open_files: AtomicUsize::new(0),
-            counters: Counters::default(),
+            counters,
         })
     }
 
-    /// 换一条连接（重连上了），或者拿掉（断了）。留着的目录、属性都不要了。
+    /// 换一条连接（重连上了），或者拿掉（断了）。留着的目录、属性都不要了；新的连接可能走的是
+    /// 别的路（换了网络），线路速度重新量。
     pub(crate) fn set_channel(&self, channel: Option<Channel>) {
         *lock(&self.channel) = channel;
         lock(&self.dirs).clear();
         lock(&self.stats).clear();
+        lock(&self.pace).reset();
     }
 
     fn channel(&self) -> Nt<Channel> {
@@ -479,10 +812,7 @@ impl Mount {
                         state: Mutex::new(NodeState {
                             path: path.to_string(),
                             stat,
-                            blocks: VecDeque::new(),
-                            ahead: VecDeque::new(),
-                            last_block: None,
-                            run: 0,
+                            cache: Cache::default(),
                             flying: Vec::new(),
                             flying_bytes: 0,
                             failed: None,
@@ -491,6 +821,7 @@ impl Mount {
                             listing: None,
                         }),
                         landed: Condvar::new(),
+                        arrived: Condvar::new(),
                     });
                     nodes.insert(self.key(path), Arc::downgrade(&node));
                     (node, false)
@@ -503,8 +834,9 @@ impl Mount {
             // 自己正在写的不算别人改的
             if changed && state.flying.is_empty() && !state.dirty {
                 state.stat = stat;
-                state.blocks.clear();
-                state.ahead.clear();
+                state.cache.renew();
+                drop(state);
+                node.arrived.notify_all();
             }
         }
         node
@@ -611,98 +943,183 @@ impl Mount {
         }
     }
 
-    /// 一块读回来了：留着。别人改过这个文件的话，之前留着的不能再用。
-    fn keep(
+    /// 把第 `from` 到 `to` 格里还没有的向服务器要。`must` 为真时 `from` 那格不管线路忙不忙都要
+    /// （有读在等它），别的格线路有余量才要。在路上的写入先等它们落地，免得读到写之前的。
+    fn request<'a>(
         &self,
+        node: &'a Arc<Node>,
+        mut state: MutexGuard<'a, NodeState>,
+        from: u64,
+        to: u64,
+        must: bool,
+    ) -> Nt<MutexGuard<'a, NodeState>> {
+        if !(from..=to).any(|unit| state.cache.missing(unit)) {
+            return Ok(state);
+        }
+        if !state.flying.is_empty() {
+            state = self.drain(node, state);
+        }
+        let channel = self.channel()?;
+        let budget = lock(&self.pace).budget();
+        let most = fetch_units(budget);
+        let mut unit = from;
+        while unit <= to {
+            if !state.cache.missing(unit) {
+                unit += 1;
+                continue;
+            }
+            let mut count = 1;
+            while count < most && unit + count <= to && state.cache.missing(unit + count) {
+                count += 1;
+            }
+            {
+                let mut pace = lock(&self.pace);
+                if pace.flying + count * UNIT > budget && !(must && unit == from) {
+                    break;
+                }
+                pace.flying += count * UNIT;
+            }
+            self.issue(&channel, node, &mut state, unit, count)?;
+            unit += count;
+        }
+        Ok(state)
+    }
+
+    /// 发一个读请求：从第 `first` 格起要 `count` 格。回音由收回音的线程放进缓存。
+    fn issue(
+        &self,
+        channel: &Channel,
+        node: &Arc<Node>,
         state: &mut NodeState,
-        index: u64,
-        stat: FsStat,
-        bytes: Vec<u8>,
-    ) -> Arc<Vec<u8>> {
-        self.counters.down.fetch_add(bytes.len() as u64, Relaxed);
-        if stat.mtime != state.stat.mtime || stat.size != state.stat.size {
-            state.blocks.clear();
-            state.stat = stat;
+        first: u64,
+        count: u64,
+    ) -> Nt<()> {
+        let id = self.next_fetch.fetch_add(1, Relaxed);
+        let reading = channel.fs_read(&self.root, &state.path, first * UNIT, count * UNIT);
+        self.counters.calls.fetch_add(1, Relaxed);
+        let asked = Asked {
+            id,
+            node: node.clone(),
+            generation: state.cache.generation,
+            first,
+            count,
+            issued: Instant::now(),
+        };
+        if lock(&self.fetches)
+            .unbounded_send(Fetch { asked, reading })
+            .is_err()
+        {
+            // 收回音的线程没了：这个盘正在卸载
+            let mut pace = lock(&self.pace);
+            pace.flying = pace.flying.saturating_sub(count * UNIT);
+            return Err(STATUS_CONNECTION_DISCONNECTED);
         }
-        let data = Arc::new(bytes);
-        state.blocks.push_back((index, data.clone()));
-        if state.blocks.len() > CACHE_BLOCKS {
-            state.blocks.pop_front();
+        // 收回音的线程要拿着这个文件的锁才放得进去：它这时还看不到这些格
+        for unit in first..first + count {
+            state.cache.units.insert(unit, Unit::Wanted(id));
         }
-        data
+        Ok(())
     }
 
-    /// 要第 `index` 块：留着就用留着的，预先要了的等它回来，都没有就向服务器读。
-    fn block(&self, state: &mut NodeState, index: u64) -> Nt<Arc<Vec<u8>>> {
-        // 是不是接着上一块往后读
-        state.run = match state.last_block {
-            Some(last) if last + 1 == index => state.run + 1,
-            Some(last) if last == index => state.run,
-            _ => 0,
-        };
-        state.last_block = Some(index);
-        let cached = state.blocks.iter().find(|(at, _)| *at == index);
-        let data = match cached.map(|(_, data)| data.clone()) {
-            Some(data) => data,
-            None => {
-                // 预先要的那些里，这一块前面的用不上了
-                while state.ahead.front().is_some_and(|(at, _)| *at < index) {
-                    state.ahead.pop_front();
-                }
-                let reading = match state.ahead.front() {
-                    Some((at, _)) if *at == index => state.ahead.pop_front().map(|(_, r)| r),
-                    // 跳到别处读了：预先要的都不要了
-                    _ => {
-                        state.ahead.clear();
-                        None
-                    }
-                };
-                let reading = match reading {
-                    Some(reading) => reading,
-                    None => self
-                        .channel()?
-                        .fs_read(&self.root, &state.path, index * BLOCK, BLOCK),
-                };
-                let path = state.path.clone();
-                let (stat, bytes) = self.wait("fs_read", &path, reading)?;
-                self.keep(state, index, stat, bytes)
-            }
-        };
-        // 连着读了两块以上：把后面几块也要了，请求这就发出去，读到那里时多半已经回来
-        if state.run >= 1 {
-            let channel = self.channel()?;
-            let mut next = state.ahead.back().map_or(index + 1, |(at, _)| at + 1);
-            while next <= index + AHEAD && next * BLOCK < state.stat.size {
-                if !state.blocks.iter().any(|(at, _)| *at == next) {
-                    let reading = channel.fs_read(&self.root, &state.path, next * BLOCK, BLOCK);
-                    self.counters.calls.fetch_add(1, Relaxed);
-                    state.ahead.push_back((next, reading));
-                }
-                next += 1;
-            }
+    /// 连着往后读的：把后面一段也要了，读到那里时多半已经回来。这一段是这一路已经读了的两倍
+    /// （越读越多，延迟高的线路上也很快就能填满），线路有余量才要；在路上的写入还没落地时不要。
+    /// 空出一个整请求（这一段还短时是半段）的量才要：一格一格地要，请求太碎，快的线路上反而慢。
+    /// 一个请求只占这一段的几分之一，后一个请求在路上时前一个就到了，线路不会空着等。
+    fn prefetch<'a>(
+        &self,
+        node: &'a Arc<Node>,
+        state: MutexGuard<'a, NodeState>,
+        stream: Stream,
+    ) -> MutexGuard<'a, NodeState> {
+        let size = state.stat.size;
+        if stream.next >= size || !state.flying.is_empty() {
+            return state;
         }
-        Ok(data)
+        let budget = lock(&self.pace).budget();
+        let window = (2 * stream.run).clamp(AHEAD_MIN, budget);
+        let end = (stream.next + window).min(size);
+        let (from, to) = (stream.next / UNIT, (end - 1) / UNIT);
+        let missing = (from..=to)
+            .filter(|unit| state.cache.missing(*unit))
+            .count() as u64;
+        let need = fetch_units(budget).min((to + 1 - from).div_ceil(2));
+        // 到了文件末尾，剩下的不够也要
+        if missing == 0 || (missing < need && end < size) {
+            return state;
+        }
+        // 要不到（断线了）也不碍事：读到那里时再要
+        match self.request(node, state, from, to, false) {
+            Ok(state) => state,
+            Err(_) => lock(&node.state),
+        }
     }
 
-    fn read(&self, node: &Node, buffer: &mut [u8], offset: u64) -> Nt<usize> {
+    fn read(&self, node: &Arc<Node>, buffer: &mut [u8], offset: u64) -> Nt<usize> {
         let mut state = self.drain(node, lock(&node.state));
         if offset >= state.stat.size {
             return Err(STATUS_END_OF_FILE);
         }
         let end = (offset + buffer.len() as u64).min(state.stat.size);
+        let stream = state.cache.follow(offset, end);
+        let last = end.saturating_sub(1) / UNIT;
+        // 先要这次要读的，紧接着要后面的（连着往后读的），再等：后面的不用等这次的到了才发。
+        // 先发的先回，这次要的不会被后面的挡住
+        state = self.request(node, state, offset / UNIT, last, true)?;
+        if stream.hits > 0 {
+            state = self.prefetch(node, state, stream);
+        }
         let mut done = 0usize;
+        // 在等的那个读请求：它出了错，这次读就报这个错
+        let mut waiting = None;
         while offset + (done as u64) < end {
             let at = offset + done as u64;
-            let index = at / BLOCK;
-            let data = self.block(&mut state, index)?;
-            let within = (at - index * BLOCK) as usize;
-            if within >= data.len() {
-                // 文件变短了
-                break;
+            let unit = at / UNIT;
+            if let Some(Unit::Failed(id, status)) = state.cache.units.get(&unit)
+                && waiting == Some(*id)
+            {
+                return Err(*status);
             }
-            let len = (data.len() - within).min((end - at) as usize);
-            buffer[done..done + len].copy_from_slice(&data[within..within + len]);
-            done += len;
+            // 这一格和后面还要的那些，没有的都要了（后面的看线路有没有余量）。别的读要的时候
+            // 出了错的、文件变了不在了的，也重新要
+            state = self.request(node, state, unit, last, true)?;
+            state.cache.tick += 1;
+            let tick = state.cache.tick;
+            if let Some(Unit::Ready { used, .. }) = state.cache.units.get_mut(&unit) {
+                *used = tick;
+            }
+            match state.cache.units.get(&unit) {
+                Some(Unit::Ready {
+                    bytes,
+                    at: start,
+                    len,
+                    ..
+                }) => {
+                    let within = (at - unit * UNIT) as usize;
+                    // 文件变短了
+                    if within >= *len {
+                        break;
+                    }
+                    let count = (*len - within).min((end - at) as usize);
+                    let from = start + within;
+                    buffer[done..done + count].copy_from_slice(&bytes[from..from + count]);
+                    done += count;
+                    waiting = None;
+                }
+                // 等它回来（在等的请求出了错，下一圈报出来）
+                Some(Unit::Wanted(id)) => {
+                    waiting = Some(*id);
+                    state = node
+                        .arrived
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+                // 刚要过，到不了这里；真到了，下一圈再要
+                _ => waiting = None,
+            }
+        }
+        // 读的这段时间里线路可能量得更快了，能多要一些
+        if stream.hits > 0 {
+            drop(self.prefetch(node, state, stream));
         }
         match done {
             0 => Err(STATUS_END_OF_FILE),
@@ -777,10 +1194,10 @@ impl Mount {
         }
         state.stat.size = state.stat.size.max(offset + len);
         state.stat.mtime = now_millis();
-        state.blocks.clear();
-        state.ahead.clear();
+        state.cache.renew();
         state.dirty = true;
         self.remember(&state.path, state.stat);
+        node.arrived.notify_all();
         Ok((len as usize, self.info(&state.stat)))
     }
 
@@ -897,8 +1314,8 @@ impl Mount {
         let path = state.path.clone();
         let resizing = self.channel()?.fs_resize(&self.root, &path, size, false);
         state.stat = self.wait("fs_resize", &path, resizing)?;
-        state.blocks.clear();
-        state.ahead.clear();
+        state.cache.renew();
+        node.arrived.notify_all();
         state.dirty = true;
         self.remember(&path, state.stat);
         Ok(self.info(&state.stat))
@@ -1458,5 +1875,299 @@ mod tests {
             (133_444_736_000_000_000 - EPOCH_GAP) / 10_000,
             1_700_000_000_000
         );
+    }
+
+    /// 当作服务器上映射的那个目录，用完删掉。
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> TempDir {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "fr-mount-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+
+        fn write(&self, name: &str, bytes: &[u8]) {
+            std::fs::write(self.0.join(name), bytes).unwrap();
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    unsafe extern "C" fn no_dir_info(_: *mut DirInfo, _: *mut c_void, _: u32, _: *mut u32) -> u8 {
+        0
+    }
+
+    /// 经本机通道映射这个目录：不经 WinFsp，直接调读写。
+    fn local_mount(dir: &TempDir) -> Mount {
+        let settings = Settings {
+            root: dir.0.to_string_lossy().into_owned(),
+            place: "T:".into(),
+            read_only: false,
+            windows: true,
+            label: "test".into(),
+        };
+        Mount::new(Channel::Local, settings, no_dir_info, Box::new(|_| {})).unwrap()
+    }
+
+    /// 一串看着随机、每次都一样的字节。
+    fn noise(len: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    fn read_at(mount: &Mount, node: &Arc<Node>, offset: u64, len: usize) -> Vec<u8> {
+        let mut buffer = vec![0; len];
+        let got = mount.read(node, &mut buffer, offset).unwrap_or(0);
+        buffer.truncate(got);
+        buffer
+    }
+
+    #[test]
+    fn 只看开头时只拉一格() {
+        let dir = TempDir::new();
+        let content = noise(3_000_000, 1);
+        dir.write("a.bin", &content);
+        let mount = local_mount(&dir);
+        let node = mount.open("a.bin").unwrap();
+        assert_eq!(read_at(&mount, &node, 0, 4096), content[..4096]);
+        assert_eq!(mount.counters.down.load(Relaxed), UNIT);
+        // 再看一遍开头：不算接着往后读，也不再向服务器要
+        assert_eq!(read_at(&mount, &node, 100, 3000), content[100..3100]);
+        assert_eq!(mount.counters.down.load(Relaxed), UNIT);
+        assert_eq!(lock(&node.state).cache.units.len(), 1);
+    }
+
+    #[test]
+    fn 连着往后读时提前要后面的_每格只要一次() {
+        let dir = TempDir::new();
+        let content = noise(5_000_000, 2);
+        dir.write("b.bin", &content);
+        let mount = local_mount(&dir);
+        let node = mount.open("b.bin").unwrap();
+        let mut got = Vec::new();
+        while got.len() < content.len() {
+            let chunk = read_at(&mount, &node, got.len() as u64, 65536);
+            assert!(!chunk.is_empty(), "读到 {} 时没有了", got.len());
+            got.extend_from_slice(&chunk);
+            if got.len() == 3 * 65536 {
+                // 读了三次：后面的已经在要了
+                assert!(!lock(&node.state).cache.missing(3));
+            }
+        }
+        assert_eq!(got, content);
+        // 不拉文件以外的，读过的也不再拉
+        assert_eq!(mount.counters.down.load(Relaxed), content.len() as u64);
+    }
+
+    #[test]
+    fn 几个线程同时乱着读_读到的都对() {
+        let dir = TempDir::new();
+        let content = noise(4_000_000, 3);
+        dir.write("c.bin", &content);
+        let mount = local_mount(&dir);
+        let node = mount.open("c.bin").unwrap();
+        std::thread::scope(|scope| {
+            for seed in 0..8u64 {
+                let (mount, node, content) = (&mount, &node, &content);
+                scope.spawn(move || {
+                    let mut x = seed * 7919 + 1;
+                    for _ in 0..200 {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        let offset = x % (content.len() as u64 + 1000);
+                        let len = (x >> 20) as usize % 300_000 + 1;
+                        let got = read_at(mount, node, offset, len);
+                        let start = (offset as usize).min(content.len());
+                        let end = (offset as usize + len).min(content.len());
+                        assert!(got == content[start..end], "从 {offset} 读 {len} 不对");
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn 写了以后读到的是新的() {
+        let dir = TempDir::new();
+        let mut model = noise(2_000_000, 4);
+        dir.write("d.bin", &model);
+        let mount = local_mount(&dir);
+        let node = mount.open("d.bin").unwrap();
+        // 先整个读一遍，缓存里都有了
+        assert!(read_at(&mount, &node, 0, model.len()) == model);
+        let data = noise(100_000, 5);
+        mount.write(&node, &data, 500_000, false, false).unwrap();
+        model[500_000..600_000].copy_from_slice(&data);
+        assert!(read_at(&mount, &node, 450_000, 200_000) == model[450_000..650_000]);
+        // 写到末尾以外：中间补 0，文件变长
+        mount.write(&node, &data, 2_050_000, false, false).unwrap();
+        model.resize(2_050_000, 0);
+        model.extend_from_slice(&data);
+        assert!(read_at(&mount, &node, 0, model.len()) == model);
+        // 截短
+        mount.resize(&node, 1_000_000, false).unwrap();
+        model.truncate(1_000_000);
+        assert!(read_at(&mount, &node, 0, 2_000_000) == model);
+        mount.commit(&node).unwrap();
+        assert!(std::fs::read(dir.0.join("d.bin")).unwrap() == model);
+    }
+
+    #[test]
+    fn 一边读一边写_写完以后读到的都是新的() {
+        let dir = TempDir::new();
+        let mut model = noise(3_000_000, 8);
+        dir.write("w.bin", &model);
+        let mount = local_mount(&dir);
+        let node = mount.open("w.bin").unwrap();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for seed in 0..3u64 {
+                let (mount, node, stop) = (&mount, &node, &stop);
+                scope.spawn(move || {
+                    let mut x = seed + 99;
+                    while !stop.load(Relaxed) {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        read_at(mount, node, x % 3_000_000, (x >> 24) as usize % 200_000 + 1);
+                    }
+                });
+            }
+            let mut x = 12345u64;
+            for round in 0..40 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let at = (x % 2_900_000) as usize;
+                let data = noise((x >> 30) as usize % 100_000 + 1, round);
+                mount.write(&node, &data, at as u64, false, false).unwrap();
+                model[at..at + data.len()].copy_from_slice(&data);
+            }
+            mount.commit(&node).unwrap();
+            stop.store(true, Relaxed);
+        });
+        assert!(read_at(&mount, &node, 0, model.len()) == model);
+    }
+
+    #[test]
+    fn 文件被别人改了以后读到新的() {
+        let dir = TempDir::new();
+        let old = noise(1_000_000, 6);
+        dir.write("e.bin", &old);
+        let mount = local_mount(&dir);
+        let node = mount.open("e.bin").unwrap();
+        assert_eq!(read_at(&mount, &node, 0, 1000), old[..1000]);
+        // 别人改了：内容和大小都变了
+        let new = noise(1_200_000, 7);
+        dir.write("e.bin", &new);
+        // 读还没留着的地方：回来时发现大小变了，之前留着的都不要了
+        assert_eq!(read_at(&mount, &node, 900_000, 1000), new[900_000..901_000]);
+        assert_eq!(read_at(&mount, &node, 0, 1000), new[..1000]);
+        assert_eq!(lock(&node.state).stat.size, 1_200_000);
+    }
+
+    #[test]
+    fn 读不到时报错_不卡住() {
+        let dir = TempDir::new();
+        dir.write("gone.bin", &noise(500_000, 9));
+        let mount = local_mount(&dir);
+        let node = mount.open("gone.bin").unwrap();
+        std::fs::remove_file(dir.0.join("gone.bin")).unwrap();
+        let mut buffer = vec![0; 4096];
+        for _ in 0..2 {
+            let read = mount.read(&node, &mut buffer, 0);
+            assert_eq!(read, Err(STATUS_OBJECT_NAME_NOT_FOUND));
+        }
+    }
+
+    #[test]
+    fn 认出连着往后读的() {
+        let mut cache = Cache::default();
+        assert_eq!(cache.follow(0, 4096).hits, 0);
+        assert_eq!(cache.follow(4096, 8192).hits, 1);
+        // 另一路从中间开始，两路交替着读
+        assert_eq!(cache.follow(1 << 20, (1 << 20) + 65536).hits, 0);
+        assert_eq!(cache.follow(8192, 16384).hits, 2);
+        let second = cache.follow((1 << 20) + 65536, (1 << 20) + 131072);
+        assert_eq!((second.hits, second.run), (1, 131072));
+        // 再读一遍读过的：不算接着读
+        assert_eq!(cache.follow(0, 4096).hits, 0);
+        // 稍微跳过一段（系统的预读打乱了先后）还算接着读
+        assert_eq!(cache.follow(16384 + 65536, 16384 + 131072).hits, 3);
+        // 跳得远了另开一路
+        assert_eq!(cache.follow(3 << 20, (3 << 20) + 4096).hits, 0);
+    }
+
+    #[test]
+    fn 留的数据有上限_先扔最久没用的() {
+        let mut cache = Cache::default();
+        cache.units.insert(10_000, Unit::Wanted(1));
+        for unit in 0..(CACHE_UNITS as u64 + 10) {
+            cache.fill(unit, 1, vec![unit as u8; UNIT as usize]);
+        }
+        assert_eq!(cache.units.len(), CACHE_UNITS);
+        assert!(cache.missing(10));
+        assert!(!cache.missing(11));
+        // 在要的不扔
+        assert!(matches!(cache.units.get(&10_000), Some(Unit::Wanted(1))));
+        // 回来的比要的少：过了文件末尾的格是空的
+        cache.fill(20_000, 3, vec![7; 100_000]);
+        let len = |unit| match cache.units.get(&unit) {
+            Some(Unit::Ready { len, .. }) => *len,
+            _ => usize::MAX,
+        };
+        assert_eq!((len(20_000), len(20_001), len(20_002)), (65536, 34464, 0));
+    }
+
+    #[test]
+    fn 线路的速度边读边量() {
+        // 400 KiB/s、往返 60 ms 的线路，一个接一个地要 128 KiB：前一个回来时后一个已经在路上
+        let mut pace = Pace::new();
+        let rate = 400.0 * 1024.0;
+        let size = 2 * UNIT;
+        let start = Instant::now();
+        let mut landed = start + Duration::from_millis(60);
+        for _ in 0..20 {
+            let issued = landed - Duration::from_millis(10);
+            landed += Duration::from_secs_f64(size as f64 / rate);
+            pace.flying += size;
+            pace.landed(size, size as usize, issued, landed);
+        }
+        assert!((pace.rate / rate - 1.0).abs() < 0.05, "{}", pace.rate);
+        assert_eq!(pace.flying, 0);
+        // 在路上的最多 0.3 秒的量：这么慢的线路上是下限，两格
+        assert_eq!(pace.budget(), AHEAD_MIN);
+        // 线路空着时发的，量到的时间里有一个往返，比真的慢：不往下拉
+        let issued = landed + Duration::from_secs(1);
+        landed = issued + Duration::from_millis(60) + Duration::from_secs_f64(UNIT as f64 / rate);
+        pace.landed(UNIT, UNIT as usize, issued, landed);
+        assert!((pace.rate / rate - 1.0).abs() < 0.05, "{}", pace.rate);
+        // 换到 100 MB/s 的线路，1 MiB 一个：很快到上限
+        let rate = 100e6;
+        for _ in 0..10 {
+            let issued = landed - Duration::from_millis(1);
+            landed += Duration::from_secs_f64((16 * UNIT) as f64 / rate);
+            pace.landed(16 * UNIT, 16 * UNIT as usize, issued, landed);
+        }
+        assert_eq!(pace.budget(), AHEAD_MAX);
     }
 }
