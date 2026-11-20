@@ -18,7 +18,8 @@
 //! 「已固定」下面有一个下拉，选只列哪台服务器上的工作区（全部、本机、各台服务器；没有配置服务器
 //! 时没有它）。固定的不受它影响，右边显示着的终端也不动。设计见 `design/machine-switch/`（方向 A）。
 //!
-//! 画面有两种接法。平常是「只看」（[`TerminalView::watch`]）：不改终端的大小，敲的字照样写得进去。
+//! 画面有两种接法。平常是「只看」（[`TerminalView::watch`]）：只看一眼不改终端的大小，敲的字照样
+//! 写得进去；焦点进到画面里（开始输入）以后，大小改成这一页放得下的（`TerminalView::claim`）。
 //! 这一页自己开的（新建、重启）是正经接着的（[`TerminalView::new`]），大小跟着这一页的画面，也就和
 //! 仓库的终端页一样大；选到别的终端再回来，就换成只看。
 //!
@@ -207,16 +208,9 @@ fn row_in<'a>(hub: &'a [RepoGroup], slot: &TermSlot) -> Option<&'a Row> {
 }
 
 /// 一个仓库的终端分成两段：固定的（按固定的先后）、没固定的。标签栏和侧栏都是这个顺序。
-/// 仓库算不算在 `scope` 那台电脑上（没选是都算）：看它所在的工作区在哪台，不在任何工作区里的看它
-/// 自己在哪台。经别的电脑连的算那台电脑的：156 的工作区里 91 的仓库是 156 的。
-fn within(scope: Option<&str>, group: &RepoGroup, entry: &RepoEntry) -> bool {
-    let Some(scope) = scope else {
-        return true;
-    };
-    let machine = match &group.workspace {
-        Some(key) => key.machine.as_str(),
-        None => machine_of(entry),
-    };
+/// 仓库在不在 `scope` 那台电脑上。经别的电脑连的算那台电脑的：经 156 连的 91 上的仓库是 156 的。
+fn on_machine(scope: &str, entry: &RepoEntry) -> bool {
+    let machine = machine_of(entry);
     split_relay(machine).map_or(machine, |(via, _)| via) == scope
 }
 
@@ -428,17 +422,45 @@ impl TermOverview {
         known.then_some(scope)
     }
 
-    /// 侧栏里看得到的终端：选的那台电脑上的，加上固定的终端、固定的仓库里的。
-    fn seen<'a>(&self, hub: &'a [RepoGroup], cx: &App) -> Vec<&'a Row> {
-        let scope = self.scope(cx);
+    /// 只看一台电脑时树里列的：那台上的工作区（只在它们之间去重，见 [`TermBoard::repos_on`]），
+    /// 加上不在任何工作区里、仓库在那台上的终端。
+    fn scoped(&self, machine: &str, hub: &[RepoGroup], cx: &App) -> Vec<RepoGroup> {
+        let mut groups = self.board.read(cx).repos_on(machine, cx);
+        for group in &mut groups {
+            for (_, rows) in &mut group.repos {
+                rows.retain(|row| !self.ending.contains(&row.id));
+            }
+        }
+        let others = hub.iter().filter(|group| group.workspace.is_none());
+        let repos: Vec<Repo> = others
+            .flat_map(|group| &group.repos)
+            .filter(|(entry, _)| on_machine(machine, entry))
+            .cloned()
+            .collect();
+        if !repos.is_empty() {
+            groups.push(RepoGroup {
+                workspace: None,
+                repos,
+            });
+        }
+        groups
+    }
+
+    /// 侧栏里看得到的终端：树里列的（选了一台电脑就是那台上的），加上固定的终端、固定的仓库里的。
+    fn seen(&self, hub: &[RepoGroup], cx: &App) -> Vec<Row> {
+        let Some(machine) = self.scope(cx) else {
+            return rows_in(hub).cloned().collect();
+        };
+        let tree = self.scoped(&machine, hub, cx);
+        let mut seen: Vec<Row> = rows_in(&tree).cloned().collect();
         let pins = &self.app.read(cx).settings.term_hub;
-        let mut seen = Vec::new();
-        for group in hub {
-            for (entry, rows) in &group.repos {
-                let whole =
-                    within(scope.as_deref(), group, entry) || pins.pinned_repos.contains(entry);
-                let pinned = |row: &&Row| whole || pins.pinned_terms.contains(&row.slot());
-                seen.extend(rows.iter().filter(pinned));
+        for (entry, rows) in hub.iter().flat_map(|group| &group.repos) {
+            let whole = pins.pinned_repos.contains(entry);
+            for row in rows {
+                let pinned = whole || pins.pinned_terms.contains(&row.slot());
+                if pinned && !seen.iter().any(|other| other.id == row.id) {
+                    seen.push(row.clone());
+                }
             }
         }
         seen
@@ -450,6 +472,8 @@ impl TermOverview {
         let pins = &self.app.read(cx).settings.term_hub;
         let scope = self.scope(cx);
         let here = scope.as_deref();
+        let scoped = here.map(|machine| self.scoped(machine, hub, cx));
+        let tree: &[RepoGroup] = scoped.as_deref().unwrap_or(hub);
         let wanted =
             |rows: &[Row]| self.filter == Filter::All || rows.iter().any(|row| self.matches(row));
         let repo = |(entry, rows): &Repo| {
@@ -477,14 +501,13 @@ impl TermOverview {
             .filter(|(_, rows)| wanted(rows))
             .map(repo)
             .collect();
-        let groups = hub
+        let groups = tree
             .iter()
             .filter_map(|group| {
                 // 固定了的仓库已经在上面，这里不再列
                 let repos: Vec<SideRepo> = group
                     .repos
                     .iter()
-                    .filter(|(entry, _)| within(here, group, entry))
                     .filter(|(entry, rows)| !pins.pinned_repos.contains(entry) && wanted(rows))
                     .map(repo)
                     .collect();
@@ -564,7 +587,7 @@ impl TermOverview {
             // 侧栏里看得到的优先（选了只看一台服务器时，别的服务器上的不在侧栏里）
             let seen = self.seen(&hub, cx);
             let stopped = |row: &&Row| row.state == TermState::Stopped;
-            let first = seen.iter().copied().find(stopped).or(seen.first().copied());
+            let first = seen.iter().find(stopped).or(seen.first());
             let first = first.or(rows_in(&hub).next());
             self.shown = first.map(Row::slot);
             if let Some(row) = first {
@@ -575,16 +598,14 @@ impl TermOverview {
         // 选中的仓库不在了（从工作区里移走了，或者那台服务器断开了）：换成第一个
         let listed = |entry: &RepoEntry| repo_in(&hub, entry).is_some();
         if !self.repo.as_ref().is_some_and(listed) {
+            // 侧栏的树里列着的优先
             let scope = self.scope(cx);
-            let all: Vec<(&RepoGroup, &RepoEntry)> = hub
-                .iter()
-                .flat_map(|group| group.repos.iter().map(move |(entry, _)| (group, entry)))
-                .collect();
-            let first = all
-                .iter()
-                .find(|(group, entry)| within(scope.as_deref(), group, entry))
-                .or(all.first());
-            self.repo = first.map(|(_, entry)| (*entry).clone());
+            let tree = scope.map(|machine| self.scoped(&machine, &hub, cx));
+            let first_in = |groups: &[RepoGroup]| {
+                let first = groups.iter().flat_map(|group| &group.repos).next();
+                first.map(|(entry, _)| entry.clone())
+            };
+            self.repo = tree.as_deref().and_then(first_in).or(first_in(&hub));
         }
         self.sync(window, cx);
         self.focus.focus(window, cx);
@@ -2456,8 +2477,8 @@ impl Render for TermOverview {
 #[cfg(test)]
 mod tests {
     // 不整个引进来：界面库里也有一个叫 test 的属性宏，会顶掉标准的 #[test]
-    use super::{RepoEntry, RepoGroup, Row, TermId, TermSlot, TermState, WorkspaceKey};
-    use super::{ordered, within};
+    use super::{RepoEntry, Row, TermId, TermSlot, TermState};
+    use super::{on_machine, ordered};
 
     fn row(number: u32) -> Row {
         Row {
@@ -2502,38 +2523,16 @@ mod tests {
         assert_eq!(numbers(own), [1]);
     }
     #[test]
-    fn 只看一台服务器_按工作区所在的电脑算_不在工作区里的按仓库算() {
+    fn 不在工作区里的仓库_按它自己在哪台电脑算() {
         let entry = |server: Option<&str>| RepoEntry {
             server: server.map(str::to_string),
             path: "/repo".into(),
         };
-        let group = |machine: Option<&str>| RepoGroup {
-            workspace: machine.map(|machine| WorkspaceKey {
-                machine: machine.into(),
-                id: "w1".into(),
-            }),
-            repos: Vec::new(),
-        };
-        // 没选：都算
-        assert!(within(None, &group(Some("s1")), &entry(Some("s1"))));
-        // 本机的工作区、服务器的工作区
-        assert!(within(Some(""), &group(Some("")), &entry(None)));
-        assert!(!within(Some("s1"), &group(Some("")), &entry(None)));
-        assert!(within(Some("s1"), &group(Some("s1")), &entry(Some("s1"))));
-        // s1 的工作区里有它经手连的 s2 的仓库：算 s1 的，不算本机配置的 s2 的
-        assert!(within(
-            Some("s1"),
-            &group(Some("s1")),
-            &entry(Some("s1>s2"))
-        ));
-        assert!(!within(
-            Some("s2"),
-            &group(Some("s1")),
-            &entry(Some("s1>s2"))
-        ));
-        // 不在任何工作区里的：看仓库自己在哪台
-        assert!(within(Some(""), &group(None), &entry(None)));
-        assert!(within(Some("s1"), &group(None), &entry(Some("s1>s2"))));
-        assert!(!within(Some(""), &group(None), &entry(Some("s1"))));
+        assert!(on_machine("", &entry(None)));
+        assert!(!on_machine("", &entry(Some("s1"))));
+        assert!(on_machine("s1", &entry(Some("s1"))));
+        // 经 s1 连的 s2 上的仓库：算 s1 的，不算本机配置的 s2 的
+        assert!(on_machine("s1", &entry(Some("s1>s2"))));
+        assert!(!on_machine("s2", &entry(Some("s1>s2"))));
     }
 }

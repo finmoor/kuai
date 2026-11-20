@@ -555,7 +555,9 @@ impl TerminalView {
     /// 画面）。和 [`Self::new`] 的区别：
     ///
     /// - 用「只看」的接法，不改那个终端的大小：按它自己的行列数画，地方不够就把字缩小。它改了大小
-    ///   要重新建一个（见 [`Self::size`]）。
+    ///   要重新建一个（见 [`Self::size`]）。只看一眼不改大小，是因为一改里面的程序就要重画（Claude
+    ///   Code 会把整段对话重画一遍）。焦点进来、开始往里输入以后例外：大小改成这边画面放得下的（见
+    ///   [`Self::claim`]），不然窗口变大以后四周一直空着（2026-11-19 Feng 在终端页里用 OpenCode 时报的）。
     /// - 键盘、输入法、粘贴、鼠标、发文件和平常一样，都写得进去。
     /// - 仿真器要回答程序的话（问光标位置、颜色、终端大小）不发：那些由正经接着它的那一头或者
     ///   kuaid 回答，这里再答就重了。
@@ -581,9 +583,32 @@ impl TerminalView {
         this
     }
 
-    /// [`Self::watch`] 建的时候那个终端是几列几行。
+    /// [`Self::watch`] 建的这个画面按几列几行画：建的时候那个终端的大小，往里输入以后是这边要过来的
+    /// 大小（见 [`Self::claim`]）。
     pub fn size(&self) -> Option<(u16, u16)> {
         self.watch.map(|grid| (grid.cols as u16, grid.rows as u16))
+    }
+
+    /// 「只看」接着的终端要不要把大小要过来：焦点在这里（正往里输入）、里面的程序还在、这块面板按
+    /// 设置里的字号放得下的行列数 `roomy` 和它现在的不一样。
+    fn wants_size(&self, roomy: Grid, window: &Window) -> bool {
+        self.watch.is_some_and(|grid| grid != roomy)
+            && self.is_alive()
+            && self.focus.is_focused(window)
+    }
+
+    /// 把「只看」接着的终端改成 `grid` 这么大：这里的仿真器跟着改，再告诉 kuaid，里面的程序按新的
+    /// 大小重画。之后还是只看的接法（不回答程序的话），只是大小由这边定了：终端列表报上来的大小和
+    /// 它一样，终端页不会再重建这个画面。别处的画面（仓库的终端页、别的电脑上的 Kuai）焦点进去时再
+    /// 把大小要回去（见 [`Self::focus_changed`]），谁在输入就按谁的大小。
+    fn claim(&mut self, grid: Grid, cx: &mut Context<Self>) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let cell = session.cell;
+        session.resize(grid, cell);
+        self.watch = Some(grid);
+        cx.notify();
     }
 
     fn build(launcher: Option<Launcher>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -944,6 +969,16 @@ impl TerminalView {
         }
         if !focused {
             self.marked = None;
+        }
+        // 焦点进来时把大小要回来：终端页、别的电脑上的 Kuai 往里输入时可能按它们的画面改过（见
+        // `claim`）。只发给 kuaid，大小没变它不动；开在 Kuai 进程里的终端没有别人改大小
+        if focused
+            && self.watch.is_none()
+            && let Some((grid, cell)) = self.fitted
+            && let Some(session) = &mut self.session
+            && !session.in_process()
+        {
+            session.resize(grid, cell);
         }
         cx.notify();
     }
@@ -1749,8 +1784,18 @@ fn prepaint(
             .map(|advance| advance.width)
             .unwrap_or(size * 0.55)
     };
-    // 按设置里的字号，一格多大
+    // 按设置里的字号，一格多大；这块面板放得下几行几列
     let full = size(advance(px(prefs.font_size)), px(prefs.cell_height()));
+    let roomy = Grid {
+        cols: ((bounds.size.width / full.width).floor() as usize).max(2),
+        rows: ((bounds.size.height / full.height).floor() as usize).max(1),
+    };
+    // 「只看」接着的终端，焦点在这里（正往里输入）：大小交给这一边（见 `claim`）。面板小得放不下
+    // 几个字时（正在收起、窗口极小）不改
+    let room = bounds.size.width >= full.width * 4. && bounds.size.height >= full.height;
+    if room && view.read(cx).wants_size(roomy, window) {
+        view.update(cx, |this, cx| this.claim(roomy, cx));
+    }
     let watch = view.read(cx).watch;
     let (grid, cell, font_size) = match watch {
         // 行列数是那个终端定的：放不下就按比例把字缩小
@@ -1764,13 +1809,7 @@ fn prepaint(
             let cell = size(advance(font_size), px(prefs.cell_height() * scale));
             (grid, cell, font_size)
         }
-        None => {
-            let grid = Grid {
-                cols: ((bounds.size.width / full.width).floor() as usize).max(2),
-                rows: ((bounds.size.height / full.height).floor() as usize).max(1),
-            };
-            (grid, full, px(prefs.font_size))
-        }
+        None => (roomy, full, px(prefs.font_size)),
     };
     // 面板小得放不下几个字（正在收起、窗口极小）：不启动、不改大小
     if bounds.size.width < cell.width * 4. || bounds.size.height < cell.height {

@@ -485,6 +485,11 @@ impl RepoView {
     }
 
     /// 从子仓库、工作树回到上一层的总览表（返回按钮、Alt+←），一次退一层。没进到里面时返回假。
+    /// Ctrl+F 在子仓库总览里：焦点放到过滤框。
+    pub(super) fn focus_subs_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.subs.filter.focus_handle(cx).focus(window, cx);
+    }
+
     pub fn back_to_root(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         // 里面还进了一层（子仓库的工作树）：先退那一层
         if let Some(inner) = self.active_sub()

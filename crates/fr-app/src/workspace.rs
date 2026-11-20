@@ -8,7 +8,7 @@
 //! 的标签页留在内存里（正在做的操作不会被打断），只是不显示。工作区保存在它所在的电脑上
 //! （本机或服务器，见 `machines`），菜单里按电脑分组；开着哪些标签页各台电脑各记各的。
 //!
-//! 快捷键：F5 刷新、Ctrl+W 关标签页、Ctrl+Tab 切标签页、Ctrl+F 搜索提交、Ctrl+P 快速打开仓库、
+//! 快捷键：F5 刷新、Ctrl+W 关标签页、Ctrl+Tab 切标签页、Ctrl+F 查找（在哪一页就找哪一页的）、Ctrl+P 快速打开仓库、
 //! Ctrl+1 本地修改、Ctrl+2 所有提交、Ctrl+, 设置、Ctrl+Shift+T 重新打开刚关掉的标签页、
 //! Ctrl+` 当前仓库在 Git、终端两页之间切换、Ctrl+Shift+B 收起、展开侧栏。
 //!
@@ -1425,11 +1425,10 @@ impl Workspace {
         self.select(next as usize, cx);
     }
 
-    /// Ctrl+F：在当前仓库里搜索提交。
+    /// Ctrl+F：在当前仓库页正看着的东西里找（文件、改动、提交……见 `RepoView::find`）。
     pub fn find_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_repo() {
-            tab.shown(cx)
-                .update(cx, |view, cx| view.find_commit(window, cx));
+            tab.shown(cx).update(cx, |view, cx| view.find(window, cx));
         }
     }
 

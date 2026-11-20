@@ -149,7 +149,11 @@ impl RepoView {
             .ok();
         });
         let picker = cx.new(|cx| DiffState::new(Vec::new(), cx));
-        let editor = cx.new(|cx| EditorState::new(window, cx).line_number(true));
+        let editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .line_number(true)
+                .searchable(true)
+        });
         let observe = cx.observe(&picker, |_, _, cx| cx.notify());
         let back = match self.mode {
             Mode::Merge => self.merge.as_ref().map_or(Mode::Changes, |view| view.back),
@@ -210,6 +214,16 @@ impl RepoView {
     }
 
     /// 在「逐处选择」和「手动编辑」之间切换，内容跟着带过去。
+    /// Ctrl+F 在合并编辑器里：手工编辑时在编辑器里查找；逐块选的时候没有可找的，不动。
+    pub(super) fn find_in_merge(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = &self.merge else {
+            return;
+        };
+        if view.manual && !view.loading && view.error.is_none() {
+            super::files::open_editor_search(&view.editor, window, cx);
+        }
+    }
+
     fn merge_set_manual(&mut self, manual: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = &self.merge else {
             return;

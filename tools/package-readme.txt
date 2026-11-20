@@ -119,7 +119,7 @@ Windows 上的 Git 客户端，界面和操作方式接近 Fork，可以直接�
 
 快捷键
 ------
-F5 刷新；Ctrl+Enter 提交；Ctrl+F 搜索提交；Ctrl+P 快速打开仓库；
+F5 刷新；Ctrl+Enter 提交；Ctrl+F 在当前页中查找（Git 页中搜索提交，文件页中查找打开的文件）；Ctrl+P 快速打开仓库；
 Ctrl+1 本地修改；Ctrl+2 所有提交；
 Ctrl+W 关闭标签页（也可用鼠标中键；在文件页中先关闭当前打开的文件）；Ctrl+Shift+T 重新打开已关闭的标签页；
 Ctrl+Tab、Ctrl+Shift+Tab 切换标签页；Ctrl+, 设置；Ctrl+` 进入终端页，再按一次返回；

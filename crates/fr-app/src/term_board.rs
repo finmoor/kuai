@@ -519,29 +519,8 @@ impl TermBoard {
     /// 也开不了。
     pub fn repos(&self, cx: &App) -> Vec<RepoGroup> {
         let app = self.app.read(cx);
-        let mut rows = self.all_rows(app);
-        let mut seen: Vec<RepoEntry> = Vec::new();
-        let mut groups: Vec<RepoGroup> = Vec::new();
-        for key in workspace_order(app) {
-            let mut repos: Vec<(RepoEntry, Vec<Row>)> = Vec::new();
-            for entry in app.members(&key) {
-                let reachable = entry.server.is_none() || self.watching(machine_of(&entry));
-                if seen.contains(&entry) || !reachable {
-                    continue;
-                }
-                let (mine, rest): (Vec<Row>, Vec<Row>) =
-                    rows.into_iter().partition(|row| row.entry == entry);
-                rows = rest;
-                seen.push(entry.clone());
-                repos.push((entry, mine));
-            }
-            if !repos.is_empty() {
-                groups.push(RepoGroup {
-                    workspace: Some(key),
-                    repos,
-                });
-            }
-        }
+        let workspaces = self.reachable_members(workspace_order(app), app);
+        let (mut groups, rows) = group_by_workspace(workspaces, self.all_rows(app));
         let mut repos: Vec<(RepoEntry, Vec<Row>)> = Vec::new();
         for row in rows {
             match repos.iter_mut().find(|(entry, _)| *entry == row.entry) {
@@ -557,6 +536,66 @@ impl TermBoard {
         }
         groups
     }
+
+    /// 电脑 `machine` 上的工作区里的仓库和各自的终端（终端页只看一台服务器时用）。和 [`Self::repos`]
+    /// 不一样的地方：只在这台电脑的工作区之间去重。同一个仓库也在别的电脑的工作区里时，[`Self::repos`]
+    /// 把它归到排在前面的那个工作区（比如本机现在用的），这里照样列在这台电脑的工作区里；不然
+    /// 这台电脑的工作区会因为仓库都被别处占了而整个不见（2026-11-19 Feng 报的）。不在任何工作区里的
+    /// 终端这里不管。
+    pub fn repos_on(&self, machine: &str, cx: &App) -> Vec<RepoGroup> {
+        let app = self.app.read(cx);
+        let mut keys = workspace_order(app);
+        keys.retain(|key| key.machine == machine);
+        let workspaces = self.reachable_members(keys, app);
+        group_by_workspace(workspaces, self.all_rows(app)).0
+    }
+
+    /// 各个工作区里的仓库，去掉这次还没连上的服务器上的。
+    fn reachable_members(
+        &self,
+        keys: Vec<WorkspaceKey>,
+        app: &AppState,
+    ) -> Vec<(WorkspaceKey, Vec<RepoEntry>)> {
+        let reachable =
+            |entry: &RepoEntry| entry.server.is_none() || self.watching(machine_of(entry));
+        keys.into_iter()
+            .map(|key| {
+                let mut members = app.members(&key);
+                members.retain(reachable);
+                (key, members)
+            })
+            .collect()
+    }
+}
+
+/// 把终端按工作区、仓库分组。同一个仓库在几个工作区里时只列在最前面的那个里；没有仓库可列的
+/// 工作区不出现。返回分好的组，和不属于其中任何仓库的终端。
+fn group_by_workspace(
+    workspaces: Vec<(WorkspaceKey, Vec<RepoEntry>)>,
+    mut rows: Vec<Row>,
+) -> (Vec<RepoGroup>, Vec<Row>) {
+    let mut seen: Vec<RepoEntry> = Vec::new();
+    let mut groups: Vec<RepoGroup> = Vec::new();
+    for (key, members) in workspaces {
+        let mut repos: Vec<(RepoEntry, Vec<Row>)> = Vec::new();
+        for entry in members {
+            if seen.contains(&entry) {
+                continue;
+            }
+            let (mine, rest): (Vec<Row>, Vec<Row>) =
+                rows.into_iter().partition(|row| row.entry == entry);
+            rows = rest;
+            seen.push(entry.clone());
+            repos.push((entry, mine));
+        }
+        if !repos.is_empty() {
+            groups.push(RepoGroup {
+                workspace: Some(key),
+                repos,
+            });
+        }
+    }
+    (groups, rows)
 }
 
 /// 全部读到了的工作区：现在用的在最前，然后是本机的，再是各台服务器的。
@@ -604,7 +643,39 @@ fn owner(app: &AppState, machine: &str, key: &str) -> (RepoEntry, u32) {
 mod tests {
     use std::time::{Duration, Instant};
 
+    use super::{RepoEntry, WorkspaceKey, group_by_workspace};
     use super::{TermState, free_number, state_of};
+
+    #[test]
+    fn 同一个仓库在两台电脑的工作区里_合着看归前面的_只看一台时照样列() {
+        let entry = |path: &str| RepoEntry {
+            server: Some("s1".into()),
+            path: path.into(),
+        };
+        let key = |machine: &str, id: &str| WorkspaceKey {
+            machine: machine.into(),
+            id: id.into(),
+        };
+        // 本机的工作区和 s1 自己的工作区里是同两个仓库（s1 上的）
+        let local = (key("", "w1"), vec![entry("/a"), entry("/b")]);
+        let remote = (key("s1", "w9"), vec![entry("/a"), entry("/b"), entry("/c")]);
+        // 合着看：本机的在前，两个仓库归它，s1 的工作区只剩它独有的那个
+        let (groups, _) = group_by_workspace(vec![local, remote.clone()], Vec::new());
+        let paths = |repos: &[(RepoEntry, _)]| -> Vec<String> {
+            repos.iter().map(|(entry, _)| entry.path.clone()).collect()
+        };
+        assert_eq!(paths(&groups[0].repos), ["/a", "/b"]);
+        assert_eq!(paths(&groups[1].repos), ["/c"]);
+        // 只看 s1：它的工作区里三个都在
+        let (groups, _) = group_by_workspace(vec![remote], Vec::new());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(paths(&groups[0].repos), ["/a", "/b", "/c"]);
+        // 仓库全在别处的工作区：合着看时整组不出现
+        let first = (key("", "w1"), vec![entry("/a")]);
+        let second = (key("s1", "w9"), vec![entry("/a")]);
+        let (groups, _) = group_by_workspace(vec![first, second], Vec::new());
+        assert_eq!(groups.len(), 1);
+    }
 
     #[test]
     fn 终端的三种状态() {

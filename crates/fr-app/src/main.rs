@@ -35,6 +35,7 @@ mod workspace;
 use std::path::PathBuf;
 
 use futures::StreamExt as _;
+use gpui_kit::component::input::MoveToPreviousWord;
 use gpui_kit::*;
 
 use crate::app_state::AppState;
@@ -303,6 +304,12 @@ fn main() {
                 KeyBinding::new("ctrl-s", SaveFile, None),
                 // 从子仓库回到根仓库。焦点在终端、输入框里时归它们（往回一个词）
                 KeyBinding::new("alt-left", BackToRoot, None),
+                // 上面那句对输入框要靠这一条才成立：没有上下文的绑定和输入框自己的一样深，后登记的
+                // 在前，不补这一条的话输入框里按 Alt+← 也是回根仓库。界面库的输入框和我们的全局键
+                // 撞的一共四个：Alt+←（让给输入框）、Ctrl+F（全局的接住以后按页面分派，文件页交给
+                // 编辑器的查找，见 `RepoView::find`）、Ctrl+Shift+A 和 Ctrl+Shift+E（界面库拿来选到
+                // 行首、行尾，Windows 上没人这么按，留给切页面）。界面库升级后重新对一遍。
+                KeyBinding::new("alt-left", MoveToPreviousWord, Some("Input")),
                 // 所有工作区里的终端（All terminals）。终端里的程序分不出它和 Ctrl+A，留给 Kuai
                 KeyBinding::new("ctrl-shift-a", ShowTerminals, None),
             ]);

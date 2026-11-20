@@ -462,14 +462,33 @@ impl RepoView {
         self.status.as_ref().map_or(0, |s| s.entries.len())
     }
 
-    /// Ctrl+F：正在看改动（本地修改里选了文件、比较，或者焦点在提交的改动里）就在改动里搜；
-    /// 不然切到 Git 页的提交历史，把键盘焦点放到搜索框。
-    pub fn find_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.page == Page::Git && self.find_in_diff(window, cx) {
-            return;
+    /// Ctrl+F：在正看着的东西里找，不为了找东西换到别的页面、别的视图。
+    ///
+    /// - 文件页：在打开着的文件里查找（编辑器自带的查找条）；没有打开文本文件时把焦点放到
+    ///   按名称过滤文件的框里。
+    /// - 终端页：没有可找的，不动（焦点在终端里时这个键归里面的程序，到不了这里）。
+    /// - Git 页：合并编辑器里手工编辑时在编辑器里查找；逐行追溯里没有查找，不动（原来会被
+    ///   换到提交历史，正解着的冲突、看着的追溯就不见了）；子仓库总览是它的过滤框；正在看改动
+    ///   （本地修改里选了文件、比较，或者焦点在提交的改动里）就在改动里搜；其余的是提交历史的
+    ///   搜索框。
+    ///
+    /// 1.16.1 以前不管在哪一页都切到 Git 页去搜提交：文件页上写着「Ctrl+F 在文件中查找」，按了
+    /// 却跳走（2026-11-19 Feng 报的）。
+    pub fn find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.page {
+            Page::Files => self.find_in_file(window, cx),
+            Page::Terminal => {}
+            Page::Git => match self.mode {
+                Mode::Merge => self.find_in_merge(window, cx),
+                Mode::Blame => {}
+                Mode::Subs => self.focus_subs_filter(window, cx),
+                _ => {
+                    if !self.find_in_diff(window, cx) {
+                        self.focus_search(window, cx);
+                    }
+                }
+            },
         }
-        self.show_page(Page::Git, window, cx);
-        self.focus_search(window, cx);
     }
 
     /// 仓库在哪：本机或服务器名（经别的服务器连的是它在那台服务器上的名字）。

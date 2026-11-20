@@ -24,7 +24,7 @@ use fr_core::status::{Kind, Status};
 use fr_core::tf;
 use futures::FutureExt as _;
 use gpui_kit::component::WindowExt as _;
-use gpui_kit::component::input::{EditorState, InputEvent, InputState, Position, TabSize};
+use gpui_kit::component::input::{EditorState, InputEvent, InputState, Position, Search, TabSize};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 
@@ -348,6 +348,16 @@ pub(super) enum Body {
 }
 
 /// 一个打开的文件（编辑区上面的一个标签）。
+/// 打开编辑器自带的查找条，焦点放进去。
+///
+/// 不能指望按键自己到编辑器：全局的 Ctrl+F 和编辑器自己的 Ctrl+F 在键位表里一样深，后登记的
+/// （全局的）排在前面，编辑器收不到。所以由全局的那个把「查找」这个动作直接交给编辑器。
+pub(super) fn open_editor_search(editor: &Entity<EditorState>, window: &mut Window, cx: &mut App) {
+    let handle = editor.focus_handle(cx);
+    handle.focus(window, cx);
+    handle.dispatch_action(&Search, window, cx);
+}
+
 pub(super) struct OpenFile {
     pub id: u64,
     /// 相对仓库根
@@ -1370,6 +1380,16 @@ impl RepoView {
             cx,
             move |this, window, cx| this.drop_file_tab(id, window, cx),
         );
+    }
+
+    /// Ctrl+F 在文件页上：在显示着的文件里查找；没有打开文本文件（一个都没开、开的是图片）时
+    /// 把焦点放到按名称过滤文件的框里。
+    pub(super) fn find_in_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let doc = self.files.active_tab().and_then(OpenFile::text);
+        match doc.map(|doc| doc.editor.clone()) {
+            Some(editor) => open_editor_search(&editor, window, cx),
+            None => self.files.filter.focus_handle(cx).focus(window, cx),
+        }
     }
 
     /// 关掉显示着的那个文件（Ctrl+W）；一个都没开着时返回假，由调用的地方关仓库标签页。
