@@ -1786,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "fr-app"
-version = "1.16.2"
+version = "1.17.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -1817,7 +1817,7 @@ dependencies = [
 
 [[package]]
 name = "fr-channel"
-version = "1.16.2"
+version = "1.17.0"
 dependencies = [
  "anyhow",
  "fr-core",
@@ -1828,7 +1828,7 @@ dependencies = [
 
 [[package]]
 name = "fr-core"
-version = "1.16.2"
+version = "1.17.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -1839,7 +1839,7 @@ dependencies = [
 
 [[package]]
 name = "fr-mount"
-version = "1.16.2"
+version = "1.17.0"
 dependencies = [
  "anyhow",
  "fr-channel",
@@ -3546,7 +3546,7 @@ dependencies = [
 
 [[package]]
 name = "kuaid"
-version = "1.16.2"
+version = "1.17.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
