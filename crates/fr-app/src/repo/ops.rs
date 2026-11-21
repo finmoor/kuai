@@ -1164,8 +1164,10 @@ impl RepoView {
             cx,
             move |this, result, window, cx| match result {
                 Ok(_) => {
-                    window
-                        .push_notification(Notification::success(tf!("已删除分支 {name}", name)), cx);
+                    window.push_notification(
+                        Notification::success(tf!("已删除分支 {name}", name)),
+                        cx,
+                    );
                 }
                 // `-d` 不肯删，一般是分支还没合并。不去认 git 的报错文字（它跟着系统语言变），
                 // 原样给用户看，由用户决定要不要强制删
@@ -1418,7 +1420,9 @@ pub(crate) fn explain(detail: &str) -> Option<&'static str> {
         "would be overwritten",
         "please commit your changes or stash them",
     ]) {
-        Some(tr("本地改动将被覆盖，操作未执行。请先提交或贮藏改动后重试。"))
+        Some(tr(
+            "本地改动将被覆盖，操作未执行。请先提交或贮藏改动后重试。",
+        ))
     } else if has(&["index.lock", "another git process"]) {
         Some(tr(
             "仓库已锁定：其他 git 进程正在使用，或上次操作未正常结束。请稍后重试；如仍锁定，请删除 .git/index.lock。",
@@ -1430,7 +1434,9 @@ pub(crate) fn explain(detail: &str) -> Option<&'static str> {
     } else if has(&["unmerged files", "unresolved conflict", "fix conflicts"]) {
         Some(tr("存在未解决的冲突。请在「本地修改」中解决后重试。"))
     } else if has(&["not concluded your merge", "merge_head exists"]) {
-        Some(tr("上一次合并尚未提交。请先点击上方的「提交合并」或「中止」。"))
+        Some(tr(
+            "上一次合并尚未提交。请先点击上方的「提交合并」或「中止」。",
+        ))
     } else if has(&["nothing to commit", "no changes added to commit"]) {
         Some(tr("没有可提交的改动。"))
     } else if has(&["already exists"]) {

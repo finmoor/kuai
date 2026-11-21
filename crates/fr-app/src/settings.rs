@@ -2076,7 +2076,11 @@ mod tests {
         let old = r#"{"servers":[{"id":"s1","name":"dev","destination":"u@h"}]}"#;
         let mut settings = super::parse(old).unwrap();
         assert!(!settings.servers[0].manual_connect);
-        assert!(!serde_json::to_string(&settings).unwrap().contains("manual_connect"));
+        assert!(
+            !serde_json::to_string(&settings)
+                .unwrap()
+                .contains("manual_connect")
+        );
         // 去掉了「启动时自动连接」的勾：存下来，读回来还是不连
         settings.servers[0].manual_connect = true;
         let text = serde_json::to_string(&settings).unwrap();

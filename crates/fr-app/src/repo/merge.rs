@@ -272,8 +272,9 @@ impl RepoView {
                     window.push_notification(Notification::info(note), cx);
                 }
                 Err(_) => {
-                    let note =
-                        tr("冲突标记不完整（<<<<<<<、=======、>>>>>>> 须成组出现）。请补全或删除。");
+                    let note = tr(
+                        "冲突标记不完整（<<<<<<<、=======、>>>>>>> 须成组出现）。请补全或删除。",
+                    );
                     window.push_notification(Notification::warning(note), cx);
                 }
             }

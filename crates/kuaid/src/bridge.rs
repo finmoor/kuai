@@ -104,7 +104,9 @@ pub fn connect() -> Result<()> {
         }
     };
     let mut stream = stream;
-    let auth_sock = std::env::var("SSH_AUTH_SOCK").ok().filter(|s| !s.is_empty());
+    let auth_sock = std::env::var("SSH_AUTH_SOCK")
+        .ok()
+        .filter(|s| !s.is_empty());
     send(&mut stream, "bridge", json!({ "auth_sock": auth_sock }))?;
     // 开头这几步可能设了读超时（Windows），之后客户端多久不说话都行
     let _ = stream.set_read_timeout(None);
@@ -251,8 +253,8 @@ fn call(stream: &mut Stream, method: &str, params: Value) -> Result<Value> {
     send(stream, method, params)?;
     // 一个字节一个字节地读：不能多读，后面的字节是客户端的
     let mut reader = BufReader::with_capacity(1, &*stream);
-    let (response, _) = protocol::read_message::<_, Response>(&mut reader)?
-        .context("常驻进程已断开连接")?;
+    let (response, _) =
+        protocol::read_message::<_, Response>(&mut reader)?.context("常驻进程已断开连接")?;
     match response.error {
         Some(err) => bail!("{err}"),
         None => Ok(response.result.unwrap_or(Value::Null)),

@@ -194,13 +194,11 @@ impl Render for ActivityPanel {
             .map(|repo| repo.read(cx).activity.entries.iter().cloned().collect())
             .unwrap_or_default();
         if entries.is_empty() {
-            return v_flex().gap_2().child(
-                div()
-                    .py_6()
-                    .text_sm()
-                    .text_color(muted)
-                    .child(tr("暂无记录。提交、切换分支、获取、推送等操作将记录在此处。")),
-            );
+            return v_flex()
+                .gap_2()
+                .child(div().py_6().text_sm().text_color(muted).child(tr(
+                    "暂无记录。提交、切换分支、获取、推送等操作将记录在此处。",
+                )));
         }
         let rows: Vec<AnyElement> = entries
             .into_iter()

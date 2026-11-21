@@ -210,12 +210,9 @@ impl RepoView {
                     .text_sm()
                     .child(div().text_color(muted).child(tr("逐行追溯")))
                     .child(crate::ui::clipped("blame-path", view.path.clone()).flex_1())
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(tr("点击一行跳转到修改该行的提交；使用上下方向键选择，按 Enter 跳转")),
-                    )
+                    .child(div().text_xs().text_color(muted).child(tr(
+                        "点击一行跳转到修改该行的提交；使用上下方向键选择，按 Enter 跳转",
+                    )))
                     .child(
                         Button::new("close-blame")
                             .xsmall()

@@ -206,10 +206,7 @@ mod tests {
     fn 启动项指向这个程序才算开着() {
         let exe = r"C:\Tools\Kuai\kuai.exe";
         let command = command_for(exe);
-        assert_eq!(
-            command,
-            r#""C:\Tools\Kuai\kuai.exe" --minimized"#
-        );
+        assert_eq!(command, r#""C:\Tools\Kuai\kuai.exe" --minimized"#);
         assert!(points_to(&command, exe));
         // 路径大小写不一样也算
         assert!(points_to(&command, &exe.to_lowercase()));

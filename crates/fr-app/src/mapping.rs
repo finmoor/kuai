@@ -859,8 +859,8 @@ pub fn map_dialog(
                     1 => remote,
                     _ => remote.trim_end_matches('/').to_string(),
                 };
-                let absolute = remote.starts_with('/')
-                    || remote.as_bytes().get(1).is_some_and(|c| *c == b':');
+                let absolute =
+                    remote.starts_with('/') || remote.as_bytes().get(1).is_some_and(|c| *c == b':');
                 if !absolute {
                     return fail(tr("请填写主机上目录的完整路径").into(), window);
                 }
@@ -885,7 +885,8 @@ pub fn map_dialog(
                     // 这条映射自己正映射在那里的不算
                     let own = old.local.eq_ignore_ascii_case(&local);
                     let occupied = folder.exists()
-                        && std::fs::read_dir(folder).map_or(true, |mut inside| inside.next().is_some());
+                        && std::fs::read_dir(folder)
+                            .map_or(true, |mut inside| inside.next().is_some());
                     if occupied && !own {
                         return fail(
                             tr("该文件夹不为空，请选择空文件夹或新文件夹").into(),
@@ -1090,44 +1091,47 @@ pub fn map_dialog(
                             ),
                     )
                     .child(
-                        v_flex().gap_1().child(div().text_sm().child(tr("本机位置"))).child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    Radio::new("kind-drive")
-                                        .label(tr("盘符"))
-                                        .checked(as_drive)
-                                        .on_click(pick_kind(true)),
-                                )
-                                .child(
-                                    Button::new("letter")
-                                        .outline()
-                                        .w(px(76.))
-                                        .flex_none()
-                                        .disabled(!as_drive)
-                                        .child(
-                                            div()
-                                                .font_family("Consolas")
-                                                .child(drive.borrow().clone()),
-                                        )
-                                        .dropdown_caret(true)
-                                        .dropdown_menu(letter_menu),
-                                )
-                                .child(
-                                    div().pl_2().child(
-                                        Radio::new("kind-folder")
-                                            .label(tr("文件夹"))
-                                            .checked(!as_drive)
-                                            .on_click(pick_kind(false)),
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_sm().child(tr("本机位置")))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        Radio::new("kind-drive")
+                                            .label(tr("盘符"))
+                                            .checked(as_drive)
+                                            .on_click(pick_kind(true)),
+                                    )
+                                    .child(
+                                        Button::new("letter")
+                                            .outline()
+                                            .w(px(76.))
+                                            .flex_none()
+                                            .disabled(!as_drive)
+                                            .child(
+                                                div()
+                                                    .font_family("Consolas")
+                                                    .child(drive.borrow().clone()),
+                                            )
+                                            .dropdown_caret(true)
+                                            .dropdown_menu(letter_menu),
+                                    )
+                                    .child(
+                                        div().pl_2().child(
+                                            Radio::new("kind-folder")
+                                                .label(tr("文件夹"))
+                                                .checked(!as_drive)
+                                                .on_click(pick_kind(false)),
+                                        ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .child(Input::new(&folder_input).disabled(as_drive)),
                                     ),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .child(Input::new(&folder_input).disabled(as_drive)),
-                                ),
-                        ),
+                            ),
                     )
                     // 资源管理器里显示的名称（「名称 (K:)」）：只有盘符有
                     .when(as_drive, |body| {

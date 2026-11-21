@@ -741,9 +741,7 @@ fn install_dir() -> Result<PathBuf, Problem> {
 /// 在下载线程里跑：下载、核对校验值、放进暂存目录（安装程序直接放，zip 解压）。
 fn fetch_and_stage(release: &Release, got: &AtomicU64, cancel: &AtomicBool) -> Result<(), Problem> {
     let Some(expected) = &release.asset.sha256 else {
-        return Err(Problem::Download(
-            tr("GitHub 未提供此文件的校验值").into(),
-        ));
+        return Err(Problem::Download(tr("GitHub 未提供此文件的校验值").into()));
     };
     // 这一次自己的工作目录：下载、核对、解压都在里面，做完整个目录一次改名放进暂存目录。原来
     // 几次下载共用同一个 .part、zip 和暂存目录，取消以后马上重下，旧线程还在写、删、解压同一份

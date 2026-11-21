@@ -30,7 +30,8 @@ static GATE: RwLock<()> = RwLock::new(());
 
 /// 让所有会话停止读输出，直到返回值被丢弃。
 pub fn freeze() -> RwLockWriteGuard<'static, ()> {
-    GATE.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+    GATE.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub struct Pty {
@@ -101,9 +102,7 @@ impl Pty {
                 Ok(())
             });
         }
-        let child = cmd
-            .spawn()
-            .with_context(|| format!("无法启动 {shell}"))?;
+        let child = cmd.spawn().with_context(|| format!("无法启动 {shell}"))?;
         // 不留 Child：结束没结束自己按进程号查（升级换程序后也只剩进程号）
         Ok(Pty::new(master, child.id() as i32))
     }
@@ -222,7 +221,11 @@ impl Reader {
                     break;
                 }
             }
-            let timeout = if closing_since.is_some() { 100 } else { TICK_MS };
+            let timeout = if closing_since.is_some() {
+                100
+            } else {
+                TICK_MS
+            };
             match wait_readable(fd, timeout) {
                 Ready::Data => {
                     if !self.read_once(&mut buf) {
@@ -234,9 +237,9 @@ impl Reader {
                     if let Some(code) = try_wait(self.pid) {
                         exit = Some(code);
                         // shell 退出前最后写的那些
-                        while matches!(wait_readable(fd, 0), Ready::Data) && self.read_once(&mut buf)
-                        {
-                        }
+                        while matches!(wait_readable(fd, 0), Ready::Data)
+                            && self.read_once(&mut buf)
+                        {}
                         break;
                     }
                 }
@@ -302,7 +305,11 @@ fn wait_readable(fd: RawFd, timeout_ms: i32) -> Ready {
     let ready = unsafe { libc::poll(&mut poll, 1, timeout_ms) };
     if ready < 0 {
         let interrupted = std::io::Error::last_os_error().kind() == ErrorKind::Interrupted;
-        return if interrupted { Ready::Nothing } else { Ready::Closed };
+        return if interrupted {
+            Ready::Nothing
+        } else {
+            Ready::Closed
+        };
     }
     if ready == 0 {
         Ready::Nothing

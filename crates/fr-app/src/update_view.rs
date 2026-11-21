@@ -497,11 +497,9 @@ fn problem_hint(problem: &Problem, muted: Hsla) -> Option<Div> {
                     .font_family("Consolas")
                     .child(dir.to_string_lossy().to_string()),
             )
-            .child(
-                div()
-                    .whitespace_normal()
-                    .child(tr("请前往下载页手动下载，或将 Kuai 移至有写入权限的文件夹后重试。")),
-            ),
+            .child(div().whitespace_normal().child(tr(
+                "请前往下载页手动下载，或将 Kuai 移至有写入权限的文件夹后重试。",
+            ))),
     )
 }
 

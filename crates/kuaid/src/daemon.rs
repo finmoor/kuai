@@ -269,7 +269,11 @@ pub fn run(resume: Option<&str>) -> Result<()> {
     let _ = std::fs::write(paths.current(), &build);
     log(&format!(
         "{}：kuaid {} {build}，进程号 {}，接管 {adopted} 个终端",
-        if resume.is_some() { "升级完成" } else { "启动" },
+        if resume.is_some() {
+            "升级完成"
+        } else {
+            "启动"
+        },
         crate::VERSION,
         std::process::id(),
     ));
@@ -346,8 +350,8 @@ fn start_fresh(paths: &Paths) -> Result<Option<(UnixListener, File)>> {
     // 拿到锁了：套接字文件要是还在，是上一个进程没来得及删的
     let socket = paths.socket();
     let _ = std::fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket)
-        .with_context(|| format!("无法创建 {}", socket.display()))?;
+    let listener =
+        UnixListener::bind(&socket).with_context(|| format!("无法创建 {}", socket.display()))?;
     let _ = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600));
     Ok(Some((listener, lock)))
 }

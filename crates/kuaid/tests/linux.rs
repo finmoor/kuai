@@ -13,10 +13,10 @@
 //! ```
 #![cfg(unix)]
 
+use std::collections::VecDeque;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -227,7 +227,10 @@ impl Client {
         // 这个流上的第一条：开好了，或者开不了的报错
         let (response, _) = self.take("term_open 的回答", |r| r.id == id && r.ask.is_none());
         assert_eq!(response.error, None, "开不了终端");
-        (id, serde_json::from_value(response.result.unwrap()).unwrap())
+        (
+            id,
+            serde_json::from_value(response.result.unwrap()).unwrap(),
+        )
     }
 
     fn input(&mut self, term: &str, text: &str) {
@@ -242,7 +245,10 @@ impl Client {
             let what = format!("终端里的 {needle:?}，收到的是：{seen:?}");
             assert!(Instant::now() < deadline, "等不到：{what}");
             let (response, payload) = self.take(&what, |r| r.id == stream && r.ask.is_none());
-            assert!(response.chunk, "终端提前结束了：{response:?}，收到的是：{seen:?}");
+            assert!(
+                response.chunk,
+                "终端提前结束了：{response:?}，收到的是：{seen:?}"
+            );
             seen.push_str(&String::from_utf8_lossy(&payload));
         }
         seen
@@ -335,12 +341,18 @@ fn 拉起常驻进程_终端在客户端走了以后还在() {
         "echo cwd=$PWD term=$TERM in=$KUAI_TERM auth=[$SSH_AUTH_SOCK] done-$((1+1))\n",
     );
     let seen = first.output_until(stream, "done-2");
-    assert!(seen.contains(&format!("cwd={}", home.dir.display())), "{seen}");
+    assert!(
+        seen.contains(&format!("cwd={}", home.dir.display())),
+        "{seen}"
+    );
     assert!(seen.contains("term=xterm-256color"), "{seen}");
     assert!(seen.contains(&format!("in={}", opened.term)), "{seen}");
     // 终端拿到的是固定的地址，指向这条连接的 ssh-agent：以后换了连接，改指过去就行
     let link = home.dir.join(".kuai/run/auth.sock");
-    assert!(seen.contains(&format!("auth=[{}]", link.display())), "{seen}");
+    assert!(
+        seen.contains(&format!("auth=[{}]", link.display())),
+        "{seen}"
+    );
     assert_eq!(
         std::fs::read_link(&link).unwrap(),
         Path::new("/nonexistent/first-connection")
@@ -382,21 +394,30 @@ fn 拉起常驻进程_终端在客户端走了以后还在() {
 
     // 同一个名字再开：接上原来的，屏幕还原出来
     let (stream, again) = second.open("repo", &home.dir);
-    assert_eq!((again.term.as_str(), again.created), (opened.term.as_str(), false));
+    assert_eq!(
+        (again.term.as_str(), again.created),
+        (opened.term.as_str(), false)
+    );
     second.output_until(stream, "KUAID-42");
     assert_eq!(pid_of_shell(&mut second, stream, &again.term), shell_pid);
 
     // 状态命令看得到它
     let (ok, status) = home.run(&exe, "--status");
     assert!(ok, "{status}");
-    assert!(status.contains(&again.term) && status.contains("运行中"), "{status}");
+    assert!(
+        status.contains(&again.term) && status.contains("运行中"),
+        "{status}"
+    );
 
     // 这条连接没带 ssh-agent 转发：它新开的终端里没有，常驻进程没记着拉起它的那条连接的
     let (plain_stream, plain) = second.open("plain", &home.dir);
     second.input(&plain.term, "echo auth=[$SSH_AUTH_SOCK] done-$((1+1))\n");
     let seen = second.output_until(plain_stream, "done-2");
     assert!(seen.contains("auth=[]"), "{seen}");
-    assert_eq!(second.call("term_close", json!({ "term": plain.term }))["closed"], true);
+    assert_eq!(
+        second.call("term_close", json!({ "term": plain.term }))["closed"],
+        true
+    );
     second.exit_of(plain_stream);
 
     // shell 退出：收到退出码，会话没了
@@ -456,7 +477,9 @@ fn 没人看着时结束的终端_下次来看还看得到() {
 
     let mut second = home.connect(&exe);
     second.hello();
-    wait_until("程序结束", || second.terms().iter().all(|term| !term.alive));
+    wait_until("程序结束", || {
+        second.terms().iter().all(|term| !term.alive)
+    });
     assert_eq!(second.terms().len(), 1, "还没人看过，应该留着");
     let (stream, again) = second.open("repo", &home.dir);
     assert!(!again.created);
@@ -482,11 +505,17 @@ fn 新版本连上来_常驻进程原地换掉_终端留着() {
     let (ended_stream, ended) = first.open("ended", &home.dir);
     first.send("cancel", json!({ "id": ended_stream }), &[]);
     wait_until("从终端上断开", || {
-        first.terms().iter().any(|t| t.term == ended.term && t.attached == 0)
+        first
+            .terms()
+            .iter()
+            .any(|t| t.term == ended.term && t.attached == 0)
     });
     first.input(&ended.term, "echo GONE-$((1+1)); exit 5\n");
     wait_until("那个终端结束", || {
-        first.terms().iter().any(|t| t.term == ended.term && !t.alive)
+        first
+            .terms()
+            .iter()
+            .any(|t| t.term == ended.term && !t.alive)
     });
     // 升级的那一刻程序正在不停地输出
     first.input(&opened.term, "while :; do echo tick; sleep 0.05; done &\n");
@@ -508,7 +537,10 @@ fn 新版本连上来_常驻进程原地换掉_终端留着() {
 
     // 接上原来的终端：屏幕还在，shell 还是那个，变量还在，后台的输出还在来
     let (stream, again) = second.open("repo", &home.dir);
-    assert_eq!((again.term.as_str(), again.created), (opened.term.as_str(), false));
+    assert_eq!(
+        (again.term.as_str(), again.created),
+        (opened.term.as_str(), false)
+    );
     second.output_until(stream, "tick");
     second.input(&again.term, "kill %1; echo mark=$MARK=\n");
     second.output_until(stream, "mark=kept=");
@@ -564,13 +596,26 @@ fn 两个客户端的_git_要密码_各问各的() {
     let a = alice.send("git", args.clone(), b"protocol=https\nhost=a.example\n\n");
     let b = bob.send("git", args, b"protocol=https\nhost=b.example\n\n");
     // 两个 git 同时在等；各自的客户端被问到的是自己那个地址的
-    for (client, host, name) in [(&mut bob, "b.example", "bob"), (&mut alice, "a.example", "alice")] {
+    for (client, host, name) in [
+        (&mut bob, "b.example", "bob"),
+        (&mut alice, "a.example", "alice"),
+    ] {
         let (ask, prompt) = client.next_ask();
-        assert!(prompt.contains("Username") && prompt.contains(host), "{prompt}");
+        assert!(
+            prompt.contains("Username") && prompt.contains(host),
+            "{prompt}"
+        );
         client.send("answer", json!({ "id": ask, "answer": name }), &[]);
         let (ask, prompt) = client.next_ask();
-        assert!(prompt.contains("Password") && prompt.contains(host), "{prompt}");
-        client.send("answer", json!({ "id": ask, "answer": format!("pw-{name}") }), &[]);
+        assert!(
+            prompt.contains("Password") && prompt.contains(host),
+            "{prompt}"
+        );
+        client.send(
+            "answer",
+            json!({ "id": ask, "answer": format!("pw-{name}") }),
+            &[],
+        );
     }
     for (client, id, name) in [(&mut alice, a, "alice"), (&mut bob, b, "bob")] {
         let (_, payload) = client.reply(id, "git 的结果");

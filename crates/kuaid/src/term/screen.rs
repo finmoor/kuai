@@ -760,12 +760,22 @@ mod tests {
 
     #[test]
     fn 带底色的空格和清行() {
-        roundtrip(30, 4, b"\x1b[44m\x1b[K head\x1b[m\r\n\x1b[41m   \x1b[m|", b"x");
+        roundtrip(
+            30,
+            4,
+            b"\x1b[44m\x1b[K head\x1b[m\r\n\x1b[41m   \x1b[m|",
+            b"x",
+        );
     }
 
     #[test]
     fn 中文是两格宽() {
-        roundtrip(20, 4, "中文测试 abc 混排\r\n第二行".as_bytes(), "接着写".as_bytes());
+        roundtrip(
+            20,
+            4,
+            "中文测试 abc 混排\r\n第二行".as_bytes(),
+            "接着写".as_bytes(),
+        );
     }
 
     #[test]
@@ -795,7 +805,10 @@ mod tests {
         roundtrip(10, 4, b"0123456789\r\nnext", b"!");
         // 写满后不换行：光标停在最后一列等着折行，下一个字才折
         let screen = roundtrip(10, 4, b"0123456789", b"A");
-        assert_eq!(screen.term.grid().cursor.point, Point::new(Line(1), Column(1)));
+        assert_eq!(
+            screen.term.grid().cursor.point,
+            Point::new(Line(1), Column(1))
+        );
         // 最后一格是宽字符
         roundtrip(10, 4, "01234567中".as_bytes(), b"A");
     }

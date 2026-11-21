@@ -934,13 +934,11 @@ impl RepoView {
                     }
                 }
                 None => menu
-                    .item(
-                        PopupMenuItem::new(tr("在外部终端中打开")).on_click(
-                            move |_, window, cx| {
-                                crate::shell::report(crate::shell::open_terminal(&a), window, cx)
-                            },
-                        ),
-                    )
+                    .item(PopupMenuItem::new(tr("在外部终端中打开")).on_click(
+                        move |_, window, cx| {
+                            crate::shell::report(crate::shell::open_terminal(&a), window, cx)
+                        },
+                    ))
                     .item(PopupMenuItem::new(tr("在 VS Code 中打开")).on_click(
                         move |_, window, cx| {
                             crate::shell::report(crate::shell::open_vscode(&b), window, cx)

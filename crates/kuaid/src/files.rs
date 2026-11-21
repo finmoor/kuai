@@ -343,7 +343,10 @@ pub(crate) mod tests {
 
     #[test]
     fn 文件名变成能直接贴进_shell_的() {
-        assert_eq!(safe_name("截图 2026-11-12 (1).png"), "截图_2026-11-12__1_.png");
+        assert_eq!(
+            safe_name("截图 2026-11-12 (1).png"),
+            "截图_2026-11-12__1_.png"
+        );
         assert_eq!(safe_name(r"C:\Users\me\a b.txt"), "a_b.txt");
         assert_eq!(safe_name("/etc/../x'y\"z;$(rm).sh"), "x_y_z___rm_.sh");
         assert_eq!(safe_name("..hidden"), "hidden");

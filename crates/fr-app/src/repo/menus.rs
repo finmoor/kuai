@@ -164,9 +164,11 @@ fn scope_items(
         }
     };
     let menu = menu.item(
-        item(view, tr("在提交列表中仅显示此项"), move |this, w, cx| {
-            this.set_scope(to.clone(), w, cx)
-        })
+        item(
+            view,
+            tr("在提交列表中仅显示此项"),
+            move |this, w, cx| this.set_scope(to.clone(), w, cx),
+        )
         .checked(only),
     );
     match hidden {
@@ -432,11 +434,9 @@ impl RepoView {
                     }
                     // 拉取：当前分支和工具栏上的「拉取」一样；别的分支不用切过去，只在能快进时更新
                     if branch.current {
-                        menu = menu.item(item(
-                            &view,
-                            tf!("拉取 {name}", name),
-                            |this, w, cx| this.pull(false, w, cx),
-                        ));
+                        menu = menu.item(item(&view, tf!("拉取 {name}", name), |this, w, cx| {
+                            this.pull(false, w, cx)
+                        }));
                     } else if let Some(upstream) = pull_from.clone() {
                         let branch = name.clone();
                         menu = menu.item(item(
@@ -659,11 +659,9 @@ impl RepoView {
                         tr("在新标签页中打开"),
                         move |this, w, cx| this.open_submodule(c.clone(), w, cx),
                     ))
-                    .item(item(
-                        &view,
-                        tr("更新此子模块"),
-                        move |this, w, cx| this.update_submodules(Some(a.clone()), w, cx),
-                    ))
+                    .item(item(&view, tr("更新此子模块"), move |this, w, cx| {
+                        this.update_submodules(Some(a.clone()), w, cx)
+                    }))
                     .separator()
                     .item(copy_item(tr("复制路径"), b.clone()))
                 }))
@@ -762,10 +760,11 @@ impl RepoView {
                     }
                     if entry.unstaged == Some(Kind::Untracked) {
                         let path = entry.path.clone();
-                        menu =
-                            menu.item(item(&view, tr("添加到 .gitignore"), move |this, w, cx| {
-                                this.ignore_path(path.clone(), w, cx)
-                            }));
+                        menu = menu.item(item(
+                            &view,
+                            tr("添加到 .gitignore"),
+                            move |this, w, cx| this.ignore_path(path.clone(), w, cx),
+                        ));
                     }
                 }
                 Area::Staged => {
@@ -937,7 +936,9 @@ impl RepoView {
                     match current {
                         Some(branch) => this.push_branch(&branch, true, w, cx),
                         None => w.push_notification(
-                            Notification::warning(tr("当前处于分离的 HEAD 状态，请先切换到分支再推送")),
+                            Notification::warning(tr(
+                                "当前处于分离的 HEAD 状态，请先切换到分支再推送",
+                            )),
                             cx,
                         ),
                     }
@@ -1073,7 +1074,10 @@ impl RepoView {
         };
         match flag {
             "--hard" => {
-                let description = tf!("{moved}工作区和暂存区中的所有改动将被丢弃，此操作无法撤销。", moved);
+                let description = tf!(
+                    "{moved}工作区和暂存区中的所有改动将被丢弃，此操作无法撤销。",
+                    moved
+                );
                 self.confirm(
                     tr("重置并丢弃所有改动？"),
                     description,

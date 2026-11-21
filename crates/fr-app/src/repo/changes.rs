@@ -1584,12 +1584,7 @@ impl RepoView {
         let picked = self.changes.multi_count(area);
         let busy = self.op.is_some();
         let (title, action, empty, id) = match area {
-            Area::Unstaged => (
-                tr("未暂存"),
-                tr("全部暂存"),
-                tr("工作区无改动"),
-                "unstaged",
-            ),
+            Area::Unstaged => (tr("未暂存"), tr("全部暂存"), tr("工作区无改动"), "unstaged"),
             Area::Staged => (
                 tr("已暂存"),
                 tr("全部取消暂存"),

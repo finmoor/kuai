@@ -334,8 +334,8 @@ impl Workspace {
         if updater.read(cx).updated_from.is_some() {
             cx.defer_in(window, |_, window, cx| {
                 let version = env!("CARGO_PKG_VERSION");
-                let notification = Notification::success(tf!("已更新到 {version}", version)).action(
-                    move |_, _, _| {
+                let notification = Notification::success(tf!("已更新到 {version}", version))
+                    .action(move |_, _, _| {
                         Button::new("update-notes")
                             .small()
                             .label(tr("查看更新内容"))
@@ -344,8 +344,7 @@ impl Workspace {
                                     format!("{}/releases/tag/v{version}", update::repo_url());
                                 crate::shell::report(crate::shell::open_url(&page), window, cx);
                             })
-                    },
-                );
+                    });
                 window.push_notification(notification, cx);
             });
         }
@@ -1107,8 +1106,7 @@ impl Workspace {
             return;
         };
         let front = self.front_repo();
-        self.app
-            .update(cx, |app, cx| app.toggle_pinned(&entry, cx));
+        self.app.update(cx, |app, cx| app.toggle_pinned(&entry, cx));
         let pinned = self.app.read(cx).tabs().pinned.clone();
         self.tabs.sort_by_key(|tab| !pinned.contains(&tab.entry));
         self.refocus(front, Page::Workspaces);
@@ -2654,13 +2652,8 @@ impl Render for QuickOpen {
                             ),
                     )
                     .when_some(mark, |row, mark| {
-                        row.child(div().flex_1()).child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(mark),
-                        )
+                        row.child(div().flex_1())
+                            .child(div().flex_none().text_xs().text_color(muted).child(mark))
                     })
                     .into_any_element()
             })

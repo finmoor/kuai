@@ -230,7 +230,11 @@ fn main() -> Result<()> {
             "kuaid {} {}{}",
             conn.hello.version,
             conn.hello.build,
-            if conn.hello.daemon { "，常驻" } else { "，不常驻" }
+            if conn.hello.daemon {
+                "，常驻"
+            } else {
+                "，不常驻"
+            }
         );
         if let Some(command) = &term_command {
             terminal(
@@ -347,7 +351,11 @@ fn terminal(
             Ok(Ok(TermItem::Opened { term, created })) => {
                 println!(
                     "终端 {term}：{}",
-                    if created { "新开的" } else { "接上了原来的" }
+                    if created {
+                        "新开的"
+                    } else {
+                        "接上了原来的"
+                    }
                 );
                 if !command.is_empty() {
                     conn.term_input(&term, format!("{command}\r").into_bytes());

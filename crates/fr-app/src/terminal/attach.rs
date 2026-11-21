@@ -198,7 +198,10 @@ mod tests {
 
     #[test]
     fn 每个路径是一次粘贴_后面跟空格() {
-        let paths = ["/root/.kuai/drop/a.png".to_string(), "/tmp/b c.txt".to_string()];
+        let paths = [
+            "/root/.kuai/drop/a.png".to_string(),
+            "/tmp/b c.txt".to_string(),
+        ];
         assert_eq!(
             paste_paths(&paths, true, false),
             b"\x1b[200~/root/.kuai/drop/a.png\x1b[201~ \x1b[200~'/tmp/b c.txt'\x1b[201~ "
@@ -213,12 +216,18 @@ mod tests {
     #[test]
     fn 路径里有空格和引号才加引号() {
         // 服务器上（POSIX shell）
-        assert_eq!(quote("/root/.kuai/drop/截图-2.png", false), "/root/.kuai/drop/截图-2.png");
+        assert_eq!(
+            quote("/root/.kuai/drop/截图-2.png", false),
+            "/root/.kuai/drop/截图-2.png"
+        );
         assert_eq!(quote("/a/it's here.png", false), r"'/a/it'\''s here.png'");
         assert_eq!(quote("/a/$(x).png", false), "'/a/$(x).png'");
         // 本机（Windows）
         assert_eq!(quote(r"C:\Users\me\a.png", true), r"C:\Users\me\a.png");
-        assert_eq!(quote(r"C:\Users\me\图 1.png", true), "\"C:\\Users\\me\\图 1.png\"");
+        assert_eq!(
+            quote(r"C:\Users\me\图 1.png", true),
+            "\"C:\\Users\\me\\图 1.png\""
+        );
         assert_eq!(quote(r"D:\a&b\c.txt", true), "\"D:\\a&b\\c.txt\"");
         // PowerShell 的双引号里会展开的：用单引号，单引号写两遍
         assert_eq!(quote(r"D:\a$(calc).txt", true), r"'D:\a$(calc).txt'");

@@ -417,7 +417,9 @@ fn handle(
             }
         }
         "bridge" => {
-            let reported = param("auth_sock").and_then(Value::as_str).map(str::to_string);
+            let reported = param("auth_sock")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             // 固定地址马上改指到这条连接转发来的：按编号接回的旧终端（term_attach 不经 term_env）
             // 里的 shell 用的也是固定地址，原来要等下次新开终端才改指，期间指着断掉的连接
             if let (Some(control), Some(sock)) = (&shared.control, &reported) {
@@ -882,7 +884,11 @@ mod tests {
         let (response, payload) = first.next();
         assert_eq!((response.id, response.chunk), (stream, true));
         assert_eq!(payload, b"hi\r\n");
-        first.send("term_resize", json!({ "term": opened.term, "cols": 33, "rows": 9 }), &[]);
+        first.send(
+            "term_resize",
+            json!({ "term": opened.term, "cols": 33, "rows": 9 }),
+            &[],
+        );
         wait_until("改大小", || fake.size.lock().unwrap().is_some());
         let listed = first.call("term_list", json!({}));
         assert_eq!(listed["terms"][0]["attached"], 1);
@@ -939,7 +945,11 @@ mod tests {
         );
         let mut client = connect(&shared);
         // 第一块给名字，拿到编号
-        let id = client.send("file_put", json!({ "name": "说明 1.txt" }), "你好，".as_bytes());
+        let id = client.send(
+            "file_put",
+            json!({ "name": "说明 1.txt" }),
+            "你好，".as_bytes(),
+        );
         let (response, _) = client.next();
         assert_eq!(response.id, id);
         let first = response.result.unwrap();
@@ -963,7 +973,9 @@ mod tests {
         assert!(client.next().0.result.is_some());
         assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 2);
         drop(client);
-        wait_until("没传完的删掉", || std::fs::read_dir(&dir.0).unwrap().count() == 1);
+        wait_until("没传完的删掉", || {
+            std::fs::read_dir(&dir.0).unwrap().count() == 1
+        });
         assert!(path.exists());
     }
 
@@ -1050,9 +1062,7 @@ mod tests {
         );
 
         // 映射到本机用的（协议 9）：按偏移写、截断、改时间、盘的大小、.git 也列、盖掉已有的、只删空目录
-        let at_offset = |path: &str, offset: u64, create: bool| {
-            json!({ "repo": root, "path": path, "offset": offset, "create": create })
-        };
+        let at_offset = |path: &str, offset: u64, create: bool| json!({ "repo": root, "path": path, "offset": offset, "create": create });
         client.send("fs_pwrite", at_offset("m/a.bin", 0, true), b"hello");
         assert!(client.next().0.error.is_some(), "目录不在不会顺手建");
         client.call("fs_mkdir", at("m"));

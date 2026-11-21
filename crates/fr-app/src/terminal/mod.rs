@@ -1093,7 +1093,11 @@ impl TerminalView {
     fn focus_changed(&mut self, focused: bool, cx: &mut Context<Self>) {
         self.blink_hidden = false;
         if self.mode().contains(TermMode::FOCUS_IN_OUT) {
-            self.write(if focused { &b"\x1b[I"[..] } else { &b"\x1b[O"[..] });
+            self.write(if focused {
+                &b"\x1b[I"[..]
+            } else {
+                &b"\x1b[O"[..]
+            });
         }
         if !focused {
             self.marked = None;
@@ -1327,7 +1331,12 @@ impl TerminalView {
     /// 从外面拖文件进来。
     fn on_drop(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
         self.focus.focus(window, cx);
-        let files = paths.paths().iter().cloned().map(Attachment::File).collect();
+        let files = paths
+            .paths()
+            .iter()
+            .cloned()
+            .map(Attachment::File)
+            .collect();
         self.send(files, cx);
     }
 
@@ -1452,7 +1461,12 @@ impl TerminalView {
         Some((point, side))
     }
 
-    fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.focus.focus(window, cx);
         let Some((point, side)) = self.grid_point(event.position) else {
             return;
@@ -1633,7 +1647,14 @@ impl Sending {
         };
         if self.count > 1 {
             let (index, count) = (self.index + 1, self.count);
-            tf!("正在上传第 {index}/{count} 个文件 {name}{progress}。按 Esc 取消。", index, count, name, progress).into()
+            tf!(
+                "正在上传第 {index}/{count} 个文件 {name}{progress}。按 Esc 取消。",
+                index,
+                count,
+                name,
+                progress
+            )
+            .into()
         } else {
             tf!("正在上传 {name}{progress}。按 Esc 取消。", name, progress).into()
         }
@@ -1980,7 +2001,10 @@ fn prepaint(
         font: base_font,
         font_size,
     };
-    let cursor_bounds = frame.cursor.as_ref().map(|cursor| frame.cell_bounds(cursor.row, cursor.col, 1));
+    let cursor_bounds = frame
+        .cursor
+        .as_ref()
+        .map(|cursor| frame.cell_bounds(cursor.row, cursor.col, 1));
     // 闪到「灭」的那半拍不画光标；它的位置照记（输入法的候选框跟着它）
     if this.blink_hidden && focused && this.marked.is_none() {
         frame.cursor = None;
@@ -2457,7 +2481,10 @@ mod tests {
         assert_eq!(session_key(repo, 1), repo);
         assert_eq!(session_key(repo, 3), "/data/workspaces/kuai\u{1f}3");
         for number in [1, 2, 3, 10, 120] {
-            assert_eq!(session_number(repo, &session_key(repo, number)), Some(number));
+            assert_eq!(
+                session_number(repo, &session_key(repo, number)),
+                Some(number)
+            );
         }
     }
 

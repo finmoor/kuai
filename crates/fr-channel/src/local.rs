@@ -231,7 +231,11 @@ pub(crate) fn blocking<T: Send + 'static>(
     std::thread::spawn(move || {
         let _ = tx.send(work());
     });
-    async move { rx.await.map_err(|_| anyhow!(tr("读取目录的线程意外退出")))? }.boxed()
+    async move {
+        rx.await
+            .map_err(|_| anyhow!(tr("读取目录的线程意外退出")))?
+    }
+    .boxed()
 }
 
 /// 复制时一块读这么多，每块报一次进度

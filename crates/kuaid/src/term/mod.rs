@@ -26,8 +26,8 @@ use fr_core::protocol::{Response, TermExit, TermInfo, TermOpen, TermOpened};
 use serde_json::json;
 
 use crate::out::Outbox;
-pub use screen::Size;
 use screen::Screen;
+pub use screen::Size;
 
 /// 程序结束了、一直没有客户端来看的会话，留这么久就忘掉
 const KEEP_ENDED: Duration = Duration::from_secs(24 * 3600);
@@ -964,7 +964,12 @@ pub(crate) mod tests {
         let opened = inbox.opened();
         assert!(opened.created);
         let fake = fakes.lock().unwrap()[0].clone();
-        let session = fake.session.lock().unwrap().clone().expect("没有开始读输出");
+        let session = fake
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("没有开始读输出");
 
         session.output(b"hello");
         let (response, payload) = inbox.next();
@@ -1018,7 +1023,12 @@ pub(crate) mod tests {
         let (out, mut inbox) = mailbox();
         open(&registry, "a", 1, 1, &out);
         inbox.opened();
-        let session = fakes.lock().unwrap()[0].session.lock().unwrap().clone().unwrap();
+        let session = fakes.lock().unwrap()[0]
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
         session.finish(Some(3));
         let (response, _) = inbox.next();
         assert!(!response.chunk);
@@ -1029,7 +1039,12 @@ pub(crate) mod tests {
         // 没人接着的时候结束：留着，下一个来看的人收到最后的画面和退出码，然后才忘掉
         open(&registry, "b", 1, 2, &out);
         inbox.opened();
-        let session = fakes.lock().unwrap()[1].session.lock().unwrap().clone().unwrap();
+        let session = fakes.lock().unwrap()[1]
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
         registry.detach(1, Some(2));
         session.output(b"bye");
         session.finish(None);
@@ -1074,7 +1089,12 @@ pub(crate) mod tests {
         assert_eq!(registry.count(), 0);
         assert!(!registry.close(&term));
         // 程序真的退出时，还接着的客户端收到退出码
-        let session = fakes.lock().unwrap()[0].session.lock().unwrap().clone().unwrap();
+        let session = fakes.lock().unwrap()[0]
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
         session.finish(None);
         assert!(!inbox.next().0.chunk);
     }
@@ -1177,7 +1197,12 @@ pub(crate) mod tests {
         let (out, mut inbox) = mailbox();
         open(&registry, "/repo", 1, 1, &out);
         let term = inbox.opened().term;
-        let session = fakes.lock().unwrap()[0].session.lock().unwrap().clone().unwrap();
+        let session = fakes.lock().unwrap()[0]
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
         session.output(b"\x1b[32mbefore upgrade\x1b[m");
         let (next, mut frozen) = registry.freeze();
         assert_eq!(frozen.len(), 1);

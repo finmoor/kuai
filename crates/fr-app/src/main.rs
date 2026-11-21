@@ -462,7 +462,8 @@ fn main() {
                         let (workspace, handle) = (workspace.clone(), *handle);
                         handle
                             .update(cx, |_, window, cx| {
-                                workspace.update(cx, |ws, cx| ws.on_launch_again(request, window, cx))
+                                workspace
+                                    .update(cx, |ws, cx| ws.on_launch_again(request, window, cx))
                             })
                             .is_ok_and(|updated| updated.is_ok())
                     });

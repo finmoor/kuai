@@ -406,7 +406,10 @@ impl Route<'_> {
 
 enum Started {
     Ready(Arc<Inner>, Hello),
-    Missing { os: String, arch: String },
+    Missing {
+        os: String,
+        arch: String,
+    },
     /// 登录上了，但服务器跑不了启动脚本（比如拿 Linux 的写法去问 Windows）。里面是报错
     Refused(String),
 }
@@ -1078,8 +1081,7 @@ impl Connection {
         let call = self.call("term_list", json!({}), Vec::new());
         async move {
             let (mut result, _) = call.await?;
-            serde_json::from_value(result["terms"].take())
-                .context(tr("kuaid 返回的结果格式错误"))
+            serde_json::from_value(result["terms"].take()).context(tr("kuaid 返回的结果格式错误"))
         }
         .boxed()
     }
@@ -1585,8 +1587,8 @@ impl Inner {
             Pending::Watch(_) => {}
             Pending::Term(tx, _) => {
                 let item = outcome.and_then(|result| {
-                    let exit: TermExit = serde_json::from_value(result)
-                        .context(tr("kuaid 返回的结果格式错误"))?;
+                    let exit: TermExit =
+                        serde_json::from_value(result).context(tr("kuaid 返回的结果格式错误"))?;
                     Ok(TermItem::Exited(exit.exit))
                 });
                 let _ = tx.unbounded_send(item);

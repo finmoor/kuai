@@ -1042,20 +1042,17 @@ impl RepoView {
                         .disabled(none_free)
                         .on_click(pick_mode(true)),
                 )
-                .child(
-                    v_flex()
-                        .pl(px(24.))
-                        .gap_1()
-                        .child(branch_button)
-                        .when(!none_free, |group| {
-                            group.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(tr("已在其他工作树中检出的分支不可选。")),
-                            )
-                        }),
-                );
+                .child(v_flex().pl(px(24.)).gap_1().child(branch_button).when(
+                    !none_free,
+                    |group| {
+                        group.child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(tr("已在其他工作树中检出的分支不可选。")),
+                        )
+                    },
+                ));
             let tick = open_after.clone();
             let mut body = v_flex()
                 .gap_3()

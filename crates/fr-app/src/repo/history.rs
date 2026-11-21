@@ -2000,58 +2000,63 @@ impl RepoView {
         };
         // 状态行上写的，和鼠标停在上面时显示的细节（读取、解析各花了多久）
         let mut status_detail: Option<SharedString> = None;
-        let (status, status_color, list): (SharedString, Hsla, AnyElement) =
-            match &self.history.load {
-                Load::Idle | Load::Loading => (
-                    tr("正在读取提交历史…").into(),
-                    muted,
-                    div().into_any_element(),
-                ),
-                Load::Empty => (tr("暂无提交").into(), muted, div().into_any_element()),
-                Load::Failed(err) => (err.clone(), danger, div().into_any_element()),
-                Load::Ready { data, partial } => {
-                    let (build, rows) = self.history.last_rows_build;
-                    status_detail = Some(
-                        tf!(
-                            "{stats} · 构建 {rows} 行 {as_micros} µs",
-                            stats = data.stats,
-                            rows,
-                            as_micros = build.as_micros()
-                        )
-                        .into(),
-                    );
-                    let mut text = if *partial {
-                        tf!("已显示前 {n} 个提交，正在加载其余提交…", n = data.commits.len())
-                    } else {
-                        tf!("{n} 个提交", n = data.commits.len())
-                    };
-                    if self.history.reloading && !partial {
-                        text.push_str(tr(" · 正在刷新…"));
-                    }
-                    if data.graph.max_lanes > graph_paint::MAX_LANES {
-                        text = tf!(
-                            "提交图共 {lanes} 条线，仅绘制前 {max} 条（带 ··· 的行不完整） · {text}",
-                            lanes = data.graph.max_lanes,
-                            max = graph_paint::MAX_LANES,
-                            text = text
-                        );
-                    }
-                    (
-                        text.into(),
-                        muted,
-                        uniform_list(
-                            "commits",
-                            data.commits.len(),
-                            cx.processor(move |this, range: Range<usize>, _window, cx| {
-                                this.render_commit_rows(range, colors, cx)
-                            }),
-                        )
-                        .track_scroll(&self.history.scroll)
-                        .size_full()
-                        .into_any_element(),
+        let (status, status_color, list): (SharedString, Hsla, AnyElement) = match &self
+            .history
+            .load
+        {
+            Load::Idle | Load::Loading => (
+                tr("正在读取提交历史…").into(),
+                muted,
+                div().into_any_element(),
+            ),
+            Load::Empty => (tr("暂无提交").into(), muted, div().into_any_element()),
+            Load::Failed(err) => (err.clone(), danger, div().into_any_element()),
+            Load::Ready { data, partial } => {
+                let (build, rows) = self.history.last_rows_build;
+                status_detail = Some(
+                    tf!(
+                        "{stats} · 构建 {rows} 行 {as_micros} µs",
+                        stats = data.stats,
+                        rows,
+                        as_micros = build.as_micros()
                     )
+                    .into(),
+                );
+                let mut text = if *partial {
+                    tf!(
+                        "已显示前 {n} 个提交，正在加载其余提交…",
+                        n = data.commits.len()
+                    )
+                } else {
+                    tf!("{n} 个提交", n = data.commits.len())
+                };
+                if self.history.reloading && !partial {
+                    text.push_str(tr(" · 正在刷新…"));
                 }
-            };
+                if data.graph.max_lanes > graph_paint::MAX_LANES {
+                    text = tf!(
+                        "提交图共 {lanes} 条线，仅绘制前 {max} 条（带 ··· 的行不完整） · {text}",
+                        lanes = data.graph.max_lanes,
+                        max = graph_paint::MAX_LANES,
+                        text = text
+                    );
+                }
+                (
+                    text.into(),
+                    muted,
+                    uniform_list(
+                        "commits",
+                        data.commits.len(),
+                        cx.processor(move |this, range: Range<usize>, _window, cx| {
+                            this.render_commit_rows(range, colors, cx)
+                        }),
+                    )
+                    .track_scroll(&self.history.scroll)
+                    .size_full()
+                    .into_any_element(),
+                )
+            }
+        };
 
         // 还没读完时不能说「没有匹配」：只是还没读到
         let still_reading = matches!(

@@ -112,7 +112,8 @@ pub fn build() -> String {
         .ok()
         .and_then(|exe| {
             let name = exe.parent()?.file_name()?.to_str()?.to_string();
-            name.starts_with(|c: char| c.is_ascii_digit()).then_some(name)
+            name.starts_with(|c: char| c.is_ascii_digit())
+                .then_some(name)
         })
         .unwrap_or_default()
 }
