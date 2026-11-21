@@ -438,6 +438,12 @@ impl RepoView {
     /// 子仓库的清单里去掉这个仓库自己的工作树：工作树的 `.git` 也是一个文件，建在仓库目录里面时
     /// 会被当成子仓库找出来，它归工作树总览管，不列两遍。
     pub(super) fn drop_worktrees_from_subs(&mut self) {
+        self.prune_worktree_subs();
+        // 文件页的树里子仓库的目录换图标、不按忽略变淡
+        self.files.set_repos(&self.subs.paths);
+    }
+
+    fn prune_worktree_subs(&mut self) {
         let trees: Vec<String> = self.worktree_paths();
         if trees.is_empty() || self.subs.paths.is_empty() {
             return;

@@ -25,15 +25,20 @@
 //!
 //! 字体、字号、行高、光标、往回翻多少行、选中即复制、右键做什么都可以在设置里改（见 [`prefs`]），
 //! 所有终端共用，改了马上生效。
+//!
+//! 滚动条、往回翻时固定住的输入区、左边的消息刻度见 [`scroll`]。
 
 mod attach;
 mod colors;
 mod glyphs;
 mod keys;
+mod links;
 mod prefs;
 mod preview;
+mod scroll;
 
 pub use attach::Attachment;
+pub use links::LinkBase;
 pub use prefs::{font_choices, set_prefs, set_prefs_writer};
 pub use preview::preview;
 
@@ -60,7 +65,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::tty::{self, Options, Shell};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor};
-use fr_channel::{Connection, TermItem, TermStream, UploadItem};
+use fr_channel::{Connection, TermItem, TermMark, TermStream, UploadItem};
 use fr_core::i18n::tr;
 use fr_core::tf;
 use futures::channel::mpsc;
@@ -175,6 +180,8 @@ enum Feed {
     Lost(String),
     /// 输出处理不过来、积压太多，流断了（见 [`TermItem::Lagging`]，终端里的程序还在跑）
     Lagging,
+    /// kuaid 记着的发出去的消息（全部，从早到晚）
+    Marks(Vec<TermMark>),
 }
 
 /// 把仿真器的事件送回界面线程。「有新内容」只在上一个还没处理时不送：输出来得再快，排着的也
@@ -418,6 +425,8 @@ impl Session {
                     for feed in feeds {
                         this.on_feed(feed, cx);
                     }
+                    // 程序要不要焦点报告，可能这批输出里才知道（刚接上时还原屏幕的那几段）
+                    this.tell_focus();
                 });
                 if delivered.is_err() {
                     break;
@@ -486,6 +495,59 @@ impl Drop for Session {
     }
 }
 
+/// 接上已有的会话时，开头的输出是还原屏幕用的，分几段（见 `TermOpened::restore`）：一段收齐了才
+/// 一起交给仿真器，中间的样子不画出来（远程的线路上整份要传一会儿，照着一块块画，看到的是从最早的
+/// 记录一路滚下来）。
+#[derive(Default)]
+struct Restore {
+    /// 还没收齐的各段多长，最前面的是正在收的
+    parts: std::collections::VecDeque<usize>,
+    /// 正在收的那一段已经到了的
+    buf: Vec<u8>,
+    /// 什么时候接上的（日志里写每段收齐时过了多久）
+    since: Option<Instant>,
+}
+
+impl Restore {
+    /// 接上了：后面还原屏幕的输出分这几段（空的是新开的会话，或者旧的 kuaid 不说）。
+    fn start(&mut self, parts: Vec<u64>) {
+        self.parts = parts
+            .into_iter()
+            .map(|len| len as usize)
+            .filter(|&len| len > 0)
+            .collect();
+        self.buf.clear();
+        self.since = Some(Instant::now());
+        if !self.parts.is_empty() {
+            // 只在 FR_LOG=1 时打出来：慢线路上量还原要多久用
+            log::info!("接上终端：还原屏幕的输出分 {:?} 字节", self.parts);
+        }
+    }
+
+    /// 收到一块输出：凑齐了的段和还原以后的实时输出按顺序交给 `feed`。交过东西返回真（要重画）。
+    fn take(&mut self, mut bytes: &[u8], mut feed: impl FnMut(&[u8])) -> bool {
+        let mut fed = false;
+        while let Some(&want) = self.parts.front() {
+            let take = (want - self.buf.len()).min(bytes.len());
+            self.buf.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.buf.len() < want {
+                return fed;
+            }
+            self.parts.pop_front();
+            let ms = self.since.map_or(0, |at| at.elapsed().as_millis());
+            log::info!("还原屏幕的一段收齐了：{want} 字节，接上后 {ms} 毫秒");
+            feed(&std::mem::take(&mut self.buf));
+            fed = true;
+        }
+        if !bytes.is_empty() {
+            feed(bytes);
+            fed = true;
+        }
+        fed
+    }
+}
+
 /// 收服务器上终端的输出，喂给仿真器。连接断了、程序结束了就停。
 async fn pump(
     mut stream: TermStream,
@@ -494,6 +556,7 @@ async fn pump(
     executor: BackgroundExecutor,
 ) {
     let mut parser: Processor = Processor::new();
+    let mut restore = Restore::default();
     let send = |feed: Feed| proxy.send(feed);
     loop {
         // 程序开了「同步刷新」（攒着一起画）又迟迟不结束：到时间就画出来
@@ -514,10 +577,18 @@ async fn pump(
             None => stream.next().await,
         };
         let alive = match item {
-            Some(Ok(TermItem::Opened { term, .. })) => send(Feed::Opened(term)),
+            Some(Ok(TermItem::Opened {
+                term: id,
+                restore: parts,
+                ..
+            })) => {
+                restore.start(parts);
+                send(Feed::Opened(id))
+            }
+            Some(Ok(TermItem::Marks(marks))) => send(Feed::Marks(marks)),
             Some(Ok(TermItem::Output(bytes))) => {
-                parser.advance(&mut *term.lock(), &bytes);
-                send(Feed::Term(TermEvent::Wakeup))
+                let fed = restore.take(&bytes, |part| parser.advance(&mut *term.lock(), part));
+                !fed || send(Feed::Term(TermEvent::Wakeup))
             }
             Some(Ok(TermItem::Exited(code))) => {
                 send(Feed::Exited(code));
@@ -602,6 +673,10 @@ pub struct TerminalView {
     marked: Option<String>,
     /// 正按着左键拖选
     selecting: bool,
+    /// 报给了程序、还按着的鼠标键（左 0、中 1、右 2）：拖动、松开接着报给它（见 [`Self::press_mouse`]）
+    mouse_held: Option<u8>,
+    /// 上一次报给程序的鼠标在第几列、第几行：在同一格里挪不重复报
+    mouse_cell: Option<(usize, usize)>,
     /// 滚轮滚了不到一行的零头
     scroll_rest: f32,
     /// 程序自己设的标题（OSC 0、2）
@@ -612,9 +687,39 @@ pub struct TerminalView {
     blink_hidden: bool,
     /// 上一次敲键盘的时刻：正打着字的时候光标不闪
     typed_at: Instant,
+    /// 焦点在这里（`focus_changed` 里记下：收到输出时没有窗口可问）
+    focused: bool,
+    /// 焦点进来以后告诉过程序了（`CSI I`，见 [`Self::tell_focus`]）
+    focus_told: bool,
+    /// 「只看」接着的终端，这边要把大小要过来（见 [`Self::wants_size`]）：往里打了字、点了画面、
+    /// 焦点由人放进来、这边的面板改了大小。下一帧看过就放下
+    size_wanted: bool,
+    /// 下一次焦点进来不算要大小：终端页跟着别处改的大小换上新建的画面时（见 [`Self::follow_size`]）
+    follow: bool,
+    /// 上一帧这块面板按设置里的字号放得下几行几列
+    roomy: Option<Grid>,
+    /// 发出去的消息，从早到晚（kuaid 推来的；开在 Kuai 进程里的终端自己记，见 [`scroll`]）
+    marks: Vec<TermMark>,
+    /// 滚动条、固定的输入区、消息刻度的状态
+    scroll: scroll::ScrollUi,
+    /// 按住 Ctrl 指着的链接、认路径要的东西（见 [`links`]）
+    links: links::LinkUi,
     _blink: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
+
+/// 终端要外面那一层做的事。
+pub enum TerminalEvent {
+    /// 按住 Ctrl 单击了仓库里的文件、目录：到这个仓库的文件页打开它。`path` 相对仓库根、`/`
+    /// 分隔；`at` 是行号、列号（从 1 起）
+    OpenFile {
+        path: String,
+        at: Option<(u32, u32)>,
+        dir: bool,
+    },
+}
+
+impl EventEmitter<TerminalEvent> for TerminalView {}
 
 impl Focusable for TerminalView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -670,11 +775,25 @@ impl TerminalView {
     }
 
     /// 「只看」接着的终端要不要把大小要过来：焦点在这里（正往里输入）、里面的程序还在、这块面板按
-    /// 设置里的字号放得下的行列数 `roomy` 和它现在的不一样。
-    fn wants_size(&self, roomy: Grid, window: &Window) -> bool {
-        self.watch.is_some_and(|grid| grid != roomy)
+    /// 设置里的字号放得下的行列数 `roomy` 和它现在的不一样，而且是这边有了动静（[`Self::size_wanted`]，
+    /// 或者窗口在前台时这块面板改了大小）。每帧画之前问一次。
+    ///
+    /// 只看焦点在不在不行：两台电脑的终端页焦点都停在同一个终端里时（一台的窗口在后面没人用也算），
+    /// 一边要过去，另一边的终端页跟着换上新建的画面，焦点在就又要回来，画面一直在两个大小之间跳。
+    fn wants_size(&mut self, roomy: Grid, window: &Window) -> bool {
+        let resized = self.roomy.replace(roomy).is_some_and(|old| old != roomy);
+        let wanted =
+            std::mem::take(&mut self.size_wanted) || (resized && window.is_window_active());
+        wanted
+            && self.watch.is_some_and(|grid| grid != roomy)
             && self.is_alive()
             && self.focus.is_focused(window)
+    }
+
+    /// 终端页跟着别处改的大小换上了这个新建的画面，焦点随后挪进来：这一下不算这边要大小，往里打字、
+    /// 点画面时再要（见 [`Self::wants_size`]）。
+    pub fn follow_size(&mut self) {
+        self.follow = true;
     }
 
     /// 把「只看」接着的终端改成 `grid` 这么大：这里的仿真器跟着改，再告诉 kuaid，里面的程序按新的
@@ -685,6 +804,14 @@ impl TerminalView {
         let Some(session) = &mut self.session else {
             return;
         };
+        // 只在 FR_LOG=1 时打出来：数一数改了几次，看有没有来回改
+        log::info!(
+            "终端的大小要过来：{}×{}（原来 {}×{}）",
+            grid.cols,
+            grid.rows,
+            session.grid.cols,
+            session.grid.rows
+        );
         let cell = session.cell;
         session.resize(grid, cell);
         self.watch = Some(grid);
@@ -727,11 +854,21 @@ impl TerminalView {
             geometry: Rc::default(),
             marked: None,
             selecting: false,
+            mouse_held: None,
+            mouse_cell: None,
             scroll_rest: 0.,
             title: None,
             blinking: Rc::default(),
             blink_hidden: false,
             typed_at: Instant::now(),
+            focused: false,
+            focus_told: false,
+            size_wanted: false,
+            follow: false,
+            roomy: None,
+            marks: Vec::new(),
+            scroll: scroll::ScrollUi::default(),
+            links: links::LinkUi::default(),
             _blink: blink,
             _subscriptions: subscriptions,
         }
@@ -921,6 +1058,9 @@ impl TerminalView {
         };
         self.exited = None;
         self.lost = false;
+        // 换了一个会话：接上 kuaid 里留着的会话时它再把记着的消息发过来
+        self.marks.clear();
+        self.scroll.reset();
         let launch = match launcher(cx) {
             Ok(launch) => launch,
             Err(err) => {
@@ -1000,6 +1140,10 @@ impl TerminalView {
                 }
             }
             Feed::Exited(code) => self.exited = Some(code),
+            Feed::Marks(marks) => {
+                self.marks = marks;
+                self.scroll.hovered = None;
+            }
             Feed::Lost(reason) => {
                 if !reason.is_empty() {
                     log::warn!("终端和 kuaid 断开了：{reason}");
@@ -1064,10 +1208,10 @@ impl TerminalView {
             }
             // 读剪贴板（OSC 52 的读）不给：服务器上的程序不该能拿到本机剪贴板里的东西
             TermEvent::ClipboardLoad(..) => {}
-            TermEvent::Wakeup
-            | TermEvent::Bell
-            | TermEvent::MouseCursorDirty
-            | TermEvent::CursorBlinkingChange => {}
+            // 往回翻着时来了新输出：回到底部的按钮上一个蓝点。只是输入区里的字变了（往回翻着打字的
+            // 回显）不算，见 `scroll::outside_digest`、`settle_outside`
+            TermEvent::Wakeup => self.watch_outside(cx),
+            TermEvent::Bell | TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => {}
         }
         cx.notify();
     }
@@ -1079,11 +1223,41 @@ impl TerminalView {
         }
     }
 
-    /// 用户敲进去的东西：先回到最底下、去掉选区，再写。
+    /// 按了回车：开在 Kuai 进程里的终端自己从屏幕上读出这条消息记下（kuaid 里的由 kuaid 记，见
+    /// 协议 16）。
+    fn record_mark(&mut self) {
+        let Some(session) = self.session.as_ref().filter(|session| session.in_process()) else {
+            return;
+        };
+        let Some((text, continued)) = scroll::message(&session.term.lock()) else {
+            return;
+        };
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        fr_core::term_text::record(&mut self.marks, text, continued, at);
+    }
+
+    /// 用户敲进去的东西（粘贴、输入法）：先回到最底下、去掉选区，再写。
     fn input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        self.type_bytes(bytes, false, cx);
+    }
+
+    /// 写用户敲的东西。往回翻着、输入区固定住时画面不动（看得见输入区里打的字），`enter`（按的是
+    /// 回车）才回到最底下；没固定住时和原来一样，一打字就回到最底下，不然看不见光标。
+    fn type_bytes(&mut self, bytes: Vec<u8>, enter: bool, cx: &mut Context<Self>) {
+        // 这边在往里输入：「只看」的画面把大小要过来（见 `wants_size`）
+        self.size_wanted = true;
         if let Some(session) = &self.session {
             let mut term = session.term.lock();
-            term.scroll_display(Scroll::Bottom);
+            if enter || self.scroll.fixed.get().len == 0 {
+                term.scroll_display(Scroll::Bottom);
+            } else {
+                log::info!(
+                    "往回翻着打字：画面不动（往回翻 {} 行）",
+                    term.grid().display_offset()
+                );
+            }
             term.selection = None;
         }
         self.write(bytes);
@@ -1092,13 +1266,15 @@ impl TerminalView {
 
     fn focus_changed(&mut self, focused: bool, cx: &mut Context<Self>) {
         self.blink_hidden = false;
-        if self.mode().contains(TermMode::FOCUS_IN_OUT) {
-            self.write(if focused {
-                &b"\x1b[I"[..]
-            } else {
-                &b"\x1b[O"[..]
-            });
+        self.focused = focused;
+        self.focus_told = false;
+        // 人把焦点放进来（点了、按了 →）：「只看」的画面把大小要过来；跟着别处的大小换上的不算
+        let follow = std::mem::take(&mut self.follow);
+        self.size_wanted = focused && !follow;
+        if !focused && self.mode().contains(TermMode::FOCUS_IN_OUT) {
+            self.write(&b"\x1b[O"[..]);
         }
+        self.tell_focus();
         if !focused {
             self.marked = None;
         }
@@ -1111,6 +1287,36 @@ impl TerminalView {
             && !session.in_process()
         {
             session.resize(grid, cell);
+        }
+        cx.notify();
+    }
+
+    /// 焦点在这里、程序要焦点报告（`CSI ? 1004 h`）、还没告诉它焦点进来了：告诉它（`CSI I`）。
+    /// Claude Code 这类程序焦点不在时不画光标，没告诉它的话要等敲了字才画出来。刚接上时还原屏幕的
+    /// 输出还没到，不知道程序要不要，焦点先进来了的等输出到了再说（每批输出处理完都来一次）。
+    fn tell_focus(&mut self) {
+        if self.focused
+            && !self.focus_told
+            && self.is_alive()
+            && self.mode().contains(TermMode::FOCUS_IN_OUT)
+        {
+            self.focus_told = true;
+            self.write(&b"\x1b[I"[..]);
+        }
+    }
+
+    /// 鼠标点了画面：焦点放到这里。焦点本来就在这里时再告诉程序一次焦点在这里：同一个终端的别的
+    /// 画面（另一页、别的电脑上的 Kuai）焦点出去时说过「焦点出去了」，程序就当没人在看。
+    fn click_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 点了画面就是这边要用：「只看」的画面把大小要过来（见 `wants_size`）。不靠焦点进来的事件：
+        // 窗口不在前台时界面库不发它
+        self.size_wanted = true;
+        match self.focus.is_focused(window) {
+            true => {
+                self.focus_told = false;
+                self.tell_focus();
+            }
+            false => self.focus.focus(window, cx),
         }
         cx.notify();
     }
@@ -1137,31 +1343,34 @@ impl TerminalView {
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
-        // 不用 `item.text()`：剪贴板里只有文件时它会把几个路径连在一起当文字
-        let mut text = String::new();
-        let mut files = Vec::new();
-        let mut image = None;
-        for entry in item.entries() {
-            match entry {
-                ClipboardEntry::String(string) => text.push_str(string.text()),
-                ClipboardEntry::ExternalPaths(paths) => {
-                    files.extend(paths.paths().iter().cloned().map(Attachment::File));
-                }
-                ClipboardEntry::Image(found) => image = image.or(Some(found)),
+        match attach::from_clipboard(item, false, chrono::Local::now()) {
+            Some(attach::Pasted::Text(text)) => {
+                let bracketed = self.mode().contains(TermMode::BRACKETED_PASTE);
+                self.input(keys::paste(&text, bracketed), cx);
             }
+            Some(attach::Pasted::Send(files)) => self.send(files, cx),
+            None => {}
         }
-        if !text.is_empty() {
-            let bracketed = self.mode().contains(TermMode::BRACKETED_PASTE);
-            self.input(keys::paste(&text, bracketed), cx);
-            return;
+    }
+
+    /// Alt+V：Claude Code 在 Windows 上用它读剪贴板里的图。它读的是它所在那台主机的剪贴板，终端开在
+    /// 别的主机上时读不到这台电脑上截的图。所以这时剪贴板里有图片（或复制的文件）就由 Kuai 发过去，
+    /// 和 Ctrl+V 一样传上去、贴路径（不看文字：截图工具有时连带放一段文字）；没有就照旧交给程序。
+    /// 开在这台电脑上的终端不接：程序自己读得到。返回接了没有。
+    fn paste_image(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.session.as_ref().is_some_and(Session::is_remote) {
+            return false;
         }
-        // 图片转格式（截图的位图转成 PNG）在发的时候放到后台做
-        if files.is_empty()
-            && let Some(image) = image
-        {
-            files.push(attach::image_attachment(image, chrono::Local::now()));
+        let Some(item) = cx.read_from_clipboard() else {
+            return false;
+        };
+        match attach::from_clipboard(item, true, chrono::Local::now()) {
+            Some(attach::Pasted::Send(files)) => {
+                self.send(files, cx);
+                true
+            }
+            _ => false,
         }
-        self.send(files, cx);
     }
 
     /// 让用户选文件，发给终端里的程序。
@@ -1400,6 +1609,12 @@ impl TerminalView {
             cx.stop_propagation();
             return;
         }
+        // Alt+V：主机上的终端里贴这台电脑剪贴板里的图（见 `paste_image`）
+        let only_alt = mods.alt && !mods.control && !mods.shift && !mods.platform;
+        if only_alt && key == "v" && self.paste_image(cx) {
+            cx.stop_propagation();
+            return;
+        }
         // Shift+翻页：翻看前面的输出
         if mods.shift && !mods.control && !mods.alt && matches!(key, "pageup" | "pagedown") {
             if let Some(session) = &self.session {
@@ -1415,7 +1630,12 @@ impl TerminalView {
         }
         let app_cursor = self.mode().contains(TermMode::APP_CURSOR);
         if let Some(bytes) = keys::encode(keystroke, app_cursor) {
-            self.input(bytes, cx);
+            // 只是一个回车（不是 Shift、Alt 加回车那种换行）：发出去一条消息
+            let enter = key == "enter" && !mods.modified();
+            if enter {
+                self.record_mark();
+            }
+            self.type_bytes(bytes, enter, cx);
             cx.stop_propagation();
         }
     }
@@ -1456,9 +1676,94 @@ impl TerminalView {
         } else {
             GridSide::Right
         };
-        let offset = session.term.lock().grid().display_offset() as i32;
-        let point = GridPoint::new(GridLine(y as i32 - offset), GridColumn(x as usize));
+        let offset = session.term.lock().grid().display_offset();
+        // 固定住的输入区里是现在的屏幕，不按往回翻的行数挪
+        let line = self.scroll.fixed.get().line(y as usize, grid.rows, offset);
+        let point = GridPoint::new(GridLine(line), GridColumn(x as usize));
         Some((point, side))
+    }
+
+    /// 鼠标交不交给程序：程序要了鼠标（opencode、全屏的 Claude Code、开了鼠标的 vim、htop）、没按
+    /// Shift、没往回翻时交给它，给的是它要的那几样模式。按着 Shift 是 Kuai 自己选字（和 Windows
+    /// 终端一样）。原来只把滚轮报给程序，点击、拖动都留给自己选字，opencode 的按钮点不了。
+    fn mouse_mode(&self, shift: bool) -> Option<TermMode> {
+        let session = self.session.as_ref()?;
+        let term = session.term.lock();
+        let mode = *term.mode();
+        (!shift && mode.intersects(TermMode::MOUSE_MODE) && term.grid().display_offset() == 0)
+            .then_some(mode)
+    }
+
+    /// 报一下鼠标（`button` 见 [`keys::mouse_report`]，Alt、Ctrl 在这里加上）。
+    fn report_mouse(
+        &mut self,
+        mode: TermMode,
+        button: u8,
+        release: bool,
+        position: Point<Pixels>,
+        modifiers: Modifiers,
+    ) {
+        let Some((col, row)) = self.screen_cell(position) else {
+            return;
+        };
+        let extra = if modifiers.alt { 8 } else { 0 } + if modifiers.control { 16 } else { 0 };
+        self.mouse_cell = Some((col, row));
+        let (sgr, utf8) = (
+            mode.contains(TermMode::SGR_MOUSE),
+            mode.contains(TermMode::UTF8_MOUSE),
+        );
+        if let Some(bytes) = keys::mouse_report(button + extra, release, col, row, sgr, utf8) {
+            self.write(bytes);
+        }
+    }
+
+    /// 按下鼠标键：程序要了鼠标就报给它，不再自己选字、粘贴、弹菜单（返回 true）。按着的时候
+    /// 挪动、松开由 `paint` 里挂在整个窗口上的监听接着报，挪出终端、在外面松开也报得到。
+    fn press_mouse(
+        &mut self,
+        button: u8,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(mode) = self.mouse_mode(event.modifiers.shift) else {
+            return false;
+        };
+        self.click_focus(window, cx);
+        self.report_mouse(mode, button, false, event.position, event.modifiers);
+        self.mouse_held = Some(button);
+        // 右键：设置里选了菜单时，外面那一层的菜单不弹
+        if button == 2 {
+            cx.stop_propagation();
+        }
+        cx.notify();
+        true
+    }
+
+    /// 按着报过的键挪动：要了拖动、全部移动的程序，挪到另一格时报。
+    fn held_mouse_moved(&mut self, event: &MouseMoveEvent) {
+        let Some(button) = self.mouse_held else {
+            return;
+        };
+        let mode = self.mode();
+        if !mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) {
+            return;
+        }
+        if self.screen_cell(event.position) != self.mouse_cell {
+            self.report_mouse(mode, button + 32, false, event.position, event.modifiers);
+        }
+    }
+
+    /// 松开报过的键。程序这时已经不要鼠标了就不报（不然成了打进去的字）。
+    fn release_mouse(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        let Some(button) = self.mouse_held.take() else {
+            return;
+        };
+        let mode = self.mode();
+        if mode.intersects(TermMode::MOUSE_MODE) {
+            self.report_mouse(mode, button, true, event.position, event.modifiers);
+        }
+        cx.notify();
     }
 
     fn on_mouse_down(
@@ -1467,7 +1772,15 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.focus.focus(window, cx);
+        // 按住 Ctrl 单击链接：打开它，不选字、不报给程序（见 [`links`]）
+        if self.click_link(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.press_mouse(0, event, window, cx) {
+            return;
+        }
+        self.click_focus(window, cx);
         let Some((point, side)) = self.grid_point(event.position) else {
             return;
         };
@@ -1485,6 +1798,18 @@ impl TerminalView {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // 按着 Ctrl：鼠标底下的链接画上下划线
+        self.hover_link(event.position, event.modifiers.control, cx);
+        // 什么都没按地挪：要了全部移动的程序（opencode 用它做悬停）挪到另一格时报。按着报过的键时
+        // 由窗口上的监听报，这里不重复
+        if self.mouse_held.is_none()
+            && !self.selecting
+            && let Some(mode) = self.mouse_mode(event.modifiers.shift)
+            && mode.contains(TermMode::MOUSE_MOTION)
+            && self.screen_cell(event.position) != self.mouse_cell
+        {
+            self.report_mouse(mode, 35, false, event.position, event.modifiers);
+        }
         if !self.selecting {
             return;
         }
@@ -1519,9 +1844,30 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// 右键：选着字就复制，没选就粘贴（和 Windows 终端一样）。
-    fn on_right_click(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus.focus(window, cx);
+    /// 中键：程序要了鼠标就报给它，不然不做什么。
+    fn on_middle_click(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.press_mouse(1, event, window, cx);
+    }
+
+    /// 右键：程序要了鼠标就报给它；不然选着字就复制，没选就粘贴（和 Windows 终端一样），设置里
+    /// 选了菜单时弹菜单（菜单挂在外面那一层）。
+    fn on_right_click(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.press_mouse(2, event, window, cx)
+            || prefs::get(cx).right_click == crate::settings::RightClick::Menu
+        {
+            return;
+        }
+        self.click_focus(window, cx);
         if self.selected_text().is_some() {
             self.copy(cx);
         } else if self.is_alive() {
@@ -1720,8 +2066,10 @@ impl EntityInputHandler for TerminalView {
         cx: &mut Context<Self>,
     ) {
         self.marked = (!new_text.is_empty()).then(|| new_text.to_string());
-        // 往回翻着时开始组字：和打字一样先回到最底下，光标（组的字画在那里）才看得见
+        // 往回翻着时开始组字：和打字一样（见 `type_bytes`），输入区没固定住时先回到最底下，光标（组的
+        // 字画在那里、候选框跟着它）才看得见；固定住时光标就在底下固定的那几行里，画面不动
         if self.marked.is_some()
+            && self.scroll.fixed.get().len == 0
             && let Some(session) = &self.session
         {
             session.term.lock().scroll_display(Scroll::Bottom);
@@ -1758,21 +2106,32 @@ impl Render for TerminalView {
         let menu = prefs::get(cx).right_click == crate::settings::RightClick::Menu;
         let (has_selection, alive) = (self.selected_text().is_some(), self.is_alive());
         let view = cx.entity().downgrade();
+        let overlays = self.scroll_overlays(cx);
         let panel = div()
             .id("terminal")
             .relative()
             .size_full()
-            .px(px(PADDING))
-            .pt(px(4.))
+            .pl(px(scroll::GUTTER))
+            .pr(px(PADDING))
+            .pt(px(scroll::TOP))
             .bg(background)
-            .cursor_text()
+            // 按住 Ctrl 指着链接时是手形（见 [`links`]）
+            .when(self.links.hover.is_some(), |panel| panel.cursor_pointer())
+            .when(self.links.hover.is_none(), |panel| panel.cursor_text())
+            // 打字时鼠标没离开：界面库默认打过字就当鼠标不在上面（离开了），鼠标没动、接着按 Ctrl
+            // 就认不出底下的链接
+            .hover_listener_mode(HoverListenerMode::InputModalityIndependent)
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !*hovered {
+                    this.leave_link(cx);
+                }
+            }))
             .track_focus(&self.focus)
             .key_context(KEY_CONTEXT)
             .on_key_down(cx.listener(Self::on_key))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .when(!menu, |panel| {
-                panel.on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_click))
-            })
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_click))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll(cx.listener(Self::on_scroll))
@@ -1788,6 +2147,7 @@ impl Render for TerminalView {
                 )
                 .size_full(),
             )
+            .children(overlays)
             .when_some(self.notice(), |this, notice| {
                 this.child(
                     div()
@@ -1922,6 +2282,12 @@ struct Frame {
     /// 画字用的字体（不带粗体、斜体）和字号
     font: Font,
     font_size: Pixels,
+    /// 往回翻着时固定住的输入区从第几行起（上边画一条线和一点阴影）
+    fixed_top: Option<usize>,
+    /// 刚跳到的那条消息在第几行：亮一下
+    flash: Option<usize>,
+    /// 那条线、亮的那一下用的颜色
+    accents: (Hsla, Hsla),
 }
 
 fn prepaint(
@@ -1946,10 +2312,10 @@ fn prepaint(
         cols: ((bounds.size.width / full.width).floor() as usize).max(2),
         rows: ((bounds.size.height / full.height).floor() as usize).max(1),
     };
-    // 「只看」接着的终端，焦点在这里（正往里输入）：大小交给这一边（见 `claim`）。面板小得放不下
+    // 「只看」接着的终端，这边正往里输入：大小交给这一边（见 `wants_size`、`claim`）。面板小得放不下
     // 几个字时（正在收起、窗口极小）不改
     let room = bounds.size.width >= full.width * 4. && bounds.size.height >= full.height;
-    if room && view.read(cx).wants_size(roomy, window) {
+    if room && view.update(cx, |this, _| this.wants_size(roomy, window)) {
         view.update(cx, |this, cx| this.claim(roomy, cx));
     }
     let watch = view.read(cx).watch;
@@ -1977,14 +2343,35 @@ fn prepaint(
 
     let theme = cx.theme();
     let palette = Palette::new(theme.foreground, theme.background, theme.is_dark());
-    let selection = theme.selection;
+    let (selection, accents) = (theme.selection, (theme.border, theme.primary.opacity(0.22)));
     let this = view.read(cx);
     let session = this.session.as_ref()?;
     let focused = this.focus.is_focused(window);
-    let (rects, shapes, runs, cursor) = {
+    let (rects, shapes, runs, cursor, fixed, flash) = {
         let term = session.term.lock();
         this.blinking.set(focused && term.cursor_style().blinking);
-        snapshot(&term, &palette, selection)
+        // 往回翻着时最下面的输入区固定住（见 [`scroll`]）
+        let fixed = scroll::fixed_area(&term);
+        let offset = term.grid().display_offset();
+        if this.scroll.fixed.replace(fixed).len != fixed.len {
+            // 只在 FR_LOG=1 时打出来：断开远程桌面、看不到画面时靠它核对
+            log::info!(
+                "终端输入区固定 {} 行（屏幕第 {} 行起，往回翻 {offset} 行）",
+                fixed.len,
+                fixed.top
+            );
+        }
+        let rows = term.grid().screen_lines();
+        let split = fixed.split(rows);
+        let flash = scroll::flash_row(this.scroll.flash, offset, split);
+        let link = this
+            .links
+            .hover
+            .as_ref()
+            .map(|hover| (hover.start, hover.end));
+        let (rects, shapes, runs, cursor) = snapshot(&term, &palette, selection, fixed, link);
+        let fixed_top = (fixed.len > 0).then_some(split);
+        (rects, shapes, runs, cursor, fixed_top, flash)
     };
     let mut frame = Frame {
         origin: bounds.origin,
@@ -2000,6 +2387,9 @@ fn prepaint(
         marked: this.marked.clone(),
         font: base_font,
         font_size,
+        fixed_top: fixed,
+        flash,
+        accents,
     };
     let cursor_bounds = frame
         .cursor
@@ -2010,6 +2400,18 @@ fn prepaint(
         frame.cursor = None;
     }
     let moved = this.geometry.get().cursor != cursor_bounds;
+    let before = this.geometry.get();
+    if before.origin != bounds.origin || before.cell != cell || before.grid != Some(grid) {
+        log::info!(
+            "终端画面：左上角 ({:.1}, {:.1})，每格 {:.2}×{:.2}，{} 列 {} 行",
+            f32::from(bounds.origin.x),
+            f32::from(bounds.origin.y),
+            f32::from(cell.width),
+            f32::from(cell.height),
+            grid.cols,
+            grid.rows
+        );
+    }
     this.geometry.set(Geometry {
         origin: bounds.origin,
         cell,
@@ -2031,10 +2433,32 @@ type Snapshot = (
     Option<CursorDraw>,
 );
 
-/// 把现在看得见的格子拍成要画的背景块、自己画的字、文字段和光标。
-fn snapshot(term: &Term<Proxy>, palette: &Palette, selection_color: Hsla) -> Snapshot {
+/// 把现在看得见的格子拍成要画的背景块、自己画的字、文字段和光标。往回翻着、输入区固定在最下面时
+/// （见 [`scroll::Fixed`]），那几行画的是现在的屏幕，不是往回翻到的内容。`link`：按住 Ctrl 指着
+/// 的链接从哪一格到哪一格，画下划线（见 [`links`]）。
+fn snapshot(
+    term: &Term<Proxy>,
+    palette: &Palette,
+    selection_color: Hsla,
+    fixed: scroll::Fixed,
+    link: Option<(GridPoint, GridPoint)>,
+) -> Snapshot {
     let content = term.renderable_content();
     let offset = content.display_offset as i32;
+    let grid = term.grid();
+    let (rows, cols) = (grid.screen_lines(), grid.columns());
+    let split = fixed.split(rows) as i32;
+    let viewport = content
+        .display_iter
+        .filter(move |indexed| indexed.point.line.0 + offset < split)
+        .map(move |indexed| (indexed.point.line.0 + offset, indexed.point, indexed.cell));
+    let live = (split..rows as i32).flat_map(move |row| {
+        let line = fixed.top as i32 + row - split;
+        (0..cols).map(move |col| {
+            let point = GridPoint::new(GridLine(line), GridColumn(col));
+            (row, point, &grid[point])
+        })
+    });
     let overrides = content.colors;
     let selection = content.selection;
     let cursor_at = content.cursor.point;
@@ -2053,14 +2477,11 @@ fn snapshot(term: &Term<Proxy>, palette: &Palette, selection_color: Hsla) -> Sna
             }
         }
     };
-    for indexed in content.display_iter {
-        let point = indexed.point;
-        let row = point.line.0 + offset;
+    for (row, point, cell) in viewport.chain(live) {
         if row < 0 {
             continue;
         }
         let (row, col) = (row as usize, point.column.0);
-        let cell = indexed.cell;
         let flags = cell.flags;
         // 两格宽的字后面那一格是占位的，不画
         if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
@@ -2101,7 +2522,8 @@ fn snapshot(term: &Term<Proxy>, palette: &Palette, selection_color: Hsla) -> Sna
                 ch: cell.c,
             });
         }
-        let underline = flags.intersects(Flags::ALL_UNDERLINES);
+        let underline = flags.intersects(Flags::ALL_UNDERLINES)
+            || link.is_some_and(|(start, end)| start <= point && point <= end);
         let strike = flags.contains(Flags::STRIKEOUT);
         let hidden = flags.contains(Flags::HIDDEN);
         // 方块、制表线不交给字体：按格子画，一格接一格没有缝。在文字段里它算一个空格
@@ -2211,15 +2633,26 @@ fn text_run(len: usize, style: Style, base: &Font) -> TextRun {
         font,
         color: style.color,
         background_color: None,
-        underline: style.underline.then_some(UnderlineStyle {
-            thickness: px(1.),
-            color: Some(style.color),
-            wavy: false,
-        }),
-        strikethrough: style.strike.then_some(StrikethroughStyle {
-            thickness: px(1.),
-            color: Some(style.color),
-        }),
+        // 下划线、删除线不交给排版画（那样画不出来），按格子自己画，见 [`paint_decorations`]
+        underline: None,
+        strikethrough: None,
+    }
+}
+
+/// 下划线（程序写的、按住 Ctrl 指着的链接、输入法正在组的字）、删除线：在 `cells` 这几格里按格子画。
+///
+/// 不用排版带的下划线：终端里的字是一段段强制每字一格排的，那样带的下划线、删除线画不出来
+/// （`\e[4m`、`\e[9m` 的字、指着的链接原来都没有线）。
+fn paint_decorations(cells: Bounds<Pixels>, style: Style, window: &mut Window) {
+    let line = |y: Pixels| Bounds::new(point(cells.origin.x, y), size(cells.size.width, px(1.)));
+    if style.underline {
+        window.paint_quad(fill(line(cells.bottom() - px(2.)), style.color));
+    }
+    if style.strike {
+        window.paint_quad(fill(
+            line(cells.origin.y + cells.size.height / 2.),
+            style.color,
+        ));
     }
 }
 
@@ -2233,6 +2666,52 @@ fn paint(
     let focus = view.read(cx).focus.clone();
     // 不管里面有没有东西，焦点在这里时打的字都归它
     window.handle_input(&focus, ElementInputHandler::new(bounds, view.clone()), cx);
+    // 鼠标在终端里时按下、松开 Ctrl：重新看鼠标底下是不是链接（焦点不在终端里也看）
+    if view.read(cx).links.mouse_at.is_some() {
+        let watching = view.clone();
+        window.on_modifiers_changed(move |event: &ModifiersChangedEvent, _, cx| {
+            watching.update(cx, |this, cx| {
+                this.ctrl_changed(event.modifiers.control, cx)
+            });
+        });
+    }
+    // 按着报给了程序的鼠标键：挪出终端、在外面松开也接着报（见 `TerminalView::press_mouse`）
+    if view.read(cx).mouse_held.is_some() {
+        let moving = view.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+            if phase == DispatchPhase::Bubble {
+                moving.update(cx, |this, _| this.held_mouse_moved(event));
+            }
+        });
+        let ending = view.clone();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+            if phase == DispatchPhase::Bubble {
+                ending.update(cx, |this, cx| this.release_mouse(event, cx));
+            }
+        });
+    }
+    // 拖着滚动条的滑块：鼠标挪出终端也接着跟（见 [`scroll`]）
+    if view.read(cx).scroll.drag.is_some() {
+        let moving = view.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+            if phase == DispatchPhase::Bubble && event.pressed_button == Some(MouseButton::Left) {
+                moving.update(cx, |this, cx| this.drag_bar(event.position.y, cx));
+            }
+        });
+        let ending = view.clone();
+        window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+            if phase == DispatchPhase::Bubble {
+                ending.update(cx, |this, cx| {
+                    this.scroll.drag = None;
+                    if let Some(session) = &this.session {
+                        let offset = session.term.lock().grid().display_offset();
+                        log::info!("拖完滚动条：往回翻 {offset} 行");
+                    }
+                    cx.notify();
+                });
+            }
+        });
+    }
     if let Some(frame) = frame {
         paint_frame(&frame, bounds, window, cx);
     }
@@ -2244,6 +2723,14 @@ fn paint_frame(frame: &Frame, bounds: Bounds<Pixels>, window: &mut Window, cx: &
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
         for &(row, col, cols, color) in &frame.rects {
             window.paint_quad(fill(frame.cell_bounds(row, col, cols), color));
+        }
+        let width = bounds.size.width;
+        if let Some(row) = frame.flash {
+            let line = frame.cell_bounds(row, 0, 1);
+            window.paint_quad(fill(
+                Bounds::new(line.origin, size(width, line.size.height)),
+                frame.accents.1,
+            ));
         }
         for &(row, col, ch, color) in &frame.shapes {
             glyphs::paint(ch, frame.cell_bounds(row, col, 1), color, window);
@@ -2266,6 +2753,8 @@ fn paint_frame(frame: &Frame, bounds: Bounds<Pixels>, window: &mut Window, cx: &
                 origin.x += lone_shift(run, line.width, frame.cell.width, font_size);
             }
             let _ = line.paint(origin, frame.cell.height, TextAlign::Left, None, window, cx);
+            let cells = frame.cell_bounds(run.row, run.col, run.next - run.col);
+            paint_decorations(cells, run.style, window);
         }
         if let Some(cursor) = &frame.cursor {
             let cols = if cursor.wide { 2 } else { 1 };
@@ -2349,6 +2838,20 @@ fn paint_frame(frame: &Frame, bounds: Bounds<Pixels>, window: &mut Window, cx: &
             let cover = Bounds::new(origin, size(line.width, frame.cell.height));
             window.paint_quad(fill(cover, frame.background));
             let _ = line.paint(origin, frame.cell.height, TextAlign::Left, None, window, cx);
+            paint_decorations(cover, style, window);
+        }
+        // 固定住的输入区上边：一条线，上面一点阴影，表示上面的内容在它后面滚
+        if let Some(top) = frame.fixed_top {
+            let y = frame.cell_bounds(top, 0, 1).origin.y;
+            let x = bounds.origin.x;
+            for (step, alpha) in [(3., 0.05), (2., 0.08), (1., 0.12)] {
+                let shade = Bounds::new(point(x, y - px(step)), size(width, px(1.)));
+                window.paint_quad(fill(shade, gpui_kit::black().opacity(alpha)));
+            }
+            window.paint_quad(fill(
+                Bounds::new(point(x, y), size(width, px(1.))),
+                frame.accents.0,
+            ));
         }
     });
 }
@@ -2357,10 +2860,38 @@ fn paint_frame(frame: &Frame, bounds: Bounds<Pixels>, window: &mut Window, cx: &
 mod tests {
     // 不能 `use super::*`：那样 `#[test]` 会变成界面库里同名的那个宏
     use super::{
-        CursorShape, Feed, Grid, Palette, Processor, Proxy, Term, TermEvent, session_key,
+        CursorShape, Feed, Grid, Palette, Processor, Proxy, Restore, Term, TermEvent, session_key,
         session_number, short_title, snapshot,
     };
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn 还原屏幕的几段收齐了才交出去() {
+        let mut restore = Restore::default();
+        restore.start(vec![3, 0, 4]);
+        assert_eq!(restore.parts, [3, 4], "空的段不算");
+        let mut fed: Vec<Vec<u8>> = Vec::new();
+        let mut take = |restore: &mut Restore, bytes: &[u8]| {
+            let woke = restore.take(bytes, |part| fed.push(part.to_vec()));
+            (woke, fed.clone())
+        };
+        // 第一段没收齐：什么都不交，不用重画
+        assert_eq!(take(&mut restore, b"ab"), (false, vec![]));
+        // 一块里收齐了第一段、第二段收了一截
+        assert_eq!(take(&mut restore, b"cdef"), (true, vec![b"abc".to_vec()]));
+        // 第二段收齐，同一块里后面的是实时的输出，照常交
+        let (woke, got) = take(&mut restore, b"gHI");
+        assert!(woke);
+        assert_eq!(got, [&b"abc"[..], b"defg", b"HI"]);
+        assert!(restore.parts.is_empty() && restore.buf.is_empty());
+        assert_eq!(take(&mut restore, b"J").1.last().unwrap(), b"J");
+        // 没有要还原的（新开的、旧的 kuaid）：收到多少交多少
+        let mut plain = Restore::default();
+        let mut out = Vec::new();
+        assert!(plain.take(b"xy", |part| out.extend_from_slice(part)));
+        assert!(!plain.take(b"", |part| out.extend_from_slice(part)));
+        assert_eq!(out, b"xy");
+    }
 
     #[test]
     fn 有新内容的唤醒排着的只有一个() {
@@ -2405,6 +2936,53 @@ mod tests {
     }
 
     /// 喂一段程序的输出，看光标记在哪、什么形状。
+    #[test]
+    fn 往回翻的记录里只有空行时不出滚动条() {
+        use super::scroll::history_has_text;
+        use alacritty_terminal::grid::Dimensions as _;
+        let (proxy, _rx) = Proxy::new();
+        let grid = Grid { cols: 20, rows: 5 };
+        let mut term = Term::new(Default::default(), &grid, proxy);
+        let mut parser: Processor = Processor::new();
+        assert!(!history_has_text(&term));
+        // 光标在最下面一行换两次行：空着的两行滚进了记录
+        parser.advance(&mut term, b"\x1b[5;1H\r\n\r\n");
+        assert_eq!(term.grid().history_size(), 2);
+        assert!(!history_has_text(&term), "只有空行");
+        // 最上面一行写了字再滚上去
+        parser.advance(&mut term, b"\x1b[1;1Hhello\x1b[5;1H\r\n");
+        assert_eq!(term.grid().history_size(), 3);
+        assert!(history_has_text(&term));
+        // 记录比一屏还长：不一行行看，当有
+        parser.advance(&mut term, "\r\n".repeat(20).as_bytes());
+        assert!(history_has_text(&term));
+    }
+
+    #[test]
+    fn 输入区里的字变了不算新输出() {
+        use super::scroll::outside_digest;
+        use alacritty_terminal::grid::Dimensions as _;
+        let (proxy, _rx) = Proxy::new();
+        let grid = Grid { cols: 30, rows: 6 };
+        let mut term = Term::new(Default::default(), &grid, proxy);
+        let mut parser: Processor = Processor::new();
+        for n in 1..=10 {
+            parser.advance(&mut term, format!("l{n}\r\n").as_bytes());
+        }
+        parser.advance(&mut term, b"PS C:\\> ");
+        let before = outside_digest(&term);
+        // 往回翻着打字：程序回显的字在输入区里
+        parser.advance(&mut term, b"git sta");
+        assert_eq!(outside_digest(&term), before);
+        // 打的字长得折到下一行，屏幕往上滚了一行：从输入区往上数还是那几行
+        parser.advance(&mut term, "x".repeat(20).as_bytes());
+        assert_eq!(term.grid().history_size(), 6);
+        assert_eq!(outside_digest(&term), before);
+        // 程序真的输出了
+        parser.advance(&mut term, b"\r\nclean\r\nPS C:\\> ");
+        assert_ne!(outside_digest(&term), before);
+    }
+
     fn cursor_after(output: &[u8]) -> Option<(usize, usize, CursorShape)> {
         let (proxy, _rx) = Proxy::new();
         let grid = Grid { cols: 40, rows: 10 };
@@ -2414,7 +2992,13 @@ mod tests {
         let white = gpui_kit::rgb(0xeeeeee).into();
         let black = gpui_kit::rgb(0x111111).into();
         let palette = Palette::new(white, black, true);
-        let (_, _, _, cursor) = snapshot(&term, &palette, white);
+        let (_, _, _, cursor) = snapshot(
+            &term,
+            &palette,
+            white,
+            super::scroll::Fixed::default(),
+            None,
+        );
         cursor.map(|cursor| (cursor.row, cursor.col, cursor.shape))
     }
 
@@ -2442,7 +3026,13 @@ mod tests {
         let white = gpui_kit::rgb(0xeeeeee).into();
         let black = gpui_kit::rgb(0x111111).into();
         let palette = Palette::new(white, black, true);
-        let (_, _, runs, _) = snapshot(&term, &palette, white);
+        let (_, _, runs, _) = snapshot(
+            &term,
+            &palette,
+            white,
+            super::scroll::Fixed::default(),
+            None,
+        );
         runs.into_iter().map(|run| (run.col, run.text)).collect()
     }
 

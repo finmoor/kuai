@@ -422,6 +422,18 @@ pub(super) enum Body {
 ///
 /// 不能指望按键自己到编辑器：全局的 Ctrl+F 和编辑器自己的 Ctrl+F 在键位表里一样深，后登记的
 /// （全局的）排在前面，编辑器收不到。所以由全局的那个把「查找」这个动作直接交给编辑器。
+/// 编辑器的光标跳到 `position`，滚到看得见的地方。编辑器画过一次才知道每一行在哪（刚建的、刚切过来
+/// 的页上的还没画），所以等两帧再跳。
+fn jump_to(editor: Entity<EditorState>, position: Position, window: &mut Window) {
+    window.on_next_frame(move |window, _| {
+        window.on_next_frame(move |window, cx| {
+            editor.update(cx, |state, cx| {
+                state.set_cursor_position(position, window, cx)
+            });
+        });
+    });
+}
+
 pub(super) fn open_editor_search(editor: &Entity<EditorState>, window: &mut Window, cx: &mut App) {
     let handle = editor.focus_handle(cx);
     handle.focus(window, cx);
@@ -445,6 +457,8 @@ pub(super) struct OpenFile {
     epoch: u64,
     load_task: Option<Task<()>>,
     stat_task: Option<Task<()>>,
+    /// 读回来以后光标跳到这里（终端里按住 Ctrl 单击了带行号的路径，见 [`RepoView::show_path`]）
+    jump: Option<Position>,
 }
 
 impl OpenFile {
@@ -490,6 +504,8 @@ pub(super) struct TreeRow {
     pub open: bool,
     /// 被 .gitignore 忽略（自己或者上面的目录）
     pub ignored: bool,
+    /// 子仓库的目录
+    pub repo: bool,
     /// 过滤时：所在的目录，写在名字后面
     pub parent: Option<SharedString>,
 }
@@ -520,6 +536,10 @@ pub(super) struct Files {
     /// 被忽略的路径（`git ls-files -o -i --directory` 给的，目录不带末尾的斜杠）
     ignored: HashSet<String>,
     ignored_task: Option<Task<()>>,
+    /// 子仓库的目录（相对仓库根，见 `RepoView::scan_subs`）。子仓库常被根仓库的 .gitignore 忽略，
+    /// 但它是单独的仓库，不是用不着的文件：不按忽略变淡、不跟着「显示忽略的文件」藏起来，里面的
+    /// 东西也不算被根仓库忽略
+    repos: HashSet<String>,
     /// 有改动的文件 → 是哪种改动
     marks: HashMap<String, Kind>,
     /// 里面有改动的目录
@@ -538,6 +558,15 @@ pub(super) struct Files {
     pub loaded: bool,
     /// 拖着本机的文件停在哪个目录上（仓库根是空字符串）
     pub drop_target: Option<String>,
+    /// 终端里单击了仓库里的路径时还没连上仓库（刚打开）：连上后再打开（见 `RepoView::show_path`）
+    shown: Option<Shown>,
+}
+
+/// 等着打开的仓库里的路径（见 [`Files::shown`]）：路径、行列、是不是目录。
+struct Shown {
+    path: String,
+    at: Option<(u32, u32)>,
+    dir: bool,
 }
 
 impl Files {
@@ -561,6 +590,7 @@ impl Files {
             show_ignored: true,
             ignored: HashSet::new(),
             ignored_task: None,
+            repos: HashSet::new(),
             marks: HashMap::new(),
             dirty_dirs: HashSet::new(),
             scroll: UniformListScrollHandle::new(),
@@ -573,6 +603,7 @@ impl Files {
             error: None,
             loaded: false,
             drop_target: None,
+            shown: None,
         };
         (files, subscription)
     }
@@ -676,6 +707,7 @@ impl Files {
                     link: false,
                     open: false,
                     ignored: false,
+                    repo: false,
                     parent: (!parent.is_empty()).then(|| parent.to_string().into()),
                 };
                 match name.to_lowercase().contains(&needle) {
@@ -701,13 +733,26 @@ impl Files {
         }
     }
 
+    /// 子仓库的目录换了（找完子仓库时）。
+    pub(super) fn set_repos(&mut self, paths: &[String]) {
+        let repos: HashSet<String> = paths.iter().cloned().collect();
+        if self.repos != repos {
+            self.repos = repos;
+            self.rebuild();
+        }
+    }
+
     fn walk(&self, dir: &str, depth: usize, inherited: bool, rows: &mut Vec<TreeRow>) {
         let Some(entries) = self.dirs.get(dir) else {
             return;
         };
         for entry in entries {
             let path = join(dir, &entry.name);
-            let ignored = inherited || self.ignored.contains(&path);
+            let (repo, ignored) = tree_flags(
+                entry.dir && self.repos.contains(&path),
+                inherited,
+                self.ignored.contains(&path),
+            );
             if ignored && !self.show_ignored {
                 continue;
             }
@@ -720,6 +765,7 @@ impl Files {
                 link: entry.link,
                 open,
                 ignored,
+                repo,
                 parent: None,
             });
             if open {
@@ -727,6 +773,12 @@ impl Files {
             }
         }
     }
+}
+
+/// 树里一行是不是子仓库、算不算被忽略：`repo` 是子仓库的目录，`inherited` 是上面的目录被忽略了，
+/// `listed` 是它自己在被忽略的清单里。子仓库自己不算被忽略，下面的行也就不跟着变淡。
+fn tree_flags(repo: bool, inherited: bool, listed: bool) -> (bool, bool) {
+    (repo, !repo && (inherited || listed))
 }
 
 /// 拆成所在的目录和名字。
@@ -772,6 +824,11 @@ impl RepoView {
     pub(super) fn sync_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.page != Page::Files {
             return;
+        }
+        if self.channel.is_some()
+            && let Some(Shown { path, at, dir }) = self.files.shown.take()
+        {
+            self.show_path(path, at, dir, window, cx);
         }
         if !self.files.loaded
             && self.files.error.is_none()
@@ -1183,6 +1240,7 @@ impl RepoView {
             epoch: 0,
             load_task: None,
             stat_task: None,
+            jump: None,
         };
         // 预览的那个标签（没改过的）换成这个文件，位置不变
         let reuse = self
@@ -1210,6 +1268,45 @@ impl RepoView {
         self.show_page(Page::Files, window, cx);
         self.open_file(path.clone(), false, window, cx);
         self.reveal_in_tree(&path, cx);
+    }
+
+    /// 终端里按住 Ctrl 单击了仓库里的 `path`（相对仓库根，`/` 分隔）：切到文件页打开它，带行号的
+    /// （`at`，从 1 起）光标跳到那一行；目录在树里展开、选中；仓库根（空的）只切到文件页。
+    pub fn show_path(
+        &mut self,
+        path: String,
+        at: Option<(u32, u32)>,
+        dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        log::info!("从终端打开仓库里的 {path}（行列 {at:?}）");
+        // 仓库刚打开、还没连上：读不了文件、列不了目录，连上后再来（见 `sync_files`）
+        if self.channel.is_none() {
+            self.files.shown = Some(Shown { path, at, dir });
+            self.show_page(Page::Files, window, cx);
+            return;
+        }
+        if dir || path.is_empty() {
+            self.show_page(Page::Files, window, cx);
+            if !path.is_empty() {
+                self.expand_dir(path.clone(), cx);
+                self.reveal_in_tree(&path, cx);
+            }
+            return;
+        }
+        self.show_file(path.clone(), window, cx);
+        let Some((line, col)) = at else {
+            return;
+        };
+        let position = Position::new(line.saturating_sub(1), col.saturating_sub(1));
+        let Some(tab) = self.files.tabs.iter_mut().find(|tab| tab.path == path) else {
+            return;
+        };
+        match tab.text().map(|doc| doc.editor.clone()) {
+            Some(editor) => jump_to(editor, position, window),
+            None => tab.jump = Some(position),
+        }
     }
 
     /// 读文件内容，读回来按种类显示。已经在编辑器里开着的（磁盘上变了）重用那个编辑器。
@@ -1349,6 +1446,9 @@ impl RepoView {
                 state.set_cursor_position(cursor, window, cx);
                 state.set_scroll_offset(scroll, cx);
             });
+            if let Some(position) = tab.jump.take() {
+                jump_to(editor, position, window);
+            }
             return;
         }
         let (lang, label) = language(&path);
@@ -1378,6 +1478,9 @@ impl RepoView {
         let Some(tab) = self.files.tab_mut(id) else {
             return;
         };
+        if let Some(position) = tab.jump.take() {
+            jump_to(editor.clone(), position, window);
+        }
         tab.body = Body::Text(TextDoc {
             editor,
             saved: text,
@@ -1702,9 +1805,23 @@ mod tests {
     // 不能 `use super::*`：界面库也有一个叫 test 的宏，会盖掉标准的 #[test]
     use super::{
         Class, Encoding, classify, decode, encode, extension, indent_of, language, local_file_name,
+        tree_flags,
     };
     use fr_core::i18n::tr;
     use gpui_kit::ImageFormat;
+
+    #[test]
+    fn 子仓库的目录不按忽略变淡_里面的也不() {
+        // 根仓库的 .gitignore 忽略了子仓库的目录：照样是子仓库，不算被忽略
+        assert_eq!(tree_flags(true, false, true), (true, false));
+        // 被忽略的目录里的子仓库
+        assert_eq!(tree_flags(true, true, false), (true, false));
+        // 子仓库里的东西：上面没有被忽略的，自己不在清单里，不变淡
+        assert_eq!(tree_flags(false, false, false), (false, false));
+        // 别的被忽略的照旧
+        assert_eq!(tree_flags(false, false, true), (false, true));
+        assert_eq!(tree_flags(false, true, false), (false, true));
+    }
 
     #[test]
     fn 粘贴进来的_crlf_保存时不会翻倍() {

@@ -803,9 +803,7 @@ impl RepoView {
                         let file2 = file.clone();
                         menu = menu
                             .item(PopupMenuItem::new(tr("用默认程序打开")).on_click(
-                                move |_, window, cx| {
-                                    crate::shell::report(crate::shell::open_file(&file), window, cx)
-                                },
+                                move |_, window, cx| crate::shell::open_file(&file, window, cx),
                             ))
                             .item(PopupMenuItem::new(tr("在 VS Code 中打开")).on_click(
                                 move |_, window, cx| {

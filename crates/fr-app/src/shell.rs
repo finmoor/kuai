@@ -181,14 +181,41 @@ pub fn open_folder(dir: &str) -> Result<(), String> {
     spawn(cmd, tr("资源管理器"))
 }
 
-/// 用系统给这种文件设的默认程序打开它（解决冲突时用来改文件）。直接交给 ShellExecute，不经 cmd：
-/// 文件名里的 `&`、`%` 会被 cmd 当成命令分隔、变量展开，后半截被当成命令执行。
-pub fn open_file(path: &str) -> Result<(), String> {
+/// 用系统给这种文件设的默认程序打开它（解决冲突时用来改文件、终端里按住 Ctrl 单击的文件），打不开
+/// 弹通知。直接交给 ShellExecute，不经 cmd：文件名里的 `&`、`%` 会被 cmd 当成命令分隔、变量展开，
+/// 后半截被当成命令执行。
+///
+/// ShellExecute 在另起的线程上调：它要等打开的程序（浏览器、Office）回话，等的时候处理窗口消息，在
+/// 界面线程上调的话界面库会重入（日志里一串「RefCell already borrowed」，那一阵画不出来）。
+pub fn open_file(path: &str, window: &mut Window, cx: &mut App) {
     let path = windows_path(path);
     if !Path::new(&path).is_file() {
-        return Err(tf!("文件不存在：{path}", path));
+        return report(Err(tf!("文件不存在：{path}", path)), window, cx);
     }
-    shell_open(&path).map_err(|err| tf!("无法打开{what}：{err}", what = tr("此文件"), err))
+    let (send, done) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        use windows::Win32::System::Com::{
+            COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+        };
+        // SAFETY: 这个线程上先初始化 COM（ShellExecute 可能交给外壳扩展，要单线程套间），用完再收掉
+        let opened = unsafe {
+            let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+            let opened = shell_open(&path);
+            if com.is_ok() {
+                CoUninitialize();
+            }
+            opened
+        };
+        let _ = send.send(opened);
+    });
+    window
+        .spawn(cx, async move |cx| {
+            if let Ok(Err(err)) = done.await {
+                let text = tf!("无法打开{what}：{err}", what = tr("此文件"), err);
+                cx.update(|window, cx| report(Err(text), window, cx)).ok();
+            }
+        })
+        .detach();
 }
 
 /// ShellExecute 的「打开」。这种文件没有关联的程序时，像双击时一样弹出「打开方式」。
@@ -228,6 +255,18 @@ fn shell_open(path: &str) -> Result<(), String> {
 /// 在默认浏览器里打开网址（只开 https 的）。不经 cmd：网址里的 `&` 会被 cmd 当成命令分隔。
 pub fn open_url(url: &str) -> Result<(), String> {
     if !url.starts_with("https://") {
+        return Err(tf!("不支持打开此网址：{url}", url));
+    }
+    let mut cmd = Command::new("rundll32.exe");
+    cmd.args(["url.dll,FileProtocolHandler", url]);
+    spawn(cmd, tr("浏览器"))
+}
+
+/// 在默认浏览器里打开终端里按住 Ctrl 单击的网址：http 的也开（`http://localhost:3000` 这种），
+/// 别的协议不开。
+pub fn open_link(url: &str) -> Result<(), String> {
+    let lower = url.to_ascii_lowercase();
+    if !lower.starts_with("https://") && !lower.starts_with("http://") {
         return Err(tf!("不支持打开此网址：{url}", url));
     }
     let mut cmd = Command::new("rundll32.exe");

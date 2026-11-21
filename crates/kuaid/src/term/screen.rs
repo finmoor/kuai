@@ -17,6 +17,7 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, CursorStyle, NamedColor, Processor, Rgb};
+use fr_core::term_text::{Row, Shade};
 
 /// 往回翻的内容留多少行。客户端接上时全部还原，所以不能太多
 const HISTORY: usize = 2000;
@@ -175,6 +176,85 @@ impl Screen {
             .unwrap_or_default()
     }
 
+    /// 按回车的那一刻，屏幕上的输入区里写着的消息（见 [`fr_core::term_text::message`]）。全屏程序
+    /// （备用屏）里不认。
+    #[cfg(test)]
+    pub fn message(&self) -> Option<String> {
+        self.entered().map(|(text, _)| text)
+    }
+
+    /// 按回车的那一刻，屏幕上的输入区里写着的消息，连同光标是不是在 PowerShell 多行语句的续行上
+    /// （见 [`fr_core::term_text::record`]）。全屏程序（备用屏）里不认。
+    pub fn entered(&self) -> Option<(String, bool)> {
+        let (rows, cursor, shown) = self.input_rows()?;
+        let text = fr_core::term_text::message(&rows, cursor, shown)?;
+        Some((text, fr_core::term_text::continued(&rows, cursor, shown)))
+    }
+
+    /// 屏幕上的一行行字、光标在第几行、光标显示着没有：认输入区用（备用屏里是 `None`）。
+    fn input_rows(&self) -> Option<(Vec<Row>, usize, bool)> {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let grid = self.term.grid();
+        let at = grid.cursor.point;
+        let shown = self.term.mode().contains(TermMode::SHOW_CURSOR);
+        // 光标所在的那一行（连同折下去的）光标后面的部分：灰色的字也算淡色字（zsh、fish 的建议）
+        let mut tail = false;
+        let (cols, bottom) = (grid.columns(), grid.screen_lines() as i32);
+        let rows: Vec<Row> = (0..bottom)
+            .map(|line| {
+                let row = &grid[Line(line)];
+                let wraps = row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+                let in_tail = shown && (line == at.line.0 || (tail && line > at.line.0));
+                tail = in_tail && wraps;
+                let padded = wraps
+                    && line + 1 < bottom
+                    && fr_core::term_text::padded(
+                        row[Column(cols - 1)].c,
+                        grid[Line(line + 1)][Column(0)]
+                            .flags
+                            .contains(Flags::WIDE_CHAR),
+                    );
+                // 宽字的后半格、宽字放不下时留在行尾的那一格都不是字（折下去的行尾空格要留着）
+                let cells = (0..cols)
+                    .map(|col| (col, &row[Column(col)]))
+                    .filter(|&(col, cell)| {
+                        !cell
+                            .flags
+                            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                            && !(padded && col == cols - 1)
+                    })
+                    .map(move |(col, cell)| {
+                        let after = in_tail && (line > at.line.0 || col >= at.column.0);
+                        (cell.c, shade(cell, after))
+                    });
+                Row::from_cells(cells, wraps)
+            })
+            .collect();
+        Some((rows, at.line.0.max(0) as usize, shown))
+    }
+
+    /// 屏幕上的字（连同往回翻的记录有多少行、在不在备用屏）的摘要：看程序的一块输出改没改屏幕上的
+    /// 字（见 `Activity`）。光改颜色、反色，挪光标，改标题的不算。
+    pub fn digest(&self) -> u64 {
+        use std::hash::{DefaultHasher, Hash as _, Hasher as _};
+        let mut hasher = DefaultHasher::new();
+        let grid = self.term.grid();
+        grid.history_size().hash(&mut hasher);
+        self.term
+            .mode()
+            .contains(TermMode::ALT_SCREEN)
+            .hash(&mut hasher);
+        for line in 0..grid.screen_lines() as i32 {
+            let row = &grid[Line(line)];
+            for col in 0..grid.columns() {
+                row[Column(col)].c.hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
     /// 屏幕上某一行的字（测试用）。
     #[cfg(test)]
     pub(crate) fn line_text(&self, line: usize) -> String {
@@ -202,6 +282,31 @@ impl Screen {
 
     /// 把现在的屏幕写成一串终端输出，给刚接上来的客户端（它的终端是空白的）。
     pub fn dump(&mut self) -> Vec<u8> {
+        let (mut out, _) = self.picture(true);
+        // 最后是没写完的转义序列的前半截：客户端的解析器要停在同一个地方，后半截来了才接得上
+        out.extend_from_slice(self.tail.pending());
+        out
+    }
+
+    /// 给刚接上来的客户端还原屏幕用的几段输出（客户端一段收齐了才一起处理，见
+    /// `TermOpened::restore`）。往回翻的记录有好几千行时整份要传一会儿（远程的线路慢），客户端
+    /// 照着一块块画，看到的是从最早的记录一路滚下来。所以有往回翻的记录时分两段：先是只有屏幕的
+    /// 一段，几十 KB，马上画得出来；再是 [`RESET`] 开头、从头重画、带上往回翻的记录的整份。
+    pub fn restore(&mut self) -> Vec<Vec<u8>> {
+        let (mut screen, history) = self.picture(false);
+        if history == 0 {
+            // 没有往回翻的记录：只有屏幕的这一段就是整份
+            screen.extend_from_slice(self.tail.pending());
+            return vec![screen];
+        }
+        let mut full = RESET.to_vec();
+        full.extend_from_slice(&self.dump());
+        vec![screen, full]
+    }
+
+    /// [`Self::dump`] 除了没写完的转义序列以外的部分：`history` 为假时不写往回翻的记录。另外返回
+    /// 主屏往回翻的记录有多少行（在备用屏里时 [`Term::grid`] 是备用屏，没有往回翻的）。
+    fn picture(&mut self, history: bool) -> (Vec<u8>, usize) {
         // 同步刷新攒着没画的先画上，不然拍下来的是旧画面
         self.parser.stop_sync(&mut self.term);
         self.take_events();
@@ -217,7 +322,8 @@ impl Screen {
         if alt {
             self.term.swap_alt();
         }
-        write_grid(&mut out, self.term.grid(), true);
+        let lines = self.term.grid().history_size();
+        write_grid(&mut out, self.term.grid(), history);
         write_cursor(&mut out, self.term.grid());
         if let Some(part) = alt_part {
             out.extend_from_slice(&part);
@@ -233,9 +339,7 @@ impl Screen {
         }
         write_colors(&mut out, &self.term);
         write_modes(&mut out, &self.term);
-        // 最后是没写完的转义序列的前半截：客户端的解析器要停在同一个地方，后半截来了才接得上
-        out.extend_from_slice(self.tail.pending());
-        out
+        (out, lines)
     }
 }
 
@@ -372,6 +476,20 @@ fn push_color(
 }
 
 /// 这一格是不是什么都没有（没写过字、没有底色）。行尾这样的格子不用写。
+/// 认消息时这一格字算什么（见 [`Shade::of`]）。
+fn shade(cell: &Cell, after: bool) -> Shade {
+    let gray = matches!(
+        cell.fg,
+        Color::Named(NamedColor::BrightBlack) | Color::Indexed(8)
+    );
+    Shade::of(
+        cell.flags.contains(Flags::INVERSE),
+        cell.flags.contains(Flags::DIM),
+        gray,
+        after,
+    )
+}
+
 fn is_blank(cell: &Cell) -> bool {
     cell.c == ' '
         && cell.flags.is_empty()
@@ -724,6 +842,80 @@ mod tests {
     }
 
     #[test]
+    fn 往回翻的记录多时分两段还原_先只有屏幕() {
+        let size = Size::new(20, 5);
+        // 没有往回翻的记录：一段，就是整份
+        let mut short = Screen::new(size);
+        short.advance(b"$ ls\r\na b\r\n$ ");
+        let parts = short.restore();
+        assert_eq!(parts, vec![short.dump()]);
+
+        let mut input = Vec::new();
+        for n in 0..50 {
+            input.extend_from_slice(format!("\x1b[3{}mline {n}\x1b[m\r\n", n % 8).as_bytes());
+        }
+        // 设了标题、要焦点报告，停在一条没写完的转义序列中间
+        input.extend_from_slice(b"\x1b]2;title\x07\x1b[?1004h$ \x1b[38;5");
+        let mut original = Screen::new(size);
+        original.advance(&input);
+        let parts = original.restore();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[1].starts_with(RESET), "第二段先把终端重置");
+        assert!(parts[0].len() * 5 < parts[1].len(), "只有屏幕的一段小得多");
+        let mut client = Screen::new(size);
+        client.advance(&parts[0]);
+        // 第一段：屏幕、光标、模式、标题都对了，还没有往回翻的
+        assert_eq!(client.term.grid().history_size(), 0);
+        for line in 0..5 {
+            assert_eq!(
+                client.line_text(line),
+                original.line_text(line),
+                "第 {line} 行"
+            );
+        }
+        assert_eq!(
+            client.term.grid().cursor.point,
+            original.term.grid().cursor.point
+        );
+        assert_eq!(client.term.mode(), original.term.mode());
+        assert_eq!(client.title, original.title);
+        client.advance(&parts[1]);
+        assert_same(&original, &client, "两段都还原后");
+        // 拍过以后自己没变；没写完的那条序列的后半截来了两边接得上
+        assert_eq!(original.restore(), parts);
+        original.advance(b";1mX");
+        client.advance(b";1mX");
+        assert_same(&original, &client, "接着输出后");
+    }
+
+    #[test]
+    fn 在备用屏里分两段还原() {
+        let size = Size::new(20, 5);
+        let mut input = Vec::new();
+        for n in 0..30 {
+            input.extend_from_slice(format!("line {n}\r\n").as_bytes());
+        }
+        input.extend_from_slice(b"\x1b[?1049h\x1b[2J\x1b[Hfull screen\r\nmenu");
+        let mut original = Screen::new(size);
+        original.advance(&input);
+        let parts = original.restore();
+        assert_eq!(parts.len(), 2, "备用屏里看的是主屏往回翻的记录有没有");
+        let mut client = Screen::new(size);
+        client.advance(&parts[0]);
+        // 第一段：备用屏画出来了
+        assert!(client.term.mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(client.line_text(0), "full screen");
+        assert_eq!(client.line_text(1), "menu");
+        client.advance(&parts[1]);
+        assert_same(&original, &client, "两段都还原后");
+        assert_eq!(original.restore(), parts, "拍过以后自己没变");
+        // 回到主屏：主屏和往回翻的记录也一样
+        original.advance(b"\x1b[?1049l");
+        client.advance(b"\x1b[?1049l");
+        assert_same(&original, &client, "回到主屏后");
+    }
+
+    #[test]
     fn 普通的几行字() {
         roundtrip(
             40,
@@ -938,5 +1130,58 @@ mod tests {
             tail.feed(&[*byte]);
         }
         assert_eq!(tail.pending(), b"\x1b[1;3");
+    }
+
+    #[test]
+    fn 认消息时灰字建议_藏着光标的菜单不算() {
+        let message = |bytes: &[u8]| {
+            let mut screen = Screen::new(Size::new(60, 12));
+            screen.advance(bytes);
+            screen.message()
+        };
+        // PowerShell：打了 claude，后面是淡色斜体的建议（PSReadLine 2.4.5 默认的样式），光标在建议前面
+        assert_eq!(
+            message(b"PS C:\\> \x1b[93mclaude\x1b[97;2;3m update\x1b[0m\x1b[7D").as_deref(),
+            Some("claude")
+        );
+        // zsh-autosuggestions：光标后面的 8 号灰色字
+        assert_eq!(
+            message(b"me@box:~$ git\x1b[38;5;8m log --oneline\x1b[0m\x1b[13D").as_deref(),
+            Some("git")
+        );
+        // 光标前面的灰色字是打的（PowerShell 把参数画成灰色）
+        assert_eq!(
+            message(b"PS C:\\> \x1b[93mGet-Date \x1b[90m-Format\x1b[0m").as_deref(),
+            Some("Get-Date -Format")
+        );
+        // Claude Code 问信任文件夹：光标藏着，指针在第一项上
+        let menu = b" \xe2\x9d\xaf No, exit\r\n   Yes, I trust this folder\x1b[1A";
+        assert_eq!(message(&[b"\x1b[?25l", &menu[..]].concat()), None);
+        // 光标在的照样算（shell 的 ❯ 提示符）
+        assert_eq!(message(menu).as_deref(), Some("No, exit"));
+    }
+
+    #[test]
+    fn 认消息时折行处的空格留着_宽字放不下留的那一格不算() {
+        let message = |bytes: &[u8]| {
+            let mut screen = Screen::new(Size::new(20, 6));
+            screen.advance(bytes);
+            screen.message()
+        };
+        // 第 20 格正好是空格，折到下一行（原来记成 `echo 12| x`）
+        assert_eq!(
+            message(b"PS C:\\repo> echo 12 | x").as_deref(),
+            Some("echo 12 | x")
+        );
+        // 「二」在第 20 格放不下，整个折到下一行，那一格空着
+        assert_eq!(
+            message("PS C:\\repo> echo 一二三四".as_bytes()).as_deref(),
+            Some("echo 一二三四")
+        );
+        // 经 ConPTY 来的：它在那一格写一个普通空格再写「二」（测试终端里记成了两个空格）
+        assert_eq!(
+            message("PS C:\\repo> echo 一 二三四".as_bytes()).as_deref(),
+            Some("echo 一二三四")
+        );
     }
 }

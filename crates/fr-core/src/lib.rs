@@ -23,6 +23,8 @@ pub mod stash;
 pub mod state;
 pub mod status;
 pub mod store;
+pub mod term_link;
+pub mod term_text;
 pub mod watch;
 pub mod workfile;
 pub mod worktree;

@@ -26,8 +26,12 @@ def log(*parts):
 
 
 def pipe(src, dst, limit):
-    """把 src 收到的转给 dst；limit 是每秒字节数，0 是不限。"""
-    sent, start = 0, time.monotonic()
+    """把 src 收到的转给 dst；limit 是每秒字节数，0 是不限。
+
+    像真的线路一样一块块排着传：每块要等前面的按 limit 传完。不能按「连接开始以来的平均速度」算：
+    连接闲了一阵以后攒下的额度会让一大块一下子过去，测不出慢线路上收一大块要多久。"""
+    start = time.monotonic()
+    free_at = start
     try:
         while True:
             data = src.recv(16384)
@@ -39,10 +43,9 @@ def pipe(src, dst, limit):
                     time.sleep(wait)
             dst.sendall(data)
             if limit:
-                sent += len(data)
-                ahead = sent / limit - (time.monotonic() - start)
-                if ahead > 0:
-                    time.sleep(ahead)
+                now = time.monotonic()
+                free_at = max(free_at, now) + len(data) / limit
+                time.sleep(max(0.0, free_at - now))
     except OSError as err:
         log('断开', err)
     finally:

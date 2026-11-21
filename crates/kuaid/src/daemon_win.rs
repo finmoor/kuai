@@ -26,6 +26,7 @@ use crate::conn::{self, Control, Shared};
 use crate::files;
 use crate::term::hosted::{self, Hosted};
 use crate::term::{Backend, Ended, Frozen, Registry, Size};
+use fr_core::protocol::TermMark;
 
 /// 转接程序和常驻进程之间的连接。
 pub type Stream = TcpStream;
@@ -183,6 +184,9 @@ struct HandoffSession {
     /// 还原屏幕用的字节有多长
     #[serde(default)]
     dump: u64,
+    /// 发出去的消息（协议 16 起）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    marks: Vec<TermMark>,
 }
 
 fn minus_one() -> i32 {
@@ -481,6 +485,7 @@ fn write_handoff(path: &Path, host_token: &str, next_term: u64, frozen: &[Frozen
                 exited: f.exit.is_some(),
                 exit: f.exit.flatten(),
                 dump: f.dump.len() as u64,
+                marks: f.marks.clone(),
             })
             .collect(),
     };
@@ -547,6 +552,7 @@ fn adopt(terms: &Registry, handoff: Handoff, dumps: Vec<Vec<u8>>, host_token: &s
                 handle: None,
                 exit,
                 dump,
+                marks: session.marks,
             },
             backend,
         );
@@ -604,6 +610,10 @@ mod tests {
                 handle: Some((50123, 4321)),
                 exit: None,
                 dump: b"\x1b[mhello".to_vec(),
+                marks: vec![TermMark {
+                    text: "git status".into(),
+                    at: 1_700_000_000_123,
+                }],
             },
             Frozen {
                 id: "t4".into(),
@@ -614,6 +624,7 @@ mod tests {
                 handle: None,
                 exit: Some(Some(2)),
                 dump: b"bye".to_vec(),
+                marks: Vec::new(),
             },
         ];
         write_handoff(&path, "secret", 7, &frozen).unwrap();
@@ -626,6 +637,7 @@ mod tests {
         };
         assert_eq!((live.port, live.pid, live.exited), (50123, 4321, false));
         assert_eq!((live.cols, live.rows), (100, 30));
+        assert_eq!(live.marks, frozen[0].marks, "发出去的消息带过去");
         assert_eq!((ended.port, ended.exited, ended.exit), (-1, true, Some(2)));
         assert_eq!(dumps, [b"\x1b[mhello".to_vec(), b"bye".to_vec()]);
         // 以后的版本多写了字段、少写了后加的字段，都读得了

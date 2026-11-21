@@ -26,7 +26,8 @@
 //! 终端（协议 4 起）。终端会话开在 kuaid 里，客户端断开、退出以后里面的程序接着跑：
 //! - `term_open`：参数 [`TermOpen`]。有同一个 `key` 的会话就接上它，没有就在 `cwd` 里开一个登录 shell。
 //!   响应是一个流：第一条 `chunk: true`、`result` 是 [`TermOpened`]；接着是还原屏幕用的输出
-//!   （接上已有会话时）和之后的输出，每条 `chunk: true` 带一块原始字节；程序结束时最后一条
+//!   （接上已有会话时，分几段、各多长见 [`TermOpened::restore`]）和之后的输出，每条 `chunk: true`
+//!   带一块原始字节；程序结束时最后一条
 //!   `result` 是 [`TermExit`]。`cancel` 这个请求只是断开。
 //! - `term_attach`：参数 `{term, cols, rows}`，接上指定的会话，响应同上。带 `watch: true`（协议 11 起）
 //!   是只看：不改会话的大小，先收到按会话现在的大小还原的屏幕；看的人不往里写任何东西（包括终端
@@ -42,6 +43,10 @@
 //! - `term_programs`（协议 13 起）：参数 `{term}`，返回 `{programs: [名字]}`：会话里除了 shell 还有哪些
 //!   程序在跑（Linux 上是前台那一组，Windows 上是 shell 起的子进程），查不到名字的是空串。shell 闲着、
 //!   程序已经结束、没有这个会话时是空的。客户端结束、重启终端前用它决定要不要先问一句。
+//! - 发出去的消息（协议 16 起，终端左边的刻度用）：kuaid 在 `term_input` 只是一个回车时，从屏幕上的
+//!   输入区读出这条消息记下来（[`crate::term_text::message`]），每个会话最多 [`TERM_MARKS`] 条，只在
+//!   内存里。终端流里 `chunk: true`、`result` 是 [`TermMarks`] 的一条就是这个会话现在记着的全部：
+//!   接上时紧跟在 [`TermOpened`] 后面发一次（有的话），之后每记下一条给接着的客户端都再发一次。
 //!
 //! 传文件（协议 5 起）。往终端里发图片、文件用：终端那条路只能过文字，文件先传上来，
 //! 客户端再把它在服务器上的路径贴进终端：
@@ -119,7 +124,21 @@ use serde_json::Value;
 /// 14：[`TermInfo`] 多了 `programs`，终端列表里就带着各个终端在跑的程序（终端页侧栏的图标用）。
 /// 15：`fs_read` 可以带 `whole`：文件比它大时不读内容，只回文件的情况（文件页打开太大的文件时
 /// 不白传一块）；`fs_sync`，把文件刷到主机的磁盘上（映射盘上的程序要求刷盘时）。
-pub const PROTOCOL_VERSION: u32 = 15;
+/// 16：终端流里带上发出去的消息（[`TermMarks`]）；[`TermOpened`] 多了 `restore`（还原屏幕的输出分几段、
+/// 各多长），往回翻的记录多时先发只有屏幕的一段。这两样 kuaid 只给握手时说自己是 16 以上的客户端
+/// （见 [`TERM_MARKS_SINCE`]）。
+///
+/// 客户端握手（`hello`）时带上自己的 `protocol`，kuaid 按它决定发不发新加的东西：kuaid 可以比客户端
+/// 新（另一台电脑上更新的 Kuai 换上的），旧客户端认不得的不能发给它。
+pub const PROTOCOL_VERSION: u32 = 16;
+
+/// 客户端的协议从这一版起，kuaid 才在终端流里发消息刻度（[`TermMarks`]）、分段还原屏幕
+/// （[`TermOpened::restore`]）。更旧的客户端把终端流里带结果的消息都当成 [`TermOpened`]，收到刻度
+/// 就报格式错误、断开这个终端；还原的输出给它一整份，和原来一样。
+pub const TERM_MARKS_SINCE: u32 = 16;
+
+/// 一个终端会话最多记这么多条发出去的消息，多了丢掉最早的。
+pub const TERM_MARKS: usize = 200;
 
 /// 一条消息后面跟多少字节的原始数据。
 pub trait Frame {
@@ -242,6 +261,27 @@ pub struct TermOpened {
     /// 这次新开的；为假说明接上的是已有的会话
     #[serde(default)]
     pub created: bool,
+    /// 接上已有的会话时，后面紧跟着的还原屏幕用的输出分几段、每段多少字节（协议 16 起）。往回翻的
+    /// 记录多时是两段：先是只有屏幕的一段，再是从头重画（终端重置开头）、带上往回翻的记录的整份。
+    /// 客户端一段收齐了才一起处理：远程的线路上整份要传一会儿，照着一块块画，看到的是从最早的记录
+    /// 一路滚下来。旧的 kuaid 不给（空），客户端收到多少画多少
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restore: Vec<u64>,
+}
+
+/// 终端里发出去的一条消息（协议 16 起）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TermMark {
+    /// 消息的字（去掉了提示符）
+    pub text: String,
+    /// 什么时候发的：1970 年以来的毫秒
+    pub at: u64,
+}
+
+/// 终端流里的一条：这个会话现在记着的全部消息，从早到晚（协议 16 起）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TermMarks {
+    pub marks: Vec<TermMark>,
 }
 
 /// 终端流的最后一条消息：程序结束了。

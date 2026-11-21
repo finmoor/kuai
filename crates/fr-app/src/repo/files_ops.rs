@@ -799,7 +799,7 @@ impl RepoView {
         };
         if self.entry.server.is_none() {
             let path = self.full_path(&tab.path);
-            crate::shell::report(crate::shell::open_file(&path), window, cx);
+            crate::shell::open_file(&path, window, cx);
             return;
         }
         // 已经下载过：主机上的没变，或者在本机改过（还没传回去），直接打开那一份；本机没动过、
@@ -810,7 +810,7 @@ impl RepoView {
             && (copy.edited() || same_version(&copy.remote, &tab.stat))
         {
             let path = copy.path.to_string_lossy().into_owned();
-            crate::shell::report(crate::shell::open_file(&path), window, cx);
+            crate::shell::open_file(&path, window, cx);
             return;
         }
         if tab.stat.size <= OPEN_ASK {
@@ -902,7 +902,7 @@ impl RepoView {
                     remove_copy(&old);
                 }
                 let shown = dest.to_string_lossy().into_owned();
-                crate::shell::report(crate::shell::open_file(&shown), window, cx);
+                crate::shell::open_file(&shown, window, cx);
                 this.watch_local_copy(id, cx);
             })
             .ok();

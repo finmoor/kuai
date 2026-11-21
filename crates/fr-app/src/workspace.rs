@@ -238,6 +238,12 @@ impl Workspace {
                 window,
                 |this, _, event: &Go, window, cx| match event {
                     Go::Repo(entry) => this.open_repo_git(entry, window, cx),
+                    Go::File {
+                        entry,
+                        path,
+                        at,
+                        dir,
+                    } => this.open_repo_path(entry, path.clone(), *at, *dir, window, cx),
                 },
             ),
             cx.subscribe_in(&board, window, |this, _, event: &Stopped, window, cx| {
@@ -1273,6 +1279,32 @@ impl Workspace {
             tab.shown(cx)
                 .update(cx, |view, cx| view.show_git_page(window, cx));
         }
+    }
+
+    /// 终端页里按住 Ctrl 单击了仓库里的文件、目录：打开这个仓库的标签页（进了子仓库的退回这个仓库），
+    /// 在文件页打开它（见 [`RepoView::show_path`]）。
+    fn open_repo_path(
+        &mut self,
+        entry: &RepoEntry,
+        path: String,
+        at: Option<(u32, u32)>,
+        dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open(entry.clone(), window, cx);
+        let Some(view) = self.active_repo().map(|tab| tab.view.clone()) else {
+            return;
+        };
+        view.update(cx, |view, cx| {
+            // 一次退一层（子仓库的工作树里又进了一层的也退得回来）
+            for _ in 0..4 {
+                if !view.back_to_root(window, cx) {
+                    break;
+                }
+            }
+            view.show_path(path, at, dir, window, cx);
+        });
     }
 
     /// 点了系统通知：把窗口叫到前面，前往那个终端（它已经不在了就只叫窗口）。

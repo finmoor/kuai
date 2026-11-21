@@ -38,7 +38,7 @@ pub use fr_core::askpass::PromptKind;
 pub use fr_core::hop::run_helper as run_ssh_hop;
 pub use fr_core::protocol::{
     DirEntry, DirListing, FsEntry, FsExpect, FsSpace, FsStat, FsWrite, FsWritten, Hello, SubRepos,
-    TermInfo,
+    TermInfo, TermMark,
 };
 pub use remote::{ConnectOptions, Connection, Jump, Probe, StageHandler, local_kuai_root};
 
@@ -119,10 +119,17 @@ impl Stream for ChangeStream {
 
 /// 终端流里的一项。
 pub enum TermItem {
-    /// 流的第一项：会话的编号；`created` 为假说明接上的是已有的会话
-    Opened { term: String, created: bool },
+    /// 流的第一项：会话的编号；`created` 为假说明接上的是已有的会话；`restore` 是后面还原屏幕的
+    /// 输出分几段、各多少字节（见 [`fr_core::protocol::TermOpened::restore`]）
+    Opened {
+        term: String,
+        created: bool,
+        restore: Vec<u64>,
+    },
     /// 程序的一块输出（接上已有会话时，开头几块是还原屏幕用的）
     Output(Vec<u8>),
+    /// 这个会话记着的全部发出去的消息，从早到晚（协议 16 起：接上时一次，之后每多一条一次）
+    Marks(Vec<TermMark>),
     /// 程序结束了：退出码
     Exited(Option<i32>),
     /// 取得太慢，积着没取走的输出超过了 [`TERM_BACKLOG`]：流到此为止，已经不从 kuaid 收了，积着的

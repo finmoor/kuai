@@ -254,6 +254,26 @@ impl Client {
         seen
     }
 
+    /// 接上已有的终端后，先收完还原屏幕的那几段（`TermOpened::restore`），返回里面的字。之后收到的
+    /// 才是接上以后的输出：等命令的结果时不会把还原出来的旧结果当成新的。
+    fn restored(&mut self, stream: u64, opened: &TermOpened) -> String {
+        let mut left: u64 = opened.restore.iter().sum();
+        assert!(left > 0, "接上已有的终端应当有还原屏幕的输出");
+        let mut seen = String::new();
+        while left > 0 {
+            let what = format!("还原屏幕的输出（还差 {left} 字节），收到的是：{seen:?}");
+            let (response, payload) = self.take(&what, |r| {
+                r.id == stream && r.ask.is_none() && r.result.is_none()
+            });
+            assert!(response.chunk, "终端提前结束了：{response:?}");
+            left = left
+                .checked_sub(payload.len() as u64)
+                .expect("还原屏幕的输出比说的多");
+            seen.push_str(&String::from_utf8_lossy(&payload));
+        }
+        seen
+    }
+
     /// 收到这个流结束：程序的退出码。
     fn exit_of(&mut self, stream: u64) -> Option<i32> {
         let (response, _) = self.reply(stream, "终端结束的消息");
@@ -398,7 +418,8 @@ fn 拉起常驻进程_终端在客户端走了以后还在() {
         (again.term.as_str(), again.created),
         (opened.term.as_str(), false)
     );
-    second.output_until(stream, "KUAID-42");
+    let seen = second.restored(stream, &again);
+    assert!(seen.contains("KUAID-42"), "{seen}");
     assert_eq!(pid_of_shell(&mut second, stream, &again.term), shell_pid);
 
     // 状态命令看得到它
@@ -483,7 +504,8 @@ fn 没人看着时结束的终端_下次来看还看得到() {
     assert_eq!(second.terms().len(), 1, "还没人看过，应该留着");
     let (stream, again) = second.open("repo", &home.dir);
     assert!(!again.created);
-    second.output_until(stream, "LAST-42");
+    let seen = second.restored(stream, &again);
+    assert!(seen.contains("LAST-42"), "{seen}");
     assert_eq!(second.exit_of(stream), Some(3));
     assert!(second.terms().is_empty());
 }
@@ -541,14 +563,17 @@ fn 新版本连上来_常驻进程原地换掉_终端留着() {
         (again.term.as_str(), again.created),
         (opened.term.as_str(), false)
     );
-    second.output_until(stream, "tick");
+    // 先收完还原出来的屏幕（往回翻的记录多时分两段）：上面有那几行 tick
+    let seen = second.restored(stream, &again);
+    assert!(seen.contains("tick"), "{seen}");
     second.input(&again.term, "kill %1; echo mark=$MARK=\n");
     second.output_until(stream, "mark=kept=");
     assert_eq!(pid_of_shell(&mut second, stream, &again.term), shell_pid);
     // 结束了的那个：最后的画面和退出码带过来了
     let (stream, seen_ended) = second.open("ended", &home.dir);
     assert!(!seen_ended.created);
-    second.output_until(stream, "GONE-2");
+    let seen = second.restored(stream, &seen_ended);
+    assert!(seen.contains("GONE-2"), "{seen}");
     assert_eq!(second.exit_of(stream), Some(5));
     // 新开的终端编号不和带过来的重
     let (_, fresh) = second.open("fresh", &home.dir);

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,7 @@ use crate::VERSION;
 use crate::files::{self, Uploads};
 use crate::out::Outbox;
 use crate::relay::Relays;
-use crate::term::{Registry, Size};
+use crate::term::{Caller, Registry, Size};
 use crate::workspaces::Workspaces;
 
 /// 密码请求最多等用户这么久
@@ -164,9 +164,22 @@ pub struct Conn {
     uploads: Mutex<Uploads>,
     /// 替它连这台电脑配置的服务器的 ssh（协议 10），断开时跟着结束
     relays: Arc<Relays>,
+    /// 客户端握手（`hello`）时说的协议版本：它认不得的东西不发给它（见
+    /// [`fr_core::protocol::TERM_MARKS_SINCE`]）。握手前按现在这一版算（只有测试不握手）；握手时没说
+    /// 的是很旧的客户端，按 0 算
+    protocol: AtomicU32,
 }
 
 impl Conn {
+    /// 这条连接上的 `request` 号请求要接终端。
+    fn caller(&self, request: u64) -> Caller {
+        Caller {
+            conn: self.id,
+            request,
+            protocol: self.protocol.load(Ordering::Relaxed),
+        }
+    }
+
     fn send(&self, response: &Response, payload: &[u8]) {
         self.out.send(response, payload);
     }
@@ -273,6 +286,7 @@ pub fn serve(shared: &Arc<Shared>, reader: impl Read, writer: impl Write + Send 
         auth_sock: Mutex::default(),
         uploads: Mutex::new(Uploads::new(shared.drop_dir.clone())),
         relays: Arc::default(),
+        protocol: AtomicU32::new(PROTOCOL_VERSION),
     });
     shared.conns.lock().unwrap().insert(conn.id, conn.clone());
     let mut watchers: HashMap<u64, fr_core::watch::Watcher> = HashMap::new();
@@ -432,7 +446,7 @@ fn handle(
                 .context("term_open 参数无效")
                 .and_then(|params| {
                     let env = term_env(shared, conn);
-                    shared.terms.open(&params, env, conn.id, id, &conn.out)
+                    shared.terms.open(&params, env, conn.caller(id), &conn.out)
                 });
             if let Err(err) = opened {
                 conn.reply(id, Err(err));
@@ -443,7 +457,7 @@ fn handle(
                 let size = Size::new(params.cols, params.rows);
                 shared
                     .terms
-                    .attach(&params.term, size, params.watch, conn.id, id, &conn.out)
+                    .attach(&params.term, size, params.watch, conn.caller(id), &conn.out)
             });
             if let Err(err) = attached {
                 conn.reply(id, Err(err));
@@ -513,6 +527,12 @@ fn handle(
             }
             None => conn.reply(id, Err(anyhow::anyhow!("非常驻进程"))),
         },
+        "hello" => {
+            let theirs = param("protocol").and_then(Value::as_u64).unwrap_or(0);
+            conn.protocol
+                .store(u32::try_from(theirs).unwrap_or(u32::MAX), Ordering::Relaxed);
+            conn.reply(id, simple(shared, &request));
+        }
         _ => conn.reply(id, simple(shared, &request)),
     }
 }
@@ -723,7 +743,7 @@ fn git_version() -> String {
 mod tests {
     use super::*;
     use crate::term::tests::fake_registry;
-    use fr_core::protocol::{TermExit, TermOpened};
+    use fr_core::protocol::{TermExit, TermMarks, TermOpened};
     use std::io::{PipeReader, PipeWriter};
 
     /// 测试里的一个客户端：往 `to` 写请求，从 `from` 读响应。
@@ -857,6 +877,38 @@ mod tests {
         client.send("upgrade", json!({ "exe": "/x" }), &[]);
         assert!(client.next().0.error.is_some());
         client.call("ping", json!({}));
+    }
+
+    /// 握手时说自己是旧协议（1.18.0 是 15）的连接收不到消息刻度：它会把刻度当成「开好了」解析，
+    /// 报格式错误、断开终端（见 `term::Caller`）。同一个终端的新客户端照常收到。
+    #[test]
+    fn 握手说是旧协议的客户端_收不到消息刻度() {
+        let (terms, fakes) = fake_registry();
+        let shared = Shared::new(terms, None, String::new());
+        let mut old = connect(&shared);
+        old.call("hello", json!({ "protocol": 15 }));
+        let mut new = connect(&shared);
+        new.call("hello", json!({ "protocol": PROTOCOL_VERSION }));
+        let open = json!({ "key": "/repo", "cwd": "/repo", "cols": 20, "rows": 4 });
+        old.send("term_open", open.clone(), &[]);
+        let opened: TermOpened = serde_json::from_value(old.next().0.result.unwrap()).unwrap();
+        let fake = fakes.lock().unwrap()[0].clone();
+        wait_until("开始读输出", || fake.session.lock().unwrap().is_some());
+        let session = fake.session.lock().unwrap().clone().unwrap();
+        new.send("term_open", open, &[]);
+        assert!(new.next().0.result.is_some());
+        // 还原的屏幕
+        new.next();
+        session.output(br"PS C:\> git status");
+        old.next();
+        new.next();
+        new.send("term_input", json!({ "term": opened.term }), b"\r");
+        let marks: TermMarks = serde_json::from_value(new.next().0.result.unwrap()).unwrap();
+        assert_eq!(marks.marks.len(), 1);
+        // 旧客户端那边，回车以后接着收到的是输出，不是刻度
+        session.output(b"!");
+        let (response, payload) = old.next();
+        assert_eq!((response.result, payload), (None, b"!".to_vec()));
     }
 
     #[test]

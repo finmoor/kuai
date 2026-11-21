@@ -21,7 +21,8 @@
 //! 时没有它）。固定的不受它影响，右边显示着的终端也不动。设计见 `docs/design/machine-switch/`（方向 A）。
 //!
 //! 画面有两种接法。平常是「只看」（[`TerminalView::watch`]）：只看一眼不改终端的大小，敲的字照样
-//! 写得进去；焦点进到画面里（开始输入）以后，大小改成这一页放得下的（`TerminalView::claim`）。
+//! 写得进去；人把焦点放进画面（开始输入）、往里打字、点画面以后，大小改成这一页放得下的
+//! （`TerminalView::claim`）。别处（另一台电脑的 Kuai）改了大小时跟着它，这边再打字才要回来。
 //! 这一页自己开的（新建、重启）是正经接着的（[`TerminalView::new`]），大小跟着这一页的画面，也就和
 //! 仓库的终端页一样大；选到别的终端再回来，就换成只看。
 //!
@@ -34,8 +35,10 @@
 //! 就是仓库页侧栏的那个宽度（见 [`crate::side_split`]）。
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use fr_channel::Channel;
 use fr_core::i18n::{tr, trc};
 use fr_core::tf;
 use gpui_kit::assets::IconName;
@@ -53,7 +56,7 @@ use crate::machines::{LOCAL, WorkspaceKey, machine_of, split_relay};
 use crate::repo::tool_button;
 use crate::settings::{RepoEntry, TermSlot};
 use crate::term_board::{Program, RepoGroup, Row, TermBoard, TermId, TermState, free_number};
-use crate::terminal::{self, TerminalView};
+use crate::terminal::{self, LinkBase, TerminalEvent, TerminalView};
 use crate::ui;
 
 /// 侧栏、画面上面那一条的高度（和仓库页的工具栏一样）
@@ -78,6 +81,14 @@ enum Filter {
 pub enum Go {
     /// 打开这个仓库的标签页，显示 Git 页
     Repo(RepoEntry),
+    /// 打开这个仓库的标签页，在文件页打开里面的文件、目录（终端里按住 Ctrl 单击的，见
+    /// [`TerminalEvent::OpenFile`]）
+    File {
+        entry: RepoEntry,
+        path: String,
+        at: Option<(u32, u32)>,
+        dir: bool,
+    },
 }
 
 /// 右边的画面。
@@ -88,6 +99,8 @@ struct Peek {
     view: Entity<TerminalView>,
     /// 这一页自己开的：正经接着，大小跟着这里的画面。不是就是只看
     owned: bool,
+    /// 终端里按住 Ctrl 单击了仓库里的文件
+    _events: Subscription,
 }
 
 /// 侧栏里能选中的一行。
@@ -748,10 +761,16 @@ impl TermOverview {
         }
         let view =
             cx.new(|cx| TerminalView::watch(&conn, &row.id.term, row.cols, row.rows, window, cx));
-        // 正往里输入时它改了大小、被别处重启了：换上新建的那个，焦点跟过去
+        let events = self.link_view(&view, &row.entry, cx);
+        // 正往里输入时它改了大小、被别处重启了：换上新建的那个，焦点跟过去。大小是别处改的，跟着它，
+        // 这边打字、点画面时再要回来（不然两台电脑焦点都停在这个终端里时一直来回改，见
+        // `TerminalView::wants_size`）
         if typing {
             match same {
-                true => view.focus_handle(cx).focus(window, cx),
+                true => {
+                    view.update(cx, |view, _| view.follow_size());
+                    view.focus_handle(cx).focus(window, cx);
+                }
                 false => self.focus.focus(window, cx),
             }
         }
@@ -760,7 +779,44 @@ impl TermOverview {
             id: Some(row.id.clone()),
             view,
             owned: false,
+            _events: events,
         });
+    }
+
+    /// 告诉画面它开在哪个仓库（认终端里的路径用），按住 Ctrl 单击了仓库里的文件时离开这一页去
+    /// 打开它（见 [`Go::File`]）。
+    fn link_view(
+        &self,
+        view: &Entity<TerminalView>,
+        entry: &RepoEntry,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        let local = entry.server.is_none();
+        let (board, machine) = (self.board.downgrade(), machine_of(entry).to_string());
+        let base = LinkBase {
+            root: entry.path.clone(),
+            sub: String::new(),
+            local,
+            // 本机的直接看；服务器上的问那台的 kuaid（每次现拿连接：会断、会换）
+            channel: Rc::new(move |cx: &App| match local {
+                true => Some(Channel::Local),
+                false => board
+                    .upgrade()?
+                    .read(cx)
+                    .conn(&machine)
+                    .map(Channel::Remote),
+            }),
+        };
+        view.update(cx, |view, _| view.set_link_base(base));
+        let entry = entry.clone();
+        cx.subscribe(view, move |_, _, event: &TerminalEvent, cx| match event {
+            TerminalEvent::OpenFile { path, at, dir } => cx.emit(Go::File {
+                entry: entry.clone(),
+                path: path.clone(),
+                at: *at,
+                dir: *dir,
+            }),
+        })
     }
 
     /// 选中的仓库里先显示哪个终端：标签栏里的第一个。
@@ -1028,11 +1084,13 @@ impl TermOverview {
             )
         });
         view.focus_handle(cx).focus(window, cx);
+        let events = self.link_view(&view, &slot.entry, cx);
         self.peek = Some(Peek {
             slot,
             id: None,
             view,
             owned: true,
+            _events: events,
         });
     }
 
@@ -1694,7 +1752,8 @@ impl TermOverview {
 
     /// 一个仓库的那一行：最前面一列是收起、展开的箭头（没有终端的空着，名字照样对齐），然后是工作区
     /// 颜色的图标（没有终端的是灰的）和名字；收着时行尾写几个停下了、在跑、空着；鼠标移上去行尾换成
-    /// 固定和新建。
+    /// 固定和新建。点一下选中它，有箭头的同时收起或展开（和 Git 侧栏的文件夹一样）；双击打开仓库，
+    /// 收起、展开不变（第二下把第一下的切换回去）。
     fn render_repo(
         &self,
         index: usize,
@@ -1728,6 +1787,8 @@ impl TermOverview {
             entry.clone(),
             entry.clone(),
         );
+        // 下面列着终端（有箭头）才收得起来
+        let foldable = !repo.listed.is_empty();
         let twistie = h_flex()
             .id(("hub-fold", index))
             .flex_none()
@@ -1735,9 +1796,9 @@ impl TermOverview {
             .h_full()
             .justify_center()
             .text_color(muted);
-        let twistie = match repo.listed.is_empty() {
-            true => twistie,
-            false => {
+        let twistie = match foldable {
+            false => twistie,
+            true => {
                 let arrow = match repo.collapsed {
                     true => IconName::ChevronRight,
                     false => IconName::ChevronDown,
@@ -1796,7 +1857,11 @@ impl TermOverview {
         outer
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.focus.focus(window, cx);
-                match event.click_count() >= 2 {
+                let clicks = event.click_count();
+                if foldable && clicks <= 2 {
+                    this.toggle_repo(&for_click, cx);
+                }
+                match clicks >= 2 {
                     true => cx.emit(Go::Repo(for_go.clone())),
                     false => this.select_repo(for_click.clone(), window, cx),
                 }
@@ -2585,10 +2650,9 @@ impl TermOverview {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let (border, muted, primary, hover, fg) = (
+        let (border, muted, hover, fg) = (
             theme.border,
             theme.muted_foreground,
-            theme.primary,
             theme.list_hover,
             theme.foreground,
         );
@@ -2644,12 +2708,11 @@ impl TermOverview {
                     this.new_terminal(entry.clone(), window, cx)
                 }))
         });
-        // 怎么输入、正在输入时怎么换一个
-        let hint = shown.as_ref().and_then(|row| match (typing, row.alive) {
-            (true, _) => Some((tr("正在输入。Ctrl+Shift+↑ ↓ 切换终端"), primary)),
-            (false, true) => Some((tr("点击画面或按 → 输入"), muted)),
-            (false, false) => None,
-        });
+        // 怎么开始往终端里输入；正在输入时不写，画面顶上那条细线就是
+        let hint = shown
+            .as_ref()
+            .filter(|row| !typing && row.alive)
+            .map(|_| tr("点击画面或按 → 输入"));
         let slot = shown.as_ref().map(Row::slot);
         let (for_attach, for_restart) = (slot.clone(), slot);
         h_flex()
@@ -2676,12 +2739,12 @@ impl TermOverview {
                     .text_color(muted)
             }))
             // 地方不够时先省略这一句，标签留着
-            .children(hint.map(|(text, color)| {
+            .children(hint.map(|text| {
                 ui::clipped("hub-hint", text)
                     .flex_shrink(100.)
                     .mr(px(6.))
                     .text_xs()
-                    .text_color(color)
+                    .text_color(muted)
             }))
             .when(shown.is_some(), |bar| {
                 bar.child(
@@ -2754,18 +2817,21 @@ impl TermOverview {
                 .relative()
                 .flex_1()
                 .min_h_0()
-                // 点进终端里焦点就换了（终端自己接的）：这一页和主窗口跟着重画，边框、提示、
-                // 「看没看过」才跟得上
+                // 点进终端里焦点就换了（终端自己接的）：这一页和主窗口跟着重画，顶上的细线、
+                // 提示、「看没看过」才跟得上
                 .on_any_mouse_down(cx.listener(|_, _, _, cx| cx.notify()))
                 .child(peek.view.clone())
-                // 正在输入：画面带一圈边框。盖在上面画，不占地方，不然一输入终端就小一圈
+                // 正在输入：画面顶上一条主色细线，和别处表示选中的线一样 2 宽（原来是一圈边框，
+                // 太显眼）。盖在终端顶上的留白里画，不占地方、不挡字
                 .when(typing, |el| {
                     el.child(
                         div()
                             .absolute()
-                            .inset_0()
-                            .border_1()
-                            .border_color(primary.opacity(0.7)),
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .h(px(2.))
+                            .bg(primary),
                     )
                 })
                 .into_any_element(),

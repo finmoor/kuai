@@ -338,6 +338,8 @@ fn terminal(
     });
     let started = Instant::now();
     let mut bytes = 0usize;
+    // 还原屏幕的每一段收齐时一共收到多少字节，收齐一段打一次用了多久（测线路慢时先看到什么）
+    let mut restore_ends: std::collections::VecDeque<usize> = Default::default();
     // 敲完命令的时候和终端名，到点送 `keys`
     let mut typed: Option<(Instant, String)> = None;
     while let Some(left) = duration.checked_sub(started.elapsed()) {
@@ -348,7 +350,11 @@ fn terminal(
             conn.term_input(term, keys);
         }
         match rx.recv_timeout(left.min(Duration::from_millis(100))) {
-            Ok(Ok(TermItem::Opened { term, created })) => {
+            Ok(Ok(TermItem::Opened {
+                term,
+                created,
+                restore,
+            })) => {
                 println!(
                     "终端 {term}：{}",
                     if created {
@@ -357,6 +363,21 @@ fn terminal(
                         "接上了原来的"
                     }
                 );
+                // 打到标准错误：标准输出是终端的原始输出
+                if !restore.is_empty() {
+                    eprintln!(
+                        "（还原屏幕的输出 {} 段：{restore:?} 字节；接上用了 {} 毫秒）",
+                        restore.len(),
+                        started.elapsed().as_millis()
+                    );
+                }
+                restore_ends = restore
+                    .iter()
+                    .scan(0, |sum, len| {
+                        *sum += *len as usize;
+                        Some(*sum)
+                    })
+                    .collect();
                 if !command.is_empty() {
                     conn.term_input(&term, format!("{command}\r").into_bytes());
                 }
@@ -364,9 +385,21 @@ fn terminal(
             }
             Ok(Ok(TermItem::Output(output))) => {
                 bytes += output.len();
+                while restore_ends.front().is_some_and(|&end| bytes >= end) {
+                    let end = restore_ends.pop_front().unwrap_or_default();
+                    eprintln!(
+                        "（还原的输出收到 {end} 字节：{} 毫秒）",
+                        started.elapsed().as_millis()
+                    );
+                }
                 let mut out = std::io::stdout().lock();
                 out.write_all(&output)?;
                 out.flush()?;
+            }
+            // 发出去的消息打到标准错误，不和终端的输出混在一起
+            Ok(Ok(TermItem::Marks(marks))) => {
+                let texts: Vec<&str> = marks.iter().map(|mark| mark.text.as_str()).collect();
+                eprintln!("（记着的消息 {} 条：{texts:?}）", marks.len());
             }
             Ok(Ok(TermItem::Exited(code))) => {
                 println!("\n终端里的程序结束了，退出码 {code:?}");

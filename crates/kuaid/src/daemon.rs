@@ -27,6 +27,7 @@ use crate::conn::{self, Control, Shared};
 use crate::files;
 use crate::term::pty::{self, Pty};
 use crate::term::{Backend, Ended, Frozen, Registry, Size};
+use fr_core::protocol::TermMark;
 
 /// 没有客户端、没有终端会话这么久就退出
 const IDLE: Duration = Duration::from_secs(600);
@@ -149,6 +150,9 @@ struct HandoffSession {
     /// 还原屏幕用的字节有多长
     #[serde(default)]
     dump: u64,
+    /// 发出去的消息（协议 16 起）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    marks: Vec<TermMark>,
 }
 
 fn minus_one() -> i32 {
@@ -382,6 +386,7 @@ fn write_handoff(
                 exited: f.exit.is_some(),
                 exit: f.exit.flatten(),
                 dump: f.dump.len() as u64,
+                marks: f.marks.clone(),
             })
             .collect(),
     };
@@ -452,6 +457,7 @@ fn resume_from(path: &Path, terms: &Registry) -> Result<(UnixListener, File, usi
                 handle: None,
                 exit,
                 dump,
+                marks: session.marks,
             },
             backend,
         );
@@ -487,6 +493,10 @@ mod tests {
                 handle: Some((9, 4321)),
                 exit: None,
                 dump: b"\x1b[mhello".to_vec(),
+                marks: vec![TermMark {
+                    text: "git status".into(),
+                    at: 1_700_000_000_123,
+                }],
             },
             Frozen {
                 id: "t4".into(),
@@ -497,6 +507,7 @@ mod tests {
                 handle: None,
                 exit: Some(Some(2)),
                 dump: b"bye".to_vec(),
+                marks: Vec::new(),
             },
         ];
         write_handoff(&path, 5, 6, 7, &frozen).unwrap();
@@ -510,6 +521,7 @@ mod tests {
         };
         assert_eq!((live.fd, live.pid, live.exited), (9, 4321, false));
         assert_eq!((live.cols, live.rows, live.dump), (100, 30, 8));
+        assert_eq!(live.marks, frozen[0].marks, "发出去的消息带过去");
         assert_eq!((ended.fd, ended.exited, ended.exit), (-1, true, Some(2)));
         assert_eq!(&text[end + 1..], b"\x1b[mhellobye");
         // 以后的版本多写了字段、少写了后加的字段，都读得了

@@ -26,7 +26,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use fr_core::hop;
 use fr_core::protocol::{
     self, DirListing, FilePut, FilePutReply, FsEntry, FsStat, FsWrite, FsWritten, GitResult, Hello,
-    PROTOCOL_VERSION, Request, Response, SubRepos, TermExit, TermInfo, TermOpen, TermOpened,
+    PROTOCOL_VERSION, Request, Response, SubRepos, TermExit, TermInfo, TermMarks, TermOpen,
+    TermOpened,
 };
 use fr_core::ssh::{KEEP_OPTIONS, STAGE_OPTIONS, no_window, program as ssh_program};
 use fr_core::store::{Op, Store};
@@ -1520,12 +1521,18 @@ impl Inner {
                     let _ = tx.unbounded_send(());
                 }
                 Some(Pending::Term(tx, backlog)) => {
-                    // 流的第一条带着会话的编号，其余的是输出
+                    // 流的第一条带着会话的编号；带 `marks` 的是发出去的消息；其余的是输出
                     let item = match response.result.take() {
+                        Some(marks) if marks.get("marks").is_some() => {
+                            serde_json::from_value::<TermMarks>(marks)
+                                .map(|marks| TermItem::Marks(marks.marks))
+                                .context(tr("kuaid 返回的结果格式错误"))
+                        }
                         Some(opened) => serde_json::from_value::<TermOpened>(opened)
                             .map(|opened| TermItem::Opened {
                                 term: opened.term,
                                 created: opened.created,
+                                restore: opened.restore,
                             })
                             .context(tr("kuaid 返回的结果格式错误")),
                         None if backlog.add(payload.len()) => Ok(TermItem::Output(payload)),

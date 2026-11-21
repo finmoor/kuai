@@ -16,7 +16,7 @@ use chrono::{DateTime, Local};
 use fr_channel::UploadSource;
 use fr_core::i18n::tr;
 use fr_core::tf;
-use gpui_kit::{Image, ImageFormat};
+use gpui_kit::{ClipboardEntry, ClipboardItem, Image, ImageFormat};
 
 use super::keys;
 
@@ -44,8 +44,49 @@ impl Attachment {
     }
 }
 
+/// 剪贴板里的东西怎么贴（见 [`from_clipboard`]）。
+pub enum Pasted {
+    /// 文字：原样贴
+    Text(String),
+    /// 文件或图片：发给程序，贴它们的路径
+    Send(Vec<Attachment>),
+}
+
+/// 剪贴板里的东西怎么贴。Ctrl+V：有文字贴文字；没有文字时有文件（资源管理器里复制的）发文件，只有
+/// 图片（截图）发图片。`skip_text`（Alt+V，见 `TerminalView::paste_image`）：不看文字，有文件或
+/// 图片就发。没有能贴的返回 `None`。不用 `ClipboardItem::text()`：剪贴板里只有文件时它会把几个路径
+/// 连在一起当文字。
+pub fn from_clipboard(
+    item: ClipboardItem,
+    skip_text: bool,
+    now: DateTime<Local>,
+) -> Option<Pasted> {
+    let mut text = String::new();
+    let mut files = Vec::new();
+    let mut image = None;
+    for entry in item.into_entries() {
+        match entry {
+            ClipboardEntry::String(string) => text.push_str(string.text()),
+            ClipboardEntry::ExternalPaths(paths) => {
+                files.extend(paths.paths().iter().cloned().map(Attachment::File));
+            }
+            ClipboardEntry::Image(found) => image = image.or(Some(found)),
+        }
+    }
+    if !skip_text && !text.is_empty() {
+        return Some(Pasted::Text(text));
+    }
+    // 图片转格式（截图的位图转成 PNG）在发的时候放到后台做
+    if files.is_empty()
+        && let Some(image) = image
+    {
+        files.push(image_attachment(image, now));
+    }
+    (!files.is_empty()).then_some(Pasted::Send(files))
+}
+
 /// 剪贴板里的图片变成要发的东西：这里只起名字，转格式放到后台（见 [`image_bytes`]）。
-pub fn image_attachment(image: &Image, now: DateTime<Local>) -> Attachment {
+pub fn image_attachment(image: Image, now: DateTime<Local>) -> Attachment {
     let ext = match image.format {
         ImageFormat::Jpeg => "jpg",
         ImageFormat::Gif => "gif",
@@ -55,7 +96,7 @@ pub fn image_attachment(image: &Image, now: DateTime<Local>) -> Attachment {
     };
     Attachment::Image {
         name: format!("paste-{}.{ext}", now.format("%m%d-%H%M%S")),
-        image: image.clone(),
+        image,
     }
 }
 
@@ -244,7 +285,7 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut bmp), image::ImageFormat::Bmp)
             .unwrap();
         let image = Image::from_bytes(ImageFormat::Bmp, bmp);
-        let Attachment::Image { name, image } = image_attachment(&image, now) else {
+        let Attachment::Image { name, image } = image_attachment(image, now) else {
             panic!("应该是图片");
         };
         assert_eq!(name, "paste-1112-130405.png");
@@ -254,7 +295,7 @@ mod tests {
         assert_eq!(back.into_raw(), [255, 0, 0, 0, 0, 255]);
 
         let jpeg = Image::from_bytes(ImageFormat::Jpeg, b"jpeg-bytes".to_vec());
-        let Attachment::Image { name, image } = image_attachment(&jpeg, now) else {
+        let Attachment::Image { name, image } = image_attachment(jpeg, now) else {
             panic!("应该是图片");
         };
         assert_eq!(name, "paste-1112-130405.jpg");
@@ -262,6 +303,41 @@ mod tests {
         // 坏的图片：报错，不是崩
         let broken = Image::from_bytes(ImageFormat::Bmp, b"not a bitmap".to_vec());
         assert!(image_bytes(broken).is_err());
+    }
+
+    #[test]
+    fn ctrl_v_先贴文字_alt_v_只发文件和图片() {
+        let now = Local.with_ymd_and_hms(2026, 11, 21, 11, 30, 0).unwrap();
+        let text = || ClipboardEntry::String(gpui_kit::ClipboardString::new("hi".into()));
+        let png = || ClipboardEntry::Image(Image::from_bytes(ImageFormat::Png, b"png".to_vec()));
+        let file = || {
+            ClipboardEntry::ExternalPaths(gpui_kit::ExternalPaths(
+                [PathBuf::from(r"C:\a\b.png")].into_iter().collect(),
+            ))
+        };
+        let item = |entries: Vec<ClipboardEntry>| ClipboardItem { entries };
+        // 结果的样子：文字，或者要发的几样东西的名字
+        let pick = |entries, skip_text| match from_clipboard(item(entries), skip_text, now) {
+            None => "无".to_string(),
+            Some(Pasted::Text(text)) => format!("文字 {text}"),
+            Some(Pasted::Send(items)) => {
+                let names: Vec<String> = items.iter().map(Attachment::name).collect();
+                format!("发 {}", names.join(" "))
+            }
+        };
+        // Ctrl+V
+        assert_eq!(pick(vec![text(), png()], false), "文字 hi");
+        assert_eq!(pick(vec![png()], false), "发 paste-1121-113000.png");
+        assert_eq!(
+            pick(vec![png(), file()], false),
+            "发 b.png",
+            "有文件就不发图"
+        );
+        assert_eq!(pick(vec![], false), "无");
+        // Alt+V：截图工具连带放了文字也发图；只有文字就没有能发的（照旧交给程序）
+        assert_eq!(pick(vec![text(), png()], true), "发 paste-1121-113000.png");
+        assert_eq!(pick(vec![text(), file()], true), "发 b.png");
+        assert_eq!(pick(vec![text()], true), "无");
     }
 
     #[test]
@@ -273,7 +349,7 @@ mod tests {
         let png = Image::from_bytes(ImageFormat::Png, b"png-bytes".to_vec());
         let items = vec![
             Attachment::File(dir.join("a.txt")),
-            image_attachment(&png, Local::now()),
+            image_attachment(png, Local::now()),
             Attachment::File(dir.join("folder")),
             Attachment::File(dir.join("b.txt")),
         ];

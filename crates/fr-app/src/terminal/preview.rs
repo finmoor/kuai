@@ -175,5 +175,8 @@ fn frame(bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) -> Frame {
         marked: None,
         font,
         font_size,
+        fixed_top: None,
+        flash: None,
+        accents: (palette.foreground, palette.foreground),
     }
 }

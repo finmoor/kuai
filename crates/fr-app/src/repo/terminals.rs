@@ -17,6 +17,7 @@
 //!   运行的交给 [`Parked`] 保管，再打开这个仓库、到终端页时接回来；退出 Kuai（包括重启以完成
 //!   更新）时才结束。
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use fr_channel::{Channel, Connection};
@@ -33,7 +34,7 @@ use gpui_kit::*;
 use super::{Page, RepoView, TOOLBAR_HEIGHT, tool_button};
 use crate::settings::RepoEntry;
 use crate::term_board::{BoardHandle, Row as TermRow, TermBoard, free_number};
-use crate::terminal::{self, Closing, TerminalView};
+use crate::terminal::{self, Closing, TerminalEvent, TerminalView};
 use crate::ui;
 
 /// 侧栏里一个终端一行的高度。
@@ -51,6 +52,8 @@ struct TermTab {
     adopted: bool,
     /// 里面的程序结束、断开时，切换上的数字要跟着变
     _observe: Subscription,
+    /// 按住 Ctrl 单击了终端里仓库的文件：到文件页打开
+    _events: Subscription,
 }
 
 /// kuaid 里留着、这次还没接上的一个终端。
@@ -357,7 +360,7 @@ impl RepoView {
 
     /// 接回关掉的标签页留下的、这个仓库的本机终端。序号和已经打开的重了（同一个仓库在别的
     /// 工作区里也开着）就换成最小的空号。
-    fn adopt_parked(&mut self, cx: &mut Context<Self>) {
+    fn adopt_parked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let entry = self.entry.clone();
         let mine = |t: &ParkedTerminal| t.entry == entry;
         // 先只读地看一眼：取出来会通知所有盯着的仓库页重画，每帧都取就停不下来了
@@ -380,7 +383,7 @@ impl RepoView {
                 true => free_number(&used),
                 false => terminal.number,
             };
-            self.insert_terminal(number, terminal.view, cx);
+            self.insert_terminal(number, terminal.view, String::new(), window, cx);
         }
     }
 
@@ -460,7 +463,7 @@ impl RepoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
-        let (entry, app) = (self.entry.clone(), self.app.clone());
+        let (entry, app, sub) = (self.entry.clone(), self.app.clone(), dir.clone());
         let view = cx.new(|cx| {
             let mut view = TerminalView::new(
                 move |cx| crate::shell::terminal_launch(&entry, &app, number, &dir, cx),
@@ -472,23 +475,45 @@ impl RepoView {
             }
             view
         });
-        self.insert_terminal(number, view, cx)
+        self.insert_terminal(number, view, sub, window, cx)
     }
 
-    /// 把终端按序号排进去，返回它在第几个。
+    /// 把终端按序号排进去，返回它在第几个。`sub`：终端开在仓库里的哪个目录（相对仓库根，认终端里
+    /// 的相对路径用）。
     fn insert_terminal(
         &mut self,
         number: u32,
         view: Entity<TerminalView>,
+        sub: String,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
         let observe = cx.observe(&view, |_, _, cx| cx.notify());
+        // 终端里按住 Ctrl 单击的路径按这个仓库认；通道每次问的时候现拿（连接会断、会换）
+        let repo = cx.entity().downgrade();
+        let base = terminal::LinkBase {
+            root: self.entry.path.clone(),
+            sub,
+            local: self.entry.server.is_none(),
+            channel: Rc::new(move |cx: &App| repo.upgrade()?.read(cx).channel.clone()),
+        };
+        view.update(cx, |view, _| view.set_link_base(base));
+        let events = cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &TerminalEvent, window, cx| match event {
+                TerminalEvent::OpenFile { path, at, dir } => {
+                    this.show_path(path.clone(), *at, *dir, window, cx)
+                }
+            },
+        );
         let tab = TermTab {
             number,
             view,
             listed_as: None,
             adopted: false,
             _observe: observe,
+            _events: events,
         };
         let at = self
             .terminals
@@ -509,7 +534,7 @@ impl RepoView {
             .get(self.terminals.active)
             .map(|tab| tab.number);
         let before = self.terminals.tabs.len();
-        self.adopt_parked(cx);
+        self.adopt_parked(window, cx);
         for waiting in std::mem::take(&mut self.terminals.waiting) {
             let at = self.add_terminal(waiting.number, waiting.alive, window, cx);
             let tab = &mut self.terminals.tabs[at];

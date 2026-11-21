@@ -312,6 +312,8 @@ impl RepoView {
                 };
                 let glyph = match (row.dir, row.open, row.link) {
                     (true, _, true) => IconName::FolderSymlink,
+                    // 子仓库：和子仓库总览、工作区页里的仓库一个图标
+                    (true, _, false) if row.repo => IconName::FolderGit2,
                     (true, true, _) => IconName::FolderOpen,
                     (true, false, _) => IconName::Folder,
                     (false, _, true) => IconName::FileSymlink,

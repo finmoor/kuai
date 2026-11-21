@@ -153,9 +153,7 @@ fn tilde(number: u8, code: u8) -> Option<Vec<u8>> {
     })
 }
 
-/// 滚一格滚轮报给要了鼠标的程序的字节（xterm 的写法）。`col`、`row` 从 0 起；`extra` 是
-/// 修饰键（Alt 8、Ctrl 16）。程序开了 SGR（`sgr`）就用它，开了 UTF-8 坐标（`utf8`）次之，
-/// 都没开是最早的写法；后两种表示不了的坐标（最早的写法超过 223）不报。
+/// 滚一格滚轮报给要了鼠标的程序的字节（见 [`mouse_report`]）：上 64、下 65。
 pub fn wheel_report(
     up: bool,
     col: usize,
@@ -164,10 +162,27 @@ pub fn wheel_report(
     sgr: bool,
     utf8: bool,
 ) -> Option<Vec<u8>> {
-    let button = if up { 64 } else { 65 } + extra;
+    mouse_report(if up { 64 } else { 65 } + extra, false, col, row, sgr, utf8)
+}
+
+/// 鼠标的一下报给要了鼠标的程序的字节（xterm 的写法）。`button`：左 0、中 1、右 2、滚轮 64/65，
+/// 加上修饰键（Shift 4、Alt 8、Ctrl 16），挪动再加 32（没按键挪动是 35）；`release` 是松开。
+/// `col`、`row` 从 0 起。程序开了 SGR（`sgr`）就用它（松开用小写 m，按键号不变），开了 UTF-8 坐标
+/// （`utf8`）次之，都没开是最早的写法（松开不分哪个键，按键号是 3）；后两种表示不了的坐标（最早的
+/// 写法超过 223）不报。
+pub fn mouse_report(
+    button: u8,
+    release: bool,
+    col: usize,
+    row: usize,
+    sgr: bool,
+    utf8: bool,
+) -> Option<Vec<u8>> {
     if sgr {
-        return Some(format!("\x1b[<{button};{};{}M", col + 1, row + 1).into_bytes());
+        let end = if release { 'm' } else { 'M' };
+        return Some(format!("\x1b[<{button};{};{}{end}", col + 1, row + 1).into_bytes());
     }
+    let button = if release { button & !0b11 | 3 } else { button };
     let mut out = b"\x1b[M".to_vec();
     out.push(32 + button);
     for value in [col + 1, row + 1] {
@@ -197,7 +212,36 @@ pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WheelTarget, encode, paste, wheel_report, wheel_target};
+    use super::{WheelTarget, encode, mouse_report, paste, wheel_report, wheel_target};
+
+    #[test]
+    fn 按键_松开_拖动报给要了鼠标的程序() {
+        // SGR（opencode、Claude Code、vim 用的）：松开用小写 m，按的是哪个键照写
+        let sgr = |button, release, col, row| {
+            String::from_utf8(mouse_report(button, release, col, row, true, false).unwrap())
+                .unwrap()
+        };
+        assert_eq!(sgr(0, false, 9, 4), "\x1b[<0;10;5M");
+        assert_eq!(sgr(0, true, 9, 4), "\x1b[<0;10;5m");
+        assert_eq!(sgr(2, false, 0, 0), "\x1b[<2;1;1M");
+        // 按着左键拖、什么都没按地挪（要了全部移动的程序才报）、按着 Ctrl 点
+        assert_eq!(sgr(32, false, 11, 4), "\x1b[<32;12;5M");
+        assert_eq!(sgr(35, false, 11, 4), "\x1b[<35;12;5M");
+        assert_eq!(sgr(16, false, 3, 3), "\x1b[<16;4;4M");
+        // 最早的写法：松开不分哪个键，是 3，修饰键照带
+        assert_eq!(
+            mouse_report(0, false, 0, 0, false, false).unwrap(),
+            b"\x1b[M\x20\x21\x21"
+        );
+        assert_eq!(
+            mouse_report(2, true, 0, 0, false, false).unwrap(),
+            b"\x1b[M\x23\x21\x21"
+        );
+        assert_eq!(
+            mouse_report(16 + 1, true, 0, 0, false, false).unwrap(),
+            b"\x1b[M\x33\x21\x21"
+        );
+    }
     use alacritty_terminal::term::TermMode;
     use gpui_kit::Keystroke;
 

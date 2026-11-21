@@ -22,7 +22,9 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
-use fr_core::protocol::{Response, TermExit, TermInfo, TermOpen, TermOpened};
+use fr_core::protocol::{
+    Response, TERM_MARKS_SINCE, TermExit, TermInfo, TermMark, TermMarks, TermOpen, TermOpened,
+};
 use serde_json::json;
 
 use crate::out::Outbox;
@@ -41,6 +43,77 @@ const WATCH_EVERY: Duration = Duration::from_secs(1);
 const BUSY: Duration = Duration::from_secs(3);
 /// 有终端正在输出时，每看这么多次推一次列表（客户端靠它知道还在输出）
 const BUSY_BEAT: u64 = 3;
+/// 一直在输出时，隔这么久才核对一次屏幕上的字变没变（见 [`Activity`]）
+const CHECK_EVERY: Duration = Duration::from_millis(250);
+/// 改了大小以后这么久以内屏幕上的字变了不算有输出：程序按新的大小整个重画（Claude Code 会），换一台
+/// 电脑往里输入、拖窗口时都会改大小
+const RESIZE_GRACE: Duration = Duration::from_secs(2);
+
+/// 屏幕上的字什么时候变过：终端列表里的「多久没有输出了」（客户端据此算运行中、已停下）。
+///
+/// 程序写来的字节不都算：Claude Code 在焦点进出时擦掉、画回它自己画的光标（只改反色），改了大小
+/// 以后整个重画，屏幕上的字没变。这些也算的话，闲着的 Claude Code 一切走就成了「运行中」，十秒后
+/// 又成了「已停下」来提醒（闲置很久的终端图标还会亮，点开后过一会又亮）。所以看屏幕上
+/// 的字（连同往回翻的记录有多少行）的摘要变没变，一直在输出时隔 [`CHECK_EVERY`] 核对一次，停下后
+/// 由 [`Session::tick`] 补上最后一次。
+///
+/// 不准的情况：往回翻的记录满了以后一直打一样的行（`yes`），屏幕上的字不变，会被当成停了。
+struct Activity {
+    /// 屏幕上的字最近一次变了是什么时候（那块输出来的时候）。升级换程序后还没变过时是空的
+    last_change: Option<Instant>,
+    /// 上一次核对时的摘要、核对的时候
+    digest: u64,
+    checked: Option<Instant>,
+    /// 还没核对过的最近一块输出是什么时候来的
+    pending: Option<Instant>,
+    /// 最近一次改大小的时候
+    resized: Option<Instant>,
+}
+
+impl Activity {
+    fn new(screen: &Screen) -> Activity {
+        Activity {
+            last_change: None,
+            digest: screen.digest(),
+            checked: None,
+            pending: None,
+            resized: None,
+        }
+    }
+
+    /// 来了一块输出（已经交给了仿真器）：离上一次核对够久了就核对。
+    fn output(&mut self, screen: &Screen, now: Instant) {
+        self.pending = Some(now);
+        if self
+            .checked
+            .is_none_or(|at| now.saturating_duration_since(at) >= CHECK_EVERY)
+        {
+            self.check(screen, now);
+        }
+    }
+
+    /// 有没核对过的输出就核对：屏幕上的字变了，又不是刚改过大小，记下那块输出来的时候。
+    fn check(&mut self, screen: &Screen, now: Instant) {
+        let Some(at) = self.pending.take() else {
+            return;
+        };
+        let digest = screen.digest();
+        let resizing = self
+            .resized
+            .is_some_and(|resized| at.saturating_duration_since(resized) < RESIZE_GRACE);
+        if digest != self.digest && !resizing {
+            self.last_change = Some(at);
+        }
+        self.digest = digest;
+        self.checked = Some(now);
+    }
+
+    /// 改了大小（仿真器已经按新的大小折好了行）：折行带来的变化不算。
+    fn resized(&mut self, screen: &Screen, now: Instant) {
+        self.digest = screen.digest();
+        self.resized = Some(now);
+    }
+}
 
 /// 伪终端那一层。
 pub trait Backend: Send + Sync {
@@ -87,11 +160,28 @@ pub struct Spawn {
 
 pub type Spawner = Box<dyn Fn(&Spawn) -> Result<Box<dyn Backend>> + Send + Sync>;
 
+/// 要接上终端的是谁：哪条连接、挂在它的哪个请求号上、它握手时说的协议版本。
+#[derive(Debug, Clone, Copy)]
+pub struct Caller {
+    pub conn: u64,
+    pub request: u64,
+    pub protocol: u32,
+}
+
+impl Caller {
+    /// 认得消息刻度和分段还原（见 [`TERM_MARKS_SINCE`]）。
+    fn current(&self) -> bool {
+        self.protocol >= TERM_MARKS_SINCE
+    }
+}
+
 /// 接着某个会话的一个客户端：会话的输出发到 `out`，挂在它的 `request` 号上。
 struct Client {
     conn: u64,
     request: u64,
     out: Outbox,
+    /// 认得消息刻度（[`Caller::current`]）：旧客户端收到会断开这个终端，不发给它
+    marks: bool,
     /// 只看的（`term_attach` 带 `watch`）：不改大小、不回答程序的话，不算「有人接着」。用户在那一头
     /// 敲的字照样经 `term_input` 写进来
     watch: bool,
@@ -117,9 +207,11 @@ struct State {
     /// 程序结束了：里面是退出码
     exit: Option<Option<i32>>,
     ended: Option<Instant>,
-    /// 最近一次输出是什么时候。升级换程序后还没有过输出时是空的
-    last_output: Option<Instant>,
+    /// 屏幕上的字什么时候变过
+    activity: Activity,
     clients: Vec<Client>,
+    /// 发出去的消息，从早到晚，最多 [`fr_core::protocol::TERM_MARKS`] 条（见 [`Session::input`]）
+    marks: Vec<TermMark>,
 }
 
 impl State {
@@ -132,9 +224,10 @@ impl State {
 impl Session {
     /// 程序的一块输出。
     pub fn output(&self, bytes: &[u8]) {
-        let mut state = self.state.lock().unwrap();
+        let mut guard = self.state.lock().unwrap();
+        let state = &mut *guard;
         let reply = state.screen.advance(bytes);
-        state.last_output = Some(Instant::now());
+        state.activity.output(&state.screen, Instant::now());
         // 没人接着（只看的不算）：程序问终端的话由我们回答，不然它会一直等
         let answer = !reply.is_empty() && !state.attended();
         // 连接已经断了的不再发（断开的连接随后会整个摘掉）
@@ -148,8 +241,8 @@ impl Session {
             };
             client.lagging = !client.out.try_send(&header, bytes);
         }
-        catch_up(&mut state);
-        drop(state);
+        catch_up(state);
+        drop(guard);
         if answer {
             self.backend.write(reply);
         }
@@ -157,10 +250,12 @@ impl Session {
 
     /// 隔一会儿调用一次（没有输出的时候也要）。
     pub fn tick(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut guard = self.state.lock().unwrap();
+        let state = &mut *guard;
         state.screen.flush_sync();
+        state.activity.check(&state.screen, Instant::now());
         state.clients.retain(|client| !client.out.is_closed());
-        catch_up(&mut state);
+        catch_up(state);
     }
 
     /// 程序结束了。接着的客户端收到退出码；有人看到了就不用再留着这个会话。
@@ -209,19 +304,27 @@ impl Session {
     /// 之后的输出都发给它。程序已经结束的话，它收到最后的画面和退出码，这个会话就此忘掉。
     ///
     /// `watch` 是只看：不改会话的大小（`size` 不用），程序已经结束时也不忘掉这个会话。
-    fn attach(
-        &self,
-        conn: u64,
-        request: u64,
-        out: &Outbox,
-        size: Size,
-        created: bool,
-        watch: bool,
-    ) {
+    /// 旧客户端（协议 16 以前）还原的输出给一整份、不说分几段，也不发消息刻度，和原来一样。
+    fn attach(&self, caller: Caller, out: &Outbox, size: Size, created: bool, watch: bool) {
+        let Caller { conn, request, .. } = caller;
         let mut state = self.state.lock().unwrap();
+        // 先改大小再拍屏幕：还原的是改过大小的样子
+        if !watch && state.exit.is_none() && state.screen.size() != size {
+            state.screen.resize(size);
+            self.backend.resize(size);
+        }
+        let parts = match (created, caller.current()) {
+            (true, _) => Vec::new(),
+            (false, true) => state.screen.restore(),
+            (false, false) => vec![state.screen.dump()],
+        };
         let opened = TermOpened {
             term: self.id.clone(),
             created,
+            restore: match caller.current() {
+                true => parts.iter().map(|part| part.len() as u64).collect(),
+                false => Vec::new(),
+            },
         };
         let header = Response {
             id: request,
@@ -230,12 +333,11 @@ impl Session {
             ..Default::default()
         };
         out.push(&header, &[]);
-        if !watch && state.exit.is_none() && state.screen.size() != size {
-            state.screen.resize(size);
-            self.backend.resize(size);
+        if caller.current() && !state.marks.is_empty() {
+            out.push(&marks_message(request, &state.marks), &[]);
         }
-        if !created {
-            push_dump(out, request, &state.screen.dump());
+        for part in &parts {
+            push_dump(out, request, part);
         }
         match state.exit {
             Some(code) => {
@@ -254,6 +356,7 @@ impl Session {
                     conn,
                     request,
                     out: out.clone(),
+                    marks: caller.current(),
                     watch,
                     lagging: false,
                 });
@@ -270,16 +373,37 @@ impl Session {
             .retain(|client| client.conn != conn || request.is_some_and(|r| r != client.request));
     }
 
+    /// 客户端敲进来的。只是一个回车（不是粘贴里带的、不是 Alt+回车）时，先从屏幕上的输入区读出这条
+    /// 消息记下来，推给接着的客户端（终端左边的刻度），再写给程序：写过去以后程序就把输入区清掉了。
     pub fn input(&self, bytes: Vec<u8>) {
-        if self.state.lock().unwrap().exit.is_none() {
-            self.backend.write(bytes);
+        let mut state = self.state.lock().unwrap();
+        if state.exit.is_some() {
+            return;
         }
+        if bytes == b"\r"
+            && let Some((text, continued)) = state.screen.entered()
+        {
+            let at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64);
+            fr_core::term_text::record(&mut state.marks, text, continued, at);
+            state.clients.retain(|client| !client.out.is_closed());
+            for client in state.clients.iter().filter(|client| client.marks) {
+                client
+                    .out
+                    .push(&marks_message(client.request, &state.marks), &[]);
+            }
+        }
+        drop(state);
+        self.backend.write(bytes);
     }
 
     pub fn resize(&self, size: Size) {
-        let mut state = self.state.lock().unwrap();
+        let mut guard = self.state.lock().unwrap();
+        let state = &mut *guard;
         if state.exit.is_none() && state.screen.size() != size {
             state.screen.resize(size);
+            state.activity.resized(&state.screen, Instant::now());
             self.backend.resize(size);
         }
     }
@@ -302,7 +426,10 @@ impl Session {
             alive: state.exit.is_none(),
             attached: state.clients.iter().filter(|c| !c.watch).count(),
             age: now_secs().saturating_sub(self.created),
-            idle_ms: state.last_output.map(|at| at.elapsed().as_millis() as u64),
+            idle_ms: state
+                .activity
+                .last_change
+                .map(|at| at.elapsed().as_millis() as u64),
             last: state.screen.last_text(),
             programs: Some(programs),
         }
@@ -352,6 +479,18 @@ fn push_dump(out: &Outbox, request: u64, dump: &[u8]) {
     }
 }
 
+/// 终端流里的一条：会话现在记着的全部消息。
+fn marks_message(request: u64, marks: &[TermMark]) -> Response {
+    Response {
+        id: request,
+        chunk: true,
+        result: Some(json!(TermMarks {
+            marks: marks.to_vec()
+        })),
+        ..Default::default()
+    }
+}
+
 fn exit_message(request: u64, code: Option<i32>) -> Response {
     Response {
         id: request,
@@ -379,6 +518,8 @@ pub struct Frozen {
     pub exit: Option<Option<i32>>,
     /// 还原屏幕用的那一段
     pub dump: Vec<u8>,
+    /// 发出去的消息
+    pub marks: Vec<TermMark>,
 }
 
 /// 所有的终端会话。
@@ -539,8 +680,7 @@ impl Registry {
         &self,
         params: &TermOpen,
         env: Vec<(String, String)>,
-        conn: u64,
-        request: u64,
+        caller: Caller,
         out: &Outbox,
     ) -> Result<()> {
         let size = Size::new(params.cols, params.rows);
@@ -563,7 +703,7 @@ impl Registry {
                 .cloned();
             if let Some(session) = existing {
                 drop(opening);
-                session.attach(conn, request, out, size, false, false);
+                session.attach(caller, out, size, false, false);
                 return Ok(());
             }
             if key.is_empty() || opening.keys.insert(key.clone()) {
@@ -585,6 +725,7 @@ impl Registry {
             shell: params.shell.clone(),
         })
         .with_context(|| format!("无法在 {} 中打开终端", params.cwd))?;
+        let screen = Screen::new(size);
         let session = Arc::new(Session {
             id: id.clone(),
             key,
@@ -592,17 +733,18 @@ impl Registry {
             created: now_secs(),
             backend,
             state: Mutex::new(State {
-                screen: Screen::new(size),
+                activity: Activity::new(&screen),
+                screen,
                 exit: None,
                 ended: None,
-                last_output: None,
                 clients: Vec::new(),
+                marks: Vec::new(),
             }),
             registry: Arc::downgrade(&self.0),
         });
         self.0.sessions.lock().unwrap().insert(id, session.clone());
         // 先接上再开始读输出：第一个字也不会漏
-        session.attach(conn, request, out, size, true, false);
+        session.attach(caller, out, size, true, false);
         session.backend.start(session.clone());
         Ok(())
     }
@@ -613,12 +755,11 @@ impl Registry {
         term: &str,
         size: Size,
         watch: bool,
-        conn: u64,
-        request: u64,
+        caller: Caller,
         out: &Outbox,
     ) -> Result<()> {
         let session = self.get(term).context("终端会话不存在（可能已结束）")?;
-        session.attach(conn, request, out, size, false, watch);
+        session.attach(caller, out, size, false, watch);
         Ok(())
     }
 
@@ -786,6 +927,7 @@ impl Registry {
                     },
                     exit: state.exit,
                     dump: state.screen.dump(),
+                    marks: state.marks.clone(),
                 }
             })
             .collect();
@@ -805,11 +947,12 @@ impl Registry {
             created: frozen.created,
             backend,
             state: Mutex::new(State {
+                activity: Activity::new(&screen),
                 screen,
                 exit: frozen.exit,
                 ended: frozen.exit.map(|_| Instant::now()),
-                last_output: None,
                 clients: Vec::new(),
+                marks: frozen.marks,
             }),
             registry: Arc::downgrade(&self.0),
         });
@@ -917,6 +1060,15 @@ pub(crate) mod tests {
         }
     }
 
+    /// 现在这一版的客户端。
+    fn caller(conn: u64, request: u64) -> Caller {
+        Caller {
+            conn,
+            request,
+            protocol: protocol::PROTOCOL_VERSION,
+        }
+    }
+
     fn open(registry: &Registry, key: &str, conn: u64, request: u64, out: &Outbox) {
         let params = TermOpen {
             key: key.into(),
@@ -926,7 +1078,7 @@ pub(crate) mod tests {
             shell: Vec::new(),
         };
         registry
-            .open(&params, Vec::new(), conn, request, out)
+            .open(&params, Vec::new(), caller(conn, request), out)
             .unwrap();
     }
 
@@ -1001,6 +1153,116 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn 回车时记下输入区里的消息_推给接着的_再接上时先收到() {
+        let marks_of = |response: Response| -> Vec<String> {
+            let marks: TermMarks = serde_json::from_value(response.result.unwrap()).unwrap();
+            marks.marks.into_iter().map(|mark| mark.text).collect()
+        };
+        let (registry, fakes) = fake_registry();
+        let (out, mut inbox) = mailbox();
+        open(&registry, "/repo", 1, 10, &out);
+        let term = inbox.opened().term;
+        let fake = fakes.lock().unwrap()[0].clone();
+        let session = registry.get(&term).unwrap();
+        session.output(br"PS C:\> git status");
+        inbox.next();
+        // 只是一个回车：记下，推给客户端，再写给程序
+        session.input(b"\r".to_vec());
+        let (response, _) = inbox.next();
+        assert_eq!((response.id, response.chunk), (10, true));
+        assert_eq!(marks_of(response), ["git status"]);
+        assert_eq!(*fake.written.lock().unwrap(), b"\r");
+        // 粘贴里带的回车、空着的提示符按回车：不记
+        session.output(b"\r\nPS C:\\> ");
+        inbox.next();
+        session.input(b"ls\r".to_vec());
+        session.input(b"\r".to_vec());
+        // 全屏程序里按回车：不记
+        session.output(b"\x1b[?1049hPS C:\\> vim");
+        inbox.next();
+        session.input(b"\r".to_vec());
+        session.output(b"\x1b[?1049l");
+        inbox.next();
+        assert_eq!(*fake.written.lock().unwrap(), b"\rls\r\r\r");
+        // 再接上：会话的编号后面紧跟着记着的消息
+        registry.detach(1, None);
+        let (out2, mut inbox2) = mailbox();
+        open(&registry, "/repo", 2, 5, &out2);
+        inbox2.opened();
+        assert_eq!(marks_of(inbox2.next().0), ["git status"]);
+        // 最多留 TERM_MARKS 条，丢掉最早的
+        for n in 0..protocol::TERM_MARKS {
+            session.output(format!("\r\nPS C:\\> echo {n}").as_bytes());
+            session.input(b"\r".to_vec());
+        }
+        let kept = session.state.lock().unwrap().marks.clone();
+        assert_eq!(kept.len(), protocol::TERM_MARKS);
+        assert_eq!(kept[0].text, "echo 0");
+        assert!(kept.windows(2).all(|pair| pair[0].at <= pair[1].at));
+    }
+
+    /// 1.18.0（协议 15）的客户端把终端流里带结果的消息都当成「开好了」，收到消息刻度就报格式错误、
+    /// 断开这个终端：另一台电脑上的 Kuai 更新了、换上了新的 kuaid 时，没更新的那台就会这样。所以不给
+    /// 它发刻度，还原的输出也照原来给一整份；同时接着的新客户端照常收到刻度。
+    #[test]
+    fn 旧客户端_不发消息刻度_还原给一整份() {
+        let marks_of = |response: Response| -> Vec<String> {
+            let marks: TermMarks = serde_json::from_value(response.result.unwrap()).unwrap();
+            marks.marks.into_iter().map(|mark| mark.text).collect()
+        };
+        let (registry, _) = fake_registry();
+        let (out, mut inbox) = mailbox();
+        open(&registry, "/repo", 1, 10, &out);
+        let term = inbox.opened().term;
+        let session = registry.get(&term).unwrap();
+        // 往回翻的记录里有字：新客户端接上时会分两段
+        for n in 0..8 {
+            session.output(format!("line {n}\r\n").as_bytes());
+            inbox.next();
+        }
+        session.output(br"PS C:\> git status");
+        inbox.next();
+        session.input(b"\r".to_vec());
+        assert_eq!(marks_of(inbox.next().0), ["git status"]);
+
+        // 旧客户端接上：编号后面直接是还原的输出，一整份，和原来的 `dump` 一样
+        let (old_out, mut old_inbox) = mailbox();
+        let old = Caller {
+            conn: 2,
+            request: 5,
+            protocol: TERM_MARKS_SINCE - 1,
+        };
+        registry
+            .attach(&term, Size::new(20, 4), false, old, &old_out)
+            .unwrap();
+        let opened = old_inbox.opened();
+        assert!(opened.restore.is_empty(), "旧客户端不认得 restore");
+        let (response, dump) = old_inbox.next();
+        assert!(response.result.is_none(), "不该给旧客户端发消息刻度");
+        assert_eq!(dump, session.state.lock().unwrap().screen.dump());
+        // 新客户端同时接上：分两段
+        let (new_out, mut new_inbox) = mailbox();
+        registry
+            .attach(&term, Size::new(20, 4), false, caller(3, 6), &new_out)
+            .unwrap();
+        assert_eq!(new_inbox.opened().restore.len(), 2);
+
+        // 再记一条：新的两个客户端收到刻度，旧客户端只收到输出
+        session.output(b"\r\nPS C:\\> ls");
+        inbox.next();
+        old_inbox.next();
+        assert_eq!(marks_of(new_inbox.next().0), ["git status"]);
+        new_inbox.next();
+        new_inbox.next();
+        new_inbox.next();
+        session.input(b"\r".to_vec());
+        assert_eq!(marks_of(inbox.next().0), ["git status", "ls"]);
+        session.output(b"!");
+        let (response, payload) = old_inbox.next();
+        assert_eq!((response.result, payload), (None, b"!".to_vec()));
+    }
+
+    #[test]
     fn 接上时大小不一样就先改大小() {
         let (registry, fakes) = fake_registry();
         let (out, mut inbox) = mailbox();
@@ -1009,7 +1271,7 @@ pub(crate) mod tests {
         registry.detach(1, None);
         let (out2, mut inbox2) = mailbox();
         registry
-            .attach(&term, Size::new(50, 10), false, 2, 1, &out2)
+            .attach(&term, Size::new(50, 10), false, caller(2, 1), &out2)
             .unwrap();
         inbox2.opened();
         let fake = fakes.lock().unwrap()[0].clone();
@@ -1236,7 +1498,7 @@ pub(crate) mod tests {
             rows: 4,
             shell: Vec::new(),
         };
-        let refused = registry.open(&params, Vec::new(), 1, 1, &out);
+        let refused = registry.open(&params, Vec::new(), caller(1, 1), &out);
         assert!(refused.is_err());
         assert!(registry.list().is_empty());
         registry.release_opens();
@@ -1258,7 +1520,7 @@ pub(crate) mod tests {
         // 只看：大小给得不一样也不改，先收到现在的屏幕，之后的输出照收
         let (watch_out, mut watcher) = mailbox();
         registry
-            .attach(&term, Size::new(50, 10), true, 2, 7, &watch_out)
+            .attach(&term, Size::new(50, 10), true, caller(2, 7), &watch_out)
             .unwrap();
         assert!(!watcher.opened().created);
         assert_eq!(*fake.size.lock().unwrap(), None);
@@ -1283,7 +1545,7 @@ pub(crate) mod tests {
         // 结束以后再来只看：收到最后的画面和退出码，会话仍然留着
         let (late_out, mut late) = mailbox();
         registry
-            .attach(&term, Size::new(20, 4), true, 3, 1, &late_out)
+            .attach(&term, Size::new(20, 4), true, caller(3, 1), &late_out)
             .unwrap();
         late.opened();
         assert_eq!(first_line(&late.next().1), "hello!");
@@ -1296,6 +1558,38 @@ pub(crate) mod tests {
         let (response, _) = inbox.next();
         assert!(response.chunk);
         serde_json::from_value(response.result.unwrap()["terms"].clone()).unwrap()
+    }
+
+    #[test]
+    fn 屏幕上的字没变的输出不算_改大小后的重画不算() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut screen = Screen::new(Size::new(40, 5));
+        let mut activity = Activity::new(&screen);
+        // 提示符出来了：算
+        screen.advance(b"PS C:\\> ");
+        activity.output(&screen, ms(0));
+        assert_eq!(activity.last_change, Some(ms(0)));
+        // Claude Code 2.1.330 焦点出去时写的（在测试终端里抓的）：擦掉自己画的反色光标
+        screen.advance(b"\x1b[7m \x1b[27m\x08\x1b[K\x1b[8C");
+        activity.output(&screen, ms(1000));
+        assert_eq!(activity.last_change, Some(ms(0)));
+        // 一直在输出：隔一会儿才核对，没核对的那块由 tick 补上，记的是它来的时候
+        screen.advance(b"a");
+        activity.output(&screen, ms(1100));
+        assert_eq!(activity.last_change, Some(ms(0)));
+        activity.check(&screen, ms(1600));
+        assert_eq!(activity.last_change, Some(ms(1100)));
+        // 改了大小以后程序整个重画：不算
+        screen.resize(Size::new(30, 5));
+        activity.resized(&screen, ms(5000));
+        screen.advance(b"\r\x1b[Kredrawn");
+        activity.output(&screen, ms(5500));
+        assert_eq!(activity.last_change, Some(ms(1100)));
+        // 过了那一会儿再变：算
+        screen.advance(b"!");
+        activity.output(&screen, ms(8000));
+        assert_eq!(activity.last_change, Some(ms(8000)));
     }
 
     #[test]

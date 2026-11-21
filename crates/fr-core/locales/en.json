@@ -1355,7 +1355,6 @@
   "其他": "Other",
   "切换到此终端所在的工作区和仓库（Enter）": "Switch to this terminal's workspace and repository (Enter)",
   "点击画面或按 → 输入": "Click the screen or press → to type",
-  "正在输入。Ctrl+Shift+↑ ↓ 切换终端": "Typing. Ctrl+Shift+↑ ↓ switches terminal",
   "{n} 个终端": "{n} terminals",
   "{n} 个终端，{m} 个已停下": "{n} terminals, {m} stopped",
   "输入": "Type",
@@ -1613,5 +1612,8 @@
   "此提交之后有 {merges} 个合并提交，整理时无法保留合并关系。请选择最后一次合并之后的提交。": "There {merges|is|are} {merges} merge {merges|commit|commits} after this one, and rebasing here cannot keep merges. Pick a commit after the last merge.",
   "文件名里有无法识别的字符（不是 UTF-8 编码），无法操作，请在终端中处理。": "The file name contains unrecognizable characters (not UTF-8 encoded). It can't be handled here; use a terminal instead.",
   "文件名里有无法识别的字符（不是 UTF-8 编码）：{path}": "The file name contains unrecognizable characters (not UTF-8 encoded): {path}",
-  "：{sent} / {total}": ": {sent} / {total}"
+  "：{sent} / {total}": ": {sent} / {total}",
+  "第 {n} 条 · {time}": "Message {n} · {time}",
+  "已不在可回看的记录里，无法跳转": "No longer in the scrollback; can't jump to it",
+  "回到底部": "Scroll to bottom"
 }

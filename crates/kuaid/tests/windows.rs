@@ -260,6 +260,26 @@ impl Client {
         seen
     }
 
+    /// 接上已有的终端后，先收完还原屏幕的那几段（`TermOpened::restore`），返回里面的字。之后收到的
+    /// 才是接上以后的输出：等提示符时不会把还原出来的旧提示符当成新的。
+    fn restored(&mut self, stream: u64, opened: &TermOpened) -> String {
+        let mut left: u64 = opened.restore.iter().sum();
+        assert!(left > 0, "接上已有的终端应当有还原屏幕的输出");
+        let mut seen = String::new();
+        while left > 0 {
+            let what = format!("还原屏幕的输出（还差 {left} 字节），收到的是：{seen:?}");
+            let (response, payload) = self.take(&what, |r| {
+                r.id == stream && r.ask.is_none() && r.result.is_none()
+            });
+            assert!(response.chunk, "终端提前结束了：{response:?}");
+            left = left
+                .checked_sub(payload.len() as u64)
+                .expect("还原屏幕的输出比说的多");
+            seen.push_str(&String::from_utf8_lossy(&payload));
+        }
+        seen
+    }
+
     /// 收到这个流结束：程序的退出码。
     fn exit_of(&mut self, stream: u64) -> Option<i32> {
         let (response, _) = self.reply(stream, "终端结束的消息");
@@ -599,7 +619,9 @@ fn 新版本连上来_常驻进程换成新的_终端留着() {
         (again.term.as_str(), again.created),
         (opened.term.as_str(), false)
     );
-    let mut seen = second.output_until(stream, "tick-");
+    // 先收完还原出来的屏幕（往回翻的记录多时分两段）：上面有那几行编号
+    let mut seen = second.restored(stream, &again);
+    assert!(seen.contains("tick-"), "{seen}");
     // 停下那个循环（Ctrl+C），看 shell 还是那个、变量还在
     second.send("term_input", json!({ "term": again.term }), b"\x03");
     // 等提示符出来再敲：打断的那一刻敲进去的字会被 shell 丢掉

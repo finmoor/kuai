@@ -1290,7 +1290,7 @@ pub fn menu_items(
         if !dir {
             menu = menu.item(PopupMenuItem::new(tr("用默认程序打开")).on_click(
                 move |_, window, cx| {
-                    crate::shell::report(crate::shell::open_file(&open), window, cx);
+                    crate::shell::open_file(&open, window, cx);
                 },
             ));
         }
