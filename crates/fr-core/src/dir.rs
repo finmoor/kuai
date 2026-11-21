@@ -79,8 +79,8 @@ mod tests {
 
     #[test]
     fn 同一个目录的几种写法是同一个名字() {
-        assert_eq!(windows_key(r"C:\Users\Feng\Repo"), "c:/users/feng/repo");
-        assert_eq!(windows_key("c:/Users/feng/repo"), "c:/users/feng/repo");
+        assert_eq!(windows_key(r"C:\Users\me\Repo"), "c:/users/me/repo");
+        assert_eq!(windows_key("c:/Users/me/repo"), "c:/users/me/repo");
         // 第 2 个终端起名字后面带着的序号不受影响
         assert_eq!(windows_key("C:\\Repo\u{1f}2"), "c:/repo\u{1f}2");
     }

@@ -161,6 +161,19 @@ fn 删除的文件按行暂存() {
 }
 
 #[test]
+fn 已暂存删除的文件按行取消暂存() {
+    let repo = Repo::new("deleted-staged");
+    repo.commit("c.txt", b"p\nq\nr\n");
+    repo.git(&["rm", "-q", "--cached", "--", "c.txt"]);
+    let file = repo.diff(patch::staged_args("c.txt", None));
+    assert!(file.is_deleted());
+    // 取消「删掉 q」：暂存区里又有了这个文件，只剩 q（删掉 p、r 仍是暂存的）
+    let set = pick(&file, |_, c| c == b"q");
+    repo.apply(patch::apply_cached_args(true), partial(&file, true, &set));
+    assert_eq!(repo.index("c.txt"), b"q\n");
+}
+
+#[test]
 fn 新加的文件按行取消暂存() {
     let repo = Repo::new("new-file");
     repo.commit("base.txt", b"base\n");
@@ -183,6 +196,56 @@ fn 文件末尾没有换行() {
     let set = pick(&file, |_, c| c == b"b" || c == b"c");
     repo.apply(patch::apply_cached_args(false), partial(&file, false, &set));
     assert_eq!(repo.index("d.txt"), b"a\nb\nc\n");
+}
+
+#[test]
+fn 文件末尾没有换行_只暂存后面加的行() {
+    let repo = Repo::new("no-newline-append");
+    repo.commit("d.txt", b"a\nb");
+    repo.write("d.txt", b"a\nb\nc\n");
+    let file = repo.diff(patch::unstaged_args("d.txt"));
+    // 只选 +c：b 要补上换行才能在后面加行，补丁自己带上
+    let set = pick(&file, |k, c| k == LineKind::Added && c == b"c");
+    repo.apply(patch::apply_cached_args(false), partial(&file, false, &set));
+    assert_eq!(repo.index("d.txt"), b"a\nb\nc\n");
+}
+
+#[test]
+fn 文件末尾没有换行_只丢弃一部分() {
+    let repo = Repo::new("no-newline-discard");
+    repo.commit("d.txt", b"a\nb");
+    repo.write("d.txt", b"a\nc");
+    let file = repo.diff(patch::unstaged_args("d.txt"));
+    // 只丢弃「删掉 b」：b 回来，c 留着还是没有换行的最后一行
+    let set = pick(&file, |k, c| k == LineKind::Removed && c == b"b");
+    repo.apply(patch::discard_args(), partial(&file, true, &set));
+    assert_eq!(repo.read("d.txt"), b"a\nb\nc");
+}
+
+#[test]
+fn 按行取消暂存不撤销改名和权限() {
+    let repo = Repo::new("rename-mode");
+    repo.commit("old.txt", b"1\n2\n3\n4\n5\n6\n");
+    repo.git(&["mv", "old.txt", "new.txt"]);
+    repo.write("new.txt", b"1\n2\n3\n4\n5\n6\nseven\neight\n");
+    repo.git(&["add", "--", "new.txt"]);
+    repo.git(&["update-index", "--chmod=+x", "--", "new.txt"]);
+    let file = repo.diff(patch::staged_args("new.txt", Some("old.txt")));
+    assert!(file.is_moved(), "{:?}", file.header);
+    let set = pick(&file, |k, c| k == LineKind::Added && c == b"eight");
+    repo.apply(patch::apply_cached_args(true), partial(&file, true, &set));
+    assert_eq!(repo.index("new.txt"), b"1\n2\n3\n4\n5\n6\nseven\n");
+    let files = String::from_utf8(repo.git(&["ls-files", "-s"])).unwrap();
+    assert!(
+        files.lines().all(|line| !line.ends_with("old.txt")),
+        "{files}"
+    );
+    assert!(
+        files
+            .lines()
+            .any(|line| line.starts_with("100755 ") && line.ends_with("new.txt")),
+        "{files}"
+    );
 }
 
 #[test]

@@ -67,7 +67,7 @@ pub struct TermId {
 /// 正显示在窗口里的终端。
 #[derive(Clone, PartialEq)]
 pub enum Shown {
-    /// 仓库标签页的终端页上、终端标签页里：哪个仓库的第几个终端
+    /// 仓库标签页的终端页上：哪个仓库的第几个终端
     Repo(RepoEntry, u32),
     /// 总览页里选中的
     Term(TermId),
@@ -80,6 +80,9 @@ struct Listed {
     info: TermInfo,
     /// 最近一次输出的时刻，按收到时的「多久没有输出」倒推的；不知道是 None
     last_output: Option<Instant>,
+    /// 它是哪个仓库的第几个终端（见 [`owner`]）。列表推过来、工作区和仓库列表变了时算好：原来每次
+    /// 画都给每个终端把所有工作区的仓库对一遍，一帧里还要算好几遍
+    owner: (RepoEntry, u32),
 }
 
 /// 列表里的一行。
@@ -100,9 +103,64 @@ pub struct Row {
     pub alive: bool,
     pub state: TermState,
     pub last_output: Option<Instant>,
+    /// 除了 shell 还在跑的程序（协议 14 起 kuaid 随列表推）。空着是不知道：旧版 kuaid
+    pub programs: Option<Vec<String>>,
 }
 
+/// 终端里跑的是哪一类程序：终端页侧栏按它挑图标。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Program {
+    /// AI 助手（Claude Code、Codex 这些）
+    Agent,
+    /// 别的命令
+    Command,
+    /// 只有 shell，或者程序已经结束
+    Shell,
+    /// 不知道（旧版 kuaid 不报）
+    Unknown,
+}
+
+/// 认作 AI 助手的程序名（小写，Windows 上去掉了 `.exe`；Linux 上是 `comm`，最长 15 个字符）。
+const AGENTS: &[&str] = &[
+    "claude",
+    "codex",
+    "gemini",
+    "opencode",
+    "agy",
+    "aider",
+    "qwen",
+    "codebuddy",
+    "cursor-agent",
+    "copilot",
+    "amp",
+    "goose",
+    "crush",
+    "kimi",
+    "droid",
+    "auggie",
+];
+
 impl Row {
+    pub fn program(&self) -> Program {
+        // 已经结束的不用 kuaid 报也知道：旧版 kuaid 的也画成 shell，不画成「不知道」的状态点
+        if !self.alive {
+            return Program::Shell;
+        }
+        let Some(programs) = &self.programs else {
+            return Program::Unknown;
+        };
+        if programs.is_empty() {
+            return Program::Shell;
+        }
+        let agent = programs
+            .iter()
+            .any(|name| AGENTS.contains(&name.to_lowercase().as_str()));
+        match agent {
+            true => Program::Agent,
+            false => Program::Command,
+        }
+    }
+
     /// 哪个仓库的第几个终端：终端重启以后编号换了，这个不变。
     pub fn slot(&self) -> TermSlot {
         TermSlot {
@@ -193,8 +251,19 @@ impl TermBoard {
             .map(|(key, conn)| (key.clone(), conn.clone()))
             .collect();
         let before = self.watches.len();
-        self.watches
-            .retain(|key, (conn, _)| links.iter().any(|(k, c)| k == key && Arc::ptr_eq(c, conn)));
+        let mut replaced: Vec<String> = Vec::new();
+        self.watches.retain(|key, (conn, _)| {
+            let kept = links.iter().any(|(k, c)| k == key && Arc::ptr_eq(c, conn));
+            if !kept && links.iter().any(|(k, _)| k == key) {
+                replaced.push(key.clone());
+            }
+            kept
+        });
+        // 同一个键换了连接（改了地址，可能已经是另一台电脑）：旧连接读到的列表不能留到新的推过来，
+        // 不然这期间列着的是旧那台的终端，经新连接去操作的却是这一台
+        for key in replaced {
+            self.forget(&key);
+        }
         let mut changed = self.watches.len() != before;
         for (key, conn) in links {
             // 旧版 kuaid 不会有（连接时就升级了），保险起见
@@ -233,9 +302,26 @@ impl TermBoard {
             self.forget(&key);
             changed = true;
         }
+        changed |= self.refresh_owners(cx);
         if changed {
             cx.notify();
         }
+    }
+
+    /// 工作区、仓库列表可能变了：重新认一遍每个终端是哪个仓库的。返回有没有变。
+    fn refresh_owners(&mut self, cx: &App) -> bool {
+        let app = self.app.read(cx);
+        let mut changed = false;
+        for (machine, list) in &mut self.lists {
+            for listed in list {
+                let owner = owner(app, machine, &listed.info.key);
+                if listed.owner != owner {
+                    listed.owner = owner;
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     fn forget(&mut self, machine: &str) {
@@ -262,6 +348,7 @@ impl TermBoard {
     fn arrived(&mut self, machine: &str, list: Vec<TermInfo>, first: bool, cx: &mut Context<Self>) {
         let now = Instant::now();
         let old = self.lists.remove(machine).unwrap_or_default();
+        let app = self.app.read(cx);
         let listed: Vec<Listed> = list
             .into_iter()
             .map(|info| {
@@ -275,7 +362,12 @@ impl TermBoard {
                     .idle_ms
                     .and_then(|idle| now.checked_sub(Duration::from_millis(idle)));
                 let last_output = fresh.or(before);
-                Listed { info, last_output }
+                let owner = owner(app, machine, &info.key);
+                Listed {
+                    info,
+                    last_output,
+                    owner,
+                }
             })
             .collect();
         // 不在了的终端不用再记着
@@ -345,7 +437,7 @@ impl TermBoard {
             cx.notify();
         }
         for id in stopped {
-            if let Some(row) = self.row(&id, cx) {
+            if let Some(row) = self.row(&id) {
                 cx.emit(Stopped(row));
             }
         }
@@ -416,12 +508,12 @@ impl TermBoard {
             .count()
     }
 
-    fn make_row(&self, machine: &str, listed: &Listed, app: &AppState) -> Row {
+    fn make_row(&self, machine: &str, listed: &Listed) -> Row {
         let id = TermId {
             machine: machine.to_string(),
             term: listed.info.term.clone(),
         };
-        let (entry, number) = owner(app, machine, &listed.info.key);
+        let (entry, number) = listed.owner.clone();
         let state = self.states.get(&id).copied().unwrap_or(TermState::Idle);
         Row {
             id,
@@ -434,29 +526,30 @@ impl TermBoard {
             alive: listed.info.alive,
             state,
             last_output: listed.last_output,
+            programs: listed.info.programs.clone(),
         }
     }
 
-    pub fn row(&self, id: &TermId, cx: &App) -> Option<Row> {
+    pub fn row(&self, id: &TermId) -> Option<Row> {
         let listed = self
             .lists
             .get(&id.machine)?
             .iter()
             .find(|listed| listed.info.term == id.term)?;
-        Some(self.make_row(&id.machine, listed, self.app.read(cx)))
+        Some(self.make_row(&id.machine, listed))
     }
 }
 
 impl TermBoard {
     /// 全部终端：一台电脑一台电脑地排，同一台里按仓库、序号。
-    fn all_rows(&self, app: &AppState) -> Vec<Row> {
+    fn all_rows(&self) -> Vec<Row> {
         let mut machines: Vec<&String> = self.lists.keys().collect();
         machines.sort();
         let mut rows: Vec<Row> = Vec::new();
         for machine in machines {
             let mut list: Vec<Row> = self.lists[machine]
                 .iter()
-                .map(|listed| self.make_row(machine, listed, app))
+                .map(|listed| self.make_row(machine, listed))
                 .collect();
             list.sort_by(|a, b| (&a.entry.path, a.number).cmp(&(&b.entry.path, b.number)));
             rows.extend(list);
@@ -465,15 +558,23 @@ impl TermBoard {
     }
 
     /// 这个仓库的终端，按序号。那台电脑的终端列表还没读到是 None。
-    pub fn terms_of(&self, entry: &RepoEntry, cx: &App) -> Option<Vec<Row>> {
+    ///
+    /// 按会话的名字认（Windows 上不分大小写、斜杠，见 [`terminal::session_number`]），不按 [`owner`]
+    /// 认出的仓库：没登记过的子仓库 owner 认不出，给的是 kuaid 那种小写、正斜杠的写法，和打开的这个
+    /// 标签页的写法对不上，仓库的终端页就看不到自己的终端。
+    pub fn terms_of(&self, entry: &RepoEntry) -> Option<Vec<Row>> {
         let machine = machine_of(entry);
-        let app = self.app.read(cx);
         let mut rows: Vec<Row> = self
             .lists
             .get(machine)?
             .iter()
-            .map(|listed| self.make_row(machine, listed, app))
-            .filter(|row| row.entry == *entry)
+            .filter_map(|listed| {
+                let number = terminal::session_number(&entry.path, &listed.info.key)?;
+                let mut row = self.make_row(machine, listed);
+                row.entry = entry.clone();
+                row.number = number;
+                Some(row)
+            })
             .collect();
         rows.sort_by_key(|row| row.number);
         Some(rows)
@@ -485,7 +586,7 @@ impl TermBoard {
     pub fn repos(&self, cx: &App) -> Vec<RepoGroup> {
         let app = self.app.read(cx);
         let workspaces = self.reachable_members(workspace_order(app), app);
-        let (mut groups, rows) = group_by_workspace(workspaces, self.all_rows(app));
+        let (mut groups, rows) = group_by_workspace(workspaces, self.all_rows());
         let mut repos: Vec<(RepoEntry, Vec<Row>)> = Vec::new();
         for row in rows {
             match repos.iter_mut().find(|(entry, _)| *entry == row.entry) {
@@ -505,14 +606,14 @@ impl TermBoard {
     /// 电脑 `machine` 上的工作区里的仓库和各自的终端（终端页只看一台服务器时用）。和 [`Self::repos`]
     /// 不一样的地方：只在这台电脑的工作区之间去重。同一个仓库也在别的电脑的工作区里时，[`Self::repos`]
     /// 把它归到排在前面的那个工作区（比如本机现在用的），这里照样列在这台电脑的工作区里；不然
-    /// 这台电脑的工作区会因为仓库都被别处占了而整个不见（2026-11-19 Feng 报的）。不在任何工作区里的
+    /// 这台电脑的工作区会因为仓库都被别处占了而整个不见。不在任何工作区里的
     /// 终端这里不管。
     pub fn repos_on(&self, machine: &str, cx: &App) -> Vec<RepoGroup> {
         let app = self.app.read(cx);
         let mut keys = workspace_order(app);
         keys.retain(|key| key.machine == machine);
         let workspaces = self.reachable_members(keys, app);
-        group_by_workspace(workspaces, self.all_rows(app)).0
+        group_by_workspace(workspaces, self.all_rows()).0
     }
 
     /// 各个工作区里的仓库，去掉这次还没连上的服务器上的。
@@ -603,8 +704,50 @@ fn owner(app: &AppState, machine: &str, key: &str) -> (RepoEntry, u32) {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{RepoEntry, WorkspaceKey, group_by_workspace};
+    use super::{Program, RepoEntry, Row, TermId, WorkspaceKey, group_by_workspace};
     use super::{TermState, free_number, state_of};
+
+    #[test]
+    fn 终端里跑的是哪一类程序() {
+        let row = |alive: bool, programs: Option<&[&str]>| Row {
+            id: TermId {
+                machine: String::new(),
+                term: "t1".into(),
+            },
+            entry: RepoEntry {
+                server: None,
+                path: "C:/repo".into(),
+            },
+            number: 1,
+            title: None,
+            last: String::new(),
+            cols: 80,
+            rows: 24,
+            alive,
+            state: TermState::Idle,
+            last_output: None,
+            programs: programs.map(|names| names.iter().map(|name| name.to_string()).collect()),
+        };
+        assert_eq!(row(true, None).program(), Program::Unknown, "旧版 kuaid");
+        assert_eq!(
+            row(false, None).program(),
+            Program::Shell,
+            "旧版 kuaid、已结束"
+        );
+        assert_eq!(row(true, Some(&[])).program(), Program::Shell);
+        assert_eq!(row(true, Some(&["claude"])).program(), Program::Agent);
+        assert_eq!(row(true, Some(&["Codex"])).program(), Program::Agent);
+        assert_eq!(
+            row(true, Some(&["ping", "codex"])).program(),
+            Program::Agent
+        );
+        assert_eq!(row(true, Some(&["cargo"])).program(), Program::Command);
+        assert_eq!(
+            row(false, Some(&["claude"])).program(),
+            Program::Shell,
+            "已结束"
+        );
+    }
 
     #[test]
     fn 同一个仓库在两台电脑的工作区里_合着看归前面的_只看一台时照样列() {

@@ -346,8 +346,14 @@ fn 拉起常驻进程_终端在客户端走了以后还在() {
         Path::new("/nonexistent/first-connection")
     );
     let shell_pid = pid_of_shell(&mut first, stream, &opened.term);
-    // 起一个一直跑着的程序
-    first.input(&opened.term, "sleep 600 &\n");
+    // 起一个一直跑着的程序（测完收掉：shell 正常退出时不挂断后台作业，它会一直留着）
+    first.input(&opened.term, "sleep 600 & echo bg=$! ok-$((3+3))\n");
+    let seen = first.output_until(stream, "ok-6");
+    let at = seen.rfind("bg=").unwrap();
+    let background: String = seen[at + 3..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
 
     // 改大小
     first.send(
@@ -372,6 +378,7 @@ fn 拉起常驻进程_终端在客户端走了以后还在() {
     assert_eq!(terms[0].attached, 0);
     assert_eq!(terms[0].key, "repo");
     assert!(process_exists(&shell_pid), "shell 被带走了");
+    assert!(process_exists(&background), "终端里的程序被带走了");
 
     // 同一个名字再开：接上原来的，屏幕还原出来
     let (stream, again) = second.open("repo", &home.dir);
@@ -396,6 +403,7 @@ fn 拉起常驻进程_终端在客户端走了以后还在() {
     second.input(&again.term, "exit 7\n");
     assert_eq!(second.exit_of(stream), Some(7));
     wait_until("会话被忘掉", || second.terms().is_empty());
+    let _ = Command::new("kill").args(["-9", &background]).status();
 }
 
 #[test]
@@ -406,9 +414,18 @@ fn 结束终端会把里面的程序都带走() {
     client.hello();
     let (stream, opened) = client.open("repo", &home.dir);
     let shell_pid = pid_of_shell(&mut client, stream, &opened.term);
+    let programs = |client: &mut Client| {
+        client.call("term_programs", json!({ "term": opened.term }))["programs"].clone()
+    };
+    assert_eq!(programs(&mut client), json!([]), "shell 闲着时没有别的程序");
     // 前台跑着一个不会自己结束的程序
     client.input(&opened.term, "sleep 600\n");
-    std::thread::sleep(Duration::from_millis(300));
+    wait_until("看到前台的 sleep", || {
+        programs(&mut client) == json!(["sleep"])
+    });
+    // 终端列表里也带着（协议 14）
+    let listed = client.terms();
+    assert_eq!(listed[0].programs, Some(vec!["sleep".to_string()]));
     let closed = client.call("term_close", json!({ "term": opened.term }));
     assert_eq!(closed["closed"], true);
     client.exit_of(stream);
@@ -592,6 +609,64 @@ fn 叫停以后终端里的程序也结束_套接字删掉() {
     let mut again = home.connect(&exe);
     assert!(again.hello().daemon);
     assert!(again.terms().is_empty());
+}
+
+/// 叫停时，前台一个不理挂断的程序也被强杀，常驻进程等到它没了才退出。shell 收到挂断马上就退了，
+/// 读线程原来跟着结束、不再强杀，常驻进程一退它就一直留着。
+#[test]
+fn 叫停时不理挂断的前台程序也被强杀() {
+    let home = Home::new();
+    let exe = home.install("1.0.0-aaaaaaaaaaaa");
+    let mut client = home.connect(&exe);
+    client.hello();
+    let (stream, opened) = client.open("repo", &home.dir);
+    // 忽略了的信号 exec 以后还是忽略：这个 sleep 不理挂断。先打出它的进程号（exec 不换进程号）
+    client.input(
+        &opened.term,
+        "sh -c 'trap \"\" HUP; echo stubborn=$$ ok-$((2+2)); exec sleep 600'\n",
+    );
+    let seen = client.output_until(stream, "ok-4");
+    let at = seen.rfind("stubborn=").unwrap();
+    let pid: String = seen[at + 9..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    assert!(process_exists(&pid), "{seen}");
+    let (ok, text) = home.run(&exe, "--stop");
+    assert!(ok, "{text}");
+    client.wait_closed();
+    wait_until("不理挂断的程序被强杀", || !process_exists(&pid));
+}
+
+/// 固定的 ssh-agent 地址（~/.kuai/run/auth.sock）跟着连接改指：新连上一条转发了 agent 的就指过去
+/// （按编号接回的旧终端也用上新的），它断开了改指回别的还连着、也转发了的。
+#[test]
+fn ssh_agent_的固定地址跟着连接改指() {
+    let home = Home::new();
+    let exe = home.install("1.0.0-aaaaaaaaaaaa");
+    let link = home.dir.join(".kuai/run/auth.sock");
+    let target = || std::fs::read_link(&link).ok();
+    let mut first = home.connect_with(&exe, Some("/nonexistent/first"));
+    first.hello();
+    wait_until("指向第一条连接的", || {
+        target().as_deref() == Some(Path::new("/nonexistent/first"))
+    });
+    let mut second = home.connect_with(&exe, Some("/nonexistent/second"));
+    second.hello();
+    wait_until("改指到第二条连接的", || {
+        target().as_deref() == Some(Path::new("/nonexistent/second"))
+    });
+    // 没转发 agent 的连接来来去去，不动它
+    let mut plain = home.connect(&exe);
+    plain.hello();
+    plain.leave();
+    assert_eq!(target().as_deref(), Some(Path::new("/nonexistent/second")));
+    // 第二条断开：改指回还连着的第一条
+    second.leave();
+    wait_until("改指回第一条连接的", || {
+        target().as_deref() == Some(Path::new("/nonexistent/first"))
+    });
+    first.leave();
 }
 
 /// 传一块文件上去，返回 kuaid 的回答。

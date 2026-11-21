@@ -57,10 +57,18 @@ pub fn open_winfsp_download() -> Result<(), String> {
 
 impl EventEmitter<Notice> for AppState {}
 
+/// 退出时最多等映射断开这么久。
+const UNMOUNT_WAIT: Duration = Duration::from_secs(30);
+
 enum Slot {
-    /// 正在映射（在等连接，或者在挂）
-    Busy,
-    Live(fr_mount::Mounted),
+    /// 正在映射（在等连接，或者在挂）。带着这一次的编号：期间改了配置、断开又映射，旧的那次
+    /// 做完时编号对不上，结果丢掉（原来只看是不是「正在映射」，旧配置的结果会被当成新的挂上）
+    Busy(u64),
+    /// 映射着；`machine` 是挂上时那台电脑的标识（握手时报的）
+    Live {
+        mounted: fr_mount::Mounted,
+        machine: String,
+    },
     Failed(SharedString),
 }
 
@@ -79,6 +87,8 @@ pub struct Mounts {
     slots: HashMap<String, Slot>,
     installed: bool,
     installing: bool,
+    /// 上一次映射用的编号（见 [`Slot::Busy`]）
+    attempts: u64,
 }
 
 impl Mounts {
@@ -87,6 +97,7 @@ impl Mounts {
             slots: HashMap::new(),
             installed: winfsp_present(),
             installing: false,
+            attempts: 0,
         }
     }
 }
@@ -256,14 +267,14 @@ impl AppState {
     pub fn mount_status(&self, id: &str) -> MountStatus {
         match self.mounts.slots.get(id) {
             None => MountStatus::Off,
-            Some(Slot::Busy) => MountStatus::Busy,
-            Some(Slot::Live(_)) => MountStatus::Live,
+            Some(Slot::Busy(_)) => MountStatus::Busy,
+            Some(Slot::Live { .. }) => MountStatus::Live,
             Some(Slot::Failed(err)) => MountStatus::Failed(err.clone()),
         }
     }
 
     fn is_live(&self, id: &str) -> bool {
-        matches!(self.mounts.slots.get(id), Some(Slot::Live(_)))
+        matches!(self.mounts.slots.get(id), Some(Slot::Live { .. }))
     }
 
     /// 这台服务器上包含 `path` 的映射（配置了就算，不管现在映射着没有）；有几条时取最里面的。
@@ -292,7 +303,7 @@ impl AppState {
             .slots
             .values()
             .map(|slot| match slot {
-                Slot::Live(mounted) => mounted.open_files(),
+                Slot::Live { mounted, .. } => mounted.open_files(),
                 _ => 0,
             })
             .sum()
@@ -384,16 +395,40 @@ impl AppState {
     pub fn unmount_mapping(&mut self, id: &str, cx: &mut Context<Self>) -> Task<()> {
         cx.notify();
         match self.mounts.slots.remove(id) {
-            Some(Slot::Live(mounted)) => {
+            Some(Slot::Live { mounted, .. }) => {
                 cx.background_executor().spawn(async move { drop(mounted) })
             }
             _ => Task::ready(()),
         }
     }
 
-    /// 退出前：全部断开，等在路上的写入落地。
+    /// 退出前：全部断开，等在路上的写入落地。在另一个线程里断开，最多等 [`UNMOUNT_WAIT`]：主机上
+    /// 的文件操作卡住时（SSH 照样通着，比如挂死的网络盘），盘上的请求要到超时才回来，界面不能一直
+    /// 卡在这里。没等完就不等了：进程退出时盘跟着没了，还没落地的写入就丢了。
     pub fn unmount_all(&mut self) {
-        self.mounts.slots.clear();
+        let mounted: Vec<fr_mount::Mounted> = self
+            .mounts
+            .slots
+            .drain()
+            .filter_map(|(_, slot)| match slot {
+                Slot::Live { mounted, .. } => Some(mounted),
+                _ => None,
+            })
+            .collect();
+        if mounted.is_empty() {
+            return;
+        }
+        let (done, finished) = std::sync::mpsc::channel();
+        let unmounting = std::thread::Builder::new()
+            .name("unmount".into())
+            .spawn(move || {
+                drop(mounted);
+                let _ = done.send(());
+            });
+        if unmounting.is_ok() && finished.recv_timeout(UNMOUNT_WAIT).is_err() {
+            let secs = UNMOUNT_WAIT.as_secs();
+            log::warn!("退出时映射在 {secs} 秒内没有断开完，还没落到主机上的写入可能丢了");
+        }
     }
 
     /// 一台服务器被移除了：它的映射都断开。
@@ -407,7 +442,8 @@ impl AppState {
         }
     }
 
-    /// 连上了一台服务器：映射着的换到新的连接上，设了自动映射的映射上。
+    /// 连上了一台服务器：映射着的换到新的连接上，设了自动映射的映射上。连上的不是挂上时那台电脑
+    /// （改了地址）：盘上打开着的文件、读到的内容都是原来那台的，不能接着用新连接读写，断开重新映射。
     pub(crate) fn mappings_connected(
         &mut self,
         server: &str,
@@ -420,10 +456,21 @@ impl AppState {
             .unwrap_or_default();
         for mapping in mappings {
             match self.mounts.slots.get(&mapping.id) {
-                Some(Slot::Live(mounted)) => {
+                Some(Slot::Live { mounted, machine }) if *machine == conn.hello.machine => {
                     mounted.set_channel(Some(Channel::Remote(conn.clone())));
                 }
-                Some(Slot::Busy) => {}
+                Some(Slot::Live { .. }) => {
+                    log::info!("映射 {} 连上的是另一台电脑，重新映射", mapping.remote);
+                    let closing = self.unmount_mapping(&mapping.id, cx);
+                    let id = mapping.id.clone();
+                    cx.spawn(async move |this, cx| {
+                        closing.await;
+                        this.update(cx, |this, cx| this.start_mount(&id, false, cx))
+                            .ok();
+                    })
+                    .detach();
+                }
+                Some(Slot::Busy(_)) => {}
                 // 上次没成的，这次连上了再试
                 Some(Slot::Failed(_)) | None if mapping.auto && self.mounts.installed => {
                     self.start_mount(&mapping.id, false, cx);
@@ -473,7 +520,7 @@ impl AppState {
         };
         if matches!(
             self.mounts.slots.get(id),
-            Some(Slot::Busy) | Some(Slot::Live(_))
+            Some(Slot::Busy(_)) | Some(Slot::Live { .. })
         ) {
             return;
         }
@@ -484,7 +531,11 @@ impl AppState {
         let (server, mapping) = (server.clone(), mapping.clone());
         let share = self.settings.share_name(&server, &mapping);
         let (unc, explorer_label) = self.settings.explorer_name(&server, &mapping);
-        self.mounts.slots.insert(id.to_string(), Slot::Busy);
+        self.mounts.attempts += 1;
+        let attempt = self.mounts.attempts;
+        self.mounts
+            .slots
+            .insert(id.to_string(), Slot::Busy(attempt));
         cx.notify();
         let connecting = self.connect(&server.id, cx);
         let id = id.to_string();
@@ -492,8 +543,10 @@ impl AppState {
             let (errors_tx, mut errors) = futures::channel::mpsc::unbounded::<String>();
             let (remote, local) = (mapping.remote.clone(), mapping.local_root());
             let named = mapping.drive_name().map(str::to_string);
+            let mut machine = String::new();
             let mounting = match connecting.await {
                 Ok(conn) => {
+                    machine = conn.hello.machine.clone();
                     let options = fr_mount::Options {
                         root: mapping.remote.clone(),
                         place: mapping.local.clone(),
@@ -515,8 +568,8 @@ impl AppState {
                 Err(err) => Err(err),
             };
             let updated = this.update(cx, |this, cx| {
-                // 这期间这条映射被删了、断开了：不要了
-                if !matches!(this.mounts.slots.get(&id), Some(Slot::Busy)) {
+                // 这期间这条映射被删了、断开了，或者又开始了新的一次：不要了
+                if !matches!(this.mounts.slots.get(&id), Some(Slot::Busy(now)) if *now == attempt) {
                     if let Ok(mounted) = mounting {
                         cx.background_executor()
                             .spawn(async move { drop(mounted) })
@@ -527,7 +580,8 @@ impl AppState {
                 match mounting {
                     Ok(mounted) => {
                         log::info!("映射 {remote} → {local}");
-                        this.mounts.slots.insert(id.clone(), Slot::Live(mounted));
+                        let live = Slot::Live { mounted, machine };
+                        this.mounts.slots.insert(id.clone(), live);
                         if let Some(label) = &explorer_label {
                             set_explorer_label(&unc, Some(label), &mapping.local);
                         }
@@ -540,7 +594,7 @@ impl AppState {
                             this.settings.mapping_tip_shown = true;
                             this.save();
                             cx.emit(Notice::Info(
-                                tr("映射的目录适合用本机程序查看和编辑文件。在其中运行 git 或构建较慢，请在 Kuai 或服务器上进行。")
+                                tr("映射的目录适合用本机程序查看和编辑文件。在其中运行 git 或构建较慢，请在 Kuai 或主机上进行。")
                                     .into(),
                             ));
                         }
@@ -758,7 +812,7 @@ pub fn map_dialog(
         }
         state
     };
-    let remote_input = input(old.remote.clone(), tr("服务器上的目录，例如 /data/project"));
+    let remote_input = input(old.remote.clone(), tr("主机上的目录，例如 /data/project"));
     let folder_input = input(
         match old.is_drive() || !editing {
             true => default_folder(&server_entry.name, &old.remote),
@@ -766,7 +820,7 @@ pub fn map_dialog(
         },
         tr("本机上尚不存在的文件夹"),
     );
-    let name_input = input(old.name.clone(), tr("留空则按服务器名和目录名显示"));
+    let name_input = input(old.name.clone(), tr("留空则按主机名和目录名显示"));
     // 打字时预览跟着变
     let subscriptions = Rc::new([
         cx.subscribe(&remote_input, |_, _: &InputEvent, cx| cx.refresh_windows()),
@@ -808,7 +862,7 @@ pub fn map_dialog(
                 let absolute = remote.starts_with('/')
                     || remote.as_bytes().get(1).is_some_and(|c| *c == b':');
                 if !absolute {
-                    return fail(tr("请填写服务器上目录的完整路径").into(), window);
+                    return fail(tr("请填写主机上目录的完整路径").into(), window);
                 }
                 let local = match use_drive.get() {
                     true => drive.borrow().clone(),
@@ -1021,12 +1075,19 @@ pub fn map_dialog(
                     .gap_3()
                     .children(winfsp_banner(&app, cx))
                     .child(
-                        v_flex().gap_1().child(div().text_sm().child(tr("服务器目录"))).child(
-                            h_flex()
-                                .gap_2()
-                                .child(div().flex_1().min_w_0().child(Input::new(&remote_input)))
-                                .child(Button::new("browse").label(tr("浏览…")).on_click(browse)),
-                        ),
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_sm().child(tr("主机目录")))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        div().flex_1().min_w_0().child(Input::new(&remote_input)),
+                                    )
+                                    .child(
+                                        Button::new("browse").label(tr("浏览…")).on_click(browse),
+                                    ),
+                            ),
                     )
                     .child(
                         v_flex().gap_1().child(div().text_sm().child(tr("本机位置"))).child(
@@ -1083,7 +1144,7 @@ pub fn map_dialog(
                             .gap_5()
                             .child(
                                 Checkbox::new("auto")
-                                    .label(tr("连接服务器后自动映射"))
+                                    .label(tr("连接主机后自动映射"))
                                     .checked(auto.get())
                                     .on_click(toggle(&auto)),
                             )
@@ -1183,7 +1244,7 @@ impl AppState {
     /// 这一条映射出来的盘上，别的程序还开着几个文件。
     pub fn mounts_open_files(&self, id: &str) -> usize {
         match self.mounts.slots.get(id) {
-            Some(Slot::Live(mounted)) => mounted.open_files(),
+            Some(Slot::Live { mounted, .. }) => mounted.open_files(),
             _ => 0,
         }
     }
@@ -1203,7 +1264,7 @@ pub fn menu_items(
     root: &str,
     cx: &App,
 ) -> PopupMenu {
-    // 经别的服务器连的（156>91）：本机连不到它，不能映射
+    // 经别的服务器连的（A>B）：本机连不到它，不能映射
     if crate::machines::split_relay(server).is_some() {
         return menu;
     }
@@ -1479,7 +1540,7 @@ pub fn section(app: &Entity<AppState>, server: &Server, cx: &App) -> AnyElement 
                 ),
         )
         .child(div().text_xs().text_color(muted).child(tr(
-            "将服务器上的目录映射为本机的盘符或文件夹，供本机程序直接打开。仅在 Kuai 运行时可用。",
+            "将远程主机上的目录映射为本机的盘符或文件夹，供本机程序直接打开。仅在 Kuai 运行时可用。",
         )))
         .children(winfsp_banner(app, cx))
         .child(list)

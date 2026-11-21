@@ -70,7 +70,8 @@ pub fn parse(out: &[u8]) -> Blame {
         }
         let text = String::from_utf8_lossy(line);
         let (key, value) = text.split_once(' ').unwrap_or((&text, ""));
-        if key.len() == 40 && key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        // 提交头：40 位（SHA-1）或 64 位（SHA-256 的仓库）十六进制
+        if matches!(key.len(), 40 | 64) && key.bytes().all(|b| b.is_ascii_hexdigit()) {
             let next = blame.commits.len();
             let ix = *index.entry(key.to_string()).or_insert(next);
             if ix == next {
@@ -130,6 +131,33 @@ mod tests {
         assert_eq!(blame.commits[blame.lines[0].commit].author, "甲");
         // 第 3、4 行是不同的提交，各自是一段的第一行
         assert!(blame.lines.iter().all(|l| l.first));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sha256_的仓库也认得提交头() {
+        let dir = std::env::temp_dir().join(format!("fr-blame-sha256-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 太旧的 git 建不了 SHA-256 的仓库：不测
+        if crate::git::run(&dir, &["init", "-q", "--object-format=sha256"]).is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let git = |args: &[&str]| crate::git::run(&dir, args).unwrap();
+        git(&["config", "user.name", "甲"]);
+        git(&["config", "user.email", "a@example.com"]);
+        std::fs::write(dir.join("f.txt"), "一\n二\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "第一次"]);
+        std::fs::write(dir.join("f.txt"), "一\n二\n没提交\n").unwrap();
+        let args = args("f.txt");
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let blame = parse(&git(&args));
+        assert_eq!(blame.lines.len(), 3);
+        assert_eq!(blame.commits[blame.lines[0].commit].id.len(), 64);
+        assert_eq!(blame.commits[blame.lines[0].commit].summary, "第一次");
+        assert!(blame.commits[blame.lines[2].commit].uncommitted());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

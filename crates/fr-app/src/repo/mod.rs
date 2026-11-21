@@ -73,6 +73,12 @@ use crate::ui;
 
 /// 工具栏的高度；侧栏顶上写仓库名字的那一块和它一样高，底边对得齐。
 const TOOLBAR_HEIGHT: f32 = 52.;
+/// 文件监听断了（仓库目录一度没了、换了，装不上）以后，第一次隔这么久自己刷新、重新装；还是装不上
+/// 就加倍等，最多等 [`WATCH_RETRY_MAX`]
+const WATCH_RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(2);
+const WATCH_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+/// 装上的监听保持了这么久才断，算是好好用了一阵，下次重装又从最短的等起
+const WATCH_STABLE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 右边显示什么
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -112,6 +118,20 @@ pub enum RepoEvent {
 
 impl EventEmitter<RepoEvent> for RepoView {}
 
+/// 文件监听断了以后的重装（见 [`RepoView::watch_ended`]）：刷新时马上重装，没有刷新就隔一会儿
+/// 自己刷新一次（越装不上隔得越久）。
+#[derive(Default)]
+struct WatchRetry {
+    /// 监听结束了，还没重新装上
+    lost: bool,
+    /// 这一次监听是什么时候装上的
+    since: Option<std::time::Instant>,
+    /// 这一次自己刷新前等了多久
+    delay: std::time::Duration,
+    /// 等着自己刷新的任务
+    task: Option<Task<()>>,
+}
+
 pub struct RepoView {
     entry: RepoEntry,
     app: Entity<AppState>,
@@ -140,13 +160,16 @@ pub struct RepoView {
     refreshing: bool,
     /// 刷新期间又收到了变化通知：这次刷完再刷一次
     refresh_again: bool,
-    /// 文件监听；流结束（装不上监听、连接断了）后任务也结束
+    /// 文件监听；流结束（装不上监听、仓库目录没了或换了、连接断了）后任务也结束
     watch_task: Option<Task<()>>,
+    watch_retry: WatchRetry,
     history: history::History,
     changes: changes::Changes,
     sidebar: sidebar::Sidebar,
     /// 正在执行的写操作；同一时间只做一个
     op: Option<SharedString>,
+    /// 写操作期间占着这个仓库的「正在写」（见 [`ops::Writing`]）：别的页面同时写同一个仓库会被挡住
+    op_writing: Option<ops::Writing>,
     op_task: Option<Task<()>>,
     /// 获取、拉取、推送的进度（git 标准错误的最后一行）；有它说明正在做的这一步可以取消
     op_progress: Option<SharedString>,
@@ -227,10 +250,12 @@ impl RepoView {
             refreshing: false,
             refresh_again: false,
             watch_task: None,
+            watch_retry: WatchRetry::default(),
             history,
             changes,
             sidebar,
             op: None,
+            op_writing: None,
             op_task: None,
             op_progress: None,
             op_cancel: None,
@@ -303,6 +328,8 @@ impl RepoView {
     /// 监听仓库的变化，有变化就刷新。
     fn start_watch(&mut self, channel: &Channel, cx: &mut Context<Self>) {
         let mut changes = channel.watch(&self.entry.path);
+        self.watch_retry.lost = false;
+        self.watch_retry.since = Some(std::time::Instant::now());
         self.watch_task = Some(cx.spawn(async move |this, cx| {
             while changes.next().await.is_some() {
                 if this
@@ -313,6 +340,38 @@ impl RepoView {
                 }
             }
             log::info!("文件监听结束");
+            this.update(cx, |this, cx| this.watch_ended(cx)).ok();
+        }));
+    }
+
+    /// 文件监听结束了。连接断了就马上刷新，按现在的设置重连（改了主机设置时也会主动断开）。别的原因
+    /// （仓库目录一度没了、换了，装不上）记下来，刷新时重新装，没有刷新就隔一会儿自己刷新一次。原来
+    /// 只在连上时装：目录删掉又恢复以后的改动再也不自动刷新。
+    fn watch_ended(&mut self, cx: &mut Context<Self>) {
+        if matches!(&self.channel, Some(Channel::Remote(conn)) if !conn.is_alive()) {
+            self.refresh(cx);
+            return;
+        }
+        let retry = &mut self.watch_retry;
+        retry.lost = true;
+        let stable = retry
+            .since
+            .is_some_and(|since| since.elapsed() >= WATCH_STABLE);
+        retry.delay = if stable || retry.delay.is_zero() {
+            WATCH_RETRY_MIN
+        } else {
+            (retry.delay * 2).min(WATCH_RETRY_MAX)
+        };
+        let delay = retry.delay;
+        retry.task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            // 不在前台的不刷：切过来时会刷新，那时重新装
+            this.update(cx, |this, cx| {
+                if this.visible && this.watch_retry.lost {
+                    this.refresh(cx);
+                }
+            })
+            .ok();
         }));
     }
 
@@ -350,6 +409,24 @@ impl RepoView {
             }
             return;
         };
+        // git 太旧，提交详情这些用不了：直接说清楚，不让它们一样样地报 git 的错
+        if let Some(have) = fr_core::git::too_old(channel.git_version()) {
+            let (major, minor, _) = fr_core::git::MIN_VERSION;
+            let need = format!("{major}.{minor}");
+            let place = self.place(cx);
+            let text = tf!(
+                "{place}上的 git 是 {have}，Kuai 需要 {need} 或更新的版本。升级 git 后重新打开 Kuai。",
+                place,
+                have,
+                need
+            );
+            self.error = Some(text.into());
+            cx.notify();
+            return;
+        }
+        if self.watch_retry.lost {
+            self.start_watch(&channel, cx);
+        }
         let repo = self.entry.path.clone();
         let read_status = channel.git(&repo, status::args());
         let read_refs = channel.git(&repo, refs::args());
@@ -357,7 +434,8 @@ impl RepoView {
         let read_state = channel.git_with_input(&repo, state::args(), Some(state::stdin()));
         let read_submodules = channel.git(&repo, menus::submodule_args());
         let read_remotes = channel.git(&repo, vec!["remote".into()]);
-        let read_worktrees = channel.git(&repo, fr_core::worktree::list_args());
+        let nul = fr_core::worktree::has_nul(channel.git_version());
+        let read_worktrees = channel.git(&repo, fr_core::worktree::list_args(nul));
         self.refreshing = true;
         self.refresh_again = false;
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
@@ -383,7 +461,6 @@ impl RepoView {
                     Err(err) => {
                         this.error =
                             Some(tf!("读取仓库状态失败：{err}", err = format!("{:#}", err)).into());
-                        this.changes.settle();
                         cx.notify();
                         return;
                     }
@@ -411,7 +488,7 @@ impl RepoView {
                 let trees = wt
                     .ok()
                     .filter(|out| out.success())
-                    .map(|out| fr_core::worktree::parse(&out.stdout))
+                    .map(|out| fr_core::worktree::parse(&out.stdout, nul))
                     .unwrap_or_default();
                 this.set_worktrees(trees, cx);
                 let head = parsed.head.clone().unwrap_or_default();
@@ -421,7 +498,7 @@ impl RepoView {
                 let stash_out = sh.map(|out| out.stdout).unwrap_or_default();
                 let old_refs =
                     std::mem::replace(&mut this.refs, refs::parse(&refs_out, &stash_out));
-                this.remap_sidebar_selection(&old_refs);
+                this.remap_sidebar_selection(&old_refs, cx);
                 this.compare_refreshed(cx);
                 // 提交历史只含分支、远程分支、标签和 HEAD，这些都没变就不用重读
                 let mut key = refs_out;
@@ -458,9 +535,13 @@ impl RepoView {
         cx.notify();
     }
 
-    /// 工作区里有几个文件有没提交的改动（标签页上的小点用）。
+    /// 工作区里有几个文件有没提交的改动（标签页上的小点、侧栏「本地修改」后面的数字用）。
+    /// 状态读失败时不知道有几个，算 0：不留着上一次的数字。
     pub fn change_count(&self) -> usize {
-        self.status.as_ref().map_or(0, |s| s.entries.len())
+        match self.error {
+            Some(_) => 0,
+            None => self.status.as_ref().map_or(0, |s| s.entries.len()),
+        }
     }
 
     /// Ctrl+F：在正看着的东西里找，不为了找东西换到别的页面、别的视图。
@@ -474,7 +555,7 @@ impl RepoView {
     ///   搜索框。
     ///
     /// 1.16.1 以前不管在哪一页都切到 Git 页去搜提交：文件页上写着「Ctrl+F 在文件中查找」，按了
-    /// 却跳走（2026-11-19 Feng 报的）。
+    /// 却跳走。
     pub fn find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.page {
             Page::Files => self.find_in_file(window, cx),
@@ -498,7 +579,7 @@ impl RepoView {
         self.app.read(cx).machine_name(machine).to_string()
     }
 
-    /// 侧栏、图标栏上写的位置：经别的服务器连的写明经由哪台（「91 · 经由 156」）。
+    /// 侧栏、图标栏上写的位置：经别的服务器连的写明经由哪台（「B · 经由 A」）。
     fn place_label(&self, cx: &App) -> String {
         let place = self.place(cx);
         match self
@@ -518,15 +599,15 @@ impl RepoView {
 
     fn render_toolbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (border, muted, bg, danger, accent, chip) = (
+        let (border, muted, bg, accent, chip) = (
             theme.border,
             theme.muted_foreground,
             theme.background,
-            theme.danger,
             theme.primary,
             theme.secondary,
         );
-        let ready = self.channel.is_some() && self.status.is_some();
+        // 读状态失败时主区域是带「重试」的说明，工具栏的操作也先停用
+        let ready = self.channel.is_some() && self.status.is_some() && self.error.is_none();
         let idle = ready && self.op.is_none();
         let running = |label: &str| self.op.as_deref() == Some(label);
         // 当前分支；没有分支（分离的 HEAD、空仓库）时写清楚是哪种情况
@@ -640,15 +721,6 @@ impl RepoView {
                             .on_click(cx.listener(|this, _, _, cx| this.cancel_op(cx))),
                     )
                 })
-            })
-            .when_some(self.error.clone().filter(|_| ready), |bar, err| {
-                bar.child(
-                    ui::clipped("toolbar-error", err)
-                        .mr_2()
-                        .max_w(px(320.))
-                        .text_xs()
-                        .text_color(danger),
-                )
             })
             // 这三个按钮点右键有不常用的选项
             .child(
@@ -791,7 +863,7 @@ impl RepoView {
             .as_deref()
             .and_then(|id| self.app.read(cx).server(id))
             .cloned();
-        // 经别的服务器连的（156>91）：本机连不到它，外部终端和 VS Code 都用不了，也不能映射
+        // 经别的服务器连的（A>B）：本机连不到它，外部终端和 VS Code 都用不了，也不能映射
         let via = self
             .entry
             .server
@@ -1019,7 +1091,9 @@ impl RepoView {
                     self.render_placeholder(text.into(), false, cx)
                 }
             }
-        } else if let (Some(err), None) = (self.error.clone(), &self.status) {
+        } else if let Some(err) = self.error.clone() {
+            // 读状态失败：手上的是上一次的状态，接着显示的话看着正常、还能对它暂存丢弃。换成带
+            // 「重试」的说明（原来只有从没读到过时才这样，之后的失败只在工具栏上截着显示）
             self.render_placeholder(err, true, cx)
         } else if self.status.is_none() {
             self.render_placeholder(tr("正在读取仓库状态…").into(), false, cx)

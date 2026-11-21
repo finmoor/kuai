@@ -187,8 +187,16 @@ impl FileDiff {
             .count()
     }
 
+    /// 改名或复制（`-M` 取的已暂存的改动里有）。
+    pub fn is_moved(&self) -> bool {
+        self.has_header(b"rename from") || self.has_header(b"copy from")
+    }
+
     /// 生成只含选中行的补丁，`selected(块下标, 行下标)` 说明哪些改动行选中了。
     /// `reverse` 见模块说明。没有选中任何改动行时返回 None。
+    ///
+    /// 改动行全选中时是整个文件的改动，改名、权限、新建、删除照原样带上；只选了一部分时补丁只改
+    /// 内容，这些都不跟着（和 `git add -p` 一样，权限要单独暂存）。
     pub fn partial(
         &self,
         reverse: bool,
@@ -200,44 +208,68 @@ impl FileDiff {
         // 前面已经写进补丁的块让另一侧的行号偏移了多少
         let mut delta: i64 = 0;
         for (hi, hunk) in self.hunks.iter().enumerate() {
-            let mut lines = Vec::new();
-            let (mut old_n, mut new_n) = (0u32, 0u32);
-            let mut changed = false;
+            // 先定下每一行写成什么，None 是去掉
+            let mut prefixes = Vec::with_capacity(hunk.lines.len());
             for (li, line) in hunk.lines.iter().enumerate() {
                 let picked = line.kind != LineKind::Context && selected(hi, li);
                 if line.kind != LineKind::Context && !picked {
                     all = false;
                 }
-                let prefix = match (line.kind, picked, reverse) {
-                    (LineKind::Context, _, _) => b' ',
-                    (LineKind::Added, true, _) => b'+',
-                    (LineKind::Removed, true, _) => b'-',
+                prefixes.push(match (line.kind, picked, reverse) {
+                    (LineKind::Context, _, _) => Some(b' '),
+                    (LineKind::Added, true, _) => Some(b'+'),
+                    (LineKind::Removed, true, _) => Some(b'-'),
                     // 目标里有这一行，留作上下文
-                    (LineKind::Added, false, true) | (LineKind::Removed, false, false) => b' ',
-                    // 目标里没有这一行，去掉
-                    (LineKind::Added, false, false) | (LineKind::Removed, false, true) => continue,
-                };
-                match prefix {
-                    b'+' => new_n += 1,
-                    b'-' => old_n += 1,
-                    _ => {
-                        old_n += 1;
-                        new_n += 1;
+                    (LineKind::Added, false, true) | (LineKind::Removed, false, false) => {
+                        Some(b' ')
                     }
-                }
-                changed |= prefix != b' ';
-                lines.push(prefix);
-                lines.extend_from_slice(&line.content);
-                lines.push(b'\n');
-                if let Some(marker) = &line.no_newline {
-                    lines.extend_from_slice(marker);
-                    lines.push(b'\n');
+                    // 目标里没有这一行，去掉
+                    (LineKind::Added, false, false) | (LineKind::Removed, false, true) => None,
+                });
+            }
+            // 每一行后面还有没有旧的一侧、新的一侧的行：「没有末尾换行」只能跟在一侧的最后一行后面
+            let mut later = vec![(false, false); prefixes.len()];
+            let (mut old_after, mut new_after) = (false, false);
+            for (li, prefix) in prefixes.iter().enumerate().rev() {
+                later[li] = (old_after, new_after);
+                match prefix {
+                    Some(b'-') => old_after = true,
+                    Some(b'+') => new_after = true,
+                    Some(_) => (old_after, new_after) = (true, true),
+                    None => {}
                 }
             }
-            if !changed {
+            let mut out = HunkOut::default();
+            for (li, line) in hunk.lines.iter().enumerate() {
+                let Some(prefix) = prefixes[li] else {
+                    continue;
+                };
+                let content = line.content.as_slice();
+                let Some(marker) = &line.no_newline else {
+                    out.push(prefix, content, None);
+                    continue;
+                };
+                // 原来一侧没有换行的最后一行，选了一部分行以后后面可能还有行（比如只暂存了加在它后面
+                // 的行）：在那一侧它不是最后一行了，要带换行
+                let (old_last, new_last) = (!later[li].0, !later[li].1);
+                match prefix {
+                    b'-' => out.push(b'-', content, old_last.then_some(marker)),
+                    b'+' => out.push(b'+', content, new_last.then_some(marker)),
+                    _ if old_last == new_last => {
+                        out.push(b' ', content, old_last.then_some(marker))
+                    }
+                    // 只在一侧还是最后一行：写成删掉、加上两行，各带各的
+                    _ => {
+                        out.push(b'-', content, old_last.then_some(marker));
+                        out.push(b'+', content, new_last.then_some(marker));
+                    }
+                }
+            }
+            if !out.changed {
                 continue;
             }
             any = true;
+            let (old_n, new_n) = (out.old_n, out.new_n);
             // 目标一侧的起始行号不变，另一侧按前面的块偏移；`git apply` 以目标一侧为准找位置
             let (old_start, new_start) = if reverse {
                 let new_start = i64::from(hunk.new_start);
@@ -253,17 +285,55 @@ impl FileDiff {
                 body.extend_from_slice(hunk.section.as_bytes());
             }
             body.push(b'\n');
-            body.extend_from_slice(&lines);
+            body.extend_from_slice(&out.lines);
         }
         if !any {
             return None;
         }
 
+        let minus = self.header.iter().find(|l| l.starts_with(b"--- "));
+        let plus = self.header.iter().find(|l| l.starts_with(b"+++ "));
         // 只选了一部分时：暂存删除文件的部分行、取消暂存新文件的部分行，结果是修改而不是删除或新建，
         // 头部要改成修改，否则 git apply 会报「删除补丁留下了文件内容」之类的错
         let rewrite = !all && ((!reverse && self.is_deleted()) || (reverse && self.is_new()));
+        // 只选了一部分的改名、复制：改成目标一侧那个路径上的修改（取消暂存改名后的文件的几行，
+        // 改名不跟着撤销）
+        let moved = (!all && self.is_moved())
+            .then(|| match reverse {
+                true => plus.map(|plus| (swap_side(plus, b"--- ", b'b', b'a'), plus.clone())),
+                false => minus.map(|minus| (minus.clone(), swap_side(minus, b"+++ ", b'a', b'b'))),
+            })
+            .flatten();
         let mut patch = Vec::new();
         for line in &self.header {
+            // 权限不跟着只选了一部分的行走
+            if !all && (line.starts_with(b"old mode ") || line.starts_with(b"new mode ")) {
+                continue;
+            }
+            if let Some((to_minus, to_plus)) = &moved {
+                if MOVE_HEADERS.iter().any(|prefix| line.starts_with(prefix)) {
+                    continue;
+                }
+                let replaced = if line.starts_with(b"diff --git ") {
+                    // 两个路径都写目标一侧的；带引号的路径照样带着
+                    let mut diff = b"diff --git ".to_vec();
+                    diff.extend_from_slice(&to_minus[4..]);
+                    diff.push(b' ');
+                    diff.extend_from_slice(&to_plus[4..]);
+                    Some(diff)
+                } else if line.starts_with(b"--- ") {
+                    Some(to_minus.clone())
+                } else if line.starts_with(b"+++ ") {
+                    Some(to_plus.clone())
+                } else {
+                    None
+                };
+                if let Some(replaced) = replaced {
+                    patch.extend(replaced);
+                    patch.push(b'\n');
+                    continue;
+                }
+            }
             if rewrite {
                 if line.starts_with(b"new file mode")
                     || line.starts_with(b"deleted file mode")
@@ -272,14 +342,14 @@ impl FileDiff {
                     continue;
                 }
                 if line.as_slice() == b"--- /dev/null"
-                    && let Some(plus) = self.header.iter().find(|l| l.starts_with(b"+++ "))
+                    && let Some(plus) = plus
                 {
                     patch.extend(swap_side(plus, b"--- ", b'b', b'a'));
                     patch.push(b'\n');
                     continue;
                 }
                 if line.as_slice() == b"+++ /dev/null"
-                    && let Some(minus) = self.header.iter().find(|l| l.starts_with(b"--- "))
+                    && let Some(minus) = minus
                 {
                     patch.extend(swap_side(minus, b"+++ ", b'a', b'b'));
                     patch.push(b'\n');
@@ -291,6 +361,48 @@ impl FileDiff {
         }
         patch.extend(body);
         Some(patch)
+    }
+}
+
+/// 改名、复制的头部行，只选了一部分行时去掉。
+const MOVE_HEADERS: [&[u8]; 6] = [
+    b"similarity index ",
+    b"dissimilarity index ",
+    b"rename from ",
+    b"rename to ",
+    b"copy from ",
+    b"copy to ",
+];
+
+/// 一块补丁的正文，边写边数两侧的行数。
+#[derive(Default)]
+struct HunkOut {
+    lines: Vec<u8>,
+    old_n: u32,
+    new_n: u32,
+    /// 有 `+`、`-` 行
+    changed: bool,
+}
+
+impl HunkOut {
+    /// 写一行；`no_newline` 是跟在后面的「没有末尾换行」标记。
+    fn push(&mut self, prefix: u8, content: &[u8], no_newline: Option<&Vec<u8>>) {
+        match prefix {
+            b'+' => self.new_n += 1,
+            b'-' => self.old_n += 1,
+            _ => {
+                self.old_n += 1;
+                self.new_n += 1;
+            }
+        }
+        self.changed |= prefix != b' ';
+        self.lines.push(prefix);
+        self.lines.extend_from_slice(content);
+        self.lines.push(b'\n');
+        if let Some(marker) = no_newline {
+            self.lines.extend_from_slice(marker);
+            self.lines.push(b'\n');
+        }
     }
 }
 
@@ -546,6 +658,85 @@ index 3333333..0000000
         let text = String::from_utf8(f.partial(false, |_, _| true).unwrap()).unwrap();
         assert!(text.contains("deleted file mode"));
         assert!(text.contains("@@ -1,2 +0,0 @@"));
+    }
+
+    #[test]
+    fn 只暂存加在没有换行的最后一行后面的行_那一行补上换行() {
+        let diff = "diff --git a/d.txt b/d.txt
+index 1111111..2222222 100644
+--- a/d.txt
++++ b/d.txt
+@@ -1,2 +1,3 @@
+ a
+-b
+\\ No newline at end of file
++b
++c
+";
+        let f = &parse(diff.as_bytes())[0];
+        // 只选 +c：b 留作上下文的话标记会落在中间，要写成「删掉没换行的 b、加上有换行的 b」
+        let text = String::from_utf8(f.partial(false, |_, l| l == 3).unwrap()).unwrap();
+        assert!(
+            text.ends_with("@@ -1,2 +1,3 @@\n a\n-b\n\\ No newline at end of file\n+b\n+c\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn 反向时加回的最后一行后面还有行_不带无换行标记() {
+        let diff = "diff --git a/d.txt b/d.txt
+index 1111111..2222222 100644
+--- a/d.txt
++++ b/d.txt
+@@ -1,2 +1,2 @@
+ a
+-b
+\\ No newline at end of file
++c
+\\ No newline at end of file
+";
+        let f = &parse(diff.as_bytes())[0];
+        // 只丢弃「删掉 b」：b 加回来以后后面还有 c，b 要带换行
+        let text = String::from_utf8(f.partial(true, |_, l| l == 1).unwrap()).unwrap();
+        assert!(
+            text.ends_with("@@ -1,3 +1,2 @@\n a\n-b\n c\n\\ No newline at end of file\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn 只选一部分时不带改名和权限_全选时照带() {
+        let diff = "diff --git a/old.txt b/new.txt
+old mode 100644
+new mode 100755
+similarity index 80%
+rename from old.txt
+rename to new.txt
+index 1111111..2222222
+--- a/old.txt
++++ b/new.txt
+@@ -1,2 +1,4 @@
+ x
+ y
++z
++w
+";
+        let f = &parse(diff.as_bytes())[0];
+        assert!(f.is_moved());
+        // 取消暂存其中一行：只改 new.txt 的内容
+        let text = String::from_utf8(f.partial(true, |_, l| l == 3).unwrap()).unwrap();
+        assert!(
+            text.starts_with(
+                "diff --git a/new.txt b/new.txt\nindex 1111111..2222222\n--- a/new.txt\n+++ b/new.txt\n"
+            ),
+            "{text}"
+        );
+        for gone in ["mode", "rename", "similarity"] {
+            assert!(!text.contains(gone), "{text}");
+        }
+        // 全选：整个文件的改动，改名和权限照带
+        let text = String::from_utf8(f.partial(true, |_, _| true).unwrap()).unwrap();
+        assert!(text.starts_with(diff.split("@@").next().unwrap()), "{text}");
     }
 
     #[test]

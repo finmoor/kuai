@@ -3,3 +3,5 @@
 /dist
 # 测试用的大仓库，由 tools/gen-test-repo.py 生成，不进版本库
 /.testdata
+# 内部文档（另一个仓库）的工作副本
+/docs/

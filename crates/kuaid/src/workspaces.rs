@@ -54,32 +54,35 @@ impl Workspaces {
         })
     }
 
+    /// 现在的。每次从文件读：连不上 kuaid 时 Kuai 会直接改文件（见 `fr_core::store::update`），
+    /// 内存里的那份可能是旧的。文件不大，存的时候是整份换上的，不会读到半截。
     pub fn get(&self) -> Store {
-        let mut store = self.store.lock().unwrap();
-        store.get_or_insert_with(|| store::load(&self.path)).clone()
+        let mut guard = self.store.lock().unwrap();
+        let store = store::load(&self.path);
+        *guard = Some(store.clone());
+        store
     }
 
-    /// 执行一串改动。有改动就存盘、推给所有订阅的；存不了盘就不算（报错，内存里的也不动）。
+    /// 执行一串改动：在跨进程的锁里读最新的文件、改、存。有改动（或者文件被别处改过）就推给所有
+    /// 订阅的；存不了盘就不算（报错）。
     pub fn apply(&self, ops: &[Op]) -> Result<Store> {
         let mut guard = self.store.lock().unwrap();
-        let current = guard.get_or_insert_with(|| store::load(&self.path));
-        let mut next = current.clone();
-        if !next.apply(ops, cfg!(windows))? {
-            return Ok(next);
-        }
-        store::save(&self.path, &next)?;
-        *current = next.clone();
+        let (next, changed) = store::update(&self.path, ops, cfg!(windows))?;
+        let moved = guard.as_ref() != Some(&next);
+        *guard = Some(next.clone());
         // 持着锁发：两次改动推出去的先后和执行的先后一致
-        self.notify(&next);
+        if changed || moved {
+            self.notify(&next);
+        }
         drop(guard);
         Ok(next)
     }
 
     /// 订阅：马上推一份现在的，之后每次有改动推一份。
     pub fn watch(&self, conn: u64, id: u64, out: &Outbox) {
-        // 持着锁登记、发第一份：和 `apply` 的推送不会交错，不漏也不乱序
+        // 持着锁登记、发第一份：和 `apply` 的推送不会交错，不漏也不乱序。从文件读，见 `get`
         let mut guard = self.store.lock().unwrap();
-        let store = guard.get_or_insert_with(|| store::load(&self.path));
+        let store = guard.insert(store::load(&self.path));
         self.watchers.lock().unwrap().push(Watcher {
             conn,
             id,
@@ -98,7 +101,9 @@ impl Workspaces {
 
     fn notify(&self, store: &Store) {
         for watcher in self.watchers.lock().unwrap().iter() {
-            watcher.out.push(&update(watcher.id, store), &[]);
+            watcher
+                .out
+                .push_latest(watcher.id, &update(watcher.id, store), &[]);
         }
     }
 }

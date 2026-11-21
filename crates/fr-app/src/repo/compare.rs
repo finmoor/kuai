@@ -1,7 +1,7 @@
 //! 比较：两个提交、两个分支，或者提交、分支和本地修改之间差在哪。
 //!
-//! 侧栏「所有提交」下面有一项「比较」，整个主区域用来比较（Feng 2026-11-16 在两个方向里选的
-//! 「单独的比较视图」，原型在 `design/review-changes/`）：
+//! 侧栏「所有提交」下面有一项「比较」，整个主区域用来比较（单独的比较视图，原型在
+//! `docs/design/review-changes/`）：
 //! - 顶上一条：基准、对比两端各是一个下拉，可以换成本地修改、HEAD、任意分支、标签，或者填一个
 //!   提交的哈希；中间的按钮交换两边；右边写对比比基准领先、落后几个提交，一共改了几个文件。
 //! - 左边两栏：「文件」是两端之间有改动的文件（树形或平铺、可过滤，见 [`super::file_tree`]），
@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::rc::Rc;
 
+use fr_channel::Channel;
 use fr_core::compare::{self, File};
 use fr_core::i18n::{tr, trc};
 use fr_core::log::{self as gitlog, Commit};
@@ -26,7 +27,7 @@ use fr_core::status::Kind;
 use fr_core::tf;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::diff::{Diff, DiffFile, DiffMode, DiffState};
+use gpui_kit::component::diff::{Diff, DiffMode, DiffState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
@@ -113,8 +114,87 @@ enum Load {
 #[derive(Clone)]
 struct Item {
     file: File,
+    origin: Origin,
+}
+
+/// 清单里这一条是怎么来的、改动怎么取。
+#[derive(Clone, PartialEq)]
+enum Origin {
+    /// git 比较两端得出的
+    Git,
     /// 工作区里没跟踪的文件：git 的比较里没有它，是从工作区状态里补的
-    untracked: bool,
+    Untracked,
+    /// 提交里有、工作区里取消了跟踪但文件还在（`git rm --cached`）：git 的比较说它删了、工作区状态
+    /// 说它没跟踪，合成一条「修改」，比提交里的版本和磁盘上的文件。磁盘上的那份存成了 blob
+    /// （[`compare::store_args`]），这里是它的哈希
+    Disk(String),
+}
+
+/// 文件清单：git 比较出来的（`out`），一端是工作区时加上工作区状态里没跟踪的（`untracked`）。
+/// `commit` 是另一端的提交。没跟踪的那个路径 git 的比较里也有时合成一条（见 [`Origin::Disk`]）。
+async fn build_items(
+    channel: &Channel,
+    repo: &str,
+    out: &[u8],
+    untracked: Vec<String>,
+    worktree_is_base: bool,
+    commit: Option<String>,
+) -> Vec<Item> {
+    let mut items: Vec<Item> = compare::parse_files(out)
+        .into_iter()
+        .map(|file| Item {
+            file,
+            origin: Origin::Git,
+        })
+        .collect();
+    let (detached, untracked): (Vec<String>, Vec<String>) = untracked
+        .into_iter()
+        .partition(|path| items.iter().any(|item| item.file.path == *path));
+    if let (false, Some(commit)) = (detached.is_empty(), commit) {
+        let stored = channel.git(repo, compare::store_args(&detached)).await;
+        let blobs: Vec<String> = stored
+            .ok()
+            .filter(|out| out.success())
+            .map(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        // 存不下来（磁盘上的读不了）：只留 git 比较出来的那一条
+        if blobs.len() == detached.len() {
+            for (path, blob) in detached.iter().zip(blobs) {
+                let old = format!("{commit}:{path}");
+                let (a, b) = match worktree_is_base {
+                    true => (blob.as_str(), old.as_str()),
+                    false => (old.as_str(), blob.as_str()),
+                };
+                let numstat = channel.git(repo, compare::blob_numstat_args(a, b)).await;
+                let lines = numstat
+                    .ok()
+                    .filter(|out| out.success())
+                    .and_then(|out| compare::parse_numstat(&out.stdout));
+                if let Some(item) = items.iter_mut().find(|item| item.file.path == *path) {
+                    item.file.status = 'M';
+                    item.file.orig_path = None;
+                    item.file.lines = lines;
+                    item.origin = Origin::Disk(blob);
+                }
+            }
+        }
+    }
+    items.extend(untracked.into_iter().map(|path| Item {
+        file: File {
+            path,
+            orig_path: None,
+            status: if worktree_is_base { 'D' } else { 'A' },
+            lines: None,
+        },
+        origin: Origin::Untracked,
+    }));
+    items.sort_by(|a, b| a.file.path.cmp(&b.file.path));
+    items
 }
 
 /// 「提交」一栏里的一行。
@@ -154,7 +234,7 @@ pub(super) struct Compare {
     focus: FocusHandle,
     diff: Entity<DiffState>,
     /// 现在显示的补丁：刷新时内容没变就不动它，滚动位置留着
-    diff_text: String,
+    diff_text: SharedString,
     /// 没有改动可显示时写的话（正在读取、读取失败、没有差异）
     diff_note: Option<SharedString>,
     /// 忽略空白时改动上面写的那句话（少显示了多少行）
@@ -196,7 +276,7 @@ impl Compare {
             commit_scroll: UniformListScrollHandle::new(),
             focus: cx.focus_handle(),
             diff: cx.new(|cx| DiffState::new(Vec::new(), cx)),
-            diff_text: String::new(),
+            diff_text: SharedString::default(),
             diff_note: None,
             ws_note: None,
             image: None,
@@ -454,7 +534,7 @@ impl RepoView {
     }
 
     fn clear_compare_diff(&mut self, note: Option<SharedString>, cx: &mut Context<Self>) {
-        self.compare.diff_text.clear();
+        self.compare.diff_text = SharedString::default();
         self.compare.diff_note = note;
         self.compare.ws_note = None;
         self.compare
@@ -467,8 +547,8 @@ impl RepoView {
         self.compare.diff.clone()
     }
 
-    pub(super) fn compare_diff_text(&self) -> &str {
-        &self.compare.diff_text
+    pub(super) fn compare_diff_text(&self) -> SharedString {
+        self.compare.diff_text.clone()
     }
 
     /// 读两端之间的文件清单和两边各自独有的提交。`fresh` 是换了两端：旧的马上撤掉；
@@ -521,35 +601,33 @@ impl RepoView {
                 .collect(),
             false => Vec::new(),
         };
+        // 另一端的提交：取消了跟踪、还在磁盘上的文件拿它里面的版本比
+        let commit = match (&a, &b) {
+            (compare::End::Worktree, compare::End::Rev(rev))
+            | (compare::End::Rev(rev), compare::End::Worktree) => Some(rev.clone()),
+            _ => None,
+        };
         // 换两端、再刷新时旧任务随 Task 一起丢弃
         self.compare.load_task = Some(cx.spawn(async move |this, cx| {
             let (files, count, ahead, behind) =
                 futures::join!(read_files, read_count, read_ahead, read_behind);
+            let items = match files.and_then(|out| out.ok()) {
+                Ok(out) => {
+                    Ok(
+                        build_items(&channel, &repo, &out, untracked, worktree_is_base, commit)
+                            .await,
+                    )
+                }
+                Err(err) => Err(err),
+            };
             this.update(cx, |this, cx| {
-                match files.and_then(|out| out.ok()) {
+                match items {
                     Err(err) => {
                         let text = tf!("读取失败：{err}", err = format!("{:#}", err));
                         this.compare.load = Load::Failed(text.into());
                         this.compare.files.clear();
                     }
-                    Ok(out) => {
-                        let mut items: Vec<Item> = compare::parse_files(&out)
-                            .into_iter()
-                            .map(|file| Item {
-                                file,
-                                untracked: false,
-                            })
-                            .collect();
-                        items.extend(untracked.into_iter().map(|path| Item {
-                            file: File {
-                                path,
-                                orig_path: None,
-                                status: if worktree_is_base { 'D' } else { 'A' },
-                                lines: None,
-                            },
-                            untracked: true,
-                        }));
-                        items.sort_by(|a, b| a.file.path.cmp(&b.file.path));
+                    Ok(items) => {
                         this.compare.files = items;
                         this.compare.load = Load::Ready;
                     }
@@ -637,15 +715,32 @@ impl RepoView {
                 }
             }
         }
-        let (args, ok): (Option<Vec<String>>, &'static [i32]) = match item.untracked {
-            true => {
+        let (args, ok): (Option<Vec<String>>, &'static [i32]) = match &item.origin {
+            Origin::Untracked => {
                 let reverse = a == compare::End::Worktree;
                 (Some(compare::untracked_patch_args(&path, reverse)), &[0, 1])
             }
-            false => (
+            Origin::Git => (
                 compare::patch_args(&a, &b, &path, item.file.orig_path.as_deref()),
                 &[0],
             ),
+            Origin::Disk(blob) => {
+                let commit = match (&a, &b) {
+                    (compare::End::Rev(rev), _) | (_, compare::End::Rev(rev)) => rev.clone(),
+                    _ => return,
+                };
+                let old = format!("{commit}:{path}");
+                let args = match a == compare::End::Worktree {
+                    true => compare::blob_patch_args(blob, &old),
+                    false => compare::blob_patch_args(&old, blob),
+                };
+                (Some(args), &[0])
+            }
+        };
+        // 和磁盘上存下来的那份比的：补丁里 blob 的名字换成路径
+        let named = match &item.origin {
+            Origin::Disk(blob) => Some((blob.clone(), path.clone())),
+            _ => None,
         };
         let Some(mut args) = args else {
             return;
@@ -657,28 +752,44 @@ impl RepoView {
         let request = channel.git(&self.entry.path, args);
         // 换选中的文件时旧任务随 Task 一起丢弃
         self.compare.diff_task = Some(cx.spawn(async move |this, cx| {
-            let result = request.await;
-            let plain = diff_tools::plain_out(plain).await;
+            let mut result = request.await;
+            let mut plain = diff_tools::plain_out(plain).await;
+            if let Some((blob, path)) = &named {
+                if let Ok(out) = &mut result {
+                    out.stdout = compare::name_blob(&out.stdout, blob, path);
+                }
+                if let Some(plain) = &mut plain {
+                    *plain = compare::name_blob(plain, blob, path);
+                }
+            }
+            // 解码、解析放到后台：整个文件、超长的行解析要好一会儿，不能占着界面线程
+            let result = match result {
+                Ok(out) if out.code.is_some_and(|code| ok.contains(&code)) => {
+                    let parsed = cx.background_spawn(async move {
+                        let ws_note = plain
+                            .as_deref()
+                            .map(|plain| diff_tools::ws_note(plain, &out.stdout));
+                        let (text, files) = diff_tools::parse_patch(&out.stdout);
+                        (text, files, ws_note)
+                    });
+                    Ok(parsed.await)
+                }
+                Ok(out) => Err(out.stderr),
+                Err(err) => Err(format!("{err:#}")),
+            };
             this.update(cx, |this, cx| {
                 let failed =
                     |err: String| -> SharedString { tf!("读取改动失败：{err}", err).into() };
                 match result {
-                    Ok(out) if out.code.is_some_and(|code| ok.contains(&code)) => {
-                        let text = crate::text::decode(&out.stdout);
-                        let ws_note = plain
-                            .as_deref()
-                            .map(|plain| diff_tools::ws_note(plain, &out.stdout));
+                    Ok((text, files, ws_note)) => {
                         // 内容没变（别的文件触发的刷新）：不动，滚动位置留着
-                        if this.compare.diff_note.is_none() && *text == this.compare.diff_text {
+                        if this.compare.diff_note.is_none() && *text == *this.compare.diff_text {
                             this.compare.ws_note = ws_note;
                             cx.notify();
                             return;
                         }
-                        match DiffFile::parse(&text) {
-                            Err(err) => {
-                                let note = tf!("diff 解析失败：{message}", message = err.message());
-                                this.clear_compare_diff(Some(note.into()), cx);
-                            }
+                        match files {
+                            Err(note) => this.clear_compare_diff(Some(note), cx),
                             Ok(files) if files.is_empty() => {
                                 let note = match ws_note {
                                     Some(_) => tr("忽略空白后，此文件在两端没有差异"),
@@ -689,7 +800,7 @@ impl RepoView {
                             Ok(files) => {
                                 this.compare.diff_note = None;
                                 this.compare.ws_note = ws_note;
-                                this.compare.diff_text = text.into_owned();
+                                this.compare.diff_text = text.into();
                                 this.compare
                                     .diff
                                     .update(cx, |state, cx| state.set_files(files, cx));
@@ -697,8 +808,7 @@ impl RepoView {
                             }
                         }
                     }
-                    Ok(out) => this.clear_compare_diff(Some(failed(out.stderr)), cx),
-                    Err(err) => this.clear_compare_diff(Some(failed(format!("{err:#}"))), cx),
+                    Err(err) => this.clear_compare_diff(Some(failed(err)), cx),
                 }
                 cx.notify();
             })
@@ -1370,20 +1480,20 @@ impl RepoView {
                         let (dir, name) = (dir.trim_end_matches('/').to_string(), name.to_string());
                         let is_selected = self.compare.selected.as_deref() == Some(path.as_str());
                         let color = status_color(item.file.status, cx);
-                        let stats: AnyElement = match (item.untracked, item.file.lines) {
-                            (true, _) => div()
+                        let stats: AnyElement = match (&item.origin, item.file.lines) {
+                            (Origin::Untracked, _) => div()
                                 .flex_none()
                                 .text_size(px(11.))
                                 .text_color(muted)
                                 .child(tr("未跟踪"))
                                 .into_any_element(),
-                            (false, None) => div()
+                            (_, None) => div()
                                 .flex_none()
                                 .text_size(px(11.))
                                 .text_color(muted)
                                 .child(tr("二进制"))
                                 .into_any_element(),
-                            (false, Some((added, removed))) => h_flex()
+                            (_, Some((added, removed))) => h_flex()
                                 .flex_none()
                                 .gap(px(4.))
                                 .text_size(px(11.))
@@ -1395,13 +1505,16 @@ impl RepoView {
                             Some(orig) => format!("{orig} → {path}").into(),
                             None => path.clone().into(),
                         };
+                        // 根目录下、没改名的：提示里的全名就是行里的名字，只在名字被省略时弹
+                        let bare = dir.is_empty() && item.file.orig_path.is_none();
                         let row = h_flex()
                             .id(("compare-file", ix))
                             .h(px(ROW_HEIGHT))
                             .w_full()
                             .pl(indent(*depth))
                             .pr(px(10.))
-                            .gap(px(8.))
+                            // 树形里和本地修改一样：前面空出箭头那么宽，名字对着目录的名字
+                            .gap(px(if tree { 3. } else { 8. }))
                             .text_sm()
                             .cursor_pointer()
                             .when(is_selected, |row| row.bg(selected_bg))
@@ -1420,17 +1533,25 @@ impl RepoView {
                                     this.select_compare_file(path.clone(), cx);
                                 }
                             }))
+                            .when(tree, |row| {
+                                row.child(div().flex_none().w(px(file_tree::FILE_LEAD)))
+                            })
                             .child(file_tree::kind_badge(item.file.status.to_string(), color))
                             // 名字先占地方，放不下时省略中间；平铺时后面跟着目录
-                            .child(
-                                div()
+                            .child(match bare {
+                                true => ui::clipped(("compare-name", ix), name)
+                                    .flex_shrink(1.)
+                                    .text_ellipsis_middle()
+                                    .into_any_element(),
+                                false => div()
                                     .flex_shrink(1.)
                                     .min_w_0()
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis_middle()
-                                    .child(name),
-                            )
+                                    .child(ui::one_line(name))
+                                    .into_any_element(),
+                            })
                             .child(
                                 div()
                                     .flex_1()
@@ -1438,12 +1559,14 @@ impl RepoView {
                                     .truncate()
                                     .text_xs()
                                     .text_color(muted)
-                                    .when(!tree, |cell| cell.child(dir)),
+                                    .when(!tree, |cell| cell.child(ui::one_line(dir))),
                             )
                             .child(stats)
-                            .tooltip(move |window, cx| ui::tip(full.clone(), window, cx));
+                            .when(!bare, |row| {
+                                row.tooltip(move |window, cx| ui::tip(full.clone(), window, cx))
+                            });
                         // 没跟踪的文件没有历史可看
-                        Some(match item.untracked {
+                        Some(match item.origin == Origin::Untracked {
                             true => row.into_any_element(),
                             false => row
                                 .context_menu(self.tracked_file_menu(path, cx))
@@ -1676,7 +1799,7 @@ impl RepoView {
                             div()
                                 .flex_none()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .child(name.to_string()),
+                                .child(ui::one_line(name.to_string())),
                         )
                         .into_any_element(),
                 };
@@ -1813,7 +1936,7 @@ mod tests {
         assert!(!summary_fits(400., 200., (120., 180.)));
         // 名字太长的按上限算
         assert!(summary_fits(120. + END_MAX + 200., 200., (120., 400.)));
-        assert!(END_MIN < END_MAX);
+        const { assert!(END_MIN < END_MAX) };
     }
 
     #[test]

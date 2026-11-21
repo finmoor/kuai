@@ -1,7 +1,7 @@
 //! 替客户端连这台电脑配置的服务器（协议 10）。
 //!
-//! 别的电脑连着这台、打开的工作区里有这台配置的服务器上的仓库时（比如本机连 156，156 的工作区里
-//! 有 91 上的仓库），那台电脑不用配置 91：由这里起 ssh 连过去，ssh 的标准输入输出经客户端这条连接
+//! 别的电脑连着这台、打开的工作区里有这台配置的服务器上的仓库时（比如本机连 A，A 的工作区里
+//! 有 B 上的仓库），那台电脑不用配置 B：由这里起 ssh 连过去，ssh 的标准输入输出经客户端这条连接
 //! 来回转。客户端在上面做的和直接连一样：装 kuaid、启动转接程序、握手。
 //!
 //! 怎么连照这台电脑的 Kuai 的配置（[`Store::servers`]，跳板机也照它串起来）。要密码、口令时问
@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 
 use anyhow::{Context as _, Result};
-use fr_core::exec::Killer;
+use fr_core::exec::{Killer, Tree};
 use fr_core::hop::{self, Hop};
 use fr_core::protocol::Response;
 use fr_core::ssh;
@@ -42,9 +42,11 @@ pub fn command(
         .find(|(name, _)| name == fr_core::askpass::TAG_ENV)
         .map(|(_, tag)| tag.clone());
     let mut cmd = Command::new(ssh::program());
+    // 经这里转接的连接不自动回答存着的口令（客户端那边弹窗问），不用只限公钥
     cmd.args(ssh::login_args(
         target.identity_file.as_deref(),
         target.password_auth,
+        false,
         target.forward_agent,
         askpass,
     ));
@@ -60,6 +62,7 @@ pub fn command(
                 let mut args = ssh::login_args(
                     jump.identity_file.as_deref(),
                     jump.password_auth,
+                    false,
                     false,
                     askpass,
                 );
@@ -108,21 +111,15 @@ impl Relays {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         ssh::no_window(&mut cmd);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            // 自己一个进程组：结束时转接跳板机的那几层一起结束
-            cmd.process_group(0);
-        }
-        let mut child = cmd.spawn().context("无法启动 ssh")?;
-        let stdin = child.stdin.take().context("无法获取 ssh 的标准输入")?;
-        let stdout = child.stdout.take().context("无法获取 ssh 的标准输出")?;
-        let stderr = child.stderr.take().context("无法获取 ssh 的标准错误")?;
-        let child = Arc::new(Mutex::new(child));
+        // 结束时转接跳板机的那几层一起结束（见 [`Tree`]）
+        let (tree, pipes) = Tree::spawn(&mut cmd).context("无法启动 ssh")?;
+        let stdin = pipes.stdin.context("无法获取 ssh 的标准输入")?;
+        let stdout = pipes.stdout.context("无法获取 ssh 的标准输出")?;
+        let stderr = pipes.stderr.context("无法获取 ssh 的标准错误")?;
         let (input, inputs) = mpsc::channel();
         let relay = Relay {
             input,
-            killer: Killer::new(child.clone()),
+            killer: tree.killer(),
         };
         self.0.lock().unwrap().insert(id, relay);
 
@@ -148,13 +145,8 @@ impl Relays {
         std::thread::spawn(move || {
             pump(stdout, id, false, &out);
             let _ = errors.join();
-            // 输出都读完了才等：ssh 这时已经结束或者正在结束，不会一直占着锁（结束它也要这把锁）
-            let code = child
-                .lock()
-                .unwrap()
-                .wait()
-                .ok()
-                .and_then(|status| status.code());
+            // 输出都读完了才等：ssh 这时已经结束或者正在结束
+            let code = tree.wait().ok().and_then(|status| status.code());
             relays.0.lock().unwrap().remove(&id);
             let done = Response {
                 id,
@@ -188,9 +180,9 @@ impl Relays {
             .unwrap()
             .get(&id)
             .map(|relay| relay.killer.clone());
+        // 不会卡住读下一个请求：Windows 上要启动 taskkill，kill 放在别的线程里做
         if let Some(killer) = killer {
-            // Windows 上杀进程树要启动 taskkill，近一秒：不能卡住读下一个请求
-            std::thread::spawn(move || killer.kill());
+            killer.kill();
         }
     }
 
@@ -269,7 +261,7 @@ mod tests {
     #[test]
     fn 照这台的配置连_跳板机的密码也问发起的客户端() {
         let env = vec![(fr_core::askpass::TAG_ENV.to_string(), "c7".to_string())];
-        let helper = Path::new(r"C:\Users\Feng\.kuai\1.14.0-abc\kuaid.exe");
+        let helper = Path::new(r"C:\Users\me\.kuai\1.14.0-abc\kuaid.exe");
         let cmd = command(&store(), "s91", "true", &env, helper).unwrap();
         let list = args(&cmd);
         // 目标服务器用密码登录，命令在最后

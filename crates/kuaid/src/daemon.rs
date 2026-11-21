@@ -176,6 +176,7 @@ impl Control for Daemon {
         }
         log(&format!("升级：替换为 {}", exe.display()));
         shared.kill_git();
+        shared.terms.hold_opens();
         // 从这里起不再读终端的输出：程序写的东西留在伪终端里，新程序接着读
         let gate = pty::freeze();
         let (next_term, frozen) = shared.terms.freeze();
@@ -202,6 +203,7 @@ impl Control for Daemon {
         };
         let _ = std::fs::remove_file(&path);
         drop(gate);
+        shared.terms.release_opens();
         self.upgrading.store(false, Ordering::Release);
         log(&format!("升级失败：{failed:#}"));
         failed
@@ -209,19 +211,21 @@ impl Control for Daemon {
 
     fn shutdown(&self, shared: &Shared) -> ! {
         log("收到退出请求");
-        shared.terms.close_all();
-        // 等终端里的程序收到挂断退出
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while shared.terms.alive() > 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        // 等终端里的程序收到挂断退出，不理挂断的等它被强杀
+        shared.terms.close_all(Duration::from_secs(3));
         self.exit();
     }
 
     fn auth_sock(&self, path: &str) -> Option<String> {
-        // 终端里的 shell 会比这条 ssh 连接活得久：给它一个固定的地址，每次有连接带着转发来就改指过去
+        // 终端里的 shell 会比这条 ssh 连接活得久：给它一个固定的地址，每次有连接带着转发来就改指过去。
+        // 临时链接每次用新名字：几条连接同时来时不会抢同一个名字，有一条建不出来
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let link = self.paths.auth_sock();
-        let temp = self.paths.run.join(format!("auth.sock.{}", std::process::id()));
+        let temp = self
+            .paths
+            .run
+            .join(format!("auth.sock.{}.{n}", std::process::id()));
         let _ = std::fs::remove_file(&temp);
         std::os::unix::fs::symlink(path, &temp).ok()?;
         std::fs::rename(&temp, &link).ok()?;

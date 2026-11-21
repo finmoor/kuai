@@ -157,6 +157,72 @@ pub fn patch_args(
     Some(args)
 }
 
+/// 把磁盘上的文件存成 blob（`hash-object -w`，和 `git add` 一样先过 clean 过滤器），输出一行一个
+/// 哈希，顺序和 `paths` 一样。提交里有、工作区里取消了跟踪但文件还在（`git rm --cached`）时，
+/// git 的比较说它删了、工作区状态说它没跟踪：拿提交里的版本和存下来的这一份比（[`blob_patch_args`]）。
+pub fn store_args(paths: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = ["hash-object", "-w", "--"].map(String::from).to_vec();
+    args.extend(paths.iter().cloned());
+    args
+}
+
+/// 两个版本之间的补丁：`old`、`new` 是 `<提交>:<路径>` 或 blob 的哈希。补丁里 blob 的名字是哈希，
+/// 用 [`name_blob`] 换成路径。
+pub fn blob_patch_args(old: &str, new: &str) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "-U3",
+    ]
+    .map(String::from)
+    .to_vec();
+    args.extend([old.to_string(), new.to_string()]);
+    args
+}
+
+/// 两个版本之间增删了几行（`git diff --numstat`），用 [`parse_numstat`] 读。
+pub fn blob_numstat_args(old: &str, new: &str) -> Vec<String> {
+    let mut args: Vec<String> = ["diff", "--no-ext-diff", "--no-textconv", "--numstat"]
+        .map(String::from)
+        .to_vec();
+    args.extend([old.to_string(), new.to_string()]);
+    args
+}
+
+/// `增\t删\t…` 的增删行数；二进制文件（`-\t-`）没有。
+pub fn parse_numstat(out: &[u8]) -> Option<(u32, u32)> {
+    let text = String::from_utf8_lossy(out);
+    let mut parts = text.trim().splitn(3, '\t');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+/// 补丁头里 blob 的名字（`a/<哈希>`、`b/<哈希>`）换成路径。
+pub fn name_blob(patch: &[u8], blob: &str, path: &str) -> Vec<u8> {
+    let text = String::from_utf8_lossy(patch);
+    let mut out = String::with_capacity(text.len());
+    let mut in_header = true;
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("@@") {
+            in_header = false;
+        } else if line.starts_with("diff --git ") {
+            in_header = true;
+        }
+        match in_header {
+            true => out.push_str(
+                &line
+                    .replace(&format!("a/{blob}"), &format!("a/{path}"))
+                    .replace(&format!("b/{blob}"), &format!("b/{path}")),
+            ),
+            false => out.push_str(line),
+        }
+    }
+    out.into_bytes()
+}
+
 /// 工作区里没跟踪的文件：对比是工作区时显示成新文件，基准是工作区时显示成删掉的。
 /// 退出码 1 表示有差异，属于正常结果。
 pub fn untracked_patch_args(path: &str, worktree_is_base: bool) -> Vec<String> {
@@ -214,6 +280,43 @@ pub fn resolve_args(rev: &str) -> Vec<String> {
         "--quiet".into(),
         format!("{rev}^{{commit}}"),
     ]
+}
+
+#[cfg(test)]
+mod blob_tests {
+    use super::*;
+
+    #[test]
+    fn 提交里的版本和磁盘上取消了跟踪的文件比() {
+        let dir = std::env::temp_dir().join(format!("fr-compare-blob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| crate::git::run(&dir, args).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "core.autocrlf", "false"]);
+        std::fs::write(dir.join("x.txt"), "a\nb\nc\n").unwrap();
+        git(&["add", "x.txt"]);
+        git(&["commit", "-q", "-m", "c1"]);
+        git(&["rm", "-q", "--cached", "x.txt"]);
+        std::fs::write(dir.join("x.txt"), "a\nB\nc\nd\n").unwrap();
+        let args = store_args(&["x.txt".to_string()]);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let blob = String::from_utf8(git(&args)).unwrap().trim().to_string();
+        let numstat = blob_numstat_args("HEAD:x.txt", &blob);
+        let numstat: Vec<&str> = numstat.iter().map(String::as_str).collect();
+        assert_eq!(parse_numstat(&git(&numstat)), Some((2, 1)));
+        let patch = blob_patch_args("HEAD:x.txt", &blob);
+        let patch: Vec<&str> = patch.iter().map(String::as_str).collect();
+        let named = String::from_utf8(name_blob(&git(&patch), &blob, "x.txt")).unwrap();
+        assert!(named.starts_with("diff --git a/x.txt b/x.txt\n"), "{named}");
+        assert!(named.contains("+++ b/x.txt\n"));
+        assert!(named.contains("-b\n+B\n c\n+d\n"));
+        assert!(!named.contains(&blob));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(parse_numstat(b"-\t-\tx.bin\n"), None);
+    }
 }
 
 #[cfg(test)]

@@ -3,12 +3,15 @@
 看到的都是那个 kuaid 那边的东西。见 README.md「登录服务器的各种情况」。命令里没有 `--connect` 的
 （「测试连接」只问系统的那一条）不接 kuaid，答一行 `KUAID-MISSING Linux x86_64` 就结束。
 
-用法：python fake-sshd.py <主目录> <kuaid 程序> <端口> [--password-env 变量名] [--kbd] [--forward]
+用法：python fake-sshd.py <主目录> <kuaid 程序> <端口> [--password-env 变量名] [--kbd] [--pubkey 公钥文件]
+[--forward]
 设置文件里服务器的地址写 ssh://tester@127.0.0.1:<端口>。要装 paramiko。
 
 - 不带选项：谁登录都放行（none、publickey）。
 - `--password-env 变量名`：要密码，密码放在这个环境变量里（不出现在命令行上）；默认用 password
   方式问，加 `--kbd` 改用 keyboard-interactive（很多 Linux 服务器是这样）。登录结果记在输出里。
+- `--pubkey 公钥文件`：只认这把密钥（publickey），别的都不行。配上带口令的私钥，测存着的私钥口令
+  怎么自动回答。
 - `--forward`：当跳板机用：允许转接到 127.0.0.1 上的端口（`ssh -W` 要的 direct-tcpip）。
   两个实例一个当跳板机、一个当目标服务器，就能测经跳板机连接。
 - `<kuaid 程序>` 一般是本机编译的 `target/debug/kuaid.exe`（「服务器」就是 <主目录>）；也可以是
@@ -34,12 +37,15 @@ parser.add_argument('kuaid')
 parser.add_argument('port', type=int)
 parser.add_argument('--password-env')
 parser.add_argument('--kbd', action='store_true')
+parser.add_argument('--pubkey')
 parser.add_argument('--forward', action='store_true')
 ARGS = parser.parse_args()
 HOME, KUAID, PORT = os.path.abspath(ARGS.home), os.path.abspath(ARGS.kuaid), ARGS.port
 PASSWORD = os.environ.get(ARGS.password_env) if ARGS.password_env else None
 if ARGS.password_env and not PASSWORD:
     sys.exit(f'环境变量 {ARGS.password_env} 是空的')
+# 只认的那把公钥（OpenSSH 的 .pub 一行：类型 base64 注释），比的是 base64 那段
+PUBKEY = open(ARGS.pubkey, encoding='utf-8').read().split()[1] if ARGS.pubkey else None
 # 主机密钥存在主目录旁边，重启这个脚本还是同一把；每次现生成的话，ssh 第二次连接就报
 # 「主机密钥变了」，要先去 known_hosts 里删掉上一把
 KEY_FILE = HOME.rstrip('\\/') + '.host_key'
@@ -58,17 +64,23 @@ class Server(paramiko.ServerInterface):
         self.forwards = {}
 
     def get_allowed_auths(self, username):
+        if PUBKEY is not None:
+            return 'publickey'
         if PASSWORD is None:
             return 'none,publickey'
         return 'keyboard-interactive' if ARGS.kbd else 'password'
 
     def check_auth_none(self, username):
-        if PASSWORD is not None:
+        if PASSWORD is not None or PUBKEY is not None:
             return paramiko.AUTH_FAILED
         log('登录', username)
         return paramiko.AUTH_SUCCESSFUL
 
     def check_auth_publickey(self, username, key):
+        if PUBKEY is not None:
+            ok = key.get_base64() == PUBKEY
+            log('密钥登录', username, key.get_name(), '对' if ok else '不是那把')
+            return paramiko.AUTH_SUCCESSFUL if ok else paramiko.AUTH_FAILED
         return paramiko.AUTH_SUCCESSFUL if PASSWORD is None else paramiko.AUTH_FAILED
 
     def check_auth_password(self, username, password):

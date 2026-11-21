@@ -27,7 +27,8 @@ pub struct Commit {
 const FORMAT: &str = "--format=%H%x1f%P%x1f%an%x1f%at%x1f%D%x1f%s";
 
 /// `git log` 的参数：所有本地分支、远程分支、标签和 HEAD（不含 stash），按日期排序。
-/// 日期排序保证子提交总在父提交前面，提交图布局依赖这一点。
+/// 日期排序保证子提交总在父提交前面，提交图布局依赖这一点。最后的 `--` 把 HEAD 和路径分开：
+/// 仓库根目录里有个叫 HEAD 的文件时，git 分不清是哪个，整个历史读不出来。
 pub const LOG_ARGS: &[&str] = &[
     "log",
     "--branches",
@@ -37,6 +38,7 @@ pub const LOG_ARGS: &[&str] = &[
     "--date-order",
     "-z",
     FORMAT,
+    "--",
 ];
 
 /// [`LOG_ARGS`] 的 `String` 版，给通道接口用。
@@ -335,6 +337,12 @@ mod tests {
             subjects.sort();
             subjects
         };
+        assert_eq!(
+            subjects(&Scope::All, &[]),
+            ["base", "on main", "only on wip"]
+        );
+        // 根目录里有个叫 HEAD 的文件：不能把它当成路径
+        std::fs::write(dir.join("HEAD"), "x").unwrap();
         assert_eq!(
             subjects(&Scope::All, &[]),
             ["base", "on main", "only on wip"]

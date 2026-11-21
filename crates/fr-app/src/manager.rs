@@ -6,7 +6,7 @@
 //! 「连接」「编辑…」和 ⋯（映射目录到本机、移除）。下面是这台上的仓库：克隆、打开仓库（本机是添加本机
 //! 仓库）；每行写分支、改动数、在哪些工作区里（只显示）、已打开、终端个数，悬停出改显示名称、映射到
 //! 本机、从列表中移除。子仓库默认收着（列的是整台的仓库，全展开太长）。点仓库只开标签页，不碰工作区。
-//! 行的样子和工作区页一样，见 `repo_rows`。设计见 `design/server-workspace/`（第二版）。
+//! 行的样子和工作区页一样，见 `repo_rows`。设计见 `docs/design/server-workspace/`（第二版）。
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -271,7 +271,11 @@ impl ManagerView {
                         Auth::Key => read(&passphrase),
                         Auth::Password => read(&password),
                     };
-                    // 主机那一格里贴进整个 user@host:端口 的也认；单独填了的用户名、端口优先
+                    // 主机那一格里贴进整个 user@host:端口 的也认；单独填了的用户名、端口优先。
+                    // 解释不了的部分不悄悄丢掉，让用户改
+                    if !host.trim().is_empty() && !Target::well_formed(&host) {
+                        return Err(tr("主机地址格式不正确"));
+                    }
                     let mut target = Target::parse(&host);
                     if !user.trim().is_empty() {
                         target.user = user.trim().to_string();
@@ -332,9 +336,12 @@ impl ManagerView {
                         }
                     };
                     let auth = server.auth;
-                    // 存着的密码、口令：填了新的就换；没填、登录方式没变、也没点清除，就留着
-                    let keep = had_secret && auth == old.auth && !forget.get();
+                    // 存着的密码、口令：填了新的就换；没填、登录方式没变、也没点清除，就留着。密码只对
+                    // 原来的地址作数，口令只对原来的私钥文件作数：改了就不留，不然旧密码会自动交给新地址
+                    let bound = same_secret_binding(&old, &server);
+                    let keep = had_secret && auth == old.auth && bound && !forget.get();
                     let secret_changed = !secret.is_empty() || (had_secret && !keep);
+                    let unbound = had_secret && secret.is_empty() && auth == old.auth && !bound;
                     let account = server.destination.clone();
                     window.close_dialog(cx);
                     let (id, reconnect) = app.update(cx, |app, cx| {
@@ -354,6 +361,13 @@ impl ManagerView {
                         }
                     } else if had_secret && !keep {
                         crate::secrets::delete(&id);
+                        if unbound && !forget.get() {
+                            let text = match auth {
+                                Auth::Password => tr("地址已修改，原来保存的密码已清除，连接时需重新输入。"),
+                                Auth::Key => tr("私钥文件已修改，原来保存的口令已清除，连接时需重新输入。"),
+                            };
+                            window.push_notification(Notification::info(text), cx);
+                        }
                     }
                     if reconnect {
                         // 马上开始连接，结果显示在列表上
@@ -373,6 +387,7 @@ impl ManagerView {
             // 就用存着的；都没有就照常弹窗问。跳板机照它们自己存着的设置登录
             let run_test = {
                 let (collect, app, forget) = (collect.clone(), app.clone(), forget.clone());
+                let old = old.clone();
                 let (problem, test, test_run) = (problem.clone(), test.clone(), test_run.clone());
                 move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                     let (server, secret) = match collect(cx) {
@@ -385,7 +400,8 @@ impl ManagerView {
                         }
                     };
                     *problem.borrow_mut() = None;
-                    let keep = had_secret && server.auth == old_auth && !forget.get();
+                    let bound = same_secret_binding(&old, &server);
+                    let keep = had_secret && server.auth == old_auth && bound && !forget.get();
                     let mut options = crate::app_state::connect_options(&server);
                     options.forward_agent = false;
                     options.secret = match secret.is_empty() {
@@ -426,7 +442,7 @@ impl ManagerView {
                                 ),
                                 Ok(probe) => TestState::Failed(
                                     tf!(
-                                        "目前仅支持 Linux 和 Windows 服务器，该服务器为 {os}",
+                                        "目前仅支持 Linux 和 Windows 主机，该主机为 {os}",
                                         os = probe.os
                                     )
                                     .into(),
@@ -535,9 +551,9 @@ impl ManagerView {
                                     .on_click(pick_jump(None)),
                             );
                             if candidates.is_empty() {
-                                return menu.separator().label(tr("暂无其他已配置的服务器"));
+                                return menu.separator().label(tr("暂无其他已配置的主机"));
                             }
-                            menu = menu.separator().label(tr("经由已配置的服务器"));
+                            menu = menu.separator().label(tr("经由已配置的主机"));
                             for choice in candidates.iter() {
                                 let (name, destination) =
                                     (choice.name.clone(), choice.destination.clone());
@@ -566,7 +582,7 @@ impl ManagerView {
             let route_line = chosen.as_ref().map(|choice| {
                 let typed = Target::parse(host.read(cx).value().as_ref()).host;
                 let target: SharedString = if typed.is_empty() {
-                    tr("目标服务器").into()
+                    tr("目标主机").into()
                 } else {
                     typed.into()
                 };
@@ -607,9 +623,9 @@ impl ManagerView {
             let mapping_section = editing.then(|| crate::mapping::section(&app, &old, cx));
             dialog
                 .title(if editing {
-                    tr("编辑服务器")
+                    tr("编辑主机")
                 } else {
-                    tr("添加服务器")
+                    tr("添加主机")
                 })
                 // 回车等于点确定；关不关对话框由 submit 自己决定
                 .on_ok({
@@ -631,7 +647,7 @@ impl ManagerView {
                                     div()
                                         .flex_1()
                                         .min_w_0()
-                                        .child(field(tr("主机"), Input::new(&host))),
+                                        .child(field(tr("主机地址"), Input::new(&host))),
                                 )
                                 .child(
                                     div()
@@ -695,7 +711,7 @@ impl ManagerView {
                         )
                         .child(
                             Checkbox::new("forward-agent")
-                                .label(tr("转发本机的 ssh-agent（仅对受信任的服务器启用）"))
+                                .label(tr("转发本机的 ssh-agent（仅对受信任的主机启用）"))
                                 .checked(forward_agent.get())
                                 .on_click({
                                     let forward_agent = forward_agent.clone();
@@ -747,11 +763,11 @@ impl ManagerView {
                         // 这句说的是上面的登录信息，紧跟着它们；映射是单独的一节，放在最后
                         .child(div().text_xs().text_color(muted).child(if jump_now.is_some() {
                             tr(
-                                "密码和私钥口令保存在 Windows 凭据管理器中。首次连接时在服务器的 ~/.kuai/ 中安装 kuaid，跳板机上不安装。",
+                                "密码和私钥口令保存在 Windows 凭据管理器中。首次连接时在主机的 ~/.kuai/ 中安装 kuaid，跳板机上不安装。",
                             )
                         } else {
                             tr(
-                                "密码和私钥口令保存在 Windows 凭据管理器中。首次连接时在服务器的 ~/.kuai/ 中安装 kuaid。",
+                                "密码和私钥口令保存在 Windows 凭据管理器中。首次连接时在主机的 ~/.kuai/ 中安装 kuaid。",
                             )
                         }))
                         .children(mapping_section),
@@ -883,7 +899,16 @@ impl ManagerView {
     }
 }
 
-/// 经服务器连的（服务器页上它的名字后面）：「经由 156」。
+/// 经服务器连的（服务器页上它的名字后面）：「经由 A」。
+/// 存着的密码、口令还能不能给改过的设置用：密码只对原来的地址（用户、主机、端口）作数，私钥口令
+/// 只对原来的私钥文件作数。
+fn same_secret_binding(old: &Server, new: &Server) -> bool {
+    match new.auth {
+        Auth::Password => new.destination == old.destination,
+        Auth::Key => new.identity_file == old.identity_file,
+    }
+}
+
 fn relay_tag(key: &str, via: SharedString, tip: SharedString, colors: Colors) -> AnyElement {
     name_tag(
         format!("relay:{key}"),
@@ -1355,6 +1380,7 @@ impl ManagerView {
         v_flex()
             .w(px(width))
             .flex_none()
+            .relative()
             .h_full()
             .bg(panel)
             .border_r_1()
@@ -1383,10 +1409,9 @@ impl ManagerView {
                             .flex_1()
                             .min_w_0()
                             .child(
-                                div()
+                                ui::clipped("servers-title", trc("页面", "主机"))
                                     .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(trc("页面", "服务器")),
+                                    .font_weight(FontWeight::SEMIBOLD),
                             )
                             .child(
                                 ui::clipped("servers-summary", summary)
@@ -1417,12 +1442,13 @@ impl ManagerView {
                             .small()
                             .w_full()
                             .icon(ui::icon(IconName::Plus))
-                            .label(tr("添加服务器…"))
+                            .label(tr("添加主机…"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.server_dialog(None, window, cx)
                             })),
                     ),
             )
+            .child(crate::side_split::handle("servers-side-split", &self.app))
             .into_any_element()
     }
 
@@ -1454,13 +1480,13 @@ impl ManagerView {
                 format!("tag-jump:{key}"),
                 None,
                 tr("跳板机").into(),
-                tf!("经此服务器连接：{names}", names = users.join("、")).into(),
+                tf!("经此主机连接：{names}", names = users.join(tr("、"))).into(),
                 false,
                 colors,
             ));
             removal_note = tf!(
-                "{names} 经此服务器连接，移除后改为直接连接，需重新选择跳板机。\n",
-                names = users.join("、")
+                "{names} 经此主机连接，移除后改为直接连接，需重新选择跳板机。\n",
+                names = users.join(tr("、"))
             );
         }
         if !route.is_empty() {
@@ -1640,6 +1666,7 @@ impl ManagerView {
     fn repo_chips(&self, entry: &RepoEntry, colors: Colors, cx: &App) -> Vec<AnyElement> {
         let app = self.app.read(cx);
         let secondary = cx.theme().secondary;
+        let hues = app.workspace_hues();
         let mut chips: Vec<AnyElement> = Vec::new();
         let mut machines: Vec<&String> = app.machines.keys().collect();
         machines.sort_by_key(|key| (key.as_str() != LOCAL, key.as_str()));
@@ -1658,6 +1685,9 @@ impl ManagerView {
                     .into(),
                 };
                 let id = format!("ws-chip:{}:{}:{}", key.machine, key.id, entry.path);
+                let hue = hues
+                    .get(&key)
+                    .map_or(colors.muted, |slot| ui::hue(*slot, cx));
                 chips.push(
                     h_flex()
                         .id(ElementId::Name(id.into()))
@@ -1670,7 +1700,8 @@ impl ManagerView {
                         .bg(secondary)
                         .text_size(px(11.))
                         .text_color(colors.muted)
-                        .child(Icon::new(IconName::Layers).size_3().flex_none())
+                        // 工作区的色块：和工作区页、终端页同一个颜色
+                        .child(ui::hue_mark(hue, 6.))
                         .child(div().min_w_0().truncate().child(name))
                         .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
                         .into_any_element(),
@@ -1771,7 +1802,7 @@ impl ManagerView {
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(fg)
-                    .child(tr("尚未连接此服务器")),
+                    .child(tr("尚未连接此主机")),
             )
             .child(div().text_xs().child(tr("连接后显示其中的仓库和工作区。")))
             .child(
@@ -1901,7 +1932,7 @@ impl ManagerView {
                     offline: !live,
                     folded: !app.settings.unfolded_subs.contains(entry),
                     open: open.clone(),
-                    terms: crate::workspace_page::terminal_summary(board, entry, cx),
+                    terms: crate::workspace_page::terminal_summary(board, entry),
                     chips: self.repo_chips(entry, colors, cx),
                 }
             };
@@ -1974,8 +2005,8 @@ impl ManagerView {
                 .text_color(colors.muted)
                 .child(match (local, jump_only) {
                     (true, _) => tr("暂无本机仓库。请点击「添加本机仓库…」或「克隆…」。"),
-                    (false, true) => tr("仅用作跳板机，暂无此服务器上的仓库。"),
-                    (false, false) => tr("暂无此服务器上的仓库。请点击「打开仓库…」选择。"),
+                    (false, true) => tr("仅用作跳板机，暂无此主机上的仓库。"),
+                    (false, false) => tr("暂无此主机上的仓库。请点击「打开仓库…」选择。"),
                 })
         });
         v_flex()
@@ -1997,7 +2028,7 @@ impl ManagerView {
             .small()
             .ghost()
             .icon(ui::icon(IconName::Ellipsis))
-            .tooltip(tr("映射或移除此服务器"))
+            .tooltip(tr("映射或移除此主机"))
             .dropdown_menu(move |menu, _, _| {
                 let (app, remove) = (menu_app.clone(), server.clone());
                 let removal_note = removal_note.clone();
@@ -2021,20 +2052,20 @@ impl ManagerView {
                         // 仓库列表保存在服务器上，不跟着没；这里只是不再连它
                         let repos = match repo_count {
                             Some(n) if n > 0 => tf!(
-                                "该服务器上的 {n} 个仓库将不再列出，已打开的标签页将关闭。",
+                                "该主机上的 {n} 个仓库将不再列出，已打开的标签页将关闭。",
                                 n = n
                             ),
                             _ => String::new(),
                         };
                         confirm(
-                            tf!("移除服务器 {name}？", name = remove.name),
+                            tf!("移除主机 {name}？", name = remove.name),
                             tf!(
-                                "{destination}\n{jump}{repos}服务器上的内容不受影响。",
+                                "{destination}\n{jump}{repos}主机上的内容不受影响。",
                                 destination = remove.destination,
                                 jump = &removal_note,
                                 repos = repos
                             ),
-                            tr("移除服务器"),
+                            tr("移除主机"),
                             true,
                             window,
                             cx,
@@ -2071,36 +2102,47 @@ impl Render for ManagerView {
             viewport < crate::repo_rows::COMPACT_BELOW,
             cx,
         );
-        h_flex().size_full().bg(background).child(side).child(
-            div()
-                .id("server-main")
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .overflow_y_scroll()
-                .child(
-                    // 窗口宽的时候内容居中，不然右边空一大块
-                    v_flex()
-                        .w_full()
-                        .max_w(px(960.))
-                        .mx_auto()
-                        .px(px(28.))
-                        .py(px(24.))
-                        .gap(px(16.))
-                        .child(head)
-                        .children(failure.map(|failure| {
-                            div()
-                                .px(px(14.))
-                                .py(px(8.))
-                                .rounded(px(8.))
-                                .bg(colors.danger.opacity(0.08))
-                                .text_xs()
-                                .text_color(colors.danger)
-                                .whitespace_normal()
-                                .child(failure)
-                        }))
-                        .child(repos),
-                ),
-        )
+        h_flex()
+            .size_full()
+            .bg(background)
+            // 拖左边那一栏的分隔条，见 side_split
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<crate::side_split::DragSide>, window, cx| {
+                    crate::side_split::drag(&this.app, event, window, cx);
+                    cx.notify();
+                },
+            ))
+            .child(side)
+            .child(
+                div()
+                    .id("server-main")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .child(
+                        // 窗口宽的时候内容居中，不然右边空一大块
+                        v_flex()
+                            .w_full()
+                            .max_w(px(960.))
+                            .mx_auto()
+                            .px(px(28.))
+                            .py(px(24.))
+                            .gap(px(16.))
+                            .child(head)
+                            .children(failure.map(|failure| {
+                                div()
+                                    .px(px(14.))
+                                    .py(px(8.))
+                                    .rounded(px(8.))
+                                    .bg(colors.danger.opacity(0.08))
+                                    .text_xs()
+                                    .text_color(colors.danger)
+                                    .whitespace_normal()
+                                    .child(failure)
+                            }))
+                            .child(repos),
+                    ),
+            )
     }
 }

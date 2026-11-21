@@ -45,6 +45,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
@@ -59,7 +60,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::tty::{self, Options, Shell};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor};
-use fr_channel::{Connection, TermItem, TermStream, UploadItem, UploadSource};
+use fr_channel::{Connection, TermItem, TermStream, UploadItem};
 use fr_core::i18n::tr;
 use fr_core::tf;
 use futures::channel::mpsc;
@@ -83,11 +84,12 @@ const MIN_WATCH_FONT: f32 = 8.;
 /// 服务器上终端会话的名字里，仓库路径和序号之间的分隔符（路径里不会有的一个控制字符）
 const KEY_SEPARATOR: char = '\u{1f}';
 
-/// 仓库的第 `number` 个终端在 kuaid 里的会话名字。第 1 个就是仓库路径（1.5 只有一个终端时
-/// 用的就是它，升上来以后接得上），之后的在后面加分隔符和序号。
+/// 请 kuaid 结束一个终端的请求（已经发出去了，等的是它的回答）。
+pub type Closing = futures::future::BoxFuture<'static, anyhow::Result<()>>;
+
 /// 显示终端的标题：Windows 上 shell 刚启动时标题是它自己的完整路径
 /// （`C:\Program Files\PowerShell\7\pwsh.exe`），只留程序名（`pwsh`，不带 `.exe`），别的照原样。
-/// 仓库的终端页、终端页、终端标签页、停下的提醒都这样写。
+/// 仓库的终端页、终端页、停下的提醒都这样写。
 pub fn short_title(title: &str) -> SharedString {
     let is_program_path = title.to_lowercase().ends_with(".exe") && title.contains(['\\', '/']);
     match title.rsplit(['\\', '/']).next() {
@@ -97,6 +99,8 @@ pub fn short_title(title: &str) -> SharedString {
     }
 }
 
+/// 仓库的第 `number` 个终端在 kuaid 里的会话名字。第 1 个就是仓库路径（1.5 只有一个终端时
+/// 用的就是它，升上来以后接得上），之后的在后面加分隔符和序号。
 pub fn session_key(repo: &str, number: u32) -> String {
     match number {
         0 | 1 => repo.to_string(),
@@ -169,15 +173,39 @@ enum Feed {
     Exited(Option<i32>),
     /// 和服务器的连接断了（终端里的程序还在跑）
     Lost(String),
+    /// 输出处理不过来、积压太多，流断了（见 [`TermItem::Lagging`]，终端里的程序还在跑）
+    Lagging,
 }
 
-/// 把仿真器的事件送回界面线程。
+/// 把仿真器的事件送回界面线程。「有新内容」只在上一个还没处理时不送：输出来得再快，排着的也
+/// 只有一个，界面线程不会被一长串一样的唤醒占住（画面本来就是一帧画一次，画的是那时的内容）。
 #[derive(Clone)]
-struct Proxy(mpsc::UnboundedSender<Feed>);
+struct Proxy {
+    tx: mpsc::UnboundedSender<Feed>,
+    /// 有一个「有新内容」送出去了、界面还没处理（见 [`Session::deliver`]）
+    woken: Arc<AtomicBool>,
+}
+
+impl Proxy {
+    fn new() -> (Proxy, mpsc::UnboundedReceiver<Feed>) {
+        let (tx, rx) = mpsc::unbounded();
+        let woken = Arc::new(AtomicBool::new(false));
+        (Proxy { tx, woken }, rx)
+    }
+
+    /// 送一件事给界面。界面那头没了返回假。
+    fn send(&self, feed: Feed) -> bool {
+        if matches!(feed, Feed::Term(TermEvent::Wakeup)) && self.woken.swap(true, Ordering::AcqRel)
+        {
+            return !self.tx.is_closed();
+        }
+        self.tx.unbounded_send(feed).is_ok()
+    }
+}
 
 impl EventListener for Proxy {
     fn send_event(&self, event: TermEvent) {
-        let _ = self.0.unbounded_send(Feed::Term(event));
+        self.send(Feed::Term(event));
     }
 }
 
@@ -254,8 +282,8 @@ impl Session {
         cell: Size<Pixels>,
         cx: &mut Context<TerminalView>,
     ) -> std::io::Result<Self> {
-        let (tx, rx) = mpsc::unbounded();
-        let proxy = Proxy(tx);
+        let (proxy, rx) = Proxy::new();
+        let woken = proxy.woken.clone();
         let term = Term::new(prefs::config(&prefs::get(cx)), &grid, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
         let mut env: HashMap<String, String> = launch.env.into_iter().collect();
@@ -284,30 +312,50 @@ impl Session {
                 sender,
                 _keep: launch.keep,
             },
-            _events: Self::deliver(rx, cx),
+            _events: Self::deliver(rx, woken, cx),
         })
     }
 
     /// 接上开在 kuaid 里的终端：请 kuaid 接上（或者新开）名字是 `key` 的会话，它的输出喂给这里的
-    /// 仿真器。
+    /// 仿真器。给了 `id` 就只按编号接那一个，不在了也不新开。
+    #[allow(clippy::too_many_arguments)]
     fn attach(
         conn: Arc<Connection>,
         key: &str,
         cwd: &str,
         shell: &[String],
+        id: Option<&str>,
         grid: Grid,
         cell: Size<Pixels>,
         cx: &mut Context<TerminalView>,
     ) -> Self {
-        let (tx, rx) = mpsc::unbounded();
-        let term = Term::new(prefs::config(&prefs::get(cx)), &grid, Proxy(tx.clone()));
+        let (cols, rows) = (grid.cols as u16, grid.rows as u16);
+        let stream = match id {
+            Some(id) => conn.term_attach(id, cols, rows),
+            None => conn.term_open(key, cwd, shell, cols, rows),
+        };
+        Self::remote(conn, stream, id.map(str::to_string), grid, cell, cx)
+    }
+
+    /// 把 kuaid 里一个终端的输出流 `stream` 喂给这里新建的仿真器。`id` 是会话的编号（按名字开的
+    /// 要等 kuaid 回话才知道）。
+    fn remote(
+        conn: Arc<Connection>,
+        stream: TermStream,
+        id: Option<String>,
+        grid: Grid,
+        cell: Size<Pixels>,
+        cx: &mut Context<TerminalView>,
+    ) -> Self {
+        let (proxy, rx) = Proxy::new();
+        let woken = proxy.woken.clone();
+        let term = Term::new(prefs::config(&prefs::get(cx)), &grid, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
-        let stream = conn.term_open(key, cwd, shell, grid.cols as u16, grid.rows as u16);
         let executor = cx.background_executor().clone();
         // 解析输出放在后台：大段输出不卡界面
         let pump = cx
             .background_executor()
-            .spawn(pump(stream, term.clone(), tx, executor));
+            .spawn(pump(stream, term.clone(), proxy, executor));
         Self {
             term,
             grid,
@@ -315,11 +363,28 @@ impl Session {
             link: Link::Remote {
                 local: conn.local,
                 conn,
-                term: RefCell::new(None),
+                term: RefCell::new(id),
                 _pump: pump,
             },
-            _events: Self::deliver(rx, cx),
+            _events: Self::deliver(rx, woken, cx),
         }
+    }
+
+    /// 输出处理不过来、流断了（见 [`Feed::Lagging`]）：按编号重新接上同一个终端，换一个新的仿真器，
+    /// 从 kuaid 给的现在的屏幕接着。`watch` 是只看的接法（见 [`Self::view`]）。
+    fn resync(&mut self, watch: bool, cx: &mut Context<TerminalView>) {
+        let Link::Remote { conn, term, .. } = &self.link else {
+            return;
+        };
+        let Some(id) = term.borrow().clone() else {
+            return;
+        };
+        let conn = conn.clone();
+        let stream = match watch {
+            true => conn.term_view(&id),
+            false => conn.term_attach(&id, self.grid.cols as u16, self.grid.rows as u16),
+        };
+        *self = Self::remote(conn, stream, Some(id), self.grid, self.cell, cx);
     }
 
     /// 接上 kuaid 里编号是 `id` 的终端，用「只看」的接法（`term_attach` 带 `watch`）：不改它的大小，
@@ -331,33 +396,30 @@ impl Session {
         cell: Size<Pixels>,
         cx: &mut Context<TerminalView>,
     ) -> Self {
-        let (tx, rx) = mpsc::unbounded();
-        let term = Term::new(prefs::config(&prefs::get(cx)), &grid, Proxy(tx.clone()));
-        let term = Arc::new(FairMutex::new(term));
         let stream = conn.term_view(id);
-        let executor = cx.background_executor().clone();
-        let pump = cx
-            .background_executor()
-            .spawn(pump(stream, term.clone(), tx, executor));
-        Self {
-            term,
-            grid,
-            cell,
-            link: Link::Remote {
-                local: conn.local,
-                conn,
-                term: RefCell::new(Some(id.to_string())),
-                _pump: pump,
-            },
-            _events: Self::deliver(rx, cx),
-        }
+        Self::remote(conn, stream, Some(id.to_string()), grid, cell, cx)
     }
 
-    /// 把后台送来的事交给界面线程上的视图。
-    fn deliver(mut rx: mpsc::UnboundedReceiver<Feed>, cx: &mut Context<TerminalView>) -> Task<()> {
+    /// 把后台送来的事交给界面线程上的视图。攒着的一次交过去（一次更新）。
+    fn deliver(
+        mut rx: mpsc::UnboundedReceiver<Feed>,
+        woken: Arc<AtomicBool>,
+        cx: &mut Context<TerminalView>,
+    ) -> Task<()> {
         cx.spawn(async move |this, cx| {
             while let Some(feed) = rx.next().await {
-                if this.update(cx, |this, cx| this.on_feed(feed, cx)).is_err() {
+                let mut feeds = vec![feed];
+                while let Ok(feed) = rx.try_recv() {
+                    feeds.push(feed);
+                }
+                // 先放下「排着」再处理：处理的时候又来了新内容的，会再送一个
+                woken.store(false, Ordering::Release);
+                let delivered = this.update(cx, |this, cx| {
+                    for feed in feeds {
+                        this.on_feed(feed, cx);
+                    }
+                });
+                if delivered.is_err() {
                     break;
                 }
             }
@@ -428,11 +490,11 @@ impl Drop for Session {
 async fn pump(
     mut stream: TermStream,
     term: Arc<FairMutex<Term<Proxy>>>,
-    tx: mpsc::UnboundedSender<Feed>,
+    proxy: Proxy,
     executor: BackgroundExecutor,
 ) {
     let mut parser: Processor = Processor::new();
-    let send = |feed: Feed| tx.unbounded_send(feed).is_ok();
+    let send = |feed: Feed| proxy.send(feed);
     loop {
         // 程序开了「同步刷新」（攒着一起画）又迟迟不结束：到时间就画出来
         let item = match parser.sync_timeout().sync_timeout() {
@@ -459,6 +521,10 @@ async fn pump(
             }
             Some(Ok(TermItem::Exited(code))) => {
                 send(Feed::Exited(code));
+                false
+            }
+            Some(Ok(TermItem::Lagging)) => {
+                send(Feed::Lagging);
                 false
             }
             Some(Err(err)) => {
@@ -519,6 +585,8 @@ pub struct TerminalView {
     lost: bool,
     /// 这是 kuaid 里留着的终端（上次没结束），还没接上：也算有东西在跑
     restored: bool,
+    /// 第一次接上时按这个编号接（列表里看到的那个会话，见 [`Self::attach_to`]），不按名字开
+    attach: Option<String>,
     /// 这是这台电脑上的终端（开在本机的 kuaid 里，或者退回到 Kuai 进程里）：提示里不说「服务器」
     local: bool,
     /// 在本机的 kuaid 里开过（或者本来就是留在那里的）：之后 kuaid 连不上时不能改开在 Kuai 进程里，
@@ -569,7 +637,7 @@ impl TerminalView {
     /// - 用「只看」的接法，不改那个终端的大小：按它自己的行列数画，地方不够就把字缩小。它改了大小
     ///   要重新建一个（见 [`Self::size`]）。只看一眼不改大小，是因为一改里面的程序就要重画（Claude
     ///   Code 会把整段对话重画一遍）。焦点进来、开始往里输入以后例外：大小改成这边画面放得下的（见
-    ///   [`Self::claim`]），不然窗口变大以后四周一直空着（2026-11-19 Feng 在终端页里用 OpenCode 时报的）。
+    ///   [`Self::claim`]），不然窗口变大以后四周一直空着。
     /// - 键盘、输入法、粘贴、鼠标、发文件和平常一样，都写得进去。
     /// - 仿真器要回答程序的话（问光标位置、颜色、终端大小）不发：那些由正经接着它的那一头或者
     ///   kuaid 回答，这里再答就重了。
@@ -650,6 +718,7 @@ impl TerminalView {
             exited: None,
             lost: false,
             restored: false,
+            attach: None,
             local: false,
             hosted: false,
             sending: None,
@@ -725,6 +794,13 @@ impl TerminalView {
         self.hosted = true;
     }
 
+    /// 第一次接上时按 kuaid 给的编号接（`term_attach`），不按名字开。接回列表里看到的终端用：
+    /// 它刚在别处结束、列表还没跟上的那一会儿，按名字开就是新开一个 shell；按编号接，不在了就
+    /// 接不上（显示已断开），列表跟上以后那一行自己去掉。之后断开重连、重启还是按名字。
+    pub fn attach_to(&mut self, term: String) {
+        self.attach = Some(term);
+    }
+
     /// 里面的程序开在 Kuai 进程里：关掉标签页要另外保管，退出 Kuai 它就结束。
     pub fn in_process(&self) -> bool {
         self.session.as_ref().is_some_and(Session::in_process)
@@ -743,39 +819,67 @@ impl TerminalView {
         }
     }
 
-    /// 别处把这个终端重启了（同一个名字，kuaid 里换了一个会话）：丢掉手上这个已经结束的，下一帧
-    /// 接上新的。
-    pub fn reattach(&mut self, cx: &mut Context<Self>) {
+    /// 还没接上、等着按编号接的那个会话（见 [`Self::attach_to`]）。
+    pub fn pending(&self) -> Option<String> {
+        self.attach.clone()
+    }
+
+    /// 接着的那台电脑的 kuaid 的连接：开在 Kuai 进程里的、还没接上的是 None。
+    pub fn conn(&self) -> Option<Arc<Connection>> {
+        match &self.session.as_ref()?.link {
+            Link::Remote { conn, .. } => Some(conn.clone()),
+            Link::Local { .. } => None,
+        }
+    }
+
+    /// 别处把这个终端重启了（同一个名字，kuaid 里换了一个会话 `term`）：丢掉手上这个已经结束的，
+    /// 下一帧按编号接上新的。按名字开的话，新的那个要是也已经没了，就成了自己新开一个 shell。
+    pub fn reattach(&mut self, term: String, cx: &mut Context<Self>) {
         if self.launcher.is_some() {
+            self.attach = Some(term);
             self.reopen(cx);
         }
     }
 
-    /// 结束里面的进程，重新开一个（下一帧知道大小了再启动）。
-    pub fn restart(&mut self, cx: &mut Context<Self>) {
-        self.kill(cx);
+    /// 结束里面的进程，重新开一个（下一帧知道大小了再启动）。kuaid 里的会话要等它关掉了再开，
+    /// 不然按名字开接上的还是它；`closing` 是调用的另外去关的（还没接上的终端 [`Self::kill`]
+    /// 关不了，见仓库终端页的 `close_unattached`）。关不掉就不开，说一声，按 Enter 再试。
+    pub fn restart(&mut self, closing: Option<Closing>, cx: &mut Context<Self>) {
+        let closing = self.kill().or(closing);
         self.reopen(cx);
+        let Some(closing) = closing else {
+            return;
+        };
+        self.connecting = Some(cx.spawn(async move |this, cx| {
+            let closed = closing.await;
+            this.update(cx, |this, cx| {
+                this.connecting = None;
+                if let Err(err) = closed {
+                    let err = format!("{err:#}");
+                    this.error = Some(tf!("终端重启失败：{err}", err).into());
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
-    /// 结束里面的进程。开在 Kuai 进程里的丢掉会话就结束了；开在 kuaid 里的要告诉它，不然接着跑。
-    pub fn kill(&mut self, cx: &mut Context<Self>) {
-        if let Some(Session {
-            link: Link::Remote { conn, term, .. },
-            ..
-        }) = &self.session
-            && let Some(term) = term.borrow().clone()
-        {
-            let closing = conn.term_close(&term);
-            cx.background_executor()
-                .spawn(async move {
-                    let _ = closing.await;
-                })
-                .detach();
-        }
+    /// 结束里面的进程。开在 Kuai 进程里的丢掉会话就结束了；开在 kuaid 里的要告诉它，不然接着跑：
+    /// 返回这个请求，结果由调用的去等（失败时界面上要说一声）。还没接上的不再按编号接。
+    pub fn kill(&mut self) -> Option<Closing> {
+        let closing = match &self.session {
+            Some(Session {
+                link: Link::Remote { conn, term, .. },
+                ..
+            }) => term.borrow().as_deref().map(|term| conn.term_close(term)),
+            _ => None,
+        };
         self.session = None;
+        self.attach = None;
         self.restored = false;
         self.hosted = false;
         self.sending = None;
+        closing
     }
 
     /// 丢掉现在的会话，下一帧重新开：开在 Kuai 进程里的是新的进程；kuaid 里有同名的会话就接上它
@@ -842,7 +946,17 @@ impl TerminalView {
                 match (connected, fallback) {
                     (Ok(conn), _) => {
                         this.hosted |= conn.local;
-                        let session = Session::attach(conn, &key, &cwd, &shell, grid, cell, cx);
+                        let attach = this.attach.take();
+                        let session = Session::attach(
+                            conn,
+                            &key,
+                            &cwd,
+                            &shell,
+                            attach.as_deref(),
+                            grid,
+                            cell,
+                            cx,
+                        );
                         this.session = Some(session);
                     }
                     // 本机的 kuaid 用不了：这个终端还没在它里面开过，就开在 Kuai 进程里
@@ -859,7 +973,7 @@ impl TerminalView {
                         this.error = Some(tf!("无法连接 kuaid：{err}", err).into());
                     }
                     (Err(err), None) => {
-                        this.error = Some(tf!("无法连接服务器：{err}", err).into());
+                        this.error = Some(tf!("无法连接主机：{err}", err).into());
                     }
                 }
                 cx.notify();
@@ -891,6 +1005,16 @@ impl TerminalView {
                     log::warn!("终端和 kuaid 断开了：{reason}");
                 }
                 self.lost = true;
+            }
+            // 画面换成新接上的；正在发的文件、输入法正在组的字不动（还是同一个终端）
+            Feed::Lagging => {
+                log::warn!("终端输出积压过多，重新接上");
+                if let Some(session) = &mut self.session {
+                    session.resync(self.watch.is_some(), cx);
+                }
+                self.title = None;
+                self.selecting = false;
+                self.scroll_rest = 0.;
             }
         }
         cx.notify();
@@ -1027,17 +1151,11 @@ impl TerminalView {
             self.input(keys::paste(&text, bracketed), cx);
             return;
         }
+        // 图片转格式（截图的位图转成 PNG）在发的时候放到后台做
         if files.is_empty()
             && let Some(image) = image
         {
-            match attach::image_attachment(image, chrono::Local::now()) {
-                Ok(image) => files.push(image),
-                Err(err) => {
-                    self.flash = Some(err.into());
-                    cx.notify();
-                    return;
-                }
-            }
+            files.push(attach::image_attachment(image, chrono::Local::now()));
         }
         self.send(files, cx);
     }
@@ -1088,7 +1206,7 @@ impl TerminalView {
         let task = match &session.link {
             Link::Local { .. } | Link::Remote { local: true, .. } => {
                 cx.spawn(async move |this, cx| {
-                    // 存图片要写文件，放到后台
+                    // 图片要转格式、写文件，放到后台
                     let prepared = cx
                         .background_spawn(async move { attach::local_paths(items) })
                         .await;
@@ -1106,18 +1224,25 @@ impl TerminalView {
             Link::Remote { conn, .. } => {
                 let conn = conn.clone();
                 cx.spawn(async move |this, cx| {
+                    // 图片转格式、看是不是文件夹放到后台
+                    let prepared = cx
+                        .background_spawn(async move { attach::uploads(items) })
+                        .await;
+                    let (uploads, folder) = match prepared {
+                        Ok(prepared) => prepared,
+                        Err(err) => {
+                            this.update(cx, |this, cx| {
+                                this.sending = None;
+                                this.flash = Some(err.into());
+                                cx.notify();
+                            })
+                            .ok();
+                            return;
+                        }
+                    };
                     let mut paths = Vec::new();
                     let mut failed: Option<SharedString> = None;
-                    for (index, item) in items.into_iter().enumerate() {
-                        let name = item.name();
-                        let source = match item {
-                            Attachment::File(path) if path.is_dir() => {
-                                failed = Some(tf!("无法发送文件夹，请先压缩：{name}", name).into());
-                                break;
-                            }
-                            Attachment::File(path) => UploadSource::File(path),
-                            Attachment::Image { bytes, .. } => UploadSource::Bytes(bytes),
-                        };
+                    for (index, (name, source)) in uploads.into_iter().enumerate() {
                         let shown = SharedString::from(name.clone());
                         let begun = this.update(cx, |this, cx| {
                             if let Some(sending) = &mut this.sending {
@@ -1155,11 +1280,17 @@ impl TerminalView {
                             Some(path) => paths.push(path),
                             None => {
                                 failed.get_or_insert_with(|| {
-                                    tf!("{name} 上传失败：与服务器的连接已断开", name).into()
+                                    tf!("{name} 上传失败：与主机的连接已断开", name).into()
                                 });
                                 break;
                             }
                         }
+                    }
+                    // 文件夹前面的都传上去了才说文件夹（中途有没传上去的，说的是那一个）
+                    if failed.is_none()
+                        && let Some(name) = folder
+                    {
+                        failed = Some(tf!("无法发送文件夹，请先压缩：{name}", name).into());
                     }
                     this.update(cx, |this, cx| {
                         this.sending = None;
@@ -1462,13 +1593,13 @@ impl TerminalView {
         if self.connecting.is_some() {
             return Some(match self.local {
                 true => tr("正在启动终端…").into(),
-                false => tr("正在连接服务器…").into(),
+                false => tr("正在连接主机…").into(),
             });
         }
         if self.lost && self.exited.is_none() {
             return Some(match self.local {
                 true => tr("与 kuaid 的连接已断开，程序仍在运行。按 Enter 重新连接。").into(),
-                false => tr("与服务器的连接已断开，程序仍在运行。按 Enter 重新连接。").into(),
+                false => tr("与主机的连接已断开，程序仍在运行。按 Enter 重新连接。").into(),
             });
         }
         match self.exited {
@@ -1494,10 +1625,10 @@ impl Sending {
         let name = &self.name;
         let progress = match self.total {
             0 => String::new(),
-            total => format!(
-                "：{} / {}",
-                attach::human_size(self.sent),
-                attach::human_size(total)
+            total => tf!(
+                "：{sent} / {total}",
+                sent = crate::text::human_size(self.sent),
+                total = crate::text::human_size(total)
             ),
         };
         if self.count > 1 {
@@ -2202,9 +2333,36 @@ fn paint_frame(frame: &Frame, bounds: Bounds<Pixels>, window: &mut Window, cx: &
 mod tests {
     // 不能 `use super::*`：那样 `#[test]` 会变成界面库里同名的那个宏
     use super::{
-        CursorShape, Grid, Palette, Processor, Proxy, Term, session_key, session_number,
-        short_title, snapshot,
+        CursorShape, Feed, Grid, Palette, Processor, Proxy, Term, TermEvent, session_key,
+        session_number, short_title, snapshot,
     };
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn 有新内容的唤醒排着的只有一个() {
+        let (proxy, mut rx) = Proxy::new();
+        for _ in 0..100 {
+            assert!(proxy.send(Feed::Term(TermEvent::Wakeup)));
+        }
+        // 别的事照送
+        assert!(proxy.send(Feed::Term(TermEvent::ResetTitle)));
+        let mut queued = Vec::new();
+        while let Ok(feed) = rx.try_recv() {
+            queued.push(feed);
+        }
+        assert_eq!(queued.len(), 2);
+        assert!(matches!(queued[0], Feed::Term(TermEvent::Wakeup)));
+        // 界面处理了（放下「排着」）以后再来新内容，再送一个
+        proxy.woken.store(false, Ordering::Release);
+        assert!(proxy.send(Feed::Term(TermEvent::Wakeup)));
+        assert!(proxy.send(Feed::Term(TermEvent::Wakeup)));
+        assert!(matches!(rx.try_recv(), Ok(Feed::Term(TermEvent::Wakeup))));
+        assert!(rx.try_recv().is_err());
+        // 界面那头没了：送不出去
+        drop(rx);
+        assert!(!proxy.send(Feed::Term(TermEvent::Wakeup)));
+        assert!(!proxy.send(Feed::Exited(None)));
+    }
 
     #[test]
     fn 标题是程序的完整路径时只留程序名() {
@@ -2215,7 +2373,7 @@ mod tests {
         assert_eq!(short_title(r"C:\WINDOWS\system32\cmd.EXE"), "cmd");
         // 不是路径、路径后面还跟着别的：照原样
         assert_eq!(short_title("✳ Claude Code"), "✳ Claude Code");
-        assert_eq!(short_title("feng@dev: ~/src"), "feng@dev: ~/src");
+        assert_eq!(short_title("me@dev: ~/src"), "me@dev: ~/src");
         assert_eq!(
             short_title(r"C:\WINDOWS\system32\cmd.exe - git status"),
             r"C:\WINDOWS\system32\cmd.exe - git status"
@@ -2224,9 +2382,9 @@ mod tests {
 
     /// 喂一段程序的输出，看光标记在哪、什么形状。
     fn cursor_after(output: &[u8]) -> Option<(usize, usize, CursorShape)> {
-        let (tx, _rx) = futures::channel::mpsc::unbounded();
+        let (proxy, _rx) = Proxy::new();
         let grid = Grid { cols: 40, rows: 10 };
-        let mut term = Term::new(Default::default(), &grid, Proxy(tx));
+        let mut term = Term::new(Default::default(), &grid, proxy);
         let mut parser: Processor = Processor::new();
         parser.advance(&mut term, output);
         let white = gpui_kit::rgb(0xeeeeee).into();
@@ -2252,9 +2410,9 @@ mod tests {
 
     /// 喂一段输出，看拍下来的文字段：第几列起、什么字。
     fn runs_of(output: &str) -> Vec<(usize, String)> {
-        let (tx, _rx) = futures::channel::mpsc::unbounded();
+        let (proxy, _rx) = Proxy::new();
         let grid = Grid { cols: 40, rows: 10 };
-        let mut term = Term::new(Default::default(), &grid, Proxy(tx));
+        let mut term = Term::new(Default::default(), &grid, proxy);
         let mut parser: Processor = Processor::new();
         parser.advance(&mut term, output.as_bytes());
         let white = gpui_kit::rgb(0xeeeeee).into();
@@ -2330,14 +2488,14 @@ mod tests {
         // 不是仓库页开的（名字是空的）
         assert_eq!(session_number(repo, ""), None);
         // Windows 上的仓库：kuaid 记的名字是正斜杠、小写的
-        let repo = r"C:\Users\Feng\Repo";
-        assert_eq!(session_number(repo, "c:/users/feng/repo"), Some(1));
-        assert_eq!(session_number(repo, "c:/users/feng/repo\u{1f}3"), Some(3));
+        let repo = r"C:\Users\me\Repo";
+        assert_eq!(session_number(repo, "c:/users/me/repo"), Some(1));
+        assert_eq!(session_number(repo, "c:/users/me/repo\u{1f}3"), Some(3));
         assert_eq!(
-            session_number("C:/Users/Feng/Repo", "c:/users/feng/repo"),
+            session_number("C:/Users/me/Repo", "c:/users/me/repo"),
             Some(1)
         );
-        assert_eq!(session_number(repo, "c:/users/feng/repo2"), None);
+        assert_eq!(session_number(repo, "c:/users/me/repo2"), None);
         // Linux 上分大小写
         assert_eq!(session_number("/Data/Repo", "/data/repo"), None);
     }

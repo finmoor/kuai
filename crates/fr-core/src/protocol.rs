@@ -38,6 +38,10 @@
 //! - `term_watch`（协议 11 起）：订阅终端列表。先回一条 `chunk: true`、`result` 是 `{terms: [TermInfo]}`，
 //!   之后列表有变化（开了、结束了、标题或最后一行变了、有输出变成没输出）时再回一条；有终端正在
 //!   输出时每隔几秒也回一条，客户端靠 [`TermInfo::idle_ms`] 知道它还在输出。`cancel` 这个请求就不订阅了。
+//!   协议 14 起里面在跑的程序变了（[`TermInfo::programs`]）也推。
+//! - `term_programs`（协议 13 起）：参数 `{term}`，返回 `{programs: [名字]}`：会话里除了 shell 还有哪些
+//!   程序在跑（Linux 上是前台那一组，Windows 上是 shell 起的子进程），查不到名字的是空串。shell 闲着、
+//!   程序已经结束、没有这个会话时是空的。客户端结束、重启终端前用它决定要不要先问一句。
 //!
 //! 传文件（协议 5 起）。往终端里发图片、文件用：终端那条路只能过文字，文件先传上来，
 //! 客户端再把它在服务器上的路径贴进终端：
@@ -95,9 +99,9 @@
 
 use crate::i18n::tr;
 use crate::tf;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -111,7 +115,11 @@ use serde_json::Value;
 /// （`relay_open`、`relay_input`）。
 /// 11：`term_watch` 订阅终端列表；`term_attach` 可以只看（`watch`）；[`TermInfo`] 多了 `idle_ms`、`last`。
 /// 12：[`Hello`] 多了 `machine`（这台电脑的标识，见 [`crate::store::machine_id`]）。
-pub const PROTOCOL_VERSION: u32 = 12;
+/// 13：`term_programs`，终端里除了 shell 还有哪些程序在跑。
+/// 14：[`TermInfo`] 多了 `programs`，终端列表里就带着各个终端在跑的程序（终端页侧栏的图标用）。
+/// 15：`fs_read` 可以带 `whole`：文件比它大时不读内容，只回文件的情况（文件页打开太大的文件时
+/// 不白传一块）；`fs_sync`，把文件刷到主机的磁盘上（映射盘上的程序要求刷盘时）。
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// 一条消息后面跟多少字节的原始数据。
 pub trait Frame {
@@ -275,6 +283,10 @@ pub struct TermInfo {
     /// 屏幕上最后一行有字的内容（协议 11 起），列表里给人看一眼用
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub last: String,
+    /// 除了 shell 还有哪些程序在跑（协议 14 起，和 `term_programs` 一样；程序已经结束的是空的）。
+    /// 空着是不知道（旧版 kuaid）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub programs: Option<Vec<String>>,
 }
 
 /// `file_put` 的参数。
@@ -331,6 +343,9 @@ pub struct FsEntry {
     /// 修改时间：1970 年起的毫秒数
     #[serde(default, skip_serializing_if = "is_zero")]
     pub mtime: u64,
+    /// 只读（和 [`FsStat::readonly`] 一样；旧的 kuaid 不给，当作可写）
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub readonly: bool,
 }
 
 /// 一个文件现在的情况。
@@ -460,15 +475,30 @@ pub fn write_message<W: Write, T: Serialize>(
     w.flush()
 }
 
-/// 读一条消息和它附带的原始字节；对方正常关闭时返回 None。
+/// 一条消息 JSON 那一行最长多少。参数、结果都不大（git 的标准错误、主机列表这些）；坏数据、
+/// 不带换行的字节不会让它一直涨。
+const MAX_LINE: u64 = 64 << 20;
+/// 附带的字节最多多少。大块本来就分块传（64 KiB～4 MiB 一块），整份的 git 输出也到不了这么大。
+const MAX_PAYLOAD: u64 = 1 << 30;
+
+/// 读一条消息和它附带的原始字节；对方正常关闭时返回 None。超过上限的当坏消息，调用方断开连接：
+/// 原来按对方报的长度一次分配（报个 1 TiB 进程就因为分配失败退出了），读行也没有上限。
 pub fn read_message<R: BufRead, T: DeserializeOwned + Frame>(
     r: &mut R,
 ) -> Result<Option<(T, Vec<u8>)>> {
     let mut line = String::new();
     loop {
         line.clear();
-        if r.read_line(&mut line).context(tr("读取消息失败"))? == 0 {
+        let read = r
+            .by_ref()
+            .take(MAX_LINE)
+            .read_line(&mut line)
+            .context(tr("读取消息失败"))?;
+        if read == 0 {
             return Ok(None);
+        }
+        if read as u64 >= MAX_LINE && !line.ends_with('\n') {
+            bail!(tr("消息过长"));
         }
         if !line.trim().is_empty() {
             break;
@@ -478,9 +508,19 @@ pub fn read_message<R: BufRead, T: DeserializeOwned + Frame>(
         let shown: String = line.trim().chars().take(200).collect();
         tf!("无法解析消息：{shown}", shown)
     })?;
-    let mut payload = vec![0; header.payload_len() as usize];
-    r.read_exact(&mut payload)
+    let len = header.payload_len();
+    if len > MAX_PAYLOAD {
+        bail!(tf!("消息附带的数据过大（{len} 字节）", len));
+    }
+    // 按收到的长，不按报的长一次分配：报得很大又不发的坏消息不占内存
+    let mut payload = Vec::with_capacity(len.min(4 << 20) as usize);
+    r.by_ref()
+        .take(len)
+        .read_to_end(&mut payload)
         .context(tr("读取消息附带的数据时连接中断"))?;
+    if payload.len() as u64 != len {
+        bail!(tr("读取消息附带的数据时连接中断"));
+    }
     Ok(Some((header, payload)))
 }
 
@@ -515,6 +555,27 @@ mod tests {
         assert!(got.chunk);
         assert_eq!(payload, b"\0\n");
         assert!(read_message::<_, Response>(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn 太长太大的消息当坏消息() {
+        // 报了很大的附带数据：不按它分配，直接报错
+        let huge = format!("{{\"id\":1,\"bytes\":{}}}\n", MAX_PAYLOAD + 1);
+        let mut reader = io::BufReader::new(huge.as_bytes());
+        assert!(read_message::<_, Response>(&mut reader).is_err());
+        let forged = b"{\"id\":1,\"bytes\":1099511627776}\nab".to_vec();
+        let mut reader = io::BufReader::new(&forged[..]);
+        assert!(read_message::<_, Response>(&mut reader).is_err());
+        // 报的长度在上限里、数据不够：连接中断
+        let short = b"{\"id\":1,\"bytes\":5}\nab".to_vec();
+        let mut reader = io::BufReader::new(&short[..]);
+        let err = read_message::<_, Response>(&mut reader).unwrap_err();
+        assert!(format!("{err:#}").contains(tr("读取消息附带的数据时连接中断")));
+        // 一直不换行
+        let long = vec![b'x'; MAX_LINE as usize + 10];
+        let mut reader = io::BufReader::new(&long[..]);
+        let err = read_message::<_, Response>(&mut reader).unwrap_err();
+        assert!(format!("{err:#}").contains(tr("消息过长")));
     }
 
     #[test]

@@ -17,3 +17,7 @@ notify = "8"
 [target.'cfg(unix)'.dependencies]
 # 只用来给进程组发信号（取消 git 时连子进程一起杀）
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# 只用来取目录的身份（卷序列号加文件编号），认出仓库目录被删掉又在原处建了一个
+winapi-util = "0.1"

@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use fr_channel::Channel;
+use fr_channel::{Channel, GitOutput};
 use fr_core::i18n::tr;
 use fr_core::status;
 use fr_core::tf;
@@ -93,6 +93,14 @@ pub(super) enum Then {
     Stay,
     NewTerminal,
     Files,
+}
+
+/// 批量操作里一个子仓库的结果：没做成的写原因。
+enum Outcome {
+    Done,
+    /// 没去做：不是独立的仓库、正在别的页面里写
+    Skipped(String),
+    Failed(String),
 }
 
 /// 正在对所有子仓库做的事（全部获取、全部拉取）。
@@ -197,6 +205,26 @@ pub(crate) async fn summarize(channel: Channel, repo: String) -> Summary {
     }
 }
 
+/// 读仓库根的参数（[`toplevel`] 解析）。
+pub(super) fn toplevel_args() -> Vec<String> {
+    ["rev-parse", "--show-toplevel"].map(String::from).to_vec()
+}
+
+/// [`toplevel_args`] 的结果：仓库根；不在仓库里（或者读不了）是 None。
+pub(super) fn toplevel(out: anyhow::Result<GitOutput>) -> Option<String> {
+    out.ok()
+        .filter(GitOutput::success)
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|top| !top.is_empty())
+}
+
+/// `path` 是不是独立的仓库：有自己的仓库根，不是外面那个（`outer`，外面仓库的 [`toplevel`]）。
+/// 子仓库、子模块的目录被删了、没初始化时，git 在里面会往上找到外面的仓库。两边的仓库根都由
+/// git 算，路径里有符号链接也比得上。
+pub(super) async fn own_repo(channel: &Channel, path: &str, outer: Option<&str>) -> bool {
+    let inner = toplevel(channel.git(path, toplevel_args()).await);
+    inner.is_some() && inner.as_deref() != outer
+}
 impl RepoView {
     /// 换了界面语言：过滤框里的提示文字重新设一遍，进过的子仓库的页面也跟着换。
     pub(super) fn retranslate_subs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -236,10 +264,12 @@ impl RepoView {
         self.change_count() + subs
     }
 
-    /// 根仓库或者进过的子仓库正在做的写操作的名字（关标签页前要看）。
+    /// 根仓库或者进过的子仓库正在做的写操作的名字（关标签页前要看）。总览的批量获取、拉取也算：
+    /// 原来不算，正在全部拉取时标签页说关就关。
     pub fn busy_with_subs(&self, cx: &App) -> Option<SharedString> {
         let mut subs = self.subs.views.iter();
         self.busy()
+            .or_else(|| self.subs.bulk.as_ref().map(|bulk| bulk.label.into()))
             .or_else(|| subs.find_map(|(_, view)| view.read(cx).busy_with_subs(cx)))
     }
 
@@ -278,7 +308,7 @@ impl RepoView {
 
     /// 子仓库在磁盘上的路径。本机的 Windows 路径用反斜杠，和单独打开它时的写法一样
     /// （终端、记住的东西按路径认）。
-    fn sub_path(&self, relative: &str) -> String {
+    pub(super) fn sub_path(&self, relative: &str) -> String {
         let windows_local = self.entry.server.is_none() && self.entry.path.contains('\\');
         match windows_local {
             true => format!(
@@ -652,37 +682,61 @@ impl RepoView {
             true => &["pull", "--ff-only", "--no-edit"],
             false => &["fetch", "--all"],
         };
+        // 拉取只做在分支上、设了上游的。状态还没读到（或者读失败）的照样拉：git 会说清楚为什么
+        // 不行，不能都当成没设上游跳过
+        let (mut no_upstream, mut detached) = (0, 0);
         let targets: Vec<String> = self
             .subs
             .paths
             .iter()
             .filter(|path| {
-                !pull
-                    || self
-                        .subs
-                        .summaries
-                        .get(*path)
-                        .is_some_and(|s| s.upstream && s.branch.is_some())
+                if !pull {
+                    return true;
+                }
+                match self.subs.summaries.get(*path) {
+                    Some(summary) if summary.branch.is_none() => detached += 1,
+                    Some(summary) if !summary.upstream => no_upstream += 1,
+                    _ => return true,
+                }
+                false
             })
             .cloned()
             .collect();
-        let skipped = self.subs.paths.len() - targets.len();
         if targets.is_empty() {
-            let text = tr("没有可拉取的子仓库：均未设置上游。");
+            let text = tr("没有可拉取的子仓库：都未设置上游或不在分支上。");
             window.push_notification(Notification::info(text), cx);
             return;
         }
+        // 先核对每个子仓库还是独立的仓库：目录被删了、换成了普通文件夹时，git 在里面会往上找到
+        // 这个仓库，「全部拉取」就成了拉取这个仓库
+        let outer = channel.git(&self.entry.path, toplevel_args());
+        let server = self.entry.server.clone();
+        // 每个作业轮到它时才发 git（`buffer_unordered` 拿到名额才调闭包）：同时最多 PARALLEL 个
         let jobs: Vec<_> = targets
             .iter()
             .map(|relative| {
-                let request = channel.git(
-                    &self.sub_path(relative),
-                    args.iter().map(|arg| arg.to_string()).collect(),
-                );
-                let relative = relative.clone();
-                async move {
-                    let result = request.await.and_then(|out| out.ok());
-                    (relative, result.err().map(|err| format!("{err:#}")))
+                let (channel, path, relative) =
+                    (channel.clone(), self.sub_path(relative), relative.clone());
+                let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+                let key = super::ops::writing_key(server.as_deref(), &path);
+                move |outer: Option<String>| async move {
+                    if !own_repo(&channel, &path, outer.as_deref()).await {
+                        let why = tr("不是独立的仓库（可能已删除或未初始化），已跳过。");
+                        return (relative, Outcome::Skipped(why.to_string()));
+                    }
+                    // 这个子仓库正在别的页面里写：跳过，不和它撞
+                    let _writing = match super::ops::Writing::take(key, label.into()) {
+                        Ok(writing) => writing,
+                        Err(running) => {
+                            let why = tf!("正在另一个页面中执行「{running}」，已跳过。", running);
+                            return (relative, Outcome::Skipped(why));
+                        }
+                    };
+                    let outcome = match channel.git(&path, args).await.and_then(|out| out.ok()) {
+                        Ok(_) => Outcome::Done,
+                        Err(err) => Outcome::Failed(format!("{err:#}")),
+                    };
+                    (relative, outcome)
                 }
             })
             .collect();
@@ -692,11 +746,15 @@ impl RepoView {
             total: targets.len(),
         });
         self.subs.bulk_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let outer = toplevel(outer.await);
+            let jobs = jobs.into_iter().map(|job| job(outer.clone()));
             let mut results = futures::stream::iter(jobs).buffer_unordered(PARALLEL);
-            let mut failed: Vec<(String, String)> = Vec::new();
-            while let Some((relative, error)) = results.next().await {
-                if let Some(error) = error {
-                    failed.push((relative, error));
+            let (mut failed, mut skipped) = (Vec::new(), Vec::new());
+            while let Some((relative, outcome)) = results.next().await {
+                match outcome {
+                    Outcome::Done => {}
+                    Outcome::Skipped(why) => skipped.push((relative, why)),
+                    Outcome::Failed(error) => failed.push((relative, error)),
                 }
                 let updated = this.update(cx, |this, cx| {
                     if let Some(bulk) = &mut this.subs.bulk {
@@ -710,26 +768,36 @@ impl RepoView {
             }
             this.update_in(cx, |this, window, cx| {
                 let total = this.subs.bulk.take().map_or(0, |bulk| bulk.total);
-                let mut text = match failed.is_empty() {
-                    true => tf!("{n} 个子仓库已完成", n = total),
-                    false => tf!(
-                        "{ok} 个已完成，{failed} 个失败",
-                        ok = total - failed.len(),
-                        failed = failed.len()
-                    ),
-                };
-                if skipped > 0 {
-                    text.push_str(&tf!("，{n} 个未设置上游，已跳过", n = skipped));
+                let done = total - failed.len() - skipped.len();
+                let mut text = tf!("{n} 个子仓库已完成", n = done);
+                if !failed.is_empty() {
+                    text.push_str(&tf!("，{n} 个失败", n = failed.len()));
                 }
-                if failed.is_empty() {
+                if !skipped.is_empty() {
+                    text.push_str(&tf!("，{n} 个已跳过", n = skipped.len()));
+                }
+                if no_upstream > 0 {
+                    text.push_str(&tf!("，{n} 个未设置上游，已跳过", n = no_upstream));
+                }
+                if detached > 0 {
+                    text.push_str(&tf!("，{n} 个不在分支上，已跳过", n = detached));
+                }
+                if failed.is_empty() && skipped.is_empty() {
                     window.push_notification(Notification::success(text).title(label), cx);
                 } else {
-                    failed.sort();
-                    let detail: Vec<String> = failed
+                    // 失败的、跳过的逐个写原因；有失败的才算警告
+                    let mut listed: Vec<&(String, String)> =
+                        failed.iter().chain(&skipped).collect();
+                    listed.sort();
+                    let detail: Vec<String> = listed
                         .iter()
-                        .map(|(path, error)| format!("{path}\n{}\n", error.trim()))
+                        .map(|(path, why)| format!("{path}\n{}\n", why.trim()))
                         .collect();
-                    let note = Notification::warning(text).title(label).autohide(false);
+                    let note = match failed.is_empty() {
+                        true => Notification::info(text),
+                        false => Notification::warning(text),
+                    };
+                    let note = note.title(label).autohide(false);
                     let note = super::ops::with_detail(note, label, &detail.join("\n"));
                     window.push_notification(note, cx);
                 }
@@ -975,12 +1043,14 @@ impl RepoView {
                         .font_weight(FontWeight::MEDIUM),
                     ),
             )
+            // 和名字对齐（图标 14、空 6）。缩进放在外面一层：`clipped` 拿自己的宽度和文字比
             .when(!dir.is_empty(), |cell| {
                 cell.child(
-                    ui::clipped(("sub-dir", ix), dir)
-                        .pl(px(22.))
-                        .text_size(px(11.))
-                        .text_color(muted),
+                    div().pl(px(20.)).min_w_0().child(
+                        ui::clipped(("sub-dir", ix), dir)
+                            .text_size(px(11.))
+                            .text_color(muted),
+                    ),
                 )
             });
         let dash = || div().text_color(muted).child("—");

@@ -1,11 +1,12 @@
 //! 主窗口：标题栏（三个页面、标签页、设置）和下面的内容。
 //!
 //! 标题栏是自己画的，标签页直接放在里面，不另占一行。最左边是三个页面：服务器、终端、工作区，
-//! 长得一样，名字固定不变；后面是标签页：仓库（和子仓库）一个一个排，终端的标签页排在右边另一段
-//! （设计见 `design/server-workspace/`，第二版，T3）。设置页打开时也是一个标签页。
+//! 长得一样，名字固定不变；后面是标签页：仓库（和子仓库）一个一个排（设计见
+//! `design/server-workspace/`，第二版）。设置页打开时也是一个标签页。1.17 右边还有一段终端的标签页
+//! （T3），2026-11-20 去掉了：终端在终端页里看，那里的「打开仓库」打开它所在的仓库。
 //!
 //! 标签页全局一份，像 VS Code 的编辑器标签：打开哪个就是哪个，和选了哪台服务器、哪个工作区都
-//! 无关（2026-11-19 Feng 定）。从哪里打开（工作区页、服务器页、终端页、快速打开）都是往这一排里加，
+//! 无关。从哪里打开（工作区页、服务器页、终端页、快速打开）都是往这一排里加，
 //! 已经开着的切过去。工作区只是「一组常一起看的仓库」，在工作区页里一次全部打开。开着哪些标签页
 //! 只记在这台电脑上。
 //!
@@ -49,14 +50,11 @@ use crate::manager::{ManagerEvent, ManagerView};
 use crate::prompt::{self, Prompts};
 use crate::repo::{RepoEvent, RepoView};
 use crate::repo_scan::RepoScan;
-use crate::settings::{Front, RepoEntry, TermSlot};
+use crate::settings::{Front, RepoEntry};
 use crate::settings_page::SettingsPage;
 use crate::tab_fit::{self, Segment};
-use crate::term_board::{
-    BoardHandle, Row as TermRow, Shown, Stopped, TermBoard, TermId, TermState, free_number,
-};
+use crate::term_board::{BoardHandle, Row as TermRow, Shown, Stopped, TermBoard, TermId};
 use crate::term_overview::{Go, TermOverview};
-use crate::term_tab::{TermTabEvent, TermTabView};
 use crate::toast::Toasts;
 use crate::tray::{Tray, TrayAction};
 use crate::ui;
@@ -72,11 +70,7 @@ const TAB_GAP: f32 = 4.;
 const MORE_WIDTH: f32 = 44.;
 /// 仓库标签页最宽这么宽，名字再长就省略
 const REPO_TAB_MAX: f32 = 240.;
-/// 终端标签页最宽这么宽
-const TERM_TAB_MAX: f32 = 200.;
-/// 终端标签页用等宽字（和终端里的字一样）
-const TERM_TAB_FONT: &str = "Consolas";
-/// 标签上名字后面那一截淡淡的字（同名的说明、终端的仓库名）至少放得下这么宽（连前面的间隔）才画
+/// 标签上名字后面那一截淡淡的字（同名的说明）至少放得下这么宽（连前面的间隔）才画
 const ASIDE_MIN: f32 = 6. + 24.;
 /// 窗口比这窄时，标题栏上的三个页面只留图标
 const NARROW_WIDTH: f32 = 1100.;
@@ -98,13 +92,6 @@ impl RepoTab {
     }
 }
 
-/// 一个终端标签页（标题栏右边那一排）。
-struct TermTab {
-    slot: TermSlot,
-    view: Entity<TermTabView>,
-    _events: Subscription,
-}
-
 /// 显示着的是哪一页。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Page {
@@ -113,8 +100,6 @@ enum Page {
     Workspaces,
     /// `tabs` 里的第几个
     Repo(usize),
-    /// `terms` 里的第几个
-    Term(usize),
 }
 
 /// 上一次应用到窗口上的外观设置；变了才重新应用。
@@ -135,12 +120,15 @@ pub struct Workspace {
     settings_page: Entity<SettingsPage>,
     /// 仓库（和子仓库）的标签页，全局一份
     tabs: Vec<RepoTab>,
-    /// 终端的标签页（标题栏右边那一排），全局一份
-    terms: Vec<TermTab>,
     /// 显示着的那一页
     page: Page,
     /// 按 Ctrl+Shift+A 打开终端页之前在哪一页：再按一次回去
     before_terms: Page,
+    /// 那一页是仓库标签页时是哪个仓库：回去时按它找。下标靠不住，在终端页上关了、固定了别的标签页
+    /// 位置就变了，原来会回到别的仓库，或者一个没有标签页的空页
+    before_terms_repo: Option<RepoEntry>,
+    /// 主机移除了、因为有没保存的文件或正在做操作而暂时没关的标签页（已经说过一次，不再说）
+    kept_on_removal: Vec<RepoEntry>,
     /// 设置页开着；它盖在当前标签页上面，关掉回到原来那一页
     showing_settings: bool,
     /// 所有工作区里的终端现在怎么样（见 `term_board`）
@@ -216,7 +204,7 @@ impl Workspace {
             // 经别的电脑连的那台认出来是哪一台了，它上面的标签页换过去；
             // 主题、语言、托盘的选项变了就应用到窗口上
             cx.observe_in(&app, window, |this, _, window, cx| {
-                this.drop_tabs_of_removed_servers(cx);
+                this.drop_tabs_of_removed_servers(window, cx);
                 this.remap_duplicate_tabs(window, cx);
                 this.apply_settings(window, cx);
                 cx.notify();
@@ -249,8 +237,7 @@ impl Workspace {
                 &overview,
                 window,
                 |this, _, event: &Go, window, cx| match event {
-                    Go::Term(row) => this.open_term_tab_of(row, window, cx),
-                    Go::Repo(entry) => this.go_to_repo_terminals(entry, window, cx),
+                    Go::Repo(entry) => this.open_repo_git(entry, window, cx),
                 },
             ),
             cx.subscribe_in(&board, window, |this, _, event: &Stopped, window, cx| {
@@ -400,9 +387,10 @@ impl Workspace {
             workspaces,
             settings_page,
             tabs: Vec::new(),
-            terms: Vec::new(),
             page: Page::Workspaces,
             before_terms: Page::Workspaces,
+            before_terms_repo: None,
+            kept_on_removal: Vec::new(),
             showing_settings: false,
             board,
             overview,
@@ -425,11 +413,6 @@ impl Workspace {
             let tab = this.build_tab(entry, window, cx);
             this.tabs.push(tab);
         }
-        // 终端标签页：接上 kuaid 里还在的终端（那台电脑连上、列表读到以后才有画面；不在了的自己关掉）
-        for slot in saved.terms {
-            let tab = this.build_term_tab(slot, false, window, cx);
-            this.terms.push(tab);
-        }
         this.page = match &saved.front {
             Front::Servers => Page::Servers,
             Front::Workspaces | Front::Terms => Page::Workspaces,
@@ -438,11 +421,6 @@ impl Workspace {
                 .iter()
                 .position(|tab| tab.entry == *entry)
                 .map_or(Page::Workspaces, Page::Repo),
-            Front::Term(slot) => this
-                .terms
-                .iter()
-                .position(|tab| tab.slot == *slot)
-                .map_or(Page::Workspaces, Page::Term),
         };
         this.update_visibility(cx);
         this.apply_settings(window, cx);
@@ -513,7 +491,7 @@ impl Workspace {
             alert
                 .title(tr("重启 Kuai 以完成更新"))
                 .description(tf!(
-                    "有 {n} 个本机终端正在运行，重启将结束其中的程序。服务器上的终端不受影响。",
+                    "有 {n} 个本机终端正在运行，重启将结束其中的程序。远程主机上的终端不受影响。",
                     n = terminals
                 ))
                 .on_ok(|_, _, _| false)
@@ -598,7 +576,7 @@ impl Workspace {
         let description = match (terminals, unsaved) {
             (0, 0) => mapped_note.clone(),
             (_, 0) => tf!(
-                "有 {n} 个本机终端正在运行，退出将结束其中的程序。服务器上的终端不受影响。",
+                "有 {n} 个本机终端正在运行，退出将结束其中的程序。远程主机上的终端不受影响。",
                 n = terminals
             ),
             (0, _) => tf!("有 {n} 个文件尚未保存，退出后修改将丢失。", n = unsaved),
@@ -751,8 +729,16 @@ impl Workspace {
             .map_or(fallback, Page::Repo);
     }
 
-    /// 服务器被移除了：它上面的仓库的标签页跟着关掉，经它连的也关。
-    fn drop_tabs_of_removed_servers(&mut self, cx: &mut Context<Self>) {
+    /// 这个标签页现在关不得：有没保存的文件，或者正在做操作。不经确认就关掉它的地方（移除主机、
+    /// 认出重复的主机、批量关闭）先跳过它。
+    fn unsafe_to_drop(tab: &RepoTab, cx: &App) -> bool {
+        let view = tab.view.read(cx);
+        view.unsaved_with_subs(cx) > 0 || view.busy_with_subs(cx).is_some()
+    }
+
+    /// 服务器被移除了：它上面的仓库的标签页跟着关掉，经它连的也关。有没保存的文件、正在做操作的
+    /// 先留着（它手上的连接还在，还能存），说一声；存好、做完以后再关（原来直接关，修改就丢了）。
+    fn drop_tabs_of_removed_servers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let app = self.app.read(cx);
         let gone = |entry: &RepoEntry| {
             entry.server.as_deref().is_some_and(|id| {
@@ -760,59 +746,54 @@ impl Workspace {
                 app.server(direct).is_none()
             })
         };
-        let before = (self.tabs.len(), self.terms.len());
-        let front = self.front_repo();
-        let front_term = match self.page {
-            Page::Term(ix) => self.terms.get(ix).map(|tab| tab.slot.clone()),
-            _ => None,
-        };
-        self.tabs.retain(|tab| !gone(&tab.entry));
-        self.terms.retain(|tab| !gone(&tab.slot.entry));
-        if (self.tabs.len(), self.terms.len()) != before {
+        let (kept, closing): (Vec<&RepoTab>, Vec<&RepoTab>) = self
+            .tabs
+            .iter()
+            .filter(|tab| gone(&tab.entry))
+            .partition(|tab| Self::unsafe_to_drop(tab, cx));
+        let kept: Vec<RepoEntry> = kept.into_iter().map(|tab| tab.entry.clone()).collect();
+        let closing: Vec<RepoEntry> = closing.into_iter().map(|tab| tab.entry.clone()).collect();
+        if !closing.is_empty() {
+            let was = (!self.showing_settings).then_some(self.page);
+            let front = self.front_repo();
+            self.tabs.retain(|tab| !closing.contains(&tab.entry));
             // 原来显示的标签页还在就留在它上面，不在了回到服务器页
             self.refocus(front, Page::Servers);
-            if let Some(slot) = front_term {
-                self.page = self
-                    .terms
-                    .iter()
-                    .position(|tab| tab.slot == slot)
-                    .map_or(Page::Servers, Page::Term);
-            }
+            self.page_changed(was, window, cx);
             self.persist(cx);
         }
+        let fresh = kept
+            .iter()
+            .any(|entry| !self.kept_on_removal.contains(entry));
+        if fresh {
+            let text = tf!(
+                "主机已移除，其中 {n} 个标签页有未保存的文件或正在执行操作，暂未关闭。处理完后再关闭。",
+                n = kept.len()
+            );
+            window.push_notification(Notification::warning(text).autohide(false), cx);
+        }
+        self.kept_on_removal = kept;
     }
 
     /// 经别的电脑连的那台认出来就是本机、就是它经由的那台，或者就是本机直接配置的一台（见
-    /// `machines::Identities`）：它上面开着的仓库、终端标签页换成那一台的，不再绕路连；那一台的同一个
+    /// `machines::Identities`）：它上面开着的仓库标签页换成那一台的，不再绕路连；那一台的同一个
     /// 已经开着就只留那一个。显示着的跟着换过去，固定着的照样固定。
     fn remap_duplicate_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (repos, terms) = {
+        let repos: Vec<(usize, RepoEntry)> = {
             let app = self.app.read(cx);
             let ids = app.ids();
-            let repos: Vec<(usize, RepoEntry)> = self
-                .tabs
+            self.tabs
                 .iter()
                 .enumerate()
+                // 有没保存的文件、正在做操作的先不换（换就是丢掉这个视图）：处理完以后下一次再换
+                .filter(|(_, tab)| !Self::unsafe_to_drop(tab, cx))
                 .filter_map(|(ix, tab)| {
                     let to = ids.entry(tab.entry.clone());
                     (to != tab.entry).then_some((ix, to))
                 })
-                .collect();
-            let terms: Vec<(usize, TermSlot)> = self
-                .terms
-                .iter()
-                .enumerate()
-                .filter_map(|(ix, tab)| {
-                    let entry = ids.entry(tab.slot.entry.clone());
-                    (entry != tab.slot.entry).then(|| {
-                        let number = tab.slot.number;
-                        (ix, TermSlot { entry, number })
-                    })
-                })
-                .collect();
-            (repos, terms)
+                .collect()
         };
-        if repos.is_empty() && terms.is_empty() {
+        if repos.is_empty() {
             return;
         }
         let was = (!self.showing_settings).then_some(self.page);
@@ -823,15 +804,6 @@ impl Workspace {
                     .iter()
                     .find(|(at, _)| *at == ix)
                     .map_or_else(|| tab.entry.clone(), |(_, to)| to.clone())
-            }),
-            _ => None,
-        };
-        let front_term = match self.page {
-            Page::Term(ix) => self.terms.get(ix).map(|tab| {
-                terms
-                    .iter()
-                    .find(|(at, _)| *at == ix)
-                    .map_or_else(|| tab.slot.clone(), |(_, to)| to.clone())
             }),
             _ => None,
         };
@@ -847,18 +819,6 @@ impl Workspace {
                 self.tabs[ix] = tab;
             }
         }
-        for (ix, to) in terms.into_iter().rev() {
-            log::info!(
-                "终端标签页换成同一台电脑的写法：{:?} → {to:?}",
-                self.terms[ix].slot
-            );
-            if self.terms.iter().any(|tab| tab.slot == to) {
-                self.terms.remove(ix);
-            } else {
-                let tab = self.build_term_tab(to, false, window, cx);
-                self.terms[ix] = tab;
-            }
-        }
         if let Some(entry) = front {
             self.page = self
                 .tabs
@@ -866,27 +826,15 @@ impl Workspace {
                 .position(|tab| tab.entry == entry)
                 .map_or(Page::Servers, Page::Repo);
         }
-        if let Some(slot) = front_term {
-            self.page = self
-                .terms
-                .iter()
-                .position(|tab| tab.slot == slot)
-                .map_or(Page::Servers, Page::Term);
-        }
         self.page_changed(was, window, cx);
         self.persist(cx);
         cx.notify();
     }
 
-    /// 告诉每个标签页它是不是当前显示的：切到哪一页，哪一页就刷新（终端标签页接上画面）。
+    /// 告诉每个标签页它是不是当前显示的：切到哪一页，哪一页就刷新。
     fn update_visibility(&self, cx: &mut Context<Self>) {
         for (ix, tab) in self.tabs.iter().enumerate() {
             let visible = self.page == Page::Repo(ix) && !self.showing_settings;
-            tab.view
-                .update(cx, |view, cx| view.set_visible(visible, cx));
-        }
-        for (ix, tab) in self.terms.iter().enumerate() {
-            let visible = self.page == Page::Term(ix) && !self.showing_settings;
             tab.view
                 .update(cx, |view, cx| view.set_visible(visible, cx));
         }
@@ -921,9 +869,11 @@ impl Workspace {
         }
     }
 
-    /// 工作区页上点了一个仓库的「新建终端」：新开的终端成标签页（标题栏右边那一排）。
+    /// 工作区页上点了一个仓库的「新建终端」：到终端页，在这个仓库里新开一个。
     fn new_terminal_for(&mut self, entry: RepoEntry, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_terminal_tab(entry, window, cx);
+        self.show_terms(window, cx);
+        self.overview
+            .update(cx, |overview, cx| overview.new_terminal(entry, window, cx));
     }
 
     /// 这个仓库的标签页在第几个；没开着就建一个加在最后。
@@ -933,7 +883,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
-        if let Some(ix) = self.tabs.iter().position(|t| t.entry == entry) {
+        // Windows 上同一个仓库的几种写法算一个（见 [`RepoEntry::same_repo`]），不然从终端页打开没登记
+        // 过的子仓库会再开一个标签页
+        if let Some(ix) = self.tabs.iter().position(|t| t.entry.same_repo(&entry)) {
             return ix;
         }
         let tab = self.build_tab(entry, window, cx);
@@ -1062,7 +1014,15 @@ impl Workspace {
             window.push_notification(Notification::warning(text), cx);
             return;
         }
-        let text = tf!("此仓库正在{op}，关闭标签页将取消该操作。", op);
+        // 同时有没保存的文件：一起写出来，原来只说要取消操作，确认以后修改也没了
+        let text = match unsaved {
+            0 => tf!("此仓库正在{op}，关闭标签页将取消该操作。", op),
+            n => tf!(
+                "此仓库正在{op}，关闭标签页将取消该操作；另有 {n} 个文件尚未保存，修改将丢失。",
+                op,
+                n
+            ),
+        };
         self.confirm_close(entry, text, tr("取消操作并关闭"), window, cx);
     }
 
@@ -1160,8 +1120,8 @@ impl Workspace {
         self.app.read(cx).tabs().is_pinned(entry)
     }
 
-    /// 关掉一批标签页：`which` 挑出要关的（参数是下标和仓库）。固定的不关；正在做操作的也留着，
-    /// 并说一声。显示着的那一页没被关掉就还留在它上面。
+    /// 关掉一批标签页：`which` 挑出要关的（参数是下标和仓库）。固定的不关；正在做操作的、有没保存
+    /// 的文件的也留着（原来没保存的照关，修改就丢了），并说一声。显示着的那一页没被关掉就还留在它上面。
     fn close_many(
         &mut self,
         which: impl Fn(usize, &RepoEntry) -> bool,
@@ -1176,9 +1136,9 @@ impl Workspace {
             .enumerate()
             .filter(|(ix, tab)| which(*ix, &tab.entry) && !pinned.contains(&tab.entry))
             .filter(|(_, tab)| {
-                let busy = tab.view.read(cx).busy_with_subs(cx).is_some();
-                skipped += busy as usize;
-                !busy
+                let kept = Self::unsafe_to_drop(tab, cx);
+                skipped += kept as usize;
+                !kept
             })
             .map(|(_, tab)| tab.entry.clone())
             .collect();
@@ -1188,7 +1148,10 @@ impl Workspace {
             }
         }
         if skipped > 0 {
-            let text = tf!("{n} 个标签页正在执行操作，未关闭。", n = skipped);
+            let text = tf!(
+                "{n} 个标签页有未保存的文件或正在执行操作，未关闭。",
+                n = skipped
+            );
             window.push_notification(Notification::warning(text), cx);
         }
         cx.notify();
@@ -1257,7 +1220,15 @@ impl Workspace {
     /// Ctrl+Shift+A：打开终端页；已经在上面就回到原来那一页。
     pub fn toggle_terms(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.page == Page::Terms && !self.showing_settings {
-            self.show_page(self.before_terms, window, cx);
+            let back = match self.before_terms {
+                Page::Repo(_) => self
+                    .before_terms_repo
+                    .as_ref()
+                    .and_then(|entry| self.tabs.iter().position(|tab| tab.entry == *entry))
+                    .map_or(Page::Workspaces, Page::Repo),
+                page => page,
+            };
+            self.show_page(back, window, cx);
             // 焦点还在看不见的终端页上：放回显示出来的终端里
             if let Some(tab) = self.active_repo() {
                 tab.shown(cx)
@@ -1272,31 +1243,18 @@ impl Workspace {
     fn show_terms(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.page != Page::Terms {
             self.before_terms = self.page;
+            self.before_terms_repo = self.front_repo();
         }
         self.show_page(Page::Terms, window, cx);
     }
 
-    /// 提醒里的「前往」、点了系统通知：开着这个终端的标签页就切过去，没开着到终端页选中它
-    /// （不为每条提醒新开一个标签页，要常看的在终端页里「在标签页中打开」）。
+    /// 提醒里的「前往」、点了系统通知：到终端页选中这个终端。
     fn go_to_terminal(&mut self, row: &TermRow, window: &mut Window, cx: &mut Context<Self>) {
         log::info!("前往终端：{} 的第 {} 个", row.entry.path, row.number);
+        self.show_terms(window, cx);
         let slot = row.slot();
-        match self.terms.iter().position(|tab| tab.slot == slot) {
-            Some(ix) => self.show_page(Page::Term(ix), window, cx),
-            None => self.reveal_term(&slot, window, cx),
-        }
-        self.seen_terminal(row, window, cx);
-    }
-
-    /// 终端页上「在标签页中打开」（Enter、右键菜单里的也是）：开着就切过去，没开着在标题栏右边那一排
-    /// 加一个。
-    fn open_term_tab_of(&mut self, row: &TermRow, window: &mut Window, cx: &mut Context<Self>) {
-        log::info!(
-            "在标签页中打开终端：{} 的第 {} 个",
-            row.entry.path,
-            row.number
-        );
-        self.open_term_tab(row.slot(), false, window, cx);
+        self.overview
+            .update(cx, |overview, cx| overview.reveal_term(&slot, window, cx));
         self.seen_terminal(row, window, cx);
     }
 
@@ -1309,148 +1267,13 @@ impl Workspace {
         window.remove_notification1::<TerminalStopped>(key, cx);
     }
 
-    /// 到终端页，选中这个终端。
-    fn reveal_term(&mut self, slot: &TermSlot, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_terms(window, cx);
-        self.overview
-            .update(cx, |overview, cx| overview.reveal_term(slot, window, cx));
-    }
-
-    // ---- 终端标签页 ----
-
-    fn build_term_tab(
-        &mut self,
-        slot: TermSlot,
-        fresh: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> TermTab {
-        let (app, board) = (self.app.clone(), self.board.clone());
-        let view = cx.new(|cx| TermTabView::new(app, board, slot.clone(), fresh, window, cx));
-        let events = cx.subscribe_in(&view, window, |this, view, event, window, cx| match event {
-            TermTabEvent::Gone => {
-                if let Some(ix) = this.terms.iter().position(|tab| tab.view == *view) {
-                    this.close_term_tab(ix, window, cx);
-                }
-            }
-            TermTabEvent::OpenRepo(entry) => this.open(entry.clone(), window, cx),
-            TermTabEvent::Reveal(slot) => this.reveal_term(slot, window, cx),
-        });
-        TermTab {
-            slot,
-            view,
-            _events: events,
-        }
-    }
-
-    /// 打开一个终端的标签页：开着就切过去，没开着加在那一排最后。`fresh`：这个标签页去开这个终端
-    /// （新建终端），不然接上 kuaid 里已经有的。
-    fn open_term_tab(
-        &mut self,
-        slot: TermSlot,
-        fresh: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let ix = match self.terms.iter().position(|tab| tab.slot == slot) {
-            Some(ix) => ix,
-            None => {
-                let tab = self.build_term_tab(slot, fresh, window, cx);
-                self.terms.push(tab);
-                self.terms.len() - 1
-            }
-        };
-        self.show_page(Page::Term(ix), window, cx);
-    }
-
-    /// 在一个仓库里新开一个终端，开成标签页（工作区页的「新建终端」、终端标签页上按 Ctrl+Shift+`）。
-    /// 序号用这个仓库里最小的空号：先问一遍那台电脑的 kuaid 现在有哪几个（它可能刚被拉起来，列表
-    /// 还没推过来）。
-    fn new_terminal_tab(&mut self, entry: RepoEntry, window: &mut Window, cx: &mut Context<Self>) {
-        let connecting = self.app.update(cx, |app, cx| match &entry.server {
-            Some(server) if !app.knows_server(server) => None,
-            Some(server) => Some(app.connect(server, cx)),
-            None => Some(app.connect_local(cx)),
-        });
-        let Some(connecting) = connecting else {
-            let text = tf!("终端启动失败：{err}", err = tr("未找到该服务器的设置"));
-            window.push_notification(Notification::error(text), cx);
-            return;
-        };
-        cx.spawn_in(window, async move |this, cx| {
-            let listed = match connecting.await {
-                Ok(conn) => conn.term_list().await.map_err(|err| format!("{err:#}")),
-                Err(err) => Err(err.to_string()),
-            };
-            this.update_in(cx, |this, window, cx| match listed {
-                Ok(terms) => {
-                    let used: Vec<u32> = terms
-                        .iter()
-                        .filter_map(|term| crate::terminal::session_number(&entry.path, &term.key))
-                        .collect();
-                    let slot = TermSlot {
-                        entry,
-                        number: free_number(&used),
-                    };
-                    this.open_term_tab(slot, true, window, cx);
-                }
-                Err(err) => {
-                    let text = tf!("终端启动失败：{err}", err);
-                    window.push_notification(Notification::error(text), cx);
-                }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// 关掉一个终端标签页（终端接着在 kuaid 里跑）。关掉的是显示着的那个：换到旁边的终端标签页，
-    /// 没有了回到它的仓库（开着的话），再没有回到工作区页。
-    fn close_term_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if ix >= self.terms.len() {
-            return;
-        }
-        let tab = self.terms.remove(ix);
-        let was = (!self.showing_settings).then_some(self.page);
-        match self.page {
-            Page::Term(at) if at == ix => {
-                self.page = match self.terms.len() {
-                    0 => self
-                        .tabs
-                        .iter()
-                        .position(|repo| repo.entry == tab.slot.entry)
-                        .map_or(Page::Workspaces, Page::Repo),
-                    n => Page::Term(ix.min(n - 1)),
-                };
-            }
-            Page::Term(at) if at > ix => self.page = Page::Term(at - 1),
-            _ => {}
-        }
-        self.page_changed(was, window, cx);
-        self.persist(cx);
-        cx.notify();
-    }
-
-    /// 关掉除了第 `keep` 个以外的终端标签页。
-    fn close_other_term_tabs(&mut self, keep: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(slot) = self.terms.get(keep).map(|tab| tab.slot.clone()) else {
-            return;
-        };
-        self.terms.retain(|tab| tab.slot == slot);
-        self.show_page(Page::Term(0), window, cx);
-    }
-
-    /// 从终端页前往一个仓库的终端页：打开它的标签页，到终端页。
-    fn go_to_repo_terminals(
-        &mut self,
-        entry: &RepoEntry,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// 从终端页打开一个仓库（工具栏的「打开仓库」、右键菜单、Enter、双击）：打开它的标签页，显示
+    /// Git 页。
+    fn open_repo_git(&mut self, entry: &RepoEntry, window: &mut Window, cx: &mut Context<Self>) {
         self.open(entry.clone(), window, cx);
         if let Some(tab) = self.active_repo() {
-            tab.view
-                .update(cx, |view, cx| view.show_terminal_page(window, cx));
+            tab.shown(cx)
+                .update(cx, |view, cx| view.show_git_page(window, cx));
         }
     }
 
@@ -1463,7 +1286,7 @@ impl Workspace {
                 machine: machine.to_string(),
                 term: term.to_string(),
             };
-            self.board.read(cx).row(&id, cx)
+            self.board.read(cx).row(&id)
         });
         if let Some(row) = row {
             self.go_to_terminal(&row, window, cx);
@@ -1551,11 +1374,6 @@ impl Workspace {
             };
             return overview.shown_id(cx).map(shown);
         }
-        // 终端标签页：整页就是这个终端，和仓库的终端页上显示着的一样，一直算看过
-        if let Page::Term(ix) = self.page {
-            let slot = &self.terms.get(ix)?.slot;
-            return Some(Shown::Repo(slot.entry.clone(), slot.number));
-        }
         let (entry, number) = self.active_repo()?.shown(cx).read(cx).shown_terminal()?;
         Some(Shown::Repo(entry, number))
     }
@@ -1580,8 +1398,6 @@ impl Workspace {
             self.toggle_settings(window, cx);
         } else if self.page == Page::Terms {
             self.toggle_terms(window, cx);
-        } else if let Page::Term(ix) = self.page {
-            self.close_term_tab(ix, window, cx);
         } else if let Page::Repo(ix) = self.page {
             // 在文件页上、有打开的文件：Ctrl+W 关的是那个文件，不是整个仓库标签页
             let closed_file = self.tabs.get(ix).is_some_and(|tab| {
@@ -1637,14 +1453,6 @@ impl Workspace {
                 .update(cx, |overview, cx| overview.new_terminal_here(window, cx));
             return;
         }
-        // 终端标签页上：在它的仓库里再开一个，也成标签页
-        if let Page::Term(ix) = self.page
-            && !self.showing_settings
-            && let Some(entry) = self.terms.get(ix).map(|tab| tab.slot.entry.clone())
-        {
-            self.new_terminal_tab(entry, window, cx);
-            return;
-        }
         if let Some(tab) = self.active_repo() {
             tab.shown(cx)
                 .update(cx, |view, cx| view.new_terminal(window, cx));
@@ -1688,13 +1496,10 @@ impl Workspace {
         }
     }
 
-    /// Ctrl+Tab、Ctrl+Shift+Tab：切到下一个、上一个标签页（仓库的排在前，终端的在后），到头绕回去。
-    /// 在三个页面上时从第一个（往回是最后一个）开始。
+    /// Ctrl+Tab、Ctrl+Shift+Tab：切到下一个、上一个标签页，到头绕回去。在三个页面上时从第一个
+    /// （往回是最后一个）开始。
     pub fn cycle_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let order: Vec<Page> = (0..self.tabs.len())
-            .map(Page::Repo)
-            .chain((0..self.terms.len()).map(Page::Term))
-            .collect();
+        let order: Vec<Page> = (0..self.tabs.len()).map(Page::Repo).collect();
         let count = order.len() as isize;
         if count == 0 {
             return;
@@ -1747,7 +1552,6 @@ impl Workspace {
     fn persist(&self, cx: &mut Context<Self>) {
         self.update_visibility(cx);
         let repos: Vec<RepoEntry> = self.tabs.iter().map(|t| t.entry.clone()).collect();
-        let terms: Vec<TermSlot> = self.terms.iter().map(|t| t.slot.clone()).collect();
         let front = match self.page {
             Page::Servers => Front::Servers,
             Page::Terms => Front::Terms,
@@ -1756,13 +1560,8 @@ impl Workspace {
                 .get(ix)
                 .cloned()
                 .map_or(Front::Workspaces, Front::Repo),
-            Page::Term(ix) => terms
-                .get(ix)
-                .cloned()
-                .map_or(Front::Workspaces, Front::Term),
         };
-        self.app
-            .update(cx, |app, _| app.set_tabs(repos, terms, front));
+        self.app.update(cx, |app, _| app.set_tabs(repos, front));
     }
 
     // ---- 标题栏 ----
@@ -1872,7 +1671,7 @@ impl Workspace {
                 MouseButton::Middle,
                 cx.listener(move |this, _, window, cx| this.close(ix, window, cx)),
             )
-            .child(ui::icon(look.glyph.clone()).flex_none())
+            .child(ui::icon(look.glyph).flex_none())
             .child(
                 div()
                     .flex_shrink(1.)
@@ -1924,138 +1723,10 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// 第 `ix` 个终端标签页上要画的东西。
-    fn term_tab_look(&self, ix: usize, cx: &App) -> TermTabLook {
-        let tab = &self.terms[ix];
-        let row = tab.view.read(cx).row(cx);
-        let app = self.app.read(cx);
-        let name: SharedString = match &row {
-            Some(row) => TermOverview::term_name(row),
-            None => tf!("终端 {n}", n = tab.slot.number.to_string()).into(),
-        };
-        let state: SharedString = match &row {
-            Some(row) => TermOverview::state_text(row),
-            None => machine_status(app, crate::machines::machine_of(&tab.slot.entry), cx).0,
-        };
-        TermTabLook {
-            name,
-            repo: app.repo_name(&tab.slot.entry),
-            place: TermOverview::place(app, &tab.slot.entry),
-            state,
-            dot: row.as_ref().map(|row| (row.state, row.alive)),
-            selected: self.page == Page::Term(ix) && !self.showing_settings,
-        }
-    }
-
-    /// 一个终端标签页：深底、等宽字，状态点在最前，名字（程序自己设的标题，没有是「终端 N」），后面
-    /// 淡淡写它的仓库；关闭按钮和仓库标签页的一样。`width` 宽（见 `tab_fit`）。关掉不结束终端。
-    fn render_term_tab(
-        &self,
-        ix: usize,
-        look: &TermTabLook,
-        width: f32,
-        label: TermLabel,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let theme = cx.theme();
-        let (bg, border, fg, muted, hover) = (
-            theme.background,
-            theme.primary.opacity(0.55),
-            theme.foreground,
-            theme.muted_foreground,
-            theme.accent,
-        );
-        let dot = match look.dot {
-            Some((state, alive)) => {
-                TermOverview::dot(state, 7., cx).when(!alive, |dot| dot.opacity(0.4))
-            }
-            None => TermOverview::dot(TermState::Idle, 7., cx).opacity(0.4),
-        };
-        let tip_title: SharedString = format!("{} · {}", look.name, look.repo).into();
-        let tip_sub: SharedString = tf!(
-            "{state} · {place}。关闭标签页不结束终端",
-            state = &look.state,
-            place = &look.place
-        )
-        .into();
-        let close = tab_close(("close-term-tab", ix), look.selected, cx).on_click(cx.listener(
-            move |this, _, window, cx| {
-                cx.stop_propagation();
-                this.close_term_tab(ix, window, cx);
-            },
-        ));
-        let (menu_this, slot) = (cx.entity().downgrade(), self.terms[ix].slot.clone());
-        h_flex()
-            .id(("term-tab", ix))
-            .group("tab")
-            .occlude()
-            .relative()
-            .flex_none()
-            .w(px(width))
-            .h(px(28.))
-            .pl(px(9.))
-            .pr(px(6.))
-            .gap(px(6.))
-            .rounded(px(ui::RADIUS))
-            .border_1()
-            .bg(bg)
-            .border_color(if look.selected {
-                border
-            } else {
-                gpui_kit::transparent_black()
-            })
-            // 等宽字只给标签上的字：设在整个标签上的话，右键菜单也跟着变成等宽字
-            .text_color(if look.selected { fg } else { muted })
-            .cursor_pointer()
-            .when(!look.selected, |chip| {
-                chip.hover(|s| s.bg(hover).text_color(fg))
-            })
-            .tooltip(move |window, cx| {
-                ui::two_line_tip(tip_title.clone(), tip_sub.clone(), window, cx)
-            })
-            .on_click(
-                cx.listener(move |this, _, window, cx| this.show_page(Page::Term(ix), window, cx)),
-            )
-            .on_mouse_down(
-                MouseButton::Middle,
-                cx.listener(move |this, _, window, cx| this.close_term_tab(ix, window, cx)),
-            )
-            .child(dot)
-            .child(
-                div()
-                    .flex_shrink(1.)
-                    .min_w_0()
-                    .truncate()
-                    .font_family(TERM_TAB_FONT)
-                    .text_size(px(12.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(match label {
-                        TermLabel::Repo => look.repo.clone(),
-                        _ => look.name.clone(),
-                    }),
-            )
-            .when(label == TermLabel::Both, |chip| {
-                chip.child(
-                    div()
-                        .flex_shrink(4.)
-                        .min_w_0()
-                        .truncate()
-                        .font_family(TERM_TAB_FONT)
-                        .text_size(px(12.))
-                        .text_color(muted)
-                        .child(look.repo.clone()),
-                )
-            })
-            .child(close)
-            .context_menu(move |menu, _, _| term_tab_menu(menu, ix, slot.clone(), &menu_this))
-            .into_any_element()
-    }
-
-    /// 「⌄ N」：放不下收起来了几个。点开列出全部开着的标签页，仓库、终端各一组，后面淡淡写在哪台
-    /// （子仓库写它所在的仓库）、哪个仓库，当前的打勾；点了切过去。
+    /// 「⌄ N」：放不下收起来了几个。点开列出全部开着的标签页，后面淡淡写在哪台（子仓库写它所在的
+    /// 仓库），当前的打勾；点了切过去。
     fn render_more_button(&self, hidden: usize, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme();
-        let (muted, primary, warning) = (theme.muted_foreground, theme.primary, theme.warning);
+        let muted = cx.theme().muted_foreground;
         let app = self.app.read(cx);
         let repos: Vec<(IconName, SharedString, SharedString, bool)> = self
             .tabs
@@ -2076,13 +1747,6 @@ impl Workspace {
                 (glyph, app.repo_name(&tab.entry), aside, on)
             })
             .collect();
-        let terms: Vec<(Option<(TermState, bool)>, SharedString, SharedString, bool)> =
-            (0..self.terms.len())
-                .map(|ix| {
-                    let look = self.term_tab_look(ix, cx);
-                    (look.dot, look.name, look.repo, look.selected)
-                })
-                .collect();
         let this = cx.entity().downgrade();
         div()
             .occlude()
@@ -2096,18 +1760,15 @@ impl Workspace {
                     .tooltip(tf!("另有 {n} 个标签页未显示，点击列出全部", n = hidden))
                     .dropdown_menu(move |mut menu, _, _| {
                         menu = menu.min_w(px(300.)).max_h(px(520.)).scrollable(true);
-                        if !repos.is_empty() {
-                            menu = menu.label(trc("列表", "仓库"));
-                        }
                         for (ix, (glyph, name, aside, on)) in repos.iter().enumerate() {
                             let this = this.clone();
-                            let (glyph, name, aside) = (glyph.clone(), name.clone(), aside.clone());
+                            let (glyph, name, aside) = (*glyph, name.clone(), aside.clone());
                             menu = menu.item(
                                 PopupMenuItem::element(move |_, _| {
                                     h_flex()
                                         .w_full()
                                         .gap(px(8.))
-                                        .child(ui::icon(glyph.clone()).flex_none())
+                                        .child(ui::icon(glyph).flex_none())
                                         .child(
                                             div()
                                                 .flex_shrink(1.)
@@ -2134,69 +1795,6 @@ impl Workspace {
                                 }),
                             );
                         }
-                        if !terms.is_empty() {
-                            if !repos.is_empty() {
-                                menu = menu.separator();
-                            }
-                            menu = menu.label(trc("列表", "终端"));
-                        }
-                        for (ix, (dot, name, repo, on)) in terms.iter().enumerate() {
-                            let this = this.clone();
-                            let (dot, name, repo) = (*dot, name.clone(), repo.clone());
-                            menu = menu.item(
-                                PopupMenuItem::element(move |_, _| {
-                                    // 和终端页一样：运行中实心主色，已停下警示色，空闲空心，已结束变淡
-                                    let mark = div().flex_none().size(px(7.)).rounded_full();
-                                    let mark = match dot {
-                                        Some((TermState::Running, alive)) => {
-                                            mark.bg(primary).when(!alive, |m| m.opacity(0.4))
-                                        }
-                                        Some((TermState::Stopped, alive)) => {
-                                            mark.bg(warning).when(!alive, |m| m.opacity(0.4))
-                                        }
-                                        Some((TermState::Idle, true)) => {
-                                            mark.border_1().border_color(muted)
-                                        }
-                                        _ => mark.border_1().border_color(muted).opacity(0.4),
-                                    };
-                                    h_flex()
-                                        .w_full()
-                                        .gap(px(8.))
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .w(px(14.))
-                                                .flex()
-                                                .justify_center()
-                                                .child(mark),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_shrink(1.)
-                                                .min_w_0()
-                                                .truncate()
-                                                .font_family(TERM_TAB_FONT)
-                                                .child(name.clone()),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_shrink(4.)
-                                                .min_w_0()
-                                                .truncate()
-                                                .text_xs()
-                                                .text_color(muted)
-                                                .child(repo.clone()),
-                                        )
-                                })
-                                .checked(*on)
-                                .on_click(move |_, window, cx| {
-                                    this.update(cx, |this, cx| {
-                                        this.show_page(Page::Term(ix), window, cx)
-                                    })
-                                    .ok();
-                                }),
-                            );
-                        }
                         menu
                     }),
             )
@@ -2204,7 +1802,7 @@ impl Workspace {
     }
 
     /// 标题栏最左边的一个页面入口（服务器、终端、工作区）：长得和标签页一样，名字固定，不跟着选了
-    /// 哪台服务器、哪个工作区变（2026-11-19 Feng：「名字就叫工作区，不会跟着换就变」）。窗口窄时
+    /// 哪台服务器、哪个工作区变。窗口窄时
     /// 只留图标，悬停看名字。
     fn render_page_entry(
         &self,
@@ -2254,7 +1852,7 @@ impl Workspace {
         let (border, muted, warning) = (theme.border, theme.muted_foreground, theme.warning);
         // 窗口窄的时候三个页面只留图标，给标签页腾地方
         let narrow = viewport < NARROW_WIDTH;
-        let servers_label = trc("页面", "服务器");
+        let servers_label = trc("页面", "主机");
         let servers = self
             .render_page_entry(
                 Page::Servers,
@@ -2334,19 +1932,7 @@ impl Workspace {
             .iter()
             .map(|look| repo_tab_base(look, window))
             .collect();
-        let term_looks: Vec<TermTabLook> = (0..self.terms.len())
-            .map(|ix| self.term_tab_look(ix, cx))
-            .collect();
-        let term_naturals: Vec<f32> = term_looks
-            .iter()
-            .map(|look| term_tab_natural(look, window))
-            .collect();
-        let term_bases: Vec<f32> = term_looks
-            .iter()
-            .map(|look| term_tab_base(look, window))
-            .collect();
-        // 标签页那一块里除了标签还有：「+」、拖窗口的空白、终端那一段前面的竖线、设置页开着时它的
-        // 标签，和它们之间的间隔
+        // 标签页那一块里除了标签还有：「+」、拖窗口的空白、设置页开着时它的标签，和它们之间的间隔
         let settings_width = match self.showing_settings {
             true => {
                 let label = ui::text_width(window, tr("设置"), 13., None, FontWeight::NORMAL);
@@ -2354,63 +1940,27 @@ impl Workspace {
             }
             false => 0.,
         };
-        let mut room = region - (20. + TAB_GAP) - (24. + TAB_GAP) - settings_width;
-        if !self.terms.is_empty() {
-            room -= 9. + TAB_GAP * 2.;
-        }
-        let active = |page: Page| (!self.showing_settings && self.page == page).then_some(());
-        let active_repo = (0..self.tabs.len()).find(|ix| active(Page::Repo(*ix)).is_some());
-        let active_term = (0..self.terms.len()).find(|ix| active(Page::Term(*ix)).is_some());
+        let room = region - (20. + TAB_GAP) - (24. + TAB_GAP) - settings_width;
+        let active =
+            (0..self.tabs.len()).find(|ix| !self.showing_settings && self.page == Page::Repo(*ix));
         let fit = tab_fit::fit(
             &Segment {
                 natural: &naturals,
                 min: tab_fit::REPO_MIN,
-                active: active_repo,
-            },
-            &Segment {
-                natural: &term_naturals,
-                min: tab_fit::TERM_MIN,
-                active: active_term,
+                active,
             },
             room,
             TAB_GAP,
-            viewport,
             MORE_WIDTH + TAB_GAP,
         );
-        let hidden = fit.repos.hidden(naturals.len()) + fit.terms.hidden(term_naturals.len());
-        // 名字后面那一截淡淡的字（同名的说明、终端的仓库名）压得只剩一点时不画，免得只剩一个省略号
+        let hidden = fit.hidden(naturals.len());
+        // 名字后面那一截淡淡的字（同名的说明）压得只剩一点时不画，免得只剩一个省略号
         let repo_tabs: Vec<AnyElement> = fit
-            .repos
             .shown
             .iter()
             .map(|(ix, width)| {
                 let aside = *width >= bases[*ix] + ASIDE_MIN;
                 self.render_repo_tab(*ix, &looks[*ix], *width, aside, cx)
-            })
-            .collect();
-        let term_twins: Vec<bool> = term_looks
-            .iter()
-            .map(|look| {
-                term_looks
-                    .iter()
-                    .filter(|other| other.name == look.name)
-                    .count()
-                    > 1
-            })
-            .collect();
-        let term_tabs: Vec<AnyElement> = fit
-            .terms
-            .shown
-            .iter()
-            .map(|(ix, width)| {
-                // 只放得下一截时写名字；几个终端同名（都叫 pwsh、都是 Claude Code）时写仓库名，
-                // 同样的名字分不出是哪个
-                let label = match (*width >= term_bases[*ix] + ASIDE_MIN, term_twins[*ix]) {
-                    (true, _) => TermLabel::Both,
-                    (false, true) => TermLabel::Repo,
-                    (false, false) => TermLabel::Name,
-                };
-                self.render_term_tab(*ix, &term_looks[*ix], *width, label, cx)
             })
             .collect();
         let more = fit.overflow.then(|| self.render_more_button(hidden, cx));
@@ -2433,7 +1983,7 @@ impl Workspace {
             .absolute()
             .inset_0()
         };
-        // 标签页这一块：仓库标签、「⌄ N」、「+」、拖窗口的空白，终端标签在最右边（T3）
+        // 标签页这一块：仓库标签、「⌄ N」、「+」、拖窗口的空白
         let strip = h_flex()
             .absolute()
             .inset_0()
@@ -2452,12 +2002,7 @@ impl Workspace {
                 ),
             )
             // 这一段是空的：按住可以拖窗口
-            .child(div().flex_1().min_w(px(24.)).h_full())
-            .when(!term_tabs.is_empty(), |strip| {
-                strip
-                    .child(div().flex_none().w(px(1.)).h(px(16.)).mx(px(4.)).bg(border))
-                    .children(term_tabs)
-            });
+            .child(div().flex_1().min_w(px(24.)).h_full());
         TitleBar::new().h(px(TITLE_HEIGHT)).child(
             h_flex()
                 .h_full()
@@ -2517,26 +2062,6 @@ struct RepoTabLook {
     tip_title: SharedString,
 }
 
-/// 终端标签上写什么：名字和淡淡的仓库名；挤得只放得下一截时只写名字，或者只写仓库名（同名时）。
-#[derive(Clone, Copy, PartialEq)]
-enum TermLabel {
-    Both,
-    Name,
-    Repo,
-}
-
-/// 一个终端标签页上要画的东西。
-struct TermTabLook {
-    name: SharedString,
-    repo: SharedString,
-    /// 哪台电脑（经别的电脑连的写明经由哪台）
-    place: SharedString,
-    state: SharedString,
-    /// 列表里有它：状态、里面的程序还在不在
-    dot: Option<(TermState, bool)>,
-    selected: bool,
-}
-
 /// 仓库标签页不挤时多宽：和 `render_repo_tab` 画的一样算（边框、内边距、图标、名字、说明、改动的
 /// 小点、图钉、选中时排在后面的关闭按钮），最宽 [`REPO_TAB_MAX`]。
 fn repo_tab_natural(look: &RepoTabLook, window: &Window) -> f32 {
@@ -2558,36 +2083,6 @@ fn repo_tab_base(look: &RepoTabLook, window: &Window) -> f32 {
         width += 6. + 16.;
     }
     if look.selected && look.show_close {
-        width += 6. + 16.;
-    }
-    width
-}
-
-/// 终端标签页不挤时多宽，同上（状态点、名字、仓库名都是等宽字），最宽 [`TERM_TAB_MAX`]。
-fn term_tab_natural(look: &TermTabLook, window: &Window) -> f32 {
-    let repo = ui::text_width(
-        window,
-        &look.repo,
-        12.,
-        Some(TERM_TAB_FONT),
-        FontWeight::NORMAL,
-    );
-    (term_tab_base(look, window) + 6. + repo)
-        .ceil()
-        .min(TERM_TAB_MAX)
-}
-
-/// 终端标签页不算仓库名那一截时多宽。
-fn term_tab_base(look: &TermTabLook, window: &Window) -> f32 {
-    let name = ui::text_width(
-        window,
-        &look.name,
-        12.,
-        Some(TERM_TAB_FONT),
-        FontWeight::SEMIBOLD,
-    );
-    let mut width = 2. + 9. + 6. + 7. + 6. + name;
-    if look.selected {
         width += 6. + 16.;
     }
     width
@@ -2669,51 +2164,6 @@ pub(crate) fn machine_status(state: &AppState, machine: &str, cx: &App) -> (Shar
             _ => (tr("未连接").into(), theme.muted_foreground),
         },
     }
-}
-
-/// 终端标签页的右键菜单：关掉标签页（终端接着运行）、关掉别的终端标签页、在终端页中显示、结束终端。
-fn term_tab_menu(
-    menu: PopupMenu,
-    ix: usize,
-    slot: TermSlot,
-    this: &WeakEntity<Workspace>,
-) -> PopupMenu {
-    let (close, others, reveal, end) = (this.clone(), this.clone(), this.clone(), this.clone());
-    let reveal_slot = slot.clone();
-    menu.item(
-        PopupMenuItem::new(tr("关闭标签页（终端继续运行）")).on_click(move |_, window, cx| {
-            close
-                .update(cx, |this, cx| this.close_term_tab(ix, window, cx))
-                .ok();
-        }),
-    )
-    .item(
-        PopupMenuItem::new(tr("关闭其他终端标签页")).on_click(move |_, window, cx| {
-            others
-                .update(cx, |this, cx| this.close_other_term_tabs(ix, window, cx))
-                .ok();
-        }),
-    )
-    .separator()
-    .item(
-        PopupMenuItem::new(tr("在终端页中显示")).on_click(move |_, window, cx| {
-            reveal
-                .update(cx, |this, cx| this.reveal_term(&reveal_slot, window, cx))
-                .ok();
-        }),
-    )
-    .separator()
-    .item(
-        PopupMenuItem::new(tr("结束终端…")).on_click(move |_, window, cx| {
-            end.update(cx, |this, cx| {
-                if let Some(tab) = this.terms.iter().find(|tab| tab.slot == slot) {
-                    tab.view
-                        .update(cx, |view, cx| view.end_terminal(window, cx));
-                }
-            })
-            .ok();
-        }),
-    )
 }
 
 /// 仓库标签页的右键菜单。`in_workspace`：有工作区包含它（「在工作区页中显示」才有用）。
@@ -3060,10 +2510,6 @@ impl Render for Workspace {
                 Page::Terms => self.overview.clone().into_any_element(),
                 Page::Workspaces => self.workspaces.clone().into_any_element(),
                 Page::Repo(ix) => match self.tabs.get(ix) {
-                    Some(tab) => tab.view.clone().into_any_element(),
-                    None => self.workspaces.clone().into_any_element(),
-                },
-                Page::Term(ix) => match self.terms.get(ix) {
                     Some(tab) => tab.view.clone().into_any_element(),
                     None => self.workspaces.clone().into_any_element(),
                 },

@@ -40,6 +40,7 @@ pub const STATUS_OBJECT_NAME_NOT_FOUND: NTSTATUS = nt(0xC000_0034);
 pub const STATUS_OBJECT_NAME_COLLISION: NTSTATUS = nt(0xC000_0035);
 pub const STATUS_FILE_IS_A_DIRECTORY: NTSTATUS = nt(0xC000_00BA);
 pub const STATUS_UNEXPECTED_IO_ERROR: NTSTATUS = nt(0xC000_00E9);
+pub const STATUS_IO_TIMEOUT: NTSTATUS = nt(0xC000_00B5);
 pub const STATUS_DIRECTORY_NOT_EMPTY: NTSTATUS = nt(0xC000_0101);
 
 pub const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
@@ -212,10 +213,21 @@ unsafe extern "system" {
     fn LoadLibraryW(name: *const u16) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
     fn LocalFree(mem: *mut c_void) -> *mut c_void;
+    fn GetCurrentProcess() -> *mut c_void;
+    fn CloseHandle(handle: *mut c_void) -> i32;
 }
 
 #[link(name = "advapi32")]
 unsafe extern "system" {
+    fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
+    fn GetTokenInformation(
+        token: *mut c_void,
+        class: u32,
+        info: *mut c_void,
+        len: u32,
+        returned: *mut u32,
+    ) -> i32;
+    fn ConvertSidToStringSidW(sid: *mut c_void, text: *mut *mut u16) -> i32;
     fn RegGetValueW(
         key: isize,
         subkey: *const u16,
@@ -341,10 +353,55 @@ pub unsafe fn user_context(fs: *mut FileSystem) -> *mut c_void {
     unsafe { *fs.cast::<u8>().add(8).cast::<*mut c_void>() }
 }
 
-/// 一份「谁都能读写」的安全描述符（自相对格式的字节）。服务器上的权限由 kuaid 那边的账号决定，
-/// 盘上不再另管一层。
+/// 盘上文件的安全描述符写成 SDDL：系统、管理员和 `user`（SID）能读写，`user` 是 None 时给所有人。
+fn sddl(user: Option<&str>) -> String {
+    let user = user.unwrap_or("WD");
+    format!("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{user})")
+}
+
+/// 当前用户的 SID（`S-1-5-21-…`）；取不到是 None。
+fn current_user_sid() -> Option<String> {
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_USER: u32 = 1;
+    // SAFETY：句柄用完关掉；缓冲区按 8 字节对齐（TOKEN_USER 开头是指针），系统写进去的 SID
+    // 在缓冲区里；转出来的字符串以 0 结尾，读完用 LocalFree 还回去
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let mut len = 0u32;
+        GetTokenInformation(token, TOKEN_USER, std::ptr::null_mut(), 0, &mut len);
+        let mut buffer = vec![0u64; (len as usize).div_ceil(8).max(1)];
+        let got = GetTokenInformation(token, TOKEN_USER, buffer.as_mut_ptr().cast(), len, &mut len);
+        CloseHandle(token);
+        if got == 0 {
+            return None;
+        }
+        let sid = *buffer.as_ptr().cast::<*mut c_void>();
+        let mut text = std::ptr::null_mut();
+        if ConvertSidToStringSidW(sid, &mut text) == 0 {
+            return None;
+        }
+        let mut count = 0;
+        while *text.add(count) != 0 {
+            count += 1;
+        }
+        let sid = String::from_utf16(std::slice::from_raw_parts(text, count)).ok();
+        LocalFree(text.cast());
+        sid
+    }
+}
+
+/// 盘上文件的安全描述符（自相对格式的字节）：只有映射它的用户（和系统、管理员）能读写。服务器
+/// 上的权限由 kuaid 那边的账号决定，盘上不再细分。原来给 Everyone：映射到本机别的账号进得去的
+/// 文件夹时，别人能用你的 SSH 身份读写远程文件。取不到当前用户时退回原来的。
 pub fn open_security_descriptor() -> Result<Vec<u8>> {
-    let sddl = wide("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)");
+    let user = current_user_sid();
+    if user.is_none() {
+        log::warn!("取不到当前用户，映射的盘对本机所有用户开放");
+    }
+    let sddl = wide(&sddl(user.as_deref()));
     let mut descriptor = std::ptr::null_mut();
     let mut size = 0u32;
     let ok = unsafe {
@@ -362,4 +419,21 @@ pub fn open_security_descriptor() -> Result<Vec<u8>> {
         unsafe { std::slice::from_raw_parts(descriptor.cast::<u8>(), size as usize).to_vec() };
     unsafe { LocalFree(descriptor) };
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 盘上的权限只给当前用户() {
+        let sid = current_user_sid().expect("取当前用户的 SID");
+        assert!(sid.starts_with("S-1-5-"), "{sid}");
+        let text = sddl(Some(&sid));
+        assert!(text.ends_with(&format!("(A;;FA;;;{sid})")), "{text}");
+        assert!(!text.contains(";WD)"), "{text}");
+        // 取不到当前用户时退回原来的
+        assert!(sddl(None).ends_with("(A;;FA;;;WD)"));
+        assert!(!open_security_descriptor().unwrap().is_empty());
+    }
 }

@@ -14,6 +14,9 @@
 //!   经 `on_error` 告诉界面，文件照旧留着。
 //! - 列目录、查文件属性的结果留 2 秒：资源管理器会反复问同一批东西，还会试探一堆不存在的名字
 //!   （`desktop.ini` 这类），都从留着的那份目录里答，不再问服务器。
+//! - 等回音有期限（[`REPLY_TIMEOUT`]）：主机上的文件操作卡住时（SSH 照样通着，比如挂死的网络盘），
+//!   请求报超时，资源管理器、卸载不跟着一直等。写入按「上一次有写入落地以后」算，线路慢、排着队的
+//!   不算卡住。
 //!
 //! 同一个文件被打开几次，共用一个 [`Node`]。
 
@@ -65,6 +68,11 @@ pub(crate) const TTL: Duration = Duration::from_secs(2);
 const SPACE_TTL: Duration = Duration::from_secs(10);
 /// 留着的目录、属性超过这么多条时，把过期的清掉。
 const CACHE_MAX: usize = 4096;
+/// 主机多久不回音就不等了：一直等的话 WinFsp 的调度线程卡住，资源管理器跟着卡，卸载、退出也等不完。
+/// 前面排着大批写入的慢线路上也够用。
+const REPLY_TIMEOUT: Duration = Duration::from_secs(120);
+/// 一次读等数据时文件变了，最多从头再读几遍。
+const RESTARTS: u32 = 2;
 
 /// Windows 自己会往盘的根上建的目录。
 const SYSTEM_DIRS: [&str; 2] = ["$RECYCLE.BIN", "System Volume Information"];
@@ -92,6 +100,8 @@ struct Pending {
     offset: u64,
     len: u64,
     writing: BoxFuture<'static, Result<FsStat>>,
+    /// 发出去的时刻
+    sent: Instant,
 }
 
 /// 写入、删除没成时要用的：出了错怎么换成状态码、告诉谁。
@@ -156,6 +166,8 @@ struct NodeState {
     resync: bool,
     /// 写过：关的时候让留着的目录作废
     dirty: bool,
+    /// 上次刷盘（[`Mount::flush_file`]）以后写过、改过大小或时间
+    unsynced: bool,
     /// 这次列目录用的那一份，按名字排好；翻页时要前后一致
     listing: Option<Arc<Vec<Row>>>,
 }
@@ -285,6 +297,16 @@ impl Cache {
                 && matches!(slot, Unit::Wanted(id) if *id == asked.id)
             {
                 *slot = Unit::Failed(asked.id, status);
+            }
+        }
+    }
+
+    /// 第 `id` 个读请求不等了（主机一直不回）：在等它的格记下错误，之后的读重新要。它晚到了
+    /// 照样放进来（见 [`NodeState::arrived`]）。
+    fn give_up(&mut self, id: u64, status: NTSTATUS) {
+        for slot in self.units.values_mut() {
+            if matches!(slot, Unit::Wanted(wanted) if *wanted == id) {
+                *slot = Unit::Failed(id, status);
             }
         }
     }
@@ -458,6 +480,30 @@ fn land(
     asked.node.arrived.notify_all();
 }
 
+/// 等 `future` 好，最多等到 `deadline`；到时没好返回 None，`future` 就此放下（回音晚到了也没人要）。
+fn block_until<F: Future>(future: F, deadline: Instant) -> Option<F::Output> {
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return Some(output);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        // 醒早了（别处叫醒了这个线程）也没关系，再看一眼
+        std::thread::park_timeout(left);
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -502,7 +548,8 @@ fn stat_of(entry: &FsEntry) -> FsStat {
         dir: entry.dir,
         size: entry.size,
         mtime: entry.mtime,
-        readonly: false,
+        // 原来一律可写：同一个只读文件列目录时没有只读属性、看属性时又是只读
+        readonly: entry.readonly,
     }
 }
 
@@ -548,10 +595,23 @@ pub(crate) fn status_of(message: &str, windows: bool) -> NTSTATUS {
     }
 }
 
-/// 等写入回音的线程：请求发出去的先后就是这里等的先后。
+/// 等写入回音的线程：请求发出去的先后就是这里等的先后。主机一直不回音的（文件操作卡住了）
+/// 算没写成，不然等它的写、Flush、卸载都跟着一直等；主机还在回音的（线路慢、前面排着队）接着等。
 fn settle(incoming: mpsc::Receiver<Pending>, sink: Arc<Sink>) {
+    // 上一次有写入回音的时刻
+    let mut progress = Instant::now();
     while let Ok(pending) = incoming.recv() {
-        let result = block_on(pending.writing);
+        let deadline = pending.sent.max(progress) + REPLY_TIMEOUT;
+        let result = match block_until(pending.writing, deadline) {
+            Some(result) => {
+                progress = Instant::now();
+                result.map_err(|err| {
+                    let message = format!("{err:#}");
+                    (status_of(&message, sink.windows), message)
+                })
+            }
+            None => Err((STATUS_IO_TIMEOUT, tr("主机长时间没有回应").to_string())),
+        };
         let mut state = lock(&pending.node.state);
         let (offset, len) = (pending.offset, pending.len);
         if let Some(at) = state
@@ -566,14 +626,12 @@ fn settle(incoming: mpsc::Receiver<Pending>, sink: Arc<Sink>) {
             // 都落地了：修改时间以服务器上的为准。大小不动：这段时间里可能又截断过
             Ok(stat) if state.flying.is_empty() => state.stat.mtime = stat.mtime,
             Ok(_) => {}
-            Err(err) => {
-                let message = format!("{err:#}");
+            Err((status, message)) => {
                 log::warn!("写入 /{} 失败：{message}", state.path);
                 state.resync = true;
                 state.cache.renew();
                 // 只记第一个错：后面的多半是它引出来的
                 if state.failed.is_none() {
-                    let status = status_of(&message, sink.windows);
                     state.failed = Some(status);
                     let text = failure(&sink.place, &state.path, status, &message, false);
                     (sink.on_error)(text);
@@ -595,12 +653,13 @@ fn failure(place: &str, path: &str, status: NTSTATUS, message: &str, deleting: b
         false => format!("{root}\\{}", path.replace('/', "\\")),
     };
     let reason = match status {
-        STATUS_DISK_FULL => tr("服务器磁盘空间不足"),
+        STATUS_DISK_FULL => tr("主机磁盘空间不足"),
         STATUS_ACCESS_DENIED if deleting => tr("没有删除权限"),
         STATUS_ACCESS_DENIED => tr("没有写入权限"),
-        STATUS_MEDIA_WRITE_PROTECTED => tr("服务器上的目录是只读的"),
+        STATUS_MEDIA_WRITE_PROTECTED => tr("主机上的目录是只读的"),
         STATUS_OBJECT_NAME_NOT_FOUND => tr("文件已被删除或移走"),
-        STATUS_CONNECTION_DISCONNECTED => tr("与服务器的连接已断开"),
+        STATUS_CONNECTION_DISCONNECTED => tr("与主机的连接已断开"),
+        STATUS_IO_TIMEOUT => tr("主机长时间没有回应"),
         _ => message,
     };
     match deleting {
@@ -684,10 +743,14 @@ impl Mount {
         }
     }
 
-    /// 等服务器的回音。
+    /// 等服务器的回音，最多等 [`REPLY_TIMEOUT`]。
     fn wait<T>(&self, what: &str, path: &str, future: BoxFuture<'static, Result<T>>) -> Nt<T> {
         self.counters.calls.fetch_add(1, Relaxed);
-        block_on(future).map_err(|err| {
+        let Some(result) = block_until(future, Instant::now() + REPLY_TIMEOUT) else {
+            log::warn!("{what} /{path} 超过 {} 秒没有回音", REPLY_TIMEOUT.as_secs());
+            return Err(STATUS_IO_TIMEOUT);
+        };
+        result.map_err(|err| {
             let message = format!("{err:#}");
             let status = status_of(&message, self.windows);
             // 试探不存在的文件是常事，不记
@@ -818,6 +881,7 @@ impl Mount {
                             failed: None,
                             resync: false,
                             dirty: false,
+                            unsynced: false,
                             listing: None,
                         }),
                         landed: Condvar::new(),
@@ -995,7 +1059,7 @@ impl Mount {
         count: u64,
     ) -> Nt<()> {
         let id = self.next_fetch.fetch_add(1, Relaxed);
-        let reading = channel.fs_read(&self.root, &state.path, first * UNIT, count * UNIT);
+        let reading = channel.fs_read(&self.root, &state.path, first * UNIT, count * UNIT, None);
         self.counters.calls.fetch_add(1, Relaxed);
         let asked = Asked {
             id,
@@ -1056,74 +1120,105 @@ impl Mount {
 
     fn read(&self, node: &Arc<Node>, buffer: &mut [u8], offset: u64) -> Nt<usize> {
         let mut state = self.drain(node, lock(&node.state));
-        if offset >= state.stat.size {
-            return Err(STATUS_END_OF_FILE);
-        }
-        let end = (offset + buffer.len() as u64).min(state.stat.size);
-        let stream = state.cache.follow(offset, end);
-        let last = end.saturating_sub(1) / UNIT;
-        // 先要这次要读的，紧接着要后面的（连着往后读的），再等：后面的不用等这次的到了才发。
-        // 先发的先回，这次要的不会被后面的挡住
-        state = self.request(node, state, offset / UNIT, last, true)?;
-        if stream.hits > 0 {
-            state = self.prefetch(node, state, stream);
-        }
-        let mut done = 0usize;
-        // 在等的那个读请求：它出了错，这次读就报这个错
-        let mut waiting = None;
-        while offset + (done as u64) < end {
-            let at = offset + done as u64;
-            let unit = at / UNIT;
-            if let Some(Unit::Failed(id, status)) = state.cache.units.get(&unit)
-                && waiting == Some(*id)
-            {
-                return Err(*status);
+        // 是哪一路连着往后读的：头一遍认，从头再读时不再算一次
+        let mut followed = None;
+        let mut restarts = 0;
+        'again: loop {
+            // 这次读到的都要是同一代的。等数据时不锁着文件，这期间文件可能变了（这边写了、截断了，
+            // 或者读回来的数据说主机上的变了）：已经拷出去的是旧的，从头再读，不然前半是旧的、
+            // 后半是新的
+            let generation = state.cache.generation;
+            if offset >= state.stat.size {
+                return Err(STATUS_END_OF_FILE);
             }
-            // 这一格和后面还要的那些，没有的都要了（后面的看线路有没有余量）。别的读要的时候
-            // 出了错的、文件变了不在了的，也重新要
-            state = self.request(node, state, unit, last, true)?;
-            state.cache.tick += 1;
-            let tick = state.cache.tick;
-            if let Some(Unit::Ready { used, .. }) = state.cache.units.get_mut(&unit) {
-                *used = tick;
+            let end = (offset + buffer.len() as u64).min(state.stat.size);
+            let stream = *followed.get_or_insert_with(|| state.cache.follow(offset, end));
+            let last = end.saturating_sub(1) / UNIT;
+            // 先要这次要读的，紧接着要后面的（连着往后读的），再等：后面的不用等这次的到了才发。
+            // 先发的先回，这次要的不会被后面的挡住
+            state = self.request(node, state, offset / UNIT, last, true)?;
+            if stream.hits > 0 {
+                state = self.prefetch(node, state, stream);
             }
-            match state.cache.units.get(&unit) {
-                Some(Unit::Ready {
-                    bytes,
-                    at: start,
-                    len,
-                    ..
-                }) => {
-                    let within = (at - unit * UNIT) as usize;
-                    // 文件变短了
-                    if within >= *len {
-                        break;
+            let mut done = 0usize;
+            // 在等的那个读请求、从什么时候等起：它出了错，这次读就报这个错
+            let mut waiting: Option<(u64, Instant)> = None;
+            while offset + (done as u64) < end {
+                let at = offset + done as u64;
+                let unit = at / UNIT;
+                if let Some(Unit::Failed(id, status)) = state.cache.units.get(&unit)
+                    && waiting.is_some_and(|(waited, _)| waited == *id)
+                {
+                    return Err(*status);
+                }
+                // 这一格和后面还要的那些，没有的都要了（后面的看线路有没有余量）。别的读要的时候
+                // 出了错的、文件变了不在了的，也重新要
+                state = self.request(node, state, unit, last, true)?;
+                // 一直在变的（一边读一边有人往里写）从头读过两遍就不再从头来了：和本机磁盘上一边
+                // 写一边读一样，读到的可能新旧都有
+                if state.cache.generation != generation && restarts < RESTARTS {
+                    restarts += 1;
+                    continue 'again;
+                }
+                state.cache.tick += 1;
+                let tick = state.cache.tick;
+                if let Some(Unit::Ready { used, .. }) = state.cache.units.get_mut(&unit) {
+                    *used = tick;
+                }
+                match state.cache.units.get(&unit) {
+                    Some(Unit::Ready {
+                        bytes,
+                        at: start,
+                        len,
+                        ..
+                    }) => {
+                        let within = (at - unit * UNIT) as usize;
+                        // 文件变短了
+                        if within >= *len {
+                            break;
+                        }
+                        let count = (*len - within).min((end - at) as usize);
+                        let from = start + within;
+                        buffer[done..done + count].copy_from_slice(&bytes[from..from + count]);
+                        done += count;
+                        waiting = None;
                     }
-                    let count = (*len - within).min((end - at) as usize);
-                    let from = start + within;
-                    buffer[done..done + count].copy_from_slice(&bytes[from..from + count]);
-                    done += count;
-                    waiting = None;
+                    // 等它回来（在等的请求出了错，下一圈报出来）。主机一直不回就不等了：这个请求
+                    // 要的格记成超时，这次读报错，之后的读重新要
+                    Some(Unit::Wanted(id)) => {
+                        let id = *id;
+                        let since = match waiting {
+                            Some((waited, since)) if waited == id => since,
+                            _ => Instant::now(),
+                        };
+                        waiting = Some((id, since));
+                        let left = REPLY_TIMEOUT.saturating_sub(since.elapsed());
+                        if left.is_zero() {
+                            let secs = REPLY_TIMEOUT.as_secs();
+                            log::warn!("fs_read /{} 超过 {secs} 秒没有回音", state.path);
+                            state.cache.give_up(id, STATUS_IO_TIMEOUT);
+                            drop(state);
+                            node.arrived.notify_all();
+                            return Err(STATUS_IO_TIMEOUT);
+                        }
+                        state = node
+                            .arrived
+                            .wait_timeout(state, left)
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .0;
+                    }
+                    // 刚要过，到不了这里；真到了，下一圈再要
+                    _ => waiting = None,
                 }
-                // 等它回来（在等的请求出了错，下一圈报出来）
-                Some(Unit::Wanted(id)) => {
-                    waiting = Some(*id);
-                    state = node
-                        .arrived
-                        .wait(state)
-                        .unwrap_or_else(PoisonError::into_inner);
-                }
-                // 刚要过，到不了这里；真到了，下一圈再要
-                _ => waiting = None,
             }
-        }
-        // 读的这段时间里线路可能量得更快了，能多要一些
-        if stream.hits > 0 {
-            drop(self.prefetch(node, state, stream));
-        }
-        match done {
-            0 => Err(STATUS_END_OF_FILE),
-            done => Ok(done),
+            // 读的这段时间里线路可能量得更快了，能多要一些
+            if stream.hits > 0 {
+                drop(self.prefetch(node, state, stream));
+            }
+            return match done {
+                0 => Err(STATUS_END_OF_FILE),
+                done => Ok(done),
+            };
         }
     }
 
@@ -1140,25 +1235,26 @@ impl Mount {
         if let Some(status) = state.failed.take() {
             return Err(status);
         }
-        let offset = if to_end { state.stat.size } else { offset };
-        let mut len = data.len() as u64;
-        // 系统把缓存里的页写回来时不能把文件写长
-        if constrained {
-            len = len.min(state.stat.size.saturating_sub(offset));
-        }
-        if len == 0 {
-            return Ok((0, self.info(&state.stat)));
-        }
         // 在路上的太多、或者和在路上的重叠：等它们落地。服务器上每个请求各在各的线程里做，
-        // 重叠的两次写不等的话先后会乱
-        loop {
+        // 重叠的两次写不等的话先后会乱。写到哪、写多少每次醒来重新算：等的时候锁是放开的，别的
+        // 写可能已经把文件写长了，追加的还按原来的末尾写，就把人家刚写的盖掉了
+        let (offset, len) = loop {
+            let offset = if to_end { state.stat.size } else { offset };
+            let mut len = data.len() as u64;
+            // 系统把缓存里的页写回来时不能把文件写长
+            if constrained {
+                len = len.min(state.stat.size.saturating_sub(offset));
+            }
+            if len == 0 {
+                return Ok((0, self.info(&state.stat)));
+            }
             let overlaps = state
                 .flying
                 .iter()
                 .any(|(at, size)| offset < at + size && *at < offset + len);
             let full = state.flying_bytes + len > WINDOW && !state.flying.is_empty();
             if !overlaps && !full {
-                break;
+                break (offset, len);
             }
             state = node
                 .landed
@@ -1167,7 +1263,7 @@ impl Mount {
             if let Some(status) = state.failed.take() {
                 return Err(status);
             }
-        }
+        };
         let channel = self.channel()?;
         let sender = lock(&self.pending).clone();
         let mut at = offset;
@@ -1183,6 +1279,7 @@ impl Mount {
                 offset: at,
                 len: size,
                 writing,
+                sent: Instant::now(),
             };
             if sender.send(pending).is_err() {
                 // 等回音的线程没了：这个盘正在卸载
@@ -1196,6 +1293,7 @@ impl Mount {
         state.stat.mtime = now_millis();
         state.cache.renew();
         state.dirty = true;
+        state.unsynced = true;
         self.remember(&state.path, state.stat);
         node.arrived.notify_all();
         Ok((len as usize, self.info(&state.stat)))
@@ -1211,6 +1309,39 @@ impl Mount {
         Ok(self.info(&state.stat))
     }
 
+    /// 程序要求刷盘（`FlushFileBuffers`）：等写入落地，写过的再让主机把文件刷到它的磁盘上，
+    /// 刷不成照实报。关文件时不刷（[`Self::commit`]），和本机的文件一样交给系统。
+    fn flush_file(&self, node: &Node) -> Nt<FileInfo> {
+        let mut state = self.settled(node, lock(&node.state))?;
+        if std::mem::take(&mut state.dirty) {
+            self.invalidate(&state.path);
+            self.remember(&state.path, state.stat);
+        }
+        if state.unsynced && !state.stat.dir {
+            let path = state.path.clone();
+            let syncing = self.channel()?.fs_sync(&self.root, &path);
+            state.stat = self.wait("fs_sync", &path, syncing)?;
+            state.unsynced = false;
+            self.remember(&path, state.stat);
+        }
+        Ok(self.info(&state.stat))
+    }
+
+    /// 刷整个盘：开着的文件里写过的都刷一遍，有一个刷不成就报那一个的错。
+    fn flush_all(&self) -> Nt<()> {
+        let nodes: Vec<Arc<Node>> = lock(&self.nodes)
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        let mut result = Ok(());
+        for node in nodes {
+            if let Err(status) = self.flush_file(&node) {
+                result = Err(status);
+            }
+        }
+        result
+    }
+
     fn remove(&self, node: &Node) {
         if self.read_only {
             return;
@@ -1223,10 +1354,14 @@ impl Mount {
         let removed = match self.channel() {
             Ok(channel) => {
                 self.counters.calls.fetch_add(1, Relaxed);
-                block_on(channel.fs_remove_shallow(&self.root, &path)).map_err(|err| {
-                    let message = format!("{err:#}");
-                    (status_of(&message, self.windows), message)
-                })
+                let removing = channel.fs_remove_shallow(&self.root, &path);
+                match block_until(removing, Instant::now() + REPLY_TIMEOUT) {
+                    Some(result) => result.map_err(|err| {
+                        let message = format!("{err:#}");
+                        (status_of(&message, self.windows), message)
+                    }),
+                    None => Err((STATUS_IO_TIMEOUT, tr("主机长时间没有回应").to_string())),
+                }
             }
             Err(status) => Err((status, String::new())),
         };
@@ -1292,15 +1427,45 @@ impl Mount {
         };
         self.wait("fs_rename", &from, moving)?;
         state.path = to.to_string();
-        {
-            let mut nodes = lock(&self.nodes);
-            if let Some(weak) = nodes.remove(&self.key(&from)) {
-                nodes.insert(self.key(to), weak);
-            }
-        }
+        drop(state);
+        self.moved(&from, to);
         self.invalidate_tree(&from);
         self.invalidate_tree(to);
         Ok(())
+    }
+
+    /// 改了名：打开着的跟着换到新路径上。改的是目录时，里面打开着的也换：主机上它们已经在新目录
+    /// 里了，之后的读写要发新路径（原来只换这一个，里面的还发旧路径，读写都报「已被删除或移走」）。
+    /// 改了名的那个自己的路径调用前已经换好了。
+    fn moved(&self, from: &str, to: &str) {
+        let (old, new) = (self.key(from), self.key(to));
+        let inside = format!("{old}/");
+        let mut children = Vec::new();
+        {
+            let mut nodes = lock(&self.nodes);
+            let keys: Vec<String> = nodes
+                .keys()
+                .filter(|key| **key == old || key.starts_with(&inside))
+                .cloned()
+                .collect();
+            for key in keys {
+                if let Some(weak) = nodes.remove(&key) {
+                    if key != old
+                        && let Some(node) = weak.upgrade()
+                    {
+                        children.push(node);
+                    }
+                    nodes.insert(format!("{new}{}", &key[old.len()..]), weak);
+                }
+            }
+        }
+        // 按段换：前面几段就是 `from`（大小写可能不一样）
+        let depth = from.split('/').count();
+        for node in children {
+            let mut state = lock(&node.state);
+            let rest: Vec<&str> = state.path.split('/').skip(depth).collect();
+            state.path = format!("{to}/{}", rest.join("/"));
+        }
     }
 
     /// 截短或接长。`allocation` 是系统在预留空间：比文件小才算截断，别的不用管。
@@ -1317,6 +1482,7 @@ impl Mount {
         state.cache.renew();
         node.arrived.notify_all();
         state.dirty = true;
+        state.unsynced = true;
         self.remember(&path, state.stat);
         Ok(self.info(&state.stat))
     }
@@ -1334,6 +1500,7 @@ impl Mount {
         let touching = self.channel()?.fs_touch(&self.root, &path, mtime);
         state.stat = self.wait("fs_touch", &path, touching)?;
         state.dirty = true;
+        state.unsynced = true;
         self.remember(&path, state.stat);
         Ok(self.info(&state.stat))
     }
@@ -1674,11 +1841,14 @@ unsafe extern "C" fn write(
 
 unsafe extern "C" fn flush(fs: Fs, context: Ctx, info: *mut FileInfo) -> NTSTATUS {
     guard(|| unsafe {
-        // 空指针是刷整个盘：没有要做的
-        if !context.is_null() {
-            *info = mount(fs).commit(node(context))?;
+        // 空指针是刷整个盘
+        match context.is_null() {
+            true => mount(fs).flush_all(),
+            false => {
+                *info = mount(fs).flush_file(node(context))?;
+                Ok(())
+            }
         }
-        Ok(())
     })
 }
 
@@ -1838,7 +2008,7 @@ mod tests {
         );
         assert_eq!(
             failure(r"D:\map\logs\", "a.txt", STATUS_DISK_FULL, message, false),
-            "无法写入 D:\\map\\logs\\a.txt：服务器磁盘空间不足"
+            "无法写入 D:\\map\\logs\\a.txt：主机磁盘空间不足"
         );
         // 认不出来的原因给原话
         assert_eq!(
@@ -1863,7 +2033,7 @@ mod tests {
         );
         assert_eq!(
             failure("N:", "a.txt", STATUS_CONNECTION_DISCONNECTED, "", true),
-            "无法删除 N:\\a.txt：与服务器的连接已断开"
+            "无法删除 N:\\a.txt：与主机的连接已断开"
         );
     }
 
@@ -2083,6 +2253,107 @@ mod tests {
         assert_eq!(read_at(&mount, &node, 900_000, 1000), new[900_000..901_000]);
         assert_eq!(read_at(&mount, &node, 0, 1000), new[..1000]);
         assert_eq!(lock(&node.state).stat.size, 1_200_000);
+    }
+
+    #[test]
+    fn 等回音有期限() {
+        let started = Instant::now();
+        let never = futures::future::pending::<u32>();
+        assert_eq!(
+            block_until(never, started + Duration::from_millis(200)),
+            None
+        );
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert_eq!(block_until(async { 7 }, Instant::now()), Some(7));
+        // 别的线程送来的回音也收得到
+        let (tx, rx) = futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            tx.send(5).unwrap();
+        });
+        let got = block_until(rx, Instant::now() + Duration::from_secs(10));
+        assert_eq!(got.map(|got| got.unwrap()), Some(5));
+    }
+
+    #[test]
+    fn 读的时候文件变了_从头再读_不会前半旧后半新() {
+        let dir = TempDir::new();
+        let old = noise(2 * UNIT as usize, 10);
+        dir.write("g.bin", &old);
+        let mount = local_mount(&dir);
+        let node = mount.open("g.bin").unwrap();
+        // 第一格留着旧的，第二格假装正在要（这个请求不会回来）：读到那里要等
+        {
+            let mut state = lock(&node.state);
+            let bytes = Arc::new(old[..UNIT as usize].to_vec());
+            let len = UNIT as usize;
+            let ready = Unit::Ready {
+                bytes,
+                at: 0,
+                len,
+                used: 0,
+            };
+            state.cache.units.insert(0, ready);
+            state.cache.units.insert(1, Unit::Wanted(u64::MAX));
+        }
+        let new = noise(2 * UNIT as usize, 13);
+        std::thread::scope(|scope| {
+            let reading = scope.spawn(|| read_at(&mount, &node, 0, new.len()));
+            std::thread::sleep(Duration::from_millis(200));
+            // 等的时候主机上换了内容，这边换一代（和读回来的数据发现变了时一样）
+            dir.write("g.bin", &new);
+            let stat = block_on(Channel::Local.fs_stat(&mount.root, "g.bin")).unwrap();
+            let mut state = lock(&node.state);
+            state.stat = stat;
+            state.cache.renew();
+            drop(state);
+            node.arrived.notify_all();
+            assert!(reading.join().unwrap() == new);
+        });
+    }
+
+    #[test]
+    fn 追加时等过以后按新的末尾写() {
+        let dir = TempDir::new();
+        dir.write("log.txt", b"0123456789");
+        let mount = local_mount(&dir);
+        let node = mount.open("log.txt").unwrap();
+        // 假装有一大批写入在路上：满了，追加的要等
+        {
+            let mut state = lock(&node.state);
+            state.flying.push((0, WINDOW));
+            state.flying_bytes = WINDOW;
+        }
+        std::thread::scope(|scope| {
+            let appending = scope.spawn(|| mount.write(&node, b"XY", 0, true, false));
+            std::thread::sleep(Duration::from_millis(200));
+            // 等的时候别的写把文件写长了，在路上的都落了地
+            dir.write("log.txt", b"0123456789abcde");
+            let mut state = lock(&node.state);
+            state.stat.size = 15;
+            state.flying.clear();
+            state.flying_bytes = 0;
+            drop(state);
+            node.landed.notify_all();
+            appending.join().unwrap().unwrap();
+        });
+        mount.commit(&node).unwrap();
+        let written = std::fs::read(dir.0.join("log.txt")).unwrap();
+        assert_eq!(written, b"0123456789abcdeXY");
+    }
+
+    #[test]
+    fn 目录改了名_里面打开着的文件跟着换路径() {
+        let dir = TempDir::new();
+        std::fs::create_dir(dir.0.join("d")).unwrap();
+        dir.write("d/f.txt", b"hello");
+        let mount = local_mount(&dir);
+        let file = mount.open("d/f.txt").unwrap();
+        let folder = mount.open("D").unwrap();
+        mount.rename(&folder, "e", false).unwrap();
+        assert_eq!(lock(&file.state).path, "e/f.txt");
+        assert!(lock(&mount.nodes).contains_key("e/f.txt"));
+        assert_eq!(read_at(&mount, &file, 0, 100), b"hello");
     }
 
     #[test]

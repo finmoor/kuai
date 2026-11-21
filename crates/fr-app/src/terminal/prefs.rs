@@ -19,7 +19,8 @@ pub(super) struct Prefs(TerminalSettings);
 impl Global for Prefs {}
 
 /// 把改过的终端设置存回去的函数。
-struct Writer(Rc<dyn Fn(TerminalSettings, &mut App)>);
+type WriteFn = dyn Fn(TerminalSettings, &mut App);
+struct Writer(Rc<WriteFn>);
 
 impl Global for Writer {}
 

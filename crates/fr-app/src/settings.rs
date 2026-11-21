@@ -7,6 +7,7 @@
 
 use fr_core::tf;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context as _, Result};
 use fr_core::i18n::{Language, tr};
@@ -179,23 +180,26 @@ pub enum Front {
     Workspaces,
     /// 一个仓库（或子仓库）的标签页
     Repo(RepoEntry),
-    /// 一个终端的标签页
-    Term(TermSlot),
 }
 
-/// 标题栏上开着的标签页：全局一份，和选了哪台服务器、哪个工作区都无关，像 VS Code 的编辑器标签
-/// （2026-11-19 Feng：「我打开哪个就是哪个……跟选择的服务器、工作区都无关」）。只记在这台电脑上。
+/// 读显示着的那一页：读不懂的（1.17 的终端标签页 `term`，2026-11-20 去掉了）当作工作区页，
+/// 不让整个设置文件读不成。
+fn lenient_front<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Front, D::Error> {
+    let value = serde_json::Value::deserialize(de)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+/// 标题栏上开着的标签页：全局一份，和选了哪台服务器、哪个工作区都无关，像 VS Code 的编辑器标签：
+/// 打开哪个就是哪个。只记在这台电脑上。
 /// 1.16 以前是每个工作区各记一份（[`View`]），见 [`Settings::migrate_tabs`]。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tabs {
-    /// 仓库和子仓库的标签页，按打开的先后；固定的排在最前
+    /// 仓库和子仓库的标签页，按打开的先后；固定的排在最前。1.17 还有终端的标签页（`terms`），
+    /// 后来去掉了，旧设置里的那一项读的时候不管
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repos: Vec<RepoEntry>,
-    /// 终端的标签页（标题栏右边那一段），按打开的先后
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub terms: Vec<TermSlot>,
     /// 显示着的那一页
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_front")]
     pub front: Front,
     /// 最近关掉的仓库标签页，新的在后；重新打开了就从这里去掉
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -208,7 +212,6 @@ pub struct Tabs {
 /// 设置文件里还没有 [`Tabs`]（还没迁过来）时读到的那一份。
 static NO_TABS: Tabs = Tabs {
     repos: Vec::new(),
-    terms: Vec::new(),
     front: Front::Workspaces,
     closed: Vec::new(),
     pinned: Vec::new(),
@@ -245,9 +248,6 @@ impl Tabs {
         };
         let mut seen = std::collections::HashSet::new();
         self.repos.retain(|e| known(e) && seen.insert(e.clone()));
-        let mut seen = std::collections::HashSet::new();
-        self.terms
-            .retain(|slot| known(&slot.entry) && seen.insert(slot.clone()));
         let repos = &self.repos;
         self.closed.retain(|e| known(e) && !repos.contains(e));
         let extra = self.closed.len().saturating_sub(TabGroup::MAX_CLOSED);
@@ -256,7 +256,6 @@ impl Tabs {
         self.pinned_first();
         let open = match &self.front {
             Front::Repo(entry) => self.repos.contains(entry),
-            Front::Term(slot) => self.terms.contains(slot),
             _ => true,
         };
         if !open {
@@ -436,7 +435,7 @@ pub struct TermSlot {
     pub number: u32,
 }
 
-/// 终端页（标题栏上的「终端」）在这台电脑上记的东西，不同步到别的电脑（2026-11-18 Feng 定）。
+/// 终端页（标题栏上的「终端」）在这台电脑上记的东西，不同步到别的电脑。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TermHub {
     /// 固定的终端，按固定的先后
@@ -635,7 +634,7 @@ impl Default for Settings {
             tabs: None,
             used_machines: Vec::new(),
             language: Language::default(),
-            // 新装的默认深色（2026-11-13 Feng 定）。设置文件里没有这一项（1.1 以前的）
+            // 新装的默认深色。设置文件里没有这一项（1.1 以前的）
             // 时取 ThemeChoice 的默认值，照旧跟随系统，见 parse 的测试
             theme: ThemeChoice::Dark,
             light_theme: default_light_theme(),
@@ -723,7 +722,7 @@ impl Settings {
                 self.servers[index].jump = None;
             }
         }
-        // 服务器移除了，记的它上面的东西就不留。经服务器连的那几台（`156>91`）跟着那台服务器
+        // 服务器移除了，记的它上面的东西就不留。经服务器连的那几台（`A>B`）跟着那台服务器
         let servers = &self.servers;
         let known = |key: &str| {
             let direct = crate::machines::split_relay(key).map_or(key, |(via, _)| via);
@@ -762,7 +761,7 @@ impl Settings {
     }
 
     /// 1.16 以前开着的标签页是每个工作区各记一份（[`View`]）。改成全局一份时只带上现在用的工作区
-    /// 那一份（2026-11-19 Feng 同意），别的工作区的不自动开出来，免得一升级标题栏就堆满。
+    /// 那一份，别的工作区的不自动开出来，免得一升级标题栏就堆满。
     /// 迁过了（[`Self::tabs`] 有了）就不再动。
     pub(crate) fn migrate_tabs(&mut self) {
         if self.tabs.is_some() {
@@ -1131,6 +1130,32 @@ impl Target {
         }
     }
 
+    /// 地址里有没有 [`Self::parse`] 解释不了、会悄悄丢掉或者原样交给 ssh 的部分：方括号后面跟的
+    /// 不是「:端口」、只有左方括号、一个冒号后面不是端口、主机名里有空白。表单保存和测试连接前拿它
+    /// 校验，免得填错的地址被改成另一个目标。
+    pub fn well_formed(destination: &str) -> bool {
+        let text = destination.trim();
+        let rest = text
+            .strip_prefix("ssh://")
+            .map_or(text, |rest| rest.trim_end_matches('/'));
+        let (_, rest) = rest.rsplit_once('@').unwrap_or(("", rest));
+        let port = |port: &str| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit());
+        if rest.chars().any(char::is_whitespace) {
+            return false;
+        }
+        match rest.strip_prefix('[') {
+            Some(inner) => inner.split_once(']').is_some_and(|(host, tail)| {
+                !host.is_empty() && (tail.is_empty() || tail.strip_prefix(':').is_some_and(port))
+            }),
+            None if rest.contains(']') => false,
+            // 只有一个冒号：后面得是端口；冒号多的是不带方括号的 IPv6 地址
+            None => match rest.split_once(':') {
+                Some((_, tail)) if !tail.contains(':') => port(tail),
+                _ => true,
+            },
+        }
+    }
+
     /// `user@host:port`，没有的段不写。VS Code 的 Remote-SSH 认这种写法。
     pub fn authority(&self) -> String {
         let mut text = String::new();
@@ -1186,6 +1211,19 @@ impl RepoEntry {
         base_name(&self.path)
     }
 
+    /// 是不是同一个仓库。Windows 上的路径不分大小写、正反斜杠：同一个目录有几种写法，kuaid 报上来的
+    /// 终端名字是小写、正斜杠的（见 [`fr_core::dir::windows_key`]），没登记过的子仓库的终端就按那种
+    /// 写法列着，从终端页打开它时要认得出它就是开着的那个标签页。
+    pub fn same_repo(&self, other: &RepoEntry) -> bool {
+        let windows = |path: &str| path.as_bytes().get(1) == Some(&b':');
+        self.server == other.server
+            && (self.path == other.path
+                || (windows(&self.path)
+                    && windows(&other.path)
+                    && fr_core::dir::windows_key(&self.path)
+                        == fr_core::dir::windows_key(&other.path)))
+    }
+
     /// `other` 是不是在这个仓库的目录下面（同一台机器上、路径以这个仓库的路径加一个斜杠开头）。
     pub fn contains(&self, other: &RepoEntry) -> bool {
         let root = self.path.trim_end_matches(['/', '\\']);
@@ -1233,26 +1271,110 @@ fn adopt_legacy(appdata: &std::path::Path) {
     }
 }
 
-pub fn load() -> Settings {
+/// 读设置时出的问题。原来只写一行日志：设置悄悄回到默认（主机列表、标签页都没了），用户不知道
+/// 为什么，也不知道原文件去了哪。启动后在界面上说一声（见 [`LoadIssue::text`]）。
+#[derive(Debug, Clone)]
+pub enum LoadIssue {
+    /// 文件在，读不了（被占用、没权限、不是 UTF-8）：用的是默认设置，这次运行不写它
+    Unreadable { path: PathBuf, err: String },
+    /// 有几项读不出来（字段的类型不对），用了默认值，别的照读；原文件另存了一份
+    Partial { items: Vec<String>, backup: PathBuf },
+    /// 整份读不出来，用的是默认设置；原文件另存了一份
+    Broken { backup: PathBuf },
+    /// 读不出来，也没能另存一份：这次运行不写它，免得把它盖掉
+    Kept { path: PathBuf, err: String },
+}
+
+impl LoadIssue {
+    /// 给用户看的话：出了什么事、原文件在哪、改动存不存。
+    pub fn text(&self) -> String {
+        match self {
+            LoadIssue::Unreadable { path, err } => tf!(
+                "无法读取设置文件 {path}（{err}），现在用的是默认设置。这次运行中的改动不会保存，以免覆盖原文件。",
+                path = path.display(),
+                err
+            ),
+            LoadIssue::Partial { items, backup } => tf!(
+                "设置文件中有几项无法读取（{items}），已改用默认值，其余设置照常读取。原文件另存为 {backup}。",
+                items = items.join(", "),
+                backup = backup.display()
+            ),
+            LoadIssue::Broken { backup } => tf!(
+                "设置文件无法读取，现在用的是默认设置。原文件另存为 {backup}。",
+                backup = backup.display()
+            ),
+            LoadIssue::Kept { path, err } => tf!(
+                "设置文件 {path} 无法读取，也无法另存备份（{err}），现在用的是默认设置。这次运行中的改动不会保存，以免覆盖原文件。",
+                path = path.display(),
+                err
+            ),
+        }
+    }
+
+    /// 读出来的设置不全：主机列表可能是空的，不能拿它去盖掉本机 kuaid 记着的那份。
+    pub fn incomplete(&self) -> bool {
+        !matches!(self, LoadIssue::Partial { items, .. } if !items.iter().any(|item| item == "servers"))
+    }
+}
+
+/// 这次运行不写设置文件：它读不了，或者坏了又没能另存一份，写了就把原来的盖掉了。
+static READ_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// 这次运行不写设置文件（见 [`READ_ONLY`]）。
+pub fn read_only() -> bool {
+    READ_ONLY.load(Ordering::Relaxed)
+}
+
+/// 读设置。没有设置文件（新装）是默认设置，不算出问题。
+pub fn load() -> (Settings, Option<LoadIssue>) {
     if std::env::var_os("FR_SETTINGS").is_none() {
         adopt_legacy(&appdata());
     }
     let path = file();
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Settings::default();
+    let unreadable = |err: String| {
+        log::warn!("无法读取设置文件 {}：{err}", path.display());
+        READ_ONLY.store(true, Ordering::Relaxed);
+        let issue = LoadIssue::Unreadable {
+            path: path.clone(),
+            err,
+        };
+        (Settings::default(), Some(issue))
     };
-    match parse(&text) {
-        Ok(settings) => settings,
-        Err(err) => {
-            // 文件坏了：改名留着，从空设置开始，免得下次保存把它覆盖掉
-            let backup = path.with_extension(format!(
-                "json.broken-{}",
-                chrono::Local::now().format("%Y%m%d-%H%M%S")
-            ));
-            let _ = std::fs::rename(&path, &backup);
-            log::warn!("设置文件解析失败（{err}），已改名为 {}", backup.display());
-            Settings::default()
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return (Settings::default(), None);
         }
+        Err(err) => return unreadable(err.to_string()),
+    };
+    let Ok(text) = String::from_utf8(bytes) else {
+        return unreadable(tr("不是 UTF-8 编码的文本").to_string());
+    };
+    let err = match parse(&text) {
+        Ok(settings) => return (settings, None),
+        Err(err) => err,
+    };
+    log::warn!("设置文件解析失败：{err}");
+    let lenient = parse_lenient(&text);
+    // 原文件另存一份（复制，不改名：读得出来的那些项接着用，存盘时才盖掉它）
+    let backup = path.with_extension(format!(
+        "json.broken-{}",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    if let Err(copy) = std::fs::copy(&path, &backup) {
+        log::warn!("设置文件另存不了（{copy}），这次运行不写它");
+        READ_ONLY.store(true, Ordering::Relaxed);
+        let issue = LoadIssue::Kept {
+            path: path.clone(),
+            err: copy.to_string(),
+        };
+        let settings = lenient.map(|(settings, _)| settings).unwrap_or_default();
+        return (settings, Some(issue));
+    }
+    log::warn!("设置文件已另存为 {}", backup.display());
+    match lenient {
+        Some((settings, items)) => (settings, Some(LoadIssue::Partial { items, backup })),
+        None => (Settings::default(), Some(LoadIssue::Broken { backup })),
     }
 }
 
@@ -1271,22 +1393,136 @@ fn parse(text: &str) -> serde_json::Result<Settings> {
     Ok(settings)
 }
 
-/// 先写临时文件再改名，写到一半退出也不会留下坏文件。
+/// 整份读不出来（多半是某一项的类型不对：手改坏了，或者旧版本读到了新格式）时一项一项地读：
+/// 读得出来的项照用，读不出来的用默认值；列表（主机、标签页这些）里读不出来的那几个丢掉，别的
+/// 留着。返回读出来的设置和读坏了的项的名字。连 JSON 都不是时是 None。
+fn parse_lenient(text: &str) -> Option<(Settings, Vec<String>)> {
+    use serde_json::Value;
+    let Value::Object(file) = serde_json::from_str::<Value>(text).ok()? else {
+        return None;
+    };
+    let Value::Object(mut merged) = serde_json::to_value(Settings::default()).ok()? else {
+        return None;
+    };
+    let fits = |map: &serde_json::Map<String, Value>| {
+        serde_json::from_value::<Settings>(Value::Object(map.clone())).is_ok()
+    };
+    let has_language = file.contains_key("language");
+    let mut bad = Vec::new();
+    for (key, value) in file {
+        let mut trial = merged.clone();
+        trial.insert(key.clone(), value.clone());
+        if fits(&trial) {
+            merged = trial;
+            continue;
+        }
+        bad.push(key.clone());
+        let Value::Array(items) = value else {
+            continue;
+        };
+        let mut kept: Vec<Value> = Vec::new();
+        for item in items {
+            let mut trial = merged.clone();
+            let mut list = kept.clone();
+            list.push(item.clone());
+            trial.insert(key.clone(), Value::Array(list));
+            if fits(&trial) {
+                kept.push(item);
+            }
+        }
+        merged.insert(key, Value::Array(kept));
+    }
+    let mut settings: Settings = serde_json::from_value(Value::Object(merged)).ok()?;
+    if !has_language {
+        settings.language = Language::Chinese;
+    }
+    settings.normalize();
+    Some((settings, bad))
+}
+
+/// 先写临时文件、刷到盘上再改名：写到一半退出、断电也不会留下坏文件（原来不刷盘，NTFS 上改名
+/// 可能先落盘，重启后是个空文件，下次读又回到默认设置）。读设置时出了问题、这次运行不写它的，
+/// 返回出错。
 pub fn save(settings: &Settings) -> Result<()> {
+    if READ_ONLY.load(Ordering::Relaxed) {
+        anyhow::bail!(tr("设置文件读取失败，这次运行中的改动不会保存。"));
+    }
     let path = file();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .with_context(|| tf!("创建目录失败：{dir}", dir = dir.display()))?;
     }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(settings)?)
-        .with_context(|| tf!("保存设置失败：{tmp}", tmp = tmp.display()))?;
+    let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    let written = (|| {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&serde_json::to_vec_pretty(settings)?)?;
+        file.sync_all()
+    })();
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err).with_context(|| tf!("保存设置失败：{tmp}", tmp = tmp.display()));
+    }
     std::fs::rename(&tmp, &path).with_context(|| tf!("保存设置失败：{path}", path = path.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 设置里有几项读不出来_别的照读() {
+        let text = r#"{
+            "language": "en",
+            "servers": [
+                {"id": "a", "name": "A", "destination": "user@a"},
+                {"id": "b", "name": 5, "destination": "user@b"}
+            ],
+            "auto_fetch_minutes": "10",
+            "diff_split": true
+        }"#;
+        assert!(parse(text).is_err(), "整份读是读不出来的");
+        let (settings, bad) = parse_lenient(text).unwrap();
+        assert_eq!(settings.language, Language::English);
+        let ids: Vec<&str> = settings.servers.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["a"], "读不出来的那台丢掉，别的留着");
+        assert!(settings.diff_split);
+        assert_eq!(
+            settings.auto_fetch_minutes,
+            Settings::default().auto_fetch_minutes
+        );
+        assert_eq!(bad, ["servers", "auto_fetch_minutes"]);
+        // 少了主机的不能拿去盖本机 kuaid 的那份
+        let issue = |items: &[&str]| LoadIssue::Partial {
+            items: items.iter().map(|item| item.to_string()).collect(),
+            backup: PathBuf::new(),
+        };
+        assert!(issue(&["servers"]).incomplete());
+        assert!(!issue(&["auto_fetch_minutes"]).incomplete());
+        // 没有语言这一项的老设置还是中文
+        let (old, _) = parse_lenient(r#"{"auto_fetch_minutes": "x"}"#).unwrap();
+        assert_eq!(old.language, Language::Chinese);
+        // 连 JSON 都不是
+        assert!(parse_lenient("{oops").is_none());
+    }
+
+    #[test]
+    fn 同一个仓库的几种写法() {
+        let at = |server: Option<&str>, path: &str| RepoEntry {
+            server: server.map(str::to_string),
+            path: path.into(),
+        };
+        let tab = at(None, r"D:\Work\Kuai\sub");
+        assert!(tab.same_repo(&at(None, "d:/work/kuai/sub")), "kuaid 的写法");
+        assert!(!tab.same_repo(&at(None, "d:/work/kuai/sub2")));
+        assert!(
+            !tab.same_repo(&at(Some("sa"), "d:/work/kuai/sub")),
+            "别的电脑"
+        );
+        // Linux 上的路径分大小写
+        assert!(!at(Some("sb"), "/data/Repo").same_repo(&at(Some("sb"), "/data/repo")));
+        assert!(at(Some("sb"), "/data/repo").same_repo(&at(Some("sb"), "/data/repo")));
+    }
 
     #[test]
     fn 仓库名取最后一级目录() {
@@ -1533,6 +1769,22 @@ mod tests {
         assert_eq!(target("dev", "", "2200").compose(), "ssh://dev:2200");
         // Remote-SSH 用的写法不带 ssh://
         assert_eq!(target("dev", "root", "2200").authority(), "root@dev:2200");
+
+        for good in [
+            "dev",
+            "u@dev:2200",
+            "ssh://u@[2001:db8::1]:2222",
+            "[::1]",
+            "u@2001:db8::1",
+        ] {
+            assert!(Target::well_formed(good), "{good}");
+        }
+        // 方括号后面多了东西、只有左方括号、一个冒号后面不是端口、有空格：parse 会丢掉或者原样交给 ssh
+        for bad in [
+            "[::1]xyz", "[::1]:", "[::1", "::1]", "dev:abc", "dev:", "my host",
+        ] {
+            assert!(!Target::well_formed(bad), "{bad}");
+        }
 
         assert!(target("dev", "", "22").port_ok());
         assert!(target("dev", "", "65535").port_ok());
@@ -1930,14 +2182,31 @@ mod tests {
             gone.clone(),
         ];
         tabs.front = Front::Repo(gone.clone());
-        tabs.terms = vec![TermSlot {
-            entry: gone,
-            number: 1,
-        }];
         settings.normalize();
         let tabs = settings.tabs();
         assert_eq!(tabs.repos, [entry(None, "C:/a"), relayed]);
-        assert!(tabs.terms.is_empty());
         assert_eq!(tabs.front, Front::Workspaces);
+    }
+
+    #[test]
+    fn 旧设置里的终端标签页_读的时候不管() {
+        // 1.17 显示着终端标签页时存下的样子
+        let text = r#"{"tabs": {
+            "repos": [{"path": "C:/a"}],
+            "terms": [{"path": "C:/a", "number": 1}],
+            "front": {"term": {"path": "C:/a", "number": 1}}
+        }}"#;
+        let settings: Settings = serde_json::from_str(text).unwrap();
+        let tabs = settings.tabs();
+        assert_eq!(tabs.repos.len(), 1);
+        assert_eq!(tabs.front, Front::Workspaces);
+        // 读得懂的照常读
+        let text =
+            r#"{"tabs": {"repos": [{"path": "C:/a"}], "front": {"repo": {"path": "C:/a"}}}}"#;
+        let settings: Settings = serde_json::from_str(text).unwrap();
+        assert!(matches!(settings.tabs().front, Front::Repo(_)));
+        let text = r#"{"tabs": {"front": "servers"}}"#;
+        let settings: Settings = serde_json::from_str(text).unwrap();
+        assert_eq!(settings.tabs().front, Front::Servers);
     }
 }

@@ -5,10 +5,14 @@
 //! 路径都相对仓库根、用 `/` 分隔（空字符串是仓库根），不能带 `.`、`..`，也不能是绝对路径：
 //! 文件页只管仓库里的东西。这不是安全边界（仓库里的符号链接可以指到外面，用户自己也有终端），
 //! 只是防着拼错路径改到别处去。
+//!
+//! Git 的数据目录 `.git`（[`is_git_name`]）文件页不列、不写：新建、改名、上传时界面就拒绝。
+//! 映射到本机的盘要看得到、改得了它（盘上的 git 命令要用），那几个操作不拦。
 
 use std::fs::{self, File, Metadata};
 use std::io::{ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context as _, Result, bail};
@@ -25,16 +29,46 @@ pub fn resolve(repo: &str, path: &str) -> Result<PathBuf> {
     if repo.is_empty() {
         bail!(tr("未指定仓库"));
     }
+    // 名字里有认不出的字节（不是 UTF-8 的文件名，列目录时换成了 U+FFFD）：照这个名字找不到真的
+    // 那个，碰巧和别的文件同名还会改错
+    if path.contains(char::REPLACEMENT_CHARACTER) {
+        bail!(
+            "{}",
+            tf!("文件名里有无法识别的字符（不是 UTF-8 编码）：{path}", path)
+        );
+    }
     let mut full = PathBuf::from(repo);
     for part in path.split('/').filter(|part| !part.is_empty()) {
         // 一段只能是一个普通的名字：`..`、盘符、（Windows 上的）反斜杠都不行
         let mut components = Path::new(part).components();
         match (components.next(), components.next()) {
-            (Some(Component::Normal(name)), None) if name == part => full.push(part),
+            (Some(Component::Normal(name)), None) if name == part && !win32_special(part) => {
+                full.push(part)
+            }
             _ => bail!("{}", tf!("路径无效：{path}", path)),
         }
     }
     Ok(full)
+}
+
+/// Windows 上有特殊意思、不是普通文件的名字：设备名（CON、NUL、COM1，带不带扩展名都是）、
+/// 带冒号的（`文件:流` 是文件的数据流）、结尾是点或空格的（系统会去掉，成了另一个文件的别名）。
+fn win32_special(part: &str) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    if part.contains(':') || part.ends_with(['.', ' ']) {
+        return true;
+    }
+    let stem = part.split('.').next().unwrap_or_default().trim_end();
+    let upper = stem.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || (upper.len() == 4
+        && (upper.starts_with("COM") || upper.starts_with("LPT"))
+        && upper.as_bytes()[3].is_ascii_digit()
+        && upper.as_bytes()[3] != b'0')
 }
 
 /// 同 [`resolve`]，但不能是仓库根（改名、删除、写文件用）。
@@ -70,6 +104,14 @@ fn stat_at(full: &Path) -> Result<FsStat> {
     }
 }
 
+/// 是不是 Git 的数据目录的名字。照 git 自己的认法（core.protectNTFS、core.protectHFS，所有平台
+/// 默认都开）：不分大小写，Windows 会去掉的结尾的点和空格不算，8.3 短名 `GIT~1` 也是。
+pub fn is_git_name(name: &str) -> bool {
+    name.trim_end_matches(['.', ' '])
+        .eq_ignore_ascii_case(".git")
+        || name.eq_ignore_ascii_case("git~1")
+}
+
 /// 列出一层：文件和目录都列，`.git` 不列。顺序不保证，由界面排。
 pub fn list(repo: &str, dir: &str) -> Result<Vec<FsEntry>> {
     list_with(repo, dir, false)
@@ -83,7 +125,7 @@ pub fn list_with(repo: &str, dir: &str, all: bool) -> Result<Vec<FsEntry>> {
     let mut listed = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == ".git" && !all {
+        if !all && is_git_name(&name) {
             continue;
         }
         let link = entry.file_type().is_ok_and(|kind| kind.is_symlink());
@@ -99,6 +141,7 @@ pub fn list_with(repo: &str, dir: &str, all: bool) -> Result<Vec<FsEntry>> {
             link,
             size: stat.size,
             mtime: stat.mtime,
+            readonly: stat.readonly,
         });
     }
     Ok(listed)
@@ -110,13 +153,23 @@ pub fn stat(repo: &str, path: &str) -> Result<FsStat> {
 }
 
 /// 从 `offset` 起读最多 `len` 字节（不超过 [`READ_MAX`]），连同文件现在的情况一起返回。
-pub fn read(repo: &str, path: &str, offset: u64, len: u64) -> Result<(FsStat, Vec<u8>)> {
+/// 给了 `whole` 而文件比它大时不读，字节是空的：调用方看大小就知道太大了。
+pub fn read(
+    repo: &str,
+    path: &str,
+    offset: u64,
+    len: u64,
+    whole: Option<u64>,
+) -> Result<(FsStat, Vec<u8>)> {
     let full = resolve_inside(repo, path)?;
     let unreadable = || tf!("无法读取 {path}", path = full.display());
     let mut file = File::open(&full).with_context(unreadable)?;
     let stat = stat_of(&file.metadata().with_context(unreadable)?);
     if stat.dir {
         bail!("{}", tf!("{path} 是目录", path));
+    }
+    if whole.is_some_and(|whole| stat.size > whole) {
+        return Ok((stat, Vec::new()));
     }
     let len = len.min(READ_MAX);
     let mut bytes = Vec::with_capacity(len.min(stat.size.saturating_sub(offset)) as usize);
@@ -130,6 +183,20 @@ pub fn read(repo: &str, path: &str, offset: u64, len: u64) -> Result<(FsStat, Ve
     Ok((stat, bytes))
 }
 
+/// 把文件刷到磁盘上（fsync：内容连同大小、修改时间），返回它现在的情况。映射盘上的程序要求
+/// 刷盘（`FlushFileBuffers`）时用；平常的写入不刷，和本机的文件一样交给系统。
+pub fn sync(repo: &str, path: &str) -> Result<FsStat> {
+    let full = resolve_inside(repo, path)?;
+    let failed = || tf!("无法写入 {path}", path = full.display());
+    // Windows 上刷盘要有写权限；不新建、不截断
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(&full)
+        .with_context(failed)?;
+    file.sync_all().with_context(failed)?;
+    Ok(stat_of(&file.metadata().with_context(failed)?))
+}
+
 /// 写一个文件（整个换掉）。见 [`FsWrite`]。
 pub fn write(params: &FsWrite, bytes: &[u8]) -> Result<FsWritten> {
     let full = resolve_inside(&params.repo, &params.path)?;
@@ -137,12 +204,16 @@ pub fn write(params: &FsWrite, bytes: &[u8]) -> Result<FsWritten> {
     if current.dir {
         bail!("{}", tf!("{path} 是目录", path = params.path));
     }
+    let exists = || tf!("{path} 已存在", path = params.path);
     if params.create && current.exists {
-        bail!("{}", tf!("{path} 已存在", path = params.path));
+        bail!("{}", exists());
     }
-    if let Some(expect) = params.expect
-        && (!current.exists || current.mtime != expect.mtime || current.size != expect.size)
-    {
+    let changed = |now: &FsStat| {
+        params.expect.is_some_and(|expect| {
+            !now.exists || now.mtime != expect.mtime || now.size != expect.size
+        })
+    };
+    if changed(&current) {
         return Ok(FsWritten {
             conflict: true,
             stat: current,
@@ -152,52 +223,200 @@ pub fn write(params: &FsWrite, bytes: &[u8]) -> Result<FsWritten> {
         fs::create_dir_all(parent)
             .with_context(|| tf!("无法创建 {path}", path = parent.display()))?;
     }
-    replace(&full, bytes).with_context(|| tf!("无法写入 {path}", path = full.display()))?;
+    // 写临时文件的这一会儿别人改了、删了：不换（只比得了毫秒和大小，窗口缩到改名之前那一下）
+    let unchanged = || stat_at(&full).is_ok_and(|now| !changed(&now));
+    match replace(&full, bytes, params.create, unchanged) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Ok(FsWritten {
+                conflict: true,
+                stat: stat_at(&full)?,
+            });
+        }
+        Err(err) if params.create && err.kind() == ErrorKind::AlreadyExists => {
+            bail!("{}", exists())
+        }
+        Err(err) => {
+            return Err(err).with_context(|| tf!("无法写入 {path}", path = full.display()));
+        }
+    }
     Ok(FsWritten {
         conflict: false,
         stat: stat_at(&full)?,
     })
 }
 
+/// 临时文件的序号：同一个进程里两个客户端同时存同一个文件也不会撞。
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
+
+/// 在 `target` 旁边独占地建一个临时文件：那个名字已经有东西了就换个序号，不截断、不顺着别人放的
+/// 链接写，也不会删掉不是自己建的。
+fn create_temp(target: &Path) -> std::io::Result<(PathBuf, File)> {
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    for _ in 0..100 {
+        let seq = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let temp = target.with_file_name(format!(".{name}.kuai-{}-{seq}.tmp", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => return Ok((temp, file)),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(ErrorKind::AlreadyExists.into())
+}
+
+/// 写符号链接时真正要写的文件：它指向的那个。指向的东西不在了（悬空的链接）照链接里写的位置建，
+/// 相对的按链接所在的目录算；不是链接就是它自己。
+fn written_path(target: &Path) -> std::io::Result<PathBuf> {
+    let is_link = fs::symlink_metadata(target).is_ok_and(|meta| meta.file_type().is_symlink());
+    if !is_link {
+        return Ok(target.to_path_buf());
+    }
+    match fs::canonicalize(target) {
+        Ok(path) => Ok(path),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            let pointed = fs::read_link(target)?;
+            Ok(match target.parent() {
+                Some(dir) if pointed.is_relative() => dir.join(pointed),
+                _ => pointed,
+            })
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// 把 `target` 的内容整个换成 `bytes`：先写到旁边的临时文件再改名，写到一半出错原来的还在。
 /// 权限（和 Linux 上的属主）照原来的；是符号链接就写到它指向的文件，链接留着。
-fn replace(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let is_link = fs::symlink_metadata(target).is_ok_and(|meta| meta.file_type().is_symlink());
-    let target = match is_link {
-        true => fs::canonicalize(target)?,
-        false => target.to_path_buf(),
-    };
+///
+/// 改名之前问一遍 `unchanged`，假的话不换，返回 false。`create`：目标得还不在，这期间别人建了
+/// 同名的也不盖掉（报 AlreadyExists）。
+///
+/// 换不了时的退路是直接写进原文件（目录里不让建文件但文件本身能写，Windows 上别的程序开着它不让
+/// 换）：会先截短原文件，写到一半失败（盘满）原来的内容就没了，所以只在换不了时才走；改名失败时
+/// 新内容的临时文件留着，报错里写它在哪。
+fn replace(
+    target: &Path,
+    bytes: &[u8],
+    create: bool,
+    unchanged: impl Fn() -> bool,
+) -> std::io::Result<bool> {
+    let target = written_path(target)?;
     let existing = fs::metadata(&target).ok();
-    let name = target.file_name().unwrap_or_default().to_string_lossy();
-    let temp = target.with_file_name(format!(".{name}.kuai-{}.tmp", std::process::id()));
-    let staged = (|| {
-        let mut file = File::create(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()
-    })();
-    if let Err(err) = staged {
-        let _ = fs::remove_file(&temp);
+    let staged = create_temp(&target).and_then(|(temp, mut file)| {
+        let written = file.write_all(bytes).and_then(|()| file.sync_all());
+        match written {
+            Ok(()) => Ok(temp),
+            Err(err) => {
+                drop(file);
+                let _ = fs::remove_file(&temp);
+                Err(err)
+            }
+        }
+    });
+    let temp = match staged {
+        Ok(temp) => temp,
         // 目录里不让建文件，但文件本身能写：直接写
-        return match (err.kind(), &existing) {
-            (ErrorKind::PermissionDenied, Some(_)) => fs::write(&target, bytes),
-            _ => Err(err),
-        };
-    }
+        Err(err) if err.kind() == ErrorKind::PermissionDenied && existing.is_some() && !create => {
+            if !unchanged() {
+                return Ok(false);
+            }
+            return fs::write(&target, bytes).map(|()| true);
+        }
+        Err(err) => return Err(err),
+    };
     if let Some(meta) = &existing {
         let _ = fs::set_permissions(&temp, meta.permissions());
         #[cfg(unix)]
         keep_owner(&temp, meta);
     }
-    if let Err(err) = fs::rename(&temp, &target) {
-        // 换不掉（Windows 上别的程序正开着它）：退一步直接写，再不行报改名时的错
-        let direct = match existing {
-            Some(_) => fs::write(&target, bytes),
-            None => Err(ErrorKind::Other.into()),
-        };
+    if !unchanged() {
         let _ = fs::remove_file(&temp);
-        return direct.map_err(|_| err);
+        return Ok(false);
     }
-    Ok(())
+    let placed = match create {
+        true => rename_noreplace(&temp, &target),
+        false => fs::rename(&temp, &target),
+    };
+    let Err(err) = placed else {
+        return Ok(true);
+    };
+    if create || existing.is_none() {
+        let _ = fs::remove_file(&temp);
+        return Err(err);
+    }
+    // 换不掉（Windows 上别的程序正开着它）：退一步直接写
+    match fs::write(&target, bytes) {
+        Ok(()) => {
+            let _ = fs::remove_file(&temp);
+            Ok(true)
+        }
+        Err(direct) => Err(std::io::Error::new(
+            direct.kind(),
+            tf!(
+                "{err}；新内容留在 {temp}",
+                err = direct,
+                temp = temp.display()
+            ),
+        )),
+    }
+}
+
+/// 改名，`to` 已经有了就失败（AlreadyExists）。Linux 和 Windows 上是一步完成的：检查和改名之间
+/// 别人建了同名的也不会被盖掉。内核太老、文件系统不支持时退回先看一眼再改，中间有很短的空当。
+pub fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        const RENAME_NOREPLACE: libc::c_uint = 1;
+        let from_c = std::ffi::CString::new(from.as_os_str().as_bytes())?;
+        let to_c = std::ffi::CString::new(to.as_os_str().as_bytes())?;
+        // SAFETY: 两个都是以 NUL 结尾的合法字符串，renameat2 只读它们
+        let done = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                from_c.as_ptr(),
+                libc::AT_FDCWD,
+                to_c.as_ptr(),
+                RENAME_NOREPLACE,
+            )
+        };
+        if done == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if !matches!(err.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
+            return Err(err);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+        }
+        let wide =
+            |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain([0]).collect() };
+        let (from_w, to_w) = (wide(from), wide(to));
+        // SAFETY: 两个都以 NUL 结尾；不带 MOVEFILE_REPLACE_EXISTING，目标已经有了就失败
+        let ok = unsafe { MoveFileExW(from_w.as_ptr(), to_w.as_ptr(), 0) };
+        match ok {
+            0 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if fs::symlink_metadata(to).is_ok() {
+            return Err(ErrorKind::AlreadyExists.into());
+        }
+        fs::rename(from, to)
+    }
 }
 
 /// 属主照原文件的（root 改别人的文件时，新文件不该变成 root 的）。改不了就算了。
@@ -245,16 +464,27 @@ pub fn remove(repo: &str, path: &str) -> Result<()> {
 pub fn rename(repo: &str, from: &str, to: &str) -> Result<()> {
     let source = resolve_inside(repo, from)?;
     let target = resolve_inside(repo, to)?;
-    // 只改大小写（Windows 上是同一个文件）不算已存在
-    let same = from.to_lowercase() == to.to_lowercase();
+    let exists = || tf!("{path} 已存在", path = to);
+    // 只改大小写、而且真是同一个文件（Windows 上不分大小写）：不算已存在。只看名字转成小写一样
+    // 不够：Linux 上 readme.md 和 README.md 是两个文件，原来会把另一个盖掉
+    let same = from.to_lowercase() == to.to_lowercase()
+        && from != to
+        && fs::canonicalize(&source).is_ok_and(|a| fs::canonicalize(&target).is_ok_and(|b| a == b));
     if !same && fs::symlink_metadata(&target).is_ok() {
-        bail!("{}", tf!("{path} 已存在", path = to));
+        bail!("{}", exists());
     }
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)
             .with_context(|| tf!("无法创建 {path}", path = parent.display()))?;
     }
-    fs::rename(&source, &target).with_context(|| tf!("无法重命名 {path}", path = from))
+    let renamed = match same {
+        true => fs::rename(&source, &target),
+        false => rename_noreplace(&source, &target),
+    };
+    match renamed {
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => bail!("{}", exists()),
+        renamed => renamed.with_context(|| tf!("无法重命名 {path}", path = from)),
+    }
 }
 
 /// 把 `bytes` 写到文件的 `offset` 那里，文件不够长就接长；别的地方不动。`create` 为真时文件不在
@@ -459,6 +689,31 @@ pub fn find_repos(repo: &str) -> Result<SubRepos> {
 }
 
 #[cfg(test)]
+mod git_name_tests {
+    use super::is_git_name;
+
+    #[test]
+    fn 认得出各种写法的git目录() {
+        for name in [
+            ".git", ".GIT", ".Git", ".git.", ".git ", ".git. .", "GIT~1", "git~1",
+        ] {
+            assert!(is_git_name(name), "{name:?}");
+        }
+        for name in [
+            "git",
+            ".gitignore",
+            ".github",
+            "a.git",
+            ".git~1",
+            "GIT~2",
+            "..git",
+        ] {
+            assert!(!is_git_name(name), "{name:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::FsExpect;
@@ -588,8 +843,10 @@ mod tests {
             assert!(resolve(root, bad).is_err(), "{bad}");
         }
         assert!(resolve("", "a").is_err());
+        // 列目录时换成了 U+FFFD 的名字：对不上真的文件，不操作
+        assert!(resolve(root, "a/\u{FFFD}.txt").is_err());
         // 仓库根本身不能读写、删除
-        assert!(read(root, "", 0, 10).is_err());
+        assert!(read(root, "", 0, 10, None).is_err());
         assert!(remove(root, "/").is_err());
     }
 
@@ -661,14 +918,19 @@ mod tests {
         assert!(inner[0].mtime > 0);
 
         // 按原样读，可以只读一段
-        let (whole, bytes) = read(repo, "src/子 目录/a.txt", 0, READ_MAX).unwrap();
+        let (whole, bytes) = read(repo, "src/子 目录/a.txt", 0, READ_MAX, None).unwrap();
         assert_eq!(bytes, b"hello\r\n\xd6\xd0");
         assert_eq!(whole.size, 9);
-        let (_, part) = read(repo, "src/子 目录/a.txt", 2, 3).unwrap();
+        let (_, part) = read(repo, "src/子 目录/a.txt", 2, 3, None).unwrap();
         assert_eq!(part, b"llo");
-        let (_, end) = read(repo, "src/子 目录/a.txt", 9, 3).unwrap();
+        let (_, end) = read(repo, "src/子 目录/a.txt", 9, 3, None).unwrap();
         assert!(end.is_empty());
-        assert!(read(repo, "src", 0, 10).is_err());
+        assert!(read(repo, "src", 0, 10, None).is_err());
+        // 比 whole 大的不读，只回大小
+        let (info, none) = read(repo, "src/子 目录/a.txt", 0, READ_MAX, Some(8)).unwrap();
+        assert_eq!((info.size, none.len()), (9, 0));
+        let (_, all) = read(repo, "src/子 目录/a.txt", 0, READ_MAX, Some(9)).unwrap();
+        assert_eq!(all.len(), 9);
 
         // 改名：不盖掉别的文件
         temp.write("b.txt", b"b");
@@ -685,6 +947,18 @@ mod tests {
         remove(repo, "b.txt").unwrap();
         assert!(remove(repo, "b.txt").is_err());
         assert!(!stat(repo, "moved").unwrap().exists);
+    }
+
+    #[test]
+    fn 刷盘返回现在的情况() {
+        let temp = TempRepo::new();
+        temp.write("a.txt", b"hello");
+        let stat = sync(temp.repo(), "a.txt").unwrap();
+        assert_eq!((stat.exists, stat.size), (true, 5));
+        // 不在的文件、仓库根都不行，也不会新建
+        assert!(sync(temp.repo(), "missing.txt").is_err());
+        assert!(!temp.0.join("missing.txt").exists());
+        assert!(sync(temp.repo(), "").is_err());
     }
 
     #[test]
@@ -718,6 +992,99 @@ mod tests {
         assert!(gone.conflict && !gone.stat.exists);
         // 没留下临时文件
         assert!(list(temp.repo(), "").unwrap().is_empty());
+    }
+
+    #[test]
+    fn 改名不盖掉别的文件_只改大小写照样能改() {
+        let temp = TempRepo::new();
+        let root = temp.repo();
+        let path = |name: &str| temp.0.join(name);
+        // 一步完成的不覆盖改名
+        fs::write(path("a"), "a").unwrap();
+        fs::write(path("b"), "b").unwrap();
+        let err = rename_noreplace(&path("a"), &path("b")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(path("b")).unwrap(), b"b");
+        rename_noreplace(&path("a"), &path("c")).unwrap();
+        assert_eq!(fs::read(path("c")).unwrap(), b"a");
+        // 只改大小写
+        temp.write("readme.md", b"x");
+        rename(root, "readme.md", "README.md").unwrap();
+        let names: Vec<String> = list(root, "")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"README.md".to_string()), "{names:?}");
+        // Linux 上大小写不同是两个文件：不能把另一个盖掉
+        #[cfg(unix)]
+        {
+            temp.write("x.md", b"lower");
+            temp.write("X.md", b"upper");
+            assert!(rename(root, "x.md", "X.md").is_err());
+            assert_eq!(fs::read(path("X.md")).unwrap(), b"upper");
+            assert_eq!(fs::read(path("x.md")).unwrap(), b"lower");
+        }
+    }
+
+    #[test]
+    fn 新建时已经有了不盖掉_不留临时文件() {
+        let temp = TempRepo::new();
+        let params = FsWrite {
+            repo: temp.repo().into(),
+            path: "n.txt".into(),
+            create: true,
+            ..Default::default()
+        };
+        write(&params, b"first").unwrap();
+        assert!(write(&params, b"second").is_err());
+        assert_eq!(fs::read(temp.0.join("n.txt")).unwrap(), b"first");
+        // 连着存好几次：每次的临时文件都收拾掉了
+        for n in 0..5 {
+            temp.write("n.txt", format!("v{n}").as_bytes());
+        }
+        let names: Vec<String> = list(temp.repo(), "")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["n.txt"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_的设备名_数据流_结尾的点不算普通名字() {
+        let root = r"C:\r";
+        for bad in [
+            "con", "CON.txt", "a/nul", "Com1.log", "lpt9", "a:b", "a.", "a ",
+        ] {
+            assert!(resolve(root, bad).is_err(), "{bad}");
+        }
+        for good in [
+            "console.log",
+            "com0",
+            "com10",
+            ".gitignore",
+            "a.b.c",
+            "auxiliary",
+        ] {
+            assert!(resolve(root, good).is_ok(), "{good}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 悬空的符号链接照样写到它指向的位置() {
+        let temp = TempRepo::new();
+        std::os::unix::fs::symlink("target.txt", temp.0.join("link.txt")).unwrap();
+        temp.write("link.txt", b"hello");
+        assert_eq!(fs::read(temp.0.join("target.txt")).unwrap(), b"hello");
+        assert!(
+            fs::symlink_metadata(temp.0.join("link.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[cfg(unix)]

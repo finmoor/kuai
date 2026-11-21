@@ -17,8 +17,12 @@ use gpui_kit::component::{Sizable as _, WindowExt as _};
 use gpui_kit::*;
 
 use super::dialogs::Ask;
-use super::files::{Body, LocalCopy, OpenFile, Transfer, TreeRow, human_size, join, split};
+use super::files::{
+    Body, LocalCopy, OpenFile, Transfer, TreeRow, copies_dir, join, local_file_name, modified,
+    remove_copy, same_version, split,
+};
 use super::{Page, RepoView};
+use crate::text::human_size;
 
 /// 一次最多上传这么多个文件（拖进来一个很大的目录时先拦住）
 const UPLOAD_MAX: usize = 5000;
@@ -50,11 +54,15 @@ pub(super) fn name_error(name: &str, nested: bool) -> Option<String> {
         if part.ends_with(' ') || part.ends_with('.') || part.starts_with(' ') {
             return Some(tr("名称的首尾不能是空格，末尾不能是句点").into());
         }
+        if fr_core::files::is_git_name(part) {
+            return Some(tr("不能使用 .git：这是 Git 存放仓库数据的目录").into());
+        }
     }
     None
 }
 
 /// 把选中、拖进来的文件和目录排成要传的一个个文件：本机路径，和放到目标目录下的相对路径。
+/// `.git` 目录（拖进来的是一个仓库时里面有）不传：文件页不往 Git 的数据目录里写。
 fn plan_upload(paths: &[PathBuf]) -> Result<Vec<(PathBuf, String)>, String> {
     fn walk(
         local: &Path,
@@ -74,6 +82,9 @@ fn plan_upload(paths: &[PathBuf]) -> Result<Vec<(PathBuf, String)>, String> {
         children.sort();
         for child in children {
             let name = child.file_name().unwrap_or_default().to_string_lossy();
+            if fr_core::files::is_git_name(&name) {
+                continue;
+            }
             walk(&child, format!("{relative}/{name}"), plan)?;
         }
         Ok(())
@@ -81,12 +92,30 @@ fn plan_upload(paths: &[PathBuf]) -> Result<Vec<(PathBuf, String)>, String> {
     let mut plan = Vec::new();
     for path in paths {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        if name.is_empty() {
+        if name.is_empty() || fr_core::files::is_git_name(&name) {
             continue;
         }
         walk(path, name.into_owned(), &mut plan)?;
     }
+    if plan.is_empty() && !paths.is_empty() {
+        return Err(tr("没有可传的文件（.git 目录不传）。").into());
+    }
     Ok(plan)
+}
+
+/// 菜单项点了以后在仓库视图上做的事。
+pub(super) type ViewAction = Box<dyn Fn(&mut RepoView, &mut Window, &mut Context<RepoView>)>;
+
+/// 文件页菜单里的一项：点了在仓库视图上执行 `run`（视图已经关了就不做）。
+pub(super) fn view_item(
+    view: &WeakEntity<RepoView>,
+    label: &'static str,
+    run: ViewAction,
+) -> PopupMenuItem {
+    let view = view.clone();
+    PopupMenuItem::new(label).on_click(move |_, window, cx| {
+        view.update(cx, |this, cx| run(this, window, cx)).ok();
+    })
 }
 
 /// 树里一行（或者空白处，`row` 为 None）的右键菜单。
@@ -105,14 +134,7 @@ pub(super) fn tree_menu(
             Some(row) => split(&row.path).0.to_string(),
             None => String::new(),
         };
-        let item =
-            |label: &'static str,
-             run: Box<dyn Fn(&mut RepoView, &mut Window, &mut Context<RepoView>)>| {
-                let view = view.clone();
-                PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                    view.update(cx, |this, cx| run(this, window, cx)).ok();
-                })
-            };
+        let item = |label, run| view_item(&view, label, run);
         let mut menu = menu;
         if let Some(row) = row.as_ref().filter(|row| !row.dir) {
             let (open, changes, history, blame) = (
@@ -286,7 +308,7 @@ impl RepoView {
         let ask = Ask {
             title: tr("新建文件").into(),
             placeholder: tr("文件名，例如 notes.md").into(),
-            hint,
+            hint: hint.into(),
             ok: tr("新建"),
             validate: Some(Box::new(move |this, answer| {
                 name_error(&answer.text, true).or_else(|| this.exists_error(&within, &answer.text))
@@ -335,7 +357,7 @@ impl RepoView {
         let ask = Ask {
             title: tr("新建文件夹").into(),
             placeholder: tr("文件夹名").into(),
-            hint,
+            hint: hint.into(),
             ok: tr("新建"),
             validate: Some(Box::new(move |this, answer| {
                 name_error(&answer.text, true).or_else(|| this.exists_error(&within, &answer.text))
@@ -437,8 +459,8 @@ impl RepoView {
         let name = split(&path).1.to_string();
         let dir = self.files.is_dir(&path);
         let description = match (self.entry.server.is_some(), dir) {
-            (true, true) => tr("将从服务器上永久删除此目录及其中的全部内容，无法撤销。"),
-            (true, false) => tr("将从服务器上永久删除此文件，无法撤销。"),
+            (true, true) => tr("将从主机上永久删除此目录及其中的全部内容，无法撤销。"),
+            (true, false) => tr("将从主机上永久删除此文件，无法撤销。"),
             (false, true) => tr("此目录及其中的全部内容将移到回收站。"),
             (false, false) => tr("此文件将移到回收站。"),
         };
@@ -518,10 +540,10 @@ impl RepoView {
             return;
         }
         let names = match clash.len() {
-            1..=3 => clash.join("、"),
+            1..=3 => clash.join(tr("、")),
             count => tf!(
                 "{first} 等 {count} 项",
-                first = clash[..2].join("、"),
+                first = clash[..2].join(tr("、")),
                 count
             ),
         };
@@ -780,10 +802,12 @@ impl RepoView {
             crate::shell::report(crate::shell::open_file(&path), window, cx);
             return;
         }
-        // 已经下载过、服务器上的也没变：直接打开那一份
+        // 已经下载过：主机上的没变，或者在本机改过（还没传回去），直接打开那一份；本机没动过、
+        // 主机上的变了，重新下载
         if let Body::Opaque(doc) = &tab.body
             && let Some(copy) = &doc.local
             && copy.path.is_file()
+            && (copy.edited() || same_version(&copy.remote, &tab.stat))
         {
             let path = copy.path.to_string_lossy().into_owned();
             crate::shell::report(crate::shell::open_file(&path), window, cx);
@@ -813,16 +837,16 @@ impl RepoView {
         let Some(tab) = self.files.tab_mut(id) else {
             return;
         };
-        let (path, name) = (tab.path.clone(), tab.name().to_string());
+        let (path, name, remote) = (tab.path.clone(), tab.name().to_string(), tab.stat);
         let Some(doc) = tab.opaque_mut() else {
             return;
         };
-        // 每次下载放进自己的目录：文件名和服务器上的一样，默认程序的标题栏里看得出是哪个文件
-        let dir = std::env::temp_dir()
-            .join("kuai-open")
-            .join(format!("{}-{id}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let dest = dir.join(&name);
+        sweep_old_copies();
+        // 每次下载放进自己的目录：文件名和服务器上的一样（换掉本机不能用的字符），默认程序的
+        // 标题栏里看得出是哪个文件
+        let number = NEXT_COPY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = copies_dir().join(format!("{}-{number}", std::process::id()));
+        let dest = dir.join(local_file_name(&name));
         let mut stream = channel.fs_download(&repo, &path, dest.clone());
         let label: SharedString = tr("正在下载…").into();
         doc.busy = Some((label.clone(), 0, 0));
@@ -860,15 +884,23 @@ impl RepoView {
                 };
                 doc.busy = None;
                 if let Err(err) = outcome {
+                    let _ = std::fs::remove_dir_all(dest.parent().unwrap_or(&dest));
                     let text = tf!("下载 {name} 失败：{err}", name, err);
                     this.files_error(text, window, cx);
                     return;
                 }
-                doc.local = Some(LocalCopy {
+                let fresh = LocalCopy {
                     mtime: modified(&dest),
                     path: dest.clone(),
                     changed: false,
-                });
+                    remote,
+                };
+                // 换下来的那份（主机上变了以后重新下载的）在本机没改过，删掉
+                if let Some(old) = doc.local.replace(fresh)
+                    && !old.edited()
+                {
+                    remove_copy(&old);
+                }
                 let shown = dest.to_string_lossy().into_owned();
                 crate::shell::report(crate::shell::open_file(&shown), window, cx);
                 this.watch_local_copy(id, cx);
@@ -907,8 +939,56 @@ impl RepoView {
         }
     }
 
-    /// 把在本机改过的那份传回服务器，换掉原来的文件。
+    /// 把在本机改过的那份传回服务器，换掉原来的文件。先看一眼主机上的：下载以后在主机上被改过
+    /// （或者删了），先问一声，免得盖掉别人或者服务器上的程序（比如 Claude Code）改的。
     pub(super) fn upload_back(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((channel, repo)) = self.files_channel() else {
+            return;
+        };
+        let Some(tab) = self.files.tab_mut(id) else {
+            return;
+        };
+        let (path, name) = (tab.path.clone(), tab.name().to_string());
+        let Some(doc) = tab.opaque_mut() else {
+            return;
+        };
+        let Some(remote) = doc.local.as_ref().map(|copy| copy.remote) else {
+            return;
+        };
+        if doc.busy.is_some() {
+            return;
+        }
+        let request = channel.fs_stat(&repo, &path);
+        doc.busy = Some((tr("正在上传…").into(), 0, 0));
+        doc.task = Some(cx.spawn_in(window, async move |this, cx| {
+            let now = request.await;
+            this.update_in(cx, |this, window, cx| {
+                if let Some(doc) = this.files.tab_mut(id).and_then(OpenFile::opaque_mut) {
+                    doc.busy = None;
+                }
+                cx.notify();
+                match now {
+                    Ok(now) if !same_version(&now, &remote) => this.confirm(
+                        tr("覆盖主机上的文件？"),
+                        tf!(
+                            "主机上的 {name} 在下载之后被改过或删除了。上传会用本机的这份替换主机上现在的内容。",
+                            name
+                        ),
+                        tr("上传并覆盖"),
+                        window,
+                        cx,
+                        move |this, window, cx| this.upload_now(id, window, cx),
+                    ),
+                    // 查不了（比如断线了）照常传，传不上会报错
+                    _ => this.upload_now(id, window, cx),
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn upload_now(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some((channel, repo)) = self.files_channel() else {
             return;
         };
@@ -976,8 +1056,12 @@ impl RepoView {
                             // 传的这段时间里又改了的话，下一轮还会提示
                             copy.mtime = sent_mtime;
                             copy.changed = false;
+                            // 主机上现在是传上去的这份：之后再变才是别处改的
+                            if let Some(fresh) = fresh {
+                                copy.remote = fresh;
+                            }
                         }
-                        let text = tf!("已将 {name} 上传到服务器", name);
+                        let text = tf!("已将 {name} 上传到主机", name);
                         window.push_notification(Notification::success(text), cx);
                         this.refresh(cx);
                     }
@@ -1002,8 +1086,29 @@ impl RepoView {
     }
 }
 
-fn modified(path: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).ok()?.modified().ok()
+/// 下载副本的子目录编号：整个进程一个计数。不用标签的编号，那是每个仓库页各自从头数的，两个
+/// 仓库页会撞上，关一个标签就删了另一个仓库的副本。
+static NEXT_COPY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// 清掉以前留下的副本：Kuai 没关标签页就退出时，副本留在临时目录里。别的进程的、七天没动过的删掉
+/// （本进程的还开着）。每个进程只清一次。
+fn sweep_old_copies() {
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(|| {
+        let mine = format!("{}-", std::process::id());
+        let Ok(entries) = std::fs::read_dir(copies_dir()) else {
+            return;
+        };
+        let week = Duration::from_secs(7 * 24 * 3600);
+        for entry in entries.flatten() {
+            let old = modified(&entry.path())
+                .and_then(|time| time.elapsed().ok())
+                .is_some_and(|age| age > week);
+            if old && !entry.file_name().to_string_lossy().starts_with(&mine) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1022,6 +1127,11 @@ mod tests {
         ] {
             assert!(name_error(bad, true).is_some(), "{bad}");
         }
+        // Git 的数据目录：哪一层、什么写法都不行
+        for bad in [".git", ".GIT/config", "a/.git/hooks/pre-commit", "GIT~1"] {
+            assert!(name_error(bad, true).is_some(), "{bad}");
+        }
+        assert_eq!(name_error(".gitignore", false), None);
     }
 
     #[test]
@@ -1032,10 +1142,14 @@ mod tests {
         std::fs::write(root.join("a.txt"), b"a").unwrap();
         std::fs::write(root.join("包/b.txt"), b"b").unwrap();
         std::fs::write(root.join("包/子/c.txt"), b"c").unwrap();
+        // 拖进来的是一个仓库：里面的 .git 不传
+        std::fs::create_dir_all(root.join("包/.git")).unwrap();
+        std::fs::write(root.join("包/.git/HEAD"), b"ref: refs/heads/main\n").unwrap();
         let plan = plan_upload(&[root.join("a.txt"), root.join("包")]).unwrap();
         let relative: Vec<&str> = plan.iter().map(|(_, to)| to.as_str()).collect();
         assert_eq!(relative, ["a.txt", "包/b.txt", "包/子/c.txt"]);
         assert_eq!(plan[2].0, root.join("包/子/c.txt"));
+        assert!(plan_upload(&[root.join("包/.git")]).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

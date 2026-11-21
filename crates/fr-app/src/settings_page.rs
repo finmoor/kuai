@@ -341,9 +341,9 @@ impl SettingsPage {
             let key = |height: f32| SharedString::from(format!("{height}"));
             let label = |height: f32| -> SharedString {
                 match height {
-                    h if h == 1. => tr("1.0（紧凑）").into(),
-                    h if h == 1.25 => tr("1.25（默认）").into(),
-                    h if h == 1.6 => tr("1.6（宽松）").into(),
+                    1. => tr("1.0（紧凑）").into(),
+                    1.25 => tr("1.25（默认）").into(),
+                    1.6 => tr("1.6（宽松）").into(),
                     h => format!("{h}").into(),
                 }
             };
@@ -430,7 +430,7 @@ impl SettingsPage {
                 .default_value(key(defaults.scrollback)),
             )
             .description(tr(
-                "每个终端保留的输出行数。服务器上的终端重新连接后可回看最近 2,000 行。",
+                "每个终端保留的输出行数。远程主机上的终端重新连接后可回看最近 2,000 行。",
             ))
         };
         let copy_on_select = SettingItem::new(
@@ -498,7 +498,7 @@ impl SettingsPage {
                 ),
             )
             .description(tr(
-                "对新打开的终端生效。服务器上的仓库使用服务器的登录 shell。",
+                "对新打开的终端生效。远程主机上的仓库使用该主机的登录 shell。",
             ))
         };
         let notify = {
@@ -708,7 +708,7 @@ impl SettingsPage {
         )
         .description(format!(
             "{}\n{}",
-            tr("映射服务器目录需要 WinFsp，须单独安装。"),
+            tr("映射主机上的目录需要 WinFsp，须单独安装。"),
             fr_mount::WINFSP_NOTICE
         ));
         let file = crate::settings::file();
@@ -837,7 +837,7 @@ fn group_digits(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (index, ch) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);

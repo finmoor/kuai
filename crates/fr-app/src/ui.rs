@@ -50,26 +50,40 @@ pub fn clipped(id: impl Into<ElementId>, text: impl Into<SharedString>) -> State
     clipped_with_tip(id, text.clone(), text)
 }
 
-/// 同 [`clipped`]，提示里显示的是 `tip`（比如行里是文件名，提示给完整路径）。
+/// 单行显示的文字：换行画成「↵」，制表符画成空格，别的控制字符画成「�」。路径、目录名里可能有
+/// 这些（git 允许文件名里有换行，Linux 上的目录名也可以有），原样画会折成几行、压到别的行上。
+pub fn one_line(text: impl Into<SharedString>) -> SharedString {
+    let text: SharedString = text.into();
+    if !text.chars().any(char::is_control) {
+        return text;
+    }
+    text.chars()
+        .map(|c| match c {
+            '\n' | '\r' => '↵',
+            '\t' => ' ',
+            c if c.is_control() => '\u{FFFD}',
+            c => c,
+        })
+        .collect::<String>()
+        .into()
+}
+
+/// 同 [`clipped`]，提示里显示的是 `tip`（比如行里是文件名，提示给完整路径）。行里的文字按
+/// [`one_line`] 画，提示里是原文。
 pub fn clipped_with_tip(
     id: impl Into<ElementId>,
     text: impl Into<SharedString>,
     tip: impl Into<SharedString>,
 ) -> Stateful<Div> {
-    let (text, tip): (SharedString, SharedString) = (text.into(), tip.into());
+    let (text, tip): (SharedString, SharedString) = (one_line(text), tip.into());
     let cut = Rc::new(Cell::new(false));
     // 量一下：这一块有多宽，文字不省略要多宽。画在这一块里面，拿得到它的字体和字号
     let measure = {
-        let (text, cut) = (text.clone(), cut.clone());
+        let (line, cut) = (text.clone(), cut.clone());
         canvas(
             move |bounds, window, _| {
                 let style = window.text_style();
                 let size = style.font_size.to_pixels(window.rem_size());
-                let line: SharedString = if text.contains('\n') {
-                    text.replace('\n', " ").into()
-                } else {
-                    text
-                };
                 let run = style.to_run(line.len());
                 let width = window
                     .text_system()
@@ -264,7 +278,7 @@ pub fn avatar(name: &str, size: f32, cx: &App) -> Div {
         theme.yellow,
         theme.red,
     ];
-    let color = colors[avatar_slot(name, colors.len())];
+    let color = colors[name_slot(name, colors.len())];
     div()
         .flex_none()
         .size(px(size))
@@ -280,8 +294,59 @@ pub fn avatar(name: &str, size: f32, cx: &App) -> Div {
         .child(initial(name))
 }
 
+/// 文件夹图标的颜色：文件页、本地修改、提交详情、比较的树和侧栏里分支的文件夹都用它，一眼分得出
+/// 哪一行是文件夹。
+pub fn folder_color(cx: &App) -> Hsla {
+    cx.theme().info.opacity(0.85)
+}
+
+/// 工作区颜色有几种。
+pub const HUES: usize = 6;
+
+/// 依次给一串工作区名字分颜色（第几种）：按名字分到的那一种用得最少就用它，不然从它往后找用得最少
+/// 的。所以前六个各是各的颜色，往后加的不改前面的。
+pub fn hue_slots<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<usize> {
+    let mut used = [0usize; HUES];
+    names
+        .into_iter()
+        .map(|name| {
+            let base = name_slot(name, HUES);
+            let least = used.iter().copied().min().unwrap_or(0);
+            let slot = (0..HUES)
+                .map(|step| (base + step) % HUES)
+                .find(|slot| used[*slot] == least)
+                .unwrap_or(base);
+            used[slot] += 1;
+            slot
+        })
+        .collect()
+}
+
+/// 第 `slot` 种工作区颜色（哪个工作区是第几种见 `AppState::workspace_hues`）。从当前主题的标志色
+/// 取，换主题跟着换。不用黄色：终端「已停下」是黄的；红色单用像出错，和黄、紫各混一半。
+pub fn hue(slot: usize, cx: &App) -> Hsla {
+    let theme = cx.theme();
+    match slot % HUES {
+        0 => theme.blue,
+        1 => theme.magenta,
+        2 => theme.cyan,
+        3 => theme.green,
+        4 => theme.red.blend(theme.yellow.opacity(0.5)),
+        _ => theme.red.blend(theme.magenta.opacity(0.5)),
+    }
+}
+
+/// 工作区的色块：终端页侧栏的分节标题、工作区页的列表、「已固定」的行尾都用它标是哪个工作区。
+pub fn hue_mark(color: Hsla, size: f32) -> Div {
+    div()
+        .flex_none()
+        .size(px(size))
+        .rounded(px(size / 4.))
+        .bg(color)
+}
+
 /// 名字落在第几个颜色上。
-fn avatar_slot(name: &str, slots: usize) -> usize {
+pub fn name_slot(name: &str, slots: usize) -> usize {
     // FNV-1a：同一个名字每次、每台电脑上算出来都一样
     let mut hash: u32 = 0x811c9dc5;
     for byte in name.trim().to_lowercase().bytes() {
@@ -302,11 +367,18 @@ fn initial(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{avatar_slot, initial};
+    use super::{HUES, hue_slots, initial, name_slot, one_line};
+
+    #[test]
+    fn 单行显示时换行和控制字符换成看得见的() {
+        assert_eq!(one_line("wt-nl\nb").as_ref(), "wt-nl↵b");
+        assert_eq!(one_line("a\r\nb\tc\u{1b}d").as_ref(), "a↵↵b c\u{FFFD}d");
+        assert_eq!(one_line("普通的名字.txt").as_ref(), "普通的名字.txt");
+    }
 
     #[test]
     fn 头像取名字的首字() {
-        assert_eq!(initial("feng"), "F");
+        assert_eq!(initial("frank"), "F");
         assert_eq!(initial("  张三"), "张");
         assert_eq!(initial("<bot>"), "B");
         assert_eq!(initial(""), "?");
@@ -314,8 +386,25 @@ mod tests {
 
     #[test]
     fn 同一个名字颜色不变() {
-        assert_eq!(avatar_slot("Feng", 6), avatar_slot("feng ", 6));
-        assert!(avatar_slot("别人", 6) < 6);
-        assert_eq!(avatar_slot("x", 0), 0);
+        assert_eq!(name_slot("Alice", 6), name_slot("alice ", 6));
+        assert!(name_slot("别人", 6) < 6);
+        assert_eq!(name_slot("x", 0), 0);
+    }
+
+    #[test]
+    fn 工作区颜色_前六个各不相同_后加的不改前面的() {
+        let names = ["alpha", "beta", "gamma", "delta", "kuai", "notes", "extra"];
+        let slots = hue_slots(names);
+        let mut first: Vec<usize> = slots[..HUES].to_vec();
+        first.sort();
+        first.dedup();
+        assert_eq!(first.len(), HUES, "{slots:?}");
+        // 后面加一个，前面的不变
+        assert_eq!(hue_slots(names[..3].iter().copied()), slots[..3]);
+        // 没撞的就是按名字分到的那一种
+        assert_eq!(slots[0], name_slot("alpha", HUES));
+        // 撞了的从名字分到的那一种往后找
+        let same = hue_slots(["a", "a"]);
+        assert_eq!(same[1], (same[0] + 1) % HUES);
     }
 }

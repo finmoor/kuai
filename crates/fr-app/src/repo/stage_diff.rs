@@ -56,6 +56,9 @@ pub(super) struct StageDiff {
     pub(super) area: Area,
     pub(super) entry: Entry,
     pub(super) file: FileDiff,
+    /// diff 里不止一个文件：文件类型改了（git 写成删掉一个、新建一个）。几段的块都接在
+    /// `file.hunks` 里显示，只能对整个文件操作
+    typechange: bool,
     pub(super) rows: Vec<Row>,
     /// 每行显示的文字
     pub(super) texts: Vec<SharedString>,
@@ -78,7 +81,7 @@ pub(super) struct StageDiff {
     pub(super) notice: Option<SharedString>,
     pub(super) error: Option<SharedString>,
     /// git 给的原始 diff，重读时拿来比较有没有变
-    source: Vec<u8>,
+    pub(super) source: Vec<u8>,
 }
 
 impl StageDiff {
@@ -88,12 +91,17 @@ impl StageDiff {
         out: &[u8],
         scroll: UniformListScrollHandle,
     ) -> Self {
-        let mut files = patch::parse(out);
-        let file = if files.is_empty() {
-            FileDiff::default()
-        } else {
-            files.swap_remove(0)
-        };
+        let mut parts = patch::parse(out).into_iter();
+        let mut file = parts.next().unwrap_or_default();
+        // 文件类型改了：git 写成先删掉一个、再新建一个。后面几段的块接到第一段后面，
+        // 每段先写自己的头部（「deleted file mode」「new file mode」）
+        let mut sections = vec![(file.header.clone(), 0..file.hunks.len())];
+        for part in parts {
+            let start = file.hunks.len();
+            file.hunks.extend(part.hunks);
+            sections.push((part.header, start..file.hunks.len()));
+        }
+        let typechange = sections.len() > 1;
         let mut rows = Vec::new();
         let mut texts = Vec::new();
         if file.is_combined() {
@@ -103,18 +111,21 @@ impl StageDiff {
                 texts.push(display(line));
             }
         } else {
-            for line in &file.header {
-                if SHOWN_HEADERS.iter().any(|p| line.starts_with(p)) {
-                    rows.push(Row::Meta);
-                    texts.push(display(line));
+            for (header, hunks) in sections {
+                for line in &header {
+                    if SHOWN_HEADERS.iter().any(|p| line.starts_with(p)) {
+                        rows.push(Row::Meta);
+                        texts.push(display(line));
+                    }
                 }
-            }
-            for (hi, hunk) in file.hunks.iter().enumerate() {
-                rows.push(Row::Hunk(hi));
-                texts.push(hunk.title().into());
-                for (li, line) in hunk.lines.iter().enumerate() {
-                    rows.push(Row::Line(hi, li));
-                    texts.push(display(&line.content));
+                for hi in hunks {
+                    let hunk = &file.hunks[hi];
+                    rows.push(Row::Hunk(hi));
+                    texts.push(hunk.title().into());
+                    for (li, line) in hunk.lines.iter().enumerate() {
+                        rows.push(Row::Line(hi, li));
+                        texts.push(display(&line.content));
+                    }
                 }
             }
         }
@@ -123,6 +134,8 @@ impl StageDiff {
                 tr("存在冲突：点击「解决冲突…」逐处选择；已在别处解决的，点击「标记为已解决」")
                     .into(),
             )
+        } else if typechange {
+            Some(tr("文件类型改了（例如符号链接换成了普通文件），只能对整个文件操作").into())
         } else if file.is_binary() {
             Some(tr("二进制文件，只能对整个文件操作").into())
         } else if file.hunks.is_empty() {
@@ -149,6 +162,7 @@ impl StageDiff {
             area,
             entry,
             file,
+            typechange,
             rows,
             texts,
             highlights: Vec::new(),
@@ -241,6 +255,7 @@ impl StageDiff {
             area,
             entry,
             file: FileDiff::default(),
+            typechange: false,
             rows: Vec::new(),
             texts: Vec::new(),
             highlights: Vec::new(),
@@ -318,7 +333,10 @@ impl StageDiff {
 
     /// 能不能按块、按行操作。
     pub(super) fn editable(&self) -> bool {
-        !self.file.hunks.is_empty() && !self.file.is_binary() && !self.file.is_combined()
+        !self.file.hunks.is_empty()
+            && !self.file.is_binary()
+            && !self.file.is_combined()
+            && !self.typechange
     }
 
     fn selectable(&self, row: usize) -> bool {
@@ -603,6 +621,58 @@ mod tests {
             DIFF.as_bytes(),
             UniformListScrollHandle::new(),
         )
+    }
+
+    #[test]
+    fn 文件类型改了两段都显示() {
+        // 暂存区里是符号链接、磁盘上是普通文件：git 写成删掉链接、新建文件两段
+        let out = "diff --git a/link b/link
+deleted file mode 120000
+index 1111111..0000000
+--- a/link
++++ /dev/null
+@@ -1 +0,0 @@
+-target.txt
+\\ No newline at end of file
+diff --git a/link b/link
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/link
+@@ -0,0 +1,2 @@
++现在是普通文件
++第二行
+";
+        let entry = Entry {
+            path: "link".into(),
+            orig_path: None,
+            staged: None,
+            unstaged: Some(fr_core::status::Kind::TypeChanged),
+            submodule: false,
+        };
+        let v = StageDiff::new(
+            Area::Unstaged,
+            entry,
+            out.as_bytes(),
+            UniformListScrollHandle::new(),
+        );
+        let texts: Vec<&str> = v.texts.iter().map(|t| &**t).collect();
+        assert_eq!(
+            texts,
+            [
+                "deleted file mode 120000",
+                v.file.hunks[0].title().as_str(),
+                "target.txt",
+                "new file mode 100644",
+                v.file.hunks[1].title().as_str(),
+                "现在是普通文件",
+                "第二行",
+            ]
+        );
+        assert_eq!(v.rows[4], Row::Hunk(1));
+        assert_eq!(v.rows[6], Row::Line(1, 1));
+        assert!(!v.editable());
+        assert!(v.notice.is_some());
     }
 
     #[test]

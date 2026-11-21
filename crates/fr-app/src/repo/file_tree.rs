@@ -17,6 +17,8 @@ use crate::ui;
 
 /// 树形里每深一层往右缩进多少。
 pub(super) const INDENT: f32 = 14.;
+/// 树形里文件那一行最前面空出来的宽度：和目录那一行的箭头一样宽（见 [`dir_cells`]）。
+pub(super) const FILE_LEAD: f32 = 12.;
 
 /// 清单里的一行。
 #[derive(Clone, Debug, PartialEq)]
@@ -150,6 +152,9 @@ pub(super) fn kind_badge(letter: impl Into<SharedString>, color: Hsla) -> Div {
 }
 
 /// 目录那一行里面的东西：箭头、文件夹图标、名字、文件数。外面的行（高度、点击）调用的人自己包。
+///
+/// 树形里文件那一行最前面也留出箭头那么宽（[`FILE_LEAD`]），改动的小方块对着文件夹图标、名字对着
+/// 文件夹的名字：同一层的文件和目录对齐，下一层整个往右缩一格，看得出谁在谁里面。
 pub(super) fn dir_cells(
     id: impl Into<ElementId>,
     label: &str,
@@ -174,7 +179,7 @@ pub(super) fn dir_cells(
             IconName::Folder
         })
         .flex_none()
-        .text_color(muted)
+        .text_color(ui::folder_color(cx))
         .into_any_element(),
         ui::clipped_with_tip(id, label.to_string(), path.to_string())
             .flex_1()

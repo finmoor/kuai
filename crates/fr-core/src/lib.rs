@@ -14,6 +14,7 @@ pub mod ignore;
 pub mod log;
 pub mod patch;
 pub mod protocol;
+pub mod pull;
 pub mod rebase;
 pub mod refs;
 pub mod show;

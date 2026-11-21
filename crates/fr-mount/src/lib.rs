@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn 网络路径里的共享名() {
         assert_eq!(unc_share("devops-workspaces"), "devops-workspaces");
-        assert_eq!(unc_share("T14P-work.v2_a"), "T14P-work.v2_a");
+        assert_eq!(unc_share("PC-work.v2_a"), "PC-work.v2_a");
         // 中文、空格、别的符号都换成横线，一个字一个横线
         assert_eq!(unc_share("测试机-src"), "----src");
         assert_eq!(unc_share("my box/src"), "my-box-src");

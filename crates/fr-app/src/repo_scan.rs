@@ -1,5 +1,5 @@
-//! 工作区页、服务器页上每个仓库的子仓库，和仓库、子仓库各自在哪个分支、有几个改动（2026-11-19
-//! Feng：「中间栏子仓库一起带出来」，设计见 `design/server-workspace/` 第二版）。
+//! 工作区页、服务器页上每个仓库的子仓库，和仓库、子仓库各自在哪个分支、有几个改动（子仓库跟着
+//! 仓库一起列出来，设计见 `docs/design/server-workspace/` 第二版）。
 //!
 //! 和仓库里的子仓库总览（`repo::subs`）是同一种数据、同一套读法：子仓库用 `fs_repos` 找（服务器上
 //! 由 kuaid 找），每个仓库、子仓库读一次状态和最近一次提交（两条 git 命令），同时最多 6 个。
@@ -28,6 +28,8 @@ const STALE: Duration = Duration::from_secs(20);
 pub struct Scanned {
     /// 子仓库：相对仓库根的路径（正斜杠），按名字排。还没找过是 None
     pub subs: Option<Vec<String>>,
+    /// 子仓库太多、目录太深，没找全（kuaid 找到上限就停）：只有前面这些
+    pub truncated: bool,
     /// 仓库自己（键是空串）和各个子仓库的分支、改动数
     pub states: HashMap<String, Summary>,
     /// 最近一次开始读的时候
@@ -151,18 +153,24 @@ impl RepoScan {
             let task = cx.spawn({
                 let entry = entry.clone();
                 async move |this, cx| {
-                    let subs = find_subs(&channel, &entry).await;
+                    let found = find_subs(&channel, &entry).await;
                     let alive = this.update(cx, |this, cx| {
                         let scanned = this.repos.entry(entry.clone()).or_default();
+                        // 这次没找成（目录一时读不了）：留着上次找到的，不当成没有
+                        let Some((subs, truncated)) = &found else {
+                            return scanned.subs.clone().unwrap_or_default();
+                        };
                         scanned
                             .states
                             .retain(|key, _| key.is_empty() || subs.contains(key));
                         scanned.subs = Some(subs.clone());
+                        scanned.truncated = *truncated;
                         cx.notify();
+                        subs.clone()
                     });
-                    if alive.is_err() {
+                    let Ok(subs) = alive else {
                         return;
-                    }
+                    };
                     // 仓库自己和每个子仓库
                     let jobs = std::iter::once(String::new()).chain(subs).map(|relative| {
                         let channel = channel.clone();
@@ -196,35 +204,39 @@ impl RepoScan {
     }
 }
 
-/// 找仓库目录里的子仓库，去掉建在里面的工作树。找不了（旧的 kuaid 不认识这个请求、目录读不了）
-/// 当成没有。
-async fn find_subs(channel: &Channel, entry: &RepoEntry) -> Vec<String> {
+/// 找仓库目录里的子仓库，去掉建在里面的工作树；第二项是没找全（到了上限）。找不了（旧的 kuaid
+/// 不认识这个请求、目录一时读不了）是 None。
+async fn find_subs(channel: &Channel, entry: &RepoEntry) -> Option<(Vec<String>, bool)> {
     let found = channel.fs_repos(&entry.path);
-    let trees = channel.git(&entry.path, fr_core::worktree::list_args());
+    let nul = fr_core::worktree::has_nul(channel.git_version());
+    let trees = channel.git(&entry.path, fr_core::worktree::list_args(nul));
     let (found, trees) = futures::join!(found, trees);
     let trees: Vec<String> = trees
         .and_then(|out| out.ok())
         .map(|out| {
-            fr_core::worktree::parse(&out)
+            fr_core::worktree::parse(&out, nul)
                 .into_iter()
                 .map(|tree| tree.path)
                 .collect()
         })
         .unwrap_or_default();
     match found {
-        Ok(found) => found
-            .repos
-            .into_iter()
-            .filter(|relative| {
-                let full = sub_path(entry, relative);
-                !trees
-                    .iter()
-                    .any(|tree| fr_core::worktree::same_path(tree, &full))
-            })
-            .collect(),
+        Ok(found) => {
+            let subs = found
+                .repos
+                .into_iter()
+                .filter(|relative| {
+                    let full = sub_path(entry, relative);
+                    !trees
+                        .iter()
+                        .any(|tree| fr_core::worktree::same_path(tree, &full))
+                })
+                .collect();
+            Some((subs, found.truncated))
+        }
         Err(err) => {
             log::info!("{}：找子仓库失败：{err:#}", entry.path);
-            Vec::new()
+            None
         }
     }
 }

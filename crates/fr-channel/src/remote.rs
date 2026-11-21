@@ -37,8 +37,8 @@ use serde_json::{Value, json};
 
 use crate::binaries::{Binaries, Os};
 use crate::{
-    ChangeStream, GitOutput, GitStream, StateStream, StreamItem, TermItem, TermListStream,
-    TermStream, UploadItem, UploadSource, UploadStream,
+    Backlog, ChangeStream, GitCancel, GitOutput, GitStream, StateStream, StreamItem, TermItem,
+    TermListStream, TermStream, UploadItem, UploadSource, UploadStream,
 };
 
 /// 启动脚本找到 kuaid 时先打这一行；前面的输出（比如 `.bashrc` 打印的东西）都跳过
@@ -79,11 +79,15 @@ struct Inner {
 /// 交给写线程的一条请求和它附带的字节
 type Outgoing = std::sync::mpsc::Sender<(Request, Vec<u8>)>;
 
+/// 一个请求的回音：结果和附带的字节
+type Reply = BoxFuture<'static, Result<(Value, Vec<u8>)>>;
+
 enum Pending {
     Call(oneshot::Sender<Result<(Value, Vec<u8>)>>),
     Stream(mpsc::UnboundedSender<Result<StreamItem>>),
     Watch(mpsc::UnboundedSender<()>),
-    Term(mpsc::UnboundedSender<Result<TermItem>>),
+    /// 终端的输出，和积着还没取走的有多少（见 [`crate::TERM_BACKLOG`]）
+    Term(mpsc::UnboundedSender<Result<TermItem>>, Arc<Backlog>),
     /// `state_watch`：每次推来的整份
     State(mpsc::UnboundedSender<Result<Store>>),
     /// `term_watch`：每次推来的整份终端列表
@@ -427,6 +431,43 @@ fn remember_windows(destination: &str, windows: bool) {
     }
 }
 
+/// 登录被拒绝了（ssh 说 Permission denied）：密钥、密码不对，或者用户取消了输入。
+#[derive(Debug)]
+struct LoginDenied(String);
+
+impl std::fmt::Display for LoginDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LoginDenied {}
+
+/// 存着的私钥口令只在只用公钥认证的那次 ssh 里自动回答（见 [`login`]）：服务器在键盘交互认证
+/// 里也能问一句像解私钥的话，8.3 以前的 OpenSSH（Windows 10 自带的就是）分不出是谁在问。
+/// 只用公钥登录不上（服务器还要键盘交互的第二步，比如动态口令）时，不带存着的口令再连一次：
+/// ssh 问的每一句都弹窗给用户看。不许弹窗的（启动时自动连接）不再连。
+fn with_plain_retry<T>(
+    options: &ConnectOptions,
+    attempt: impl Fn(&ConnectOptions) -> Result<T>,
+) -> Result<T> {
+    let result = attempt(options);
+    let denied = matches!(&result, Err(err) if err.downcast_ref::<LoginDenied>().is_some());
+    if !denied || options.no_prompt || !options.saved_passphrase() {
+        return result;
+    }
+    let mut plain = options.clone();
+    if !plain.password_auth {
+        plain.secret = None;
+    }
+    for jump in &mut plain.jumps {
+        if !jump.password_auth {
+            jump.secret = None;
+        }
+    }
+    attempt(&plain)
+}
+
 /// 连接选项。
 #[derive(Clone, Default)]
 pub struct ConnectOptions {
@@ -476,6 +517,18 @@ pub struct Jump {
     pub secret: Option<String>,
 }
 
+impl ConnectOptions {
+    /// 目标服务器或哪台跳板机存着私钥口令（用密钥登录、存了口令）。
+    fn saved_passphrase(&self) -> bool {
+        let key = |password_auth: bool, secret: &Option<String>| !password_auth && secret.is_some();
+        key(self.password_auth, &self.secret)
+            || self
+                .jumps
+                .iter()
+                .any(|jump| key(jump.password_auth, &jump.secret))
+    }
+}
+
 impl std::fmt::Debug for ConnectOptions {
     /// 密码不进日志：只写有没有
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -501,7 +554,9 @@ impl Connection {
     /// 连接服务器：经 ssh 启动 kuaid；没装或版本不对就先上传再连。
     /// 会阻塞（建立连接要几百毫秒，第一次还要上传），放在后台线程里调用。
     pub fn connect(destination: &str, options: &ConnectOptions) -> Result<Connection> {
-        Self::connect_on(Route::Direct, destination, options)
+        with_plain_retry(options, |options| {
+            Self::connect_on(Route::Direct, destination, options)
+        })
     }
 
     /// 经 `via` 那台电脑的 kuaid 连它配置的服务器 `server`（那台电脑的 `Store::servers` 里的 id）：
@@ -518,7 +573,7 @@ impl Connection {
             bail!(
                 "{}",
                 tf!(
-                    "{destination} 上的 kuaid 过旧，无法经它连接其他服务器",
+                    "{destination} 上的 kuaid 过旧，无法经它连接其他主机",
                     destination = via.destination
                 )
             );
@@ -529,6 +584,10 @@ impl Connection {
     /// 测试连接：只登录上去问一句是什么系统。不装、不启动 kuaid，服务器上什么都不留。
     /// 登录不了、连不上时的报错和 [`Self::connect`] 一样。会阻塞，放在后台线程里调用。
     pub fn probe(destination: &str, options: &ConnectOptions) -> Result<Probe> {
+        with_plain_retry(options, |options| Self::probe_once(destination, options))
+    }
+
+    fn probe_once(destination: &str, options: &ConnectOptions) -> Result<Probe> {
         // 和连接时一样：先按 Linux 的写法问（已经知道是 Windows 的先按 Windows），跑不了再换另一种
         let mut windows = known_windows(destination);
         let (mut tried_sh, mut tried_cmd) = (false, false);
@@ -618,7 +677,8 @@ impl Connection {
                     match server_os(&os) {
                         Some(Os::Linux) => {
                             let binary = binaries.binary_for(Os::Linux, &arch)?;
-                            install(route, destination, options, &install_script(&dir), binary)?;
+                            let script = install_script(&dir, binary.len());
+                            install(route, destination, options, &script, binary)?;
                         }
                         Some(Os::Windows) if windows => {
                             let files = binaries.files_for(Os::Windows, &arch)?;
@@ -633,7 +693,7 @@ impl Connection {
                         }
                         None => bail!(
                             "{}",
-                            tf!("目前仅支持 Linux 和 Windows 服务器，该服务器为 {os}", os)
+                            tf!("目前仅支持 Linux 和 Windows 主机，该主机为 {os}", os)
                         ),
                     }
                     installed = true;
@@ -700,6 +760,26 @@ impl Connection {
     /// 连接还在不在。断开后所有调用都会失败，要重新连接。
     pub fn is_alive(&self) -> bool {
         self.inner.alive.load(Ordering::Acquire)
+    }
+
+    /// 主动断开：别处还拿着它也一样（改了主机地址、登录方式，拿着它的地方要按新的重连）。等待中的
+    /// 请求、订阅、终端都以 `reason` 结束，之后的请求在发的时候就失败；ssh 在后台结束。
+    pub fn close(&self, reason: String) {
+        if !self.is_alive() {
+            return;
+        }
+        self.inner.fail_all(reason);
+        let (inner, tree) = (self.inner.clone(), !self.local);
+        let reap = move || {
+            inner.link.kill(tree);
+            let _ = inner.link.wait();
+        };
+        let spawned = std::thread::Builder::new()
+            .name("fr-ssh-reaper".into())
+            .spawn(reap.clone());
+        if spawned.is_err() {
+            reap();
+        }
     }
 
     /// 经哪台电脑的 kuaid 连的（[`Self::connect_via`]）；直接连的为空。
@@ -776,18 +856,34 @@ impl Connection {
             json!({ "repo": repo, "args": args }),
             stdin.unwrap_or_default(),
         );
-        async move {
-            let (result, stdout) = call.await?;
-            let result: GitResult =
-                serde_json::from_value(result).context(tr("kuaid 返回的结果格式错误"))?;
-            Ok(GitOutput {
-                code: result.code,
-                stdout,
-                stderr: result.stderr,
-                elapsed: Duration::from_millis(result.ms),
-            })
-        }
-        .boxed()
+        git_output(call)
+    }
+
+    /// 同 [`Self::git`]，另给一个取消的办法：只叫 kuaid 杀掉 git，不丢下请求，kuaid 等它退出以后
+    /// 照常回话，future 这时才完成（见 [`GitCancel`]）。
+    pub(crate) fn git_cancellable(
+        &self,
+        repo: &str,
+        args: Vec<String>,
+    ) -> (BoxFuture<'static, Result<GitOutput>>, GitCancel) {
+        let params = json!({ "repo": repo, "args": args });
+        let (id, call) = self.inner.call_with_id("git", params, Vec::new());
+        let inner = Arc::downgrade(&self.inner);
+        let cancel = GitCancel(Arc::new(move || {
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            if inner.pending.lock().unwrap().contains_key(&id) {
+                let cancel = Request {
+                    id: 0,
+                    method: "cancel".into(),
+                    params: json!({ "id": id }),
+                    bytes: 0,
+                };
+                let _ = inner.send(cancel, Vec::new());
+            }
+        }));
+        (git_output(call), cancel)
     }
 
     pub(crate) fn watch(&self, repo: &str) -> ChangeStream {
@@ -911,12 +1007,13 @@ impl Connection {
 
     fn term_stream(&self, method: &str, params: Value) -> TermStream {
         let (tx, rx) = mpsc::unbounded();
+        let backlog = Arc::new(Backlog::default());
         let id = self.inner.next_id();
         self.inner
             .pending
             .lock()
             .unwrap()
-            .insert(id, Pending::Term(tx.clone()));
+            .insert(id, Pending::Term(tx.clone(), backlog.clone()));
         let request = Request {
             id,
             method: method.into(),
@@ -929,6 +1026,8 @@ impl Connection {
         }
         TermStream {
             rx,
+            backlog,
+            ended: false,
             _cancel: Box::new(CancelOnDrop {
                 inner: Arc::downgrade(&self.inner),
                 id,
@@ -961,6 +1060,17 @@ impl Connection {
     pub fn term_close(&self, term: &str) -> BoxFuture<'static, Result<()>> {
         let call = self.call("term_close", json!({ "term": term }), Vec::new());
         async move { call.await.map(|_| ()) }.boxed()
+    }
+
+    /// 终端里除了 shell 还有哪些程序在跑（名字，查不到名字的是空串）。shell 闲着时是空的。
+    pub fn term_programs(&self, term: &str) -> BoxFuture<'static, Result<Vec<String>>> {
+        let call = self.call("term_programs", json!({ "term": term }), Vec::new());
+        async move {
+            let (mut result, _) = call.await?;
+            serde_json::from_value(result["programs"].take())
+                .context(tr("kuaid 返回的结果格式错误"))
+        }
+        .boxed()
     }
 
     /// kuaid 里现在有哪些终端会话。
@@ -1015,8 +1125,12 @@ impl Connection {
         path: &str,
         offset: u64,
         len: u64,
+        whole: Option<u64>,
     ) -> BoxFuture<'static, Result<(FsStat, Vec<u8>)>> {
-        let params = json!({ "repo": repo, "path": path, "offset": offset, "len": len });
+        let mut params = json!({ "repo": repo, "path": path, "offset": offset, "len": len });
+        if let Some(whole) = whole {
+            params["whole"] = json!(whole);
+        }
         let call = self.call("fs_read", params, Vec::new());
         async move {
             let (result, bytes) = call.await?;
@@ -1066,12 +1180,16 @@ impl Connection {
     }
 
     /// 把仓库里的一个文件一段段读回来，存到本机的 `dest`。
+    ///
+    /// 每一段 kuaid 都重新打开文件读：读的中途文件被改了（大小、修改时间和第一段时不一样）、变短了
+    /// 就失败，临时文件删掉，原来的 `dest` 不动。原来照样存下，是新旧拼起来的、或者截断的内容。
     pub(crate) fn fs_download(&self, repo: &str, path: &str, dest: PathBuf) -> UploadStream {
         let inner = Arc::downgrade(&self.inner);
         let (repo, path) = (repo.to_string(), path.to_string());
         UploadStream::spawn(move |tx| {
             let mut part = crate::local::PartFile::create(&dest)?;
             let mut sent = 0;
+            let mut first: Option<FsStat> = None;
             loop {
                 let connection = inner.upgrade().context(tr("连接已关闭"))?;
                 let params = json!({ "repo": repo, "path": path, "offset": sent });
@@ -1079,17 +1197,23 @@ impl Connection {
                 drop(connection);
                 let (result, bytes) = futures::executor::block_on(call)?;
                 let stat: FsStat = parsed(result)?;
+                let total = first.get_or_insert(stat).size;
+                let changed =
+                    first.is_some_and(|was| was.size != stat.size || was.mtime != stat.mtime);
+                if changed || (bytes.is_empty() && sent < total) {
+                    bail!(tr("下载期间文件被改动了，请重试。"));
+                }
                 part.write(&bytes)?;
                 sent += bytes.len() as u64;
                 let progress = UploadItem::Progress {
                     sent,
-                    total: stat.size.max(sent),
+                    total: total.max(sent),
                 };
                 // 没人等了（用户取消了）：不传了，临时文件跟着 part 删掉
                 if tx.unbounded_send(Ok(progress)).is_err() {
                     return Ok(());
                 }
-                if bytes.is_empty() || sent >= stat.size {
+                if sent >= total {
                     break;
                 }
             }
@@ -1128,6 +1252,24 @@ impl Connection {
     ) -> BoxFuture<'static, Result<(Value, Vec<u8>)>> {
         self.inner.call(method, params, payload)
     }
+}
+
+/// kuaid 回的 git 结果：结果里是退出码和标准错误，附带的字节是标准输出。
+fn git_output(
+    call: BoxFuture<'static, Result<(Value, Vec<u8>)>>,
+) -> BoxFuture<'static, Result<GitOutput>> {
+    async move {
+        let (result, stdout) = call.await?;
+        let result: GitResult =
+            serde_json::from_value(result).context(tr("kuaid 返回的结果格式错误"))?;
+        Ok(GitOutput {
+            code: result.code,
+            stdout,
+            stderr: result.stderr,
+            elapsed: Duration::from_millis(result.ms),
+        })
+    }
+    .boxed()
 }
 
 fn parsed<T: serde::de::DeserializeOwned>(result: Value) -> Result<T> {
@@ -1223,8 +1365,19 @@ impl Drop for Connection {
         // 关掉标准输入，kuaid 读到结尾就退出；再杀掉 ssh，免得服务器那边卡住时它不退。
         // 本机的转接程序下面挂着它拉起的常驻进程和终端：只结束它自己
         self.inner.outgoing.lock().unwrap().take();
-        self.inner.link.kill(!self.local);
-        let _ = self.inner.link.wait();
+        // 结束 ssh 要起 taskkill（一秒多）、再等它退出：放到后台线程里做，不卡住丢弃最后一个连接的
+        // 那个线程（多半是界面线程）。线程起不来才在这里做
+        let (inner, tree) = (self.inner.clone(), !self.local);
+        let reap = move || {
+            inner.link.kill(tree);
+            let _ = inner.link.wait();
+        };
+        let spawned = std::thread::Builder::new()
+            .name("fr-ssh-reaper".into())
+            .spawn(reap.clone());
+        if spawned.is_err() {
+            reap();
+        }
     }
 }
 
@@ -1270,6 +1423,16 @@ impl Inner {
         params: Value,
         payload: Vec<u8>,
     ) -> BoxFuture<'static, Result<(Value, Vec<u8>)>> {
+        self.call_with_id(method, params, payload).1
+    }
+
+    /// 同 [`Self::call`]，另外给出请求的编号（取消要用）。
+    fn call_with_id(
+        self: &Arc<Self>,
+        method: &str,
+        params: Value,
+        payload: Vec<u8>,
+    ) -> (u64, Reply) {
         let id = self.next_id();
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, Pending::Call(tx));
@@ -1281,18 +1444,18 @@ impl Inner {
         };
         if let Err(err) = self.send(request, payload) {
             self.pending.lock().unwrap().remove(&id);
-            return future::ready(Err(err)).boxed();
+            return (id, future::ready(Err(err)).boxed());
         }
         let guard = CancelOnDrop {
             inner: Arc::downgrade(self),
             id,
         };
-        async move {
+        let call = async move {
             let result = rx.await;
             drop(guard);
-            result.unwrap_or_else(|_| Err(anyhow!(tr("与服务器的连接已断开"))))
-        }
-        .boxed()
+            result.unwrap_or_else(|_| Err(anyhow!(tr("与主机的连接已断开"))))
+        };
+        (id, call.boxed())
     }
 
     fn send(&self, request: Request, payload: Vec<u8>) -> Result<()> {
@@ -1300,7 +1463,18 @@ impl Inner {
         let sender = outgoing.as_ref().context(tr("连接已关闭"))?;
         sender
             .send((request, payload))
-            .map_err(|_| anyhow!(tr("与服务器的连接已断开")))
+            .map_err(|_| anyhow!(tr("与主机的连接已断开")))
+    }
+
+    /// 请 kuaid 停下编号是 `id` 的请求（流不要了）。
+    fn cancel(&self, id: u64) {
+        let cancel = Request {
+            id: 0,
+            method: "cancel".into(),
+            params: json!({ "id": id }),
+            bytes: 0,
+        };
+        let _ = self.send(cancel, Vec::new());
     }
 
     /// kuaid 替服务器上的 git 要密码：在另一个线程里问用户（要等用户填），再把回答发回去。
@@ -1329,6 +1503,8 @@ impl Inner {
         }
         let mut pending = self.pending.lock().unwrap();
         if response.chunk {
+            // 终端那一头取得太慢（见 [`TermItem::Lagging`]）：不再收，告诉 kuaid 别发了
+            let mut lagging = false;
             match pending.get(&response.id) {
                 Some(Pending::Stream(tx)) => {
                     let item = if response.err {
@@ -1341,7 +1517,7 @@ impl Inner {
                 Some(Pending::Watch(tx)) => {
                     let _ = tx.unbounded_send(());
                 }
-                Some(Pending::Term(tx)) => {
+                Some(Pending::Term(tx, backlog)) => {
                     // 流的第一条带着会话的编号，其余的是输出
                     let item = match response.result.take() {
                         Some(opened) => serde_json::from_value::<TermOpened>(opened)
@@ -1350,7 +1526,12 @@ impl Inner {
                                 created: opened.created,
                             })
                             .context(tr("kuaid 返回的结果格式错误")),
-                        None => Ok(TermItem::Output(payload)),
+                        None if backlog.add(payload.len()) => Ok(TermItem::Output(payload)),
+                        // 发一个过去叫醒取的那一头，它看到落后了就不再取积着的
+                        None => {
+                            lagging = true;
+                            Ok(TermItem::Lagging)
+                        }
                     };
                     let _ = tx.unbounded_send(item);
                 }
@@ -1366,6 +1547,11 @@ impl Inner {
                 }
                 Some(Pending::Relay(sink)) => sink.chunk(response.err, payload),
                 _ => {}
+            }
+            if lagging {
+                pending.remove(&response.id);
+                drop(pending);
+                self.cancel(response.id);
             }
             return;
         }
@@ -1397,7 +1583,7 @@ impl Inner {
             }
             // 监听只会以出错结束（比如目录不存在）：丢弃 tx，流结束
             Pending::Watch(_) => {}
-            Pending::Term(tx) => {
+            Pending::Term(tx, _) => {
                 let item = outcome.and_then(|result| {
                     let exit: TermExit = serde_json::from_value(result)
                         .context(tr("kuaid 返回的结果格式错误"))?;
@@ -1423,6 +1609,10 @@ impl Inner {
     /// 连接断了：所有等待中的请求都以错误结束。
     fn fail_all(&self, reason: String) {
         self.alive.store(false, Ordering::Release);
+        // 先关掉发送：之后的请求在发的时候就失败（`send` 报连接已关闭），不会登记进等待表以后再也
+        // 等不到回答（原来读的那头退出了、写的那头还开着，新请求能照样发出去、一直等着）。写的线程也
+        // 跟着退出，关掉 ssh 的标准输入
+        self.outgoing.lock().unwrap().take();
         let tail = self.stderr.tail.lock().unwrap().trim().to_string();
         let message = if tail.is_empty() {
             reason
@@ -1437,7 +1627,7 @@ impl Inner {
                 Pending::Stream(tx) => {
                     let _ = tx.unbounded_send(Err(anyhow!(message.clone())));
                 }
-                Pending::Term(tx) => {
+                Pending::Term(tx, _) => {
                     let _ = tx.unbounded_send(Err(anyhow!(message.clone())));
                 }
                 Pending::State(tx) => {
@@ -1466,13 +1656,7 @@ impl Drop for CancelOnDrop {
         };
         let was_pending = inner.pending.lock().unwrap().remove(&self.id).is_some();
         if was_pending {
-            let cancel = Request {
-                id: 0,
-                method: "cancel".into(),
-                params: json!({ "id": self.id }),
-                bytes: 0,
-            };
-            let _ = inner.send(cancel, Vec::new());
+            inner.cancel(self.id);
         }
     }
 }
@@ -1497,10 +1681,12 @@ fn start(
         let on_stage = options.and_then(|options| options.on_stage.clone());
         Watchdog::start(link.clone(), stderr.clone(), jumps.len(), on_stage)
     });
+    let limit = HANDSHAKE_TIMEOUT + STAGE_TIMEOUT * jumps.len() as u32;
+    let deadline = Deadline::start(link.clone(), limit);
+    let timed_out = || watchdog.as_ref().is_some_and(Watchdog::timed_out) || deadline.timed_out();
     let give_up = |noise: &[String]| {
         let _ = link.wait();
-        let timed_out = watchdog.as_ref().is_some_and(Watchdog::timed_out);
-        connect_error(destination, &stderr, noise, jumps, timed_out)
+        connect_error(destination, &stderr, noise, jumps, timed_out())
     };
 
     // 握手请求先发出去，省一次往返。没装 kuaid 时远程的 sh 不读它，丢掉就是了。
@@ -1520,16 +1706,18 @@ fn start(
         let mut noise = Vec::new();
         loop {
             let mut line = String::new();
-            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            // 一行最多读这么多：服务器那头打了很长、不换行的东西也不会一直往内存里攒
+            let read = (&mut reader).take(64 << 10).read_line(&mut line);
+            if read.unwrap_or(0) == 0 {
                 let code = link.wait();
-                let timed_out = watchdog.as_ref().is_some_and(Watchdog::timed_out);
+                let timed_out = timed_out();
                 let message = give_up(&noise);
                 // ssh 自己出的错（连不上、登录不了）退出码是 255；别的退出码是服务器上那条命令的：
                 // 登录上了，只是这种写法它跑不了
                 if code.is_some_and(|code| code != 255) && !timed_out {
                     return Ok(Started::Refused(message));
                 }
-                bail!("{message}");
+                return Err(failed(&stderr, message));
             }
             let line = line.trim_end();
             if line == START_MARKER {
@@ -1549,10 +1737,14 @@ fn start(
         }
     }
 
-    let Some((response, _)) = protocol::read_message::<_, Response>(&mut reader)? else {
-        bail!("{}", give_up(&[]));
+    let response = match protocol::read_message::<_, Response>(&mut reader) {
+        Ok(Some((response, _))) => response,
+        Err(err) if !timed_out() => return Err(err),
+        // 读到头了，或者期限到了、ssh 被结束了：按连接失败报
+        Ok(None) | Err(_) => return Err(failed(&stderr, give_up(&[]))),
     };
     drop(watchdog);
+    drop(deadline);
     if let Some(err) = response.error {
         bail!("{}", tf!("kuaid 握手失败：{err}", err));
     }
@@ -1567,7 +1759,7 @@ fn start(
         bail!(
             "{}",
             tf!(
-                "服务器上的 kuaid 过旧（协议 {protocol}，客户端 {PROTOCOL_VERSION}），无法自动替换。请在服务器上运行 ~/.kuai/*/kuaid --stop 后重新连接",
+                "主机上的 kuaid 过旧（协议 {protocol}，客户端 {PROTOCOL_VERSION}），无法自动替换。请在主机上运行 ~/.kuai/*/kuaid --stop 后重新连接",
                 protocol,
                 PROTOCOL_VERSION
             )
@@ -1584,12 +1776,17 @@ fn start(
         link,
         stderr,
     });
+    let writer_inner = Arc::downgrade(&inner);
     std::thread::Builder::new()
         .name("fr-ssh-writer".into())
         .spawn(move || {
             let mut writer = BufWriter::with_capacity(1 << 16, stdin);
             while let Ok((request, payload)) = rx.recv() {
                 if protocol::write_message(&mut writer, &request, &payload).is_err() {
+                    // 写不进去了：在等回答的、之后要发的都不会有结果，一起结束，不等读的那头发现
+                    if let Some(inner) = writer_inner.upgrade() {
+                        inner.fail_all(tr("与主机的连接已断开").to_string());
+                    }
                     break;
                 }
             }
@@ -1609,8 +1806,8 @@ fn read_loop(inner: Weak<Inner>, mut reader: BufReader<Box<dyn Read + Send>>) {
                 Some(inner) => inner.dispatch(response, payload),
                 None => return,
             },
-            Ok(None) => break tr("与服务器的连接已断开").to_string(),
-            Err(err) => break tf!("与服务器的连接出错：{err}", err = format!("{:#}", err)),
+            Ok(None) => break tr("与主机的连接已断开").to_string(),
+            Err(err) => break tf!("与主机的连接出错：{err}", err = format!("{:#}", err)),
         }
     };
     if let Some(inner) = inner.upgrade() {
@@ -1749,6 +1946,51 @@ impl Drop for Watchdog {
     }
 }
 
+/// 从开始连到和 kuaid 握手完最多等这么久（等用户回答密码、口令的时间不算）。经跳板机时每一台另加
+/// [`STAGE_TIMEOUT`]：那几段由 [`Watchdog`] 看着，这里只兜底。
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 握手的总期限（见 [`HANDSHAKE_TIMEOUT`]）：到了还没握手完就结束 ssh，算超时。原来登录上以后服务器
+/// 那头既不说话也不退出（启动脚本卡在挂死的网络盘上）时一直停在「连接中」，丢掉任务也取消不了。
+struct Deadline {
+    done: Arc<AtomicBool>,
+    timed_out: Arc<AtomicBool>,
+}
+
+impl Deadline {
+    fn start(link: Arc<Link>, limit: Duration) -> Deadline {
+        let done = Arc::new(AtomicBool::new(false));
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let (stop, flag) = (done.clone(), timed_out.clone());
+        std::thread::spawn(move || {
+            let step = Duration::from_millis(200);
+            let mut waited = Duration::ZERO;
+            while !stop.load(Ordering::Acquire) {
+                std::thread::sleep(step);
+                if !crate::asking() {
+                    waited += step;
+                }
+                if waited > limit && !stop.load(Ordering::Acquire) {
+                    flag.store(true, Ordering::Release);
+                    link.kill(true);
+                    return;
+                }
+            }
+        });
+        Deadline { done, timed_out }
+    }
+
+    fn timed_out(&self) -> bool {
+        self.timed_out.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for Deadline {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+    }
+}
+
 /// 连接是在哪一段出的问题。
 #[derive(Debug, PartialEq, Eq)]
 enum Trouble {
@@ -1788,6 +2030,14 @@ fn trouble(
 }
 
 /// 把 ssh 的报错翻译成用户看得懂的话。
+/// 连接失败的错误：ssh 说登录被拒绝的是 [`LoginDenied`]（见 [`with_plain_retry`]）。
+fn failed(log: &StderrLog, message: String) -> anyhow::Error {
+    match log.tail.lock().unwrap().contains("Permission denied") {
+        true => LoginDenied(message).into(),
+        false => anyhow!(message),
+    }
+}
+
 fn connect_error(
     destination: &str,
     log: &StderrLog,
@@ -1838,7 +2088,7 @@ fn connect_error(
         message.push_str(&tf!("（ssh：{stderr}）", stderr));
     }
     if !noise.is_empty() {
-        message.push_str(&tf!("（服务器输出：{join}）", join = noise.join(" / ")));
+        message.push_str(&tf!("（主机输出：{join}）", join = noise.join(" / ")));
     }
     message
 }
@@ -1897,9 +2147,12 @@ fn login(
     // 要密码或密钥口令时 ssh 启动 askpass 程序来问我们：存着的自动回答，没存的由界面弹窗。
     // 没有界面可以弹窗（比如测试工具）：只用密钥，要密码就直接失败
     let askpass = crate::ssh_env();
+    // 存着私钥口令：这次只用公钥认证，服务器问不了话，自动回答的只能是 ssh 自己解私钥那一句
+    let key_only = !password_auth && secret.is_some();
     let args = fr_core::ssh::login_args(
         identity_file,
         password_auth,
+        key_only,
         forward_agent,
         askpass.is_some(),
     );
@@ -2022,9 +2275,12 @@ fn server_os(name: &str) -> Option<Os> {
 /// 都能原样交给 cmd（里面没有 `$`、反引号和双引号），而且经 cmd 启动的程序直接拿到 ssh 的标准输入
 /// 输出，字节原样过。先进到版本目录再按名字启动：主目录带空格时路径不用加引号。
 /// `if` 外面那层括号不能省：`if 条件 (…) & 后面的` 在条件不成立时连「后面的」也不执行。
+///
+/// 主目录用延迟展开（`/v:on` 加 `!USERPROFILE!`）：`%USERPROFILE%` 是先展开再解析的，用户名里合法的
+/// `&`、括号会被 cmd 当成语法，启动、安装都会坏；延迟展开在解析之后，里面是什么都只是路径。
 fn windows_bootstrap_script(dir: &str) -> String {
     format!(
-        r#"cmd /c "2>nul cd /d %USERPROFILE%\.kuai\{dir} || (echo {MISSING_MARKER} Windows %PROCESSOR_ARCHITECTURE%& exit /b 0) & (if not exist kuaid.exe (echo {MISSING_MARKER} Windows %PROCESSOR_ARCHITECTURE%& exit /b 0)) & echo {START_MARKER}& kuaid.exe --connect""#
+        r#"cmd /v:on /c "2>nul cd /d !USERPROFILE!\.kuai\{dir} || (echo {MISSING_MARKER} Windows %PROCESSOR_ARCHITECTURE%& exit /b 0) & (if not exist kuaid.exe (echo {MISSING_MARKER} Windows %PROCESSOR_ARCHITECTURE%& exit /b 0)) & echo {START_MARKER}& kuaid.exe --connect""#
     )
 }
 
@@ -2034,7 +2290,7 @@ fn windows_bootstrap_script(dir: &str) -> String {
 /// （`kuaid --installed`）：正在用的那一版、还有程序占着的目录它会留着。
 fn windows_install_script(dir: &str) -> String {
     format!(
-        r#"cmd /c "cd /d %USERPROFILE% && (if not exist .kuai mkdir .kuai) && cd .kuai && (if exist {dir}.tmp rmdir /s /q {dir}.tmp) && mkdir {dir}.tmp && tar -xf - -C {dir}.tmp && (if exist {dir} rmdir /s /q {dir}) && ren {dir}.tmp {dir} && {dir}\kuaid.exe --installed""#
+        r#"cmd /v:on /c "cd /d !USERPROFILE! && (if not exist .kuai mkdir .kuai) && cd .kuai && (if exist {dir}.tmp rmdir /s /q {dir}.tmp) && mkdir {dir}.tmp && tar -xf - -C {dir}.tmp && (if exist {dir} rmdir /s /q {dir}) && ren {dir}.tmp {dir} && {dir}\kuaid.exe --installed""#
     )
 }
 
@@ -2070,10 +2326,17 @@ fn tar_files(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
     archive
 }
 
-/// 远程执行的安装脚本，kuaid 程序从标准输入进来。
-fn install_script(dir: &str) -> String {
+/// 安装脚本收到的程序不完整（上传中途断了）时的退出码。
+const INSTALL_INCOMPLETE: i32 = 3;
+
+/// 远程执行的安装脚本，kuaid 程序从标准输入进来，一共 `size` 字节。
+///
+/// 收完先核对大小，对不上就删掉、以 [`INSTALL_INCOMPLETE`] 退出：`ssh -T` 没有伪终端，上传中途断开时
+/// 远端只是读到标准输入的结尾，cat 照样成功，原来会把半个程序当成装好了发布出去，之后启动脚本只看
+/// 文件在不在，连不上也不会重装。临时文件名带上 shell 的进程号，同一版本同时装的两边不共用它。
+fn install_script(dir: &str, size: usize) -> String {
     format!(
-        r#"sh -c 'set -e; R="$HOME/.kuai"; V="{dir}"; mkdir -p "$R/$V"; cat > "$R/$V/kuaid.tmp"; chmod 755 "$R/$V/kuaid.tmp"; mv -f "$R/$V/kuaid.tmp" "$R/$V/kuaid"; K=$(cat "$R/run/current" 2>/dev/null || true); cd "$R"; for x in *; do case "$x" in "$V"|"$K") ;; [0-9]*) rm -rf -- "$x" ;; esac; done; rm -rf -- "$HOME/.fork-remote"'"#
+        r#"sh -c 'set -e; R="$HOME/.kuai"; V="{dir}"; T="$R/$V/kuaid.tmp.$$"; mkdir -p "$R/$V"; cat > "$T"; if [ "$(wc -c < "$T" | tr -d " ")" != "{size}" ]; then rm -f "$T"; exit {INSTALL_INCOMPLETE}; fi; chmod 755 "$T"; mv -f "$T" "$R/$V/kuaid"; K=$(cat "$R/run/current" 2>/dev/null || true); cd "$R"; for x in *; do case "$x" in "$V"|"$K") ;; [0-9]*) rm -rf -- "$x" ;; esac; done; rm -rf -- "$HOME/.fork-remote"'"#
     )
 }
 
@@ -2108,6 +2371,9 @@ fn install(
     let _ = drain.join();
     let code = link.wait();
     let written = writer.join();
+    if code == Some(INSTALL_INCOMPLETE) {
+        bail!(tr("上传 kuaid 时连接中断"));
+    }
     if code != Some(0) {
         bail!(
             "{}",
@@ -2126,6 +2392,66 @@ fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 只用公钥被拒绝时不带存着的口令再连一次() {
+        let options = ConnectOptions {
+            secret: Some("口令".into()),
+            jumps: vec![Jump {
+                password_auth: true,
+                secret: Some("跳板机密码".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let tried = std::cell::RefCell::new(Vec::new());
+        let result = with_plain_retry(&options, |options| -> Result<()> {
+            tried
+                .borrow_mut()
+                .push((options.secret.clone(), options.jumps[0].secret.clone()));
+            Err(LoginDenied("登录被拒绝".into()).into())
+        });
+        assert!(result.is_err());
+        // 第二次不带私钥口令；跳板机用的是密码，照旧带着
+        assert_eq!(
+            *tried.borrow(),
+            [
+                (Some("口令".into()), Some("跳板机密码".into())),
+                (None, Some("跳板机密码".into())),
+            ]
+        );
+        // 别的失败、不许弹窗、没存口令的都不再连
+        let once = |options: &ConnectOptions, error: fn() -> anyhow::Error| {
+            let count = std::cell::Cell::new(0);
+            let _ = with_plain_retry(options, |_| -> Result<()> {
+                count.set(count.get() + 1);
+                Err(error())
+            });
+            count.get()
+        };
+        assert_eq!(once(&options, || anyhow!("连接超时")), 1);
+        let silent = ConnectOptions {
+            no_prompt: true,
+            ..options.clone()
+        };
+        assert_eq!(once(&silent, || LoginDenied(String::new()).into()), 1);
+        let password = ConnectOptions {
+            password_auth: true,
+            ..options.clone()
+        };
+        assert_eq!(once(&password, || LoginDenied(String::new()).into()), 1);
+        // 带着口令的那次只用公钥认证
+        let key = args(&options);
+        assert!(
+            key.iter()
+                .any(|arg| arg == "PreferredAuthentications=publickey")
+        );
+        assert!(
+            !args(&ConnectOptions::default())
+                .iter()
+                .any(|arg| arg == "PreferredAuthentications=publickey")
+        );
+    }
 
     fn args(options: &ConnectOptions) -> Vec<String> {
         let (cmd, _saved) = ssh("ssh://u@h:2222", "true", options, options.forward_agent);
@@ -2168,13 +2494,54 @@ mod tests {
         let boot = bootstrap_script("1.5.0-abc");
         assert!(boot.contains(r#"exec "$A" --connect"#));
         assert!(boot.contains("/.kuai/1.5.0-abc/kuaid"));
-        let install = install_script("1.5.0-abc");
+        let install = install_script("1.5.0-abc", 1234);
+        assert!(install.contains(r#"!= "1234""#), "{install}");
         assert!(install.contains(r#"K=$(cat "$R/run/current" 2>/dev/null || true)"#));
         assert!(install.contains(r#""$V"|"$K") ;;"#));
         // 整个脚本包在单引号里，里面不能再有单引号
         for script in [&boot, &install] {
             assert_eq!(script.matches('\'').count(), 2, "{script}");
         }
+    }
+
+    /// 安装脚本真交给 sh 跑：上传中途断了（只收到一半）就删掉临时文件、以 INSTALL_INCOMPLETE 退出，
+    /// 不留下半个程序；收全了装好、可以执行。
+    #[cfg(unix)]
+    #[test]
+    fn 安装脚本收不全就不装_收全了装好() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = std::env::temp_dir().join(format!("fr-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let data = b"#!/bin/sh\necho kuaid\n".repeat(4096);
+        let run = |sent: &[u8]| {
+            let mut child = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(install_script("9.9.9-test", data.len()))
+                .env("HOME", &home)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(sent).unwrap();
+            child.wait().unwrap().code()
+        };
+        let dir = home.join(".kuai/9.9.9-test");
+        assert_eq!(run(&data[..data.len() / 2]), Some(INSTALL_INCOMPLETE));
+        assert!(!dir.join("kuaid").exists());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "临时文件没删掉"
+        );
+        assert_eq!(run(&data), Some(0));
+        assert_eq!(std::fs::read(dir.join("kuaid")).unwrap(), data);
+        let mode = std::fs::metadata(dir.join("kuaid"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -2193,7 +2560,10 @@ mod tests {
     #[test]
     fn windows_的脚本交给_cmd_里面没有会被_powershell_改掉的字符() {
         let boot = windows_bootstrap_script("1.11.0-abc");
-        assert!(boot.contains(r"%USERPROFILE%\.kuai\1.11.0-abc"), "{boot}");
+        // 主目录延迟展开：用户名里的 & 和括号不会被 cmd 当成语法
+        assert!(boot.starts_with("cmd /v:on /c "), "{boot}");
+        assert!(boot.contains(r"!USERPROFILE!\.kuai\1.11.0-abc"), "{boot}");
+        assert!(!boot.contains("%USERPROFILE%"), "{boot}");
         assert!(
             boot.ends_with(r#"echo KUAID-START& kuaid.exe --connect""#),
             "{boot}"
@@ -2206,7 +2576,7 @@ mod tests {
         );
         for script in [&boot, &install] {
             // 整个脚本包在一对双引号里，PowerShell 原样交给 cmd
-            assert!(script.starts_with("cmd /c \""));
+            assert!(script.starts_with("cmd /v:on /c \""), "{script}");
             assert_eq!(script.matches('"').count(), 2, "{script}");
             assert!(!script.contains(['$', '`', '\'']), "{script}");
         }
@@ -2270,14 +2640,14 @@ mod tests {
                 },
                 Jump {
                     name: "inner".into(),
-                    destination: "feng@10.0.0.5".into(),
+                    destination: "me@10.0.0.5".into(),
                     password_auth: true,
                     ..Default::default()
                 },
             ],
             ..Default::default()
         };
-        let (cmd, _held) = ssh("feng@10.20.1.15", "true", &options, false);
+        let (cmd, _held) = ssh("me@10.20.1.15", "true", &options, false);
         let args: Vec<String> = cmd
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -2290,7 +2660,7 @@ mod tests {
         assert!(proxy.ends_with("--ssh-hop 1 %h %p"), "{proxy}");
         assert!(!args.iter().any(|arg| arg.starts_with("ConnectTimeout")));
         assert!(args.iter().any(|arg| arg == "LogLevel=VERBOSE"));
-        assert_eq!(args[args.len() - 3..], ["--", "feng@10.20.1.15", "true"]);
+        assert_eq!(args[args.len() - 3..], ["--", "me@10.20.1.15", "true"]);
         // 各台跳板机的登录选项在环境变量里，按顺序
         let hops = cmd
             .get_envs()
@@ -2377,10 +2747,10 @@ mod tests {
             destination: "ops@203.0.113.10".into(),
             ..Default::default()
         }];
-        let message = connect_error("feng@10.20.1.15", &log, &[], &jumps, false);
+        let message = connect_error("me@10.20.1.15", &log, &[], &jumps, false);
         assert_eq!(
             message,
-            "已连接跳板机 bastion，但它无法连接 feng@10.20.1.15：连接被拒绝。请确认跳板机能访问该主机地址。\
+            "已连接跳板机 bastion，但它无法连接 me@10.20.1.15：连接被拒绝。请确认跳板机能访问该主机地址。\
              （ssh：channel 0: open failed: connect failed: Connection refused\nstdio forwarding failed）"
         );
     }

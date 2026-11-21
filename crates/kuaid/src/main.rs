@@ -102,8 +102,8 @@ fn stdio() {
         shared.start_askpass(dir);
     }
     conn::serve(&shared, std::io::stdin().lock(), std::io::stdout());
-    // 不常驻：客户端走了，终端里的程序也结束
-    shared.terms.close_all();
+    // 不常驻：客户端走了，终端里的程序也结束（等它们退出再走，不理挂断的等到被强杀）
+    shared.terms.close_all(std::time::Duration::from_secs(3));
 }
 
 /// 自己装在哪个目录里：`~/.kuai/<版本>-<哈希>/kuaid` 的那一段目录名。不是装出来的就是空的。

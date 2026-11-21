@@ -39,6 +39,8 @@ pub(super) struct MergeView {
     text: String,
     /// 原来是 CRLF 的文件，保存时换回去
     crlf: bool,
+    /// 打开时文件的散列：保存前核对，期间被别的程序改过就不写（见 [`workfile::write_args`]）
+    hash: String,
     /// 逐处选择用的视图
     picker: Entity<DiffState>,
     /// 手动编辑用的编辑框
@@ -106,12 +108,20 @@ impl RepoView {
         };
         let request = channel.git(&self.entry.path, workfile::read_args(&path));
         let task = cx.spawn_in(window, async move |this, cx| {
-            let result = request.await.and_then(|out| out.ok());
+            let result = request.await.and_then(|out| out.ok()).and_then(|out| {
+                let (hash, text) = workfile::split_read(&out)
+                    .ok_or_else(|| anyhow::anyhow!(tr("无法识别读取结果")))?;
+                Ok((hash, text.to_vec()))
+            });
             this.update_in(cx, |this, window, cx| {
                 let Some(view) = &mut this.merge else {
                     return;
                 };
                 view.loading = false;
+                let result = result.map(|(hash, text)| {
+                    view.hash = hash;
+                    text
+                });
                 let text = match result.map(String::from_utf8) {
                     Ok(Ok(text)) => text,
                     Ok(Err(_)) => {
@@ -165,6 +175,7 @@ impl RepoView {
             back,
             text: String::new(),
             crlf: false,
+            hash: String::new(),
             picker,
             editor,
             manual: false,
@@ -307,25 +318,32 @@ impl RepoView {
         } else {
             text.into_bytes()
         };
+        // 打开以后文件被别的程序改过（外部编辑器、终端里的 git）：不写，编辑的内容留在编辑器里
+        let changed =
+            tr("文件在编辑期间已被其他程序修改，未保存。可先复制编辑内容，再重新打开此文件。");
         let steps = vec![
-            Step {
-                args: workfile::write_args(&path),
-                stdin: Some(bytes),
-                net: false,
-            },
+            Step::input(workfile::write_args(&path, &view.hash, changed), bytes)
+                .shown(workfile::write_shown(&path)),
             Step::local(vec!["add".into(), "--".into(), path.clone()]),
         ];
-        self.run_seq(
-            tr("解决冲突"),
+        let label = tr("解决冲突");
+        self.run_steps(
+            label,
             steps,
             window,
             cx,
-            move |this, _, w, cx| {
-                this.close_merge_editor(cx);
-                this.show_changes(cx);
-                let text = tf!("{path} 已保存，并标记为已解决", path);
-                w.push_notification(Notification::success(text), cx);
-            },
+            Box::new(move |this, result, w, cx| match result {
+                Ok(_) => {
+                    this.close_merge_editor(cx);
+                    this.show_changes(cx);
+                    let text = tf!("{path} 已保存，并标记为已解决", path);
+                    w.push_notification(Notification::success(text), cx);
+                }
+                Err(text) if text.contains(changed) => {
+                    w.push_notification(Notification::warning(changed).autohide(false), cx);
+                }
+                Err(text) => super::ops::failure(w, cx, label, text),
+            }),
         );
     }
 
@@ -418,7 +436,7 @@ impl RepoView {
                             .text_ellipsis_start()
                             .text_sm()
                             .text_color(muted)
-                            .child(path)
+                            .child(ui::one_line(path))
                             .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx)),
                     )
                     .child(

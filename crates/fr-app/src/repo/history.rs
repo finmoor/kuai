@@ -153,6 +153,36 @@ struct RowColors {
 }
 
 /// 选中的提交改了的一个文件。
+/// 读回来的一个提交的详情和改动，在后台解析好的（见 [`parse_details`]）。
+struct Parsed {
+    details: Details,
+    ws_note: Option<SharedString>,
+    /// 补丁多大（字节）、解析花了多久：记日志用
+    size: usize,
+    took: Duration,
+    text: String,
+    files: Result<Vec<DiffFile>, SharedString>,
+}
+
+/// 解析读回来的提交。在后台调：整个文件、超长的行解析要好一会儿，原来在界面线程上做，大的改动
+/// 一点开界面就卡住。`plain` 是忽略空白时另读的一份不忽略的，用来说藏了几行。
+fn parse_details(bytes: Vec<u8>, plain: Option<Vec<u8>>) -> Parsed {
+    let started = Instant::now();
+    let (details, patch) = show::parse(&bytes);
+    let ws_note = plain
+        .as_deref()
+        .map(|plain| diff_tools::ws_note(show::parse(plain).1, patch));
+    let (text, files) = diff_tools::parse_patch(patch);
+    Parsed {
+        details,
+        ws_note,
+        size: patch.len(),
+        took: started.elapsed(),
+        text,
+        files,
+    }
+}
+
 struct ChangedFile {
     path: SharedString,
     /// 改名、复制前的路径
@@ -218,7 +248,7 @@ pub(super) struct History {
     details: Option<Details>,
     diff: Entity<DiffState>,
     /// 现在显示的补丁（在改动中搜索用）
-    diff_text: String,
+    diff_text: SharedString,
     diff_info: SharedString,
     /// 忽略空白时改动上面写的那句话（少显示了多少行）
     ws_note: Option<SharedString>,
@@ -288,7 +318,7 @@ impl History {
             match_pos: None,
             details: None,
             diff: cx.new(|cx| DiffState::new(Vec::new(), cx)),
-            diff_text: String::new(),
+            diff_text: SharedString::default(),
             diff_info: tr("选择一个提交以查看改动").into(),
             ws_note: None,
             image: None,
@@ -497,7 +527,7 @@ impl RepoView {
         cx.notify();
     }
 
-    fn clear_commit_selection(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn clear_commit_selection(&mut self, cx: &mut Context<Self>) {
         self.history.selected = None;
         self.history.details = None;
         self.history.files.clear();
@@ -505,7 +535,7 @@ impl RepoView {
         self.history.ws_note = None;
         self.history.image = None;
         self.history.diff_info = tr("选择一个提交以查看改动").into();
-        self.history.diff_text.clear();
+        self.history.diff_text = SharedString::default();
         self.history
             .diff
             .update(cx, |state, cx| state.set_files(Vec::new(), cx));
@@ -516,8 +546,8 @@ impl RepoView {
         self.history.diff.clone()
     }
 
-    pub(super) fn history_diff_text(&self) -> &str {
-        &self.history.diff_text
+    pub(super) fn history_diff_text(&self) -> SharedString {
+        self.history.diff_text.clone()
     }
 
     /// 键盘焦点是不是在提交的改动里（或者它上面的搜索条里）。
@@ -1274,7 +1304,7 @@ impl RepoView {
         self.history.ws_note = None;
         self.history.image = None;
         self.history.files.clear();
-        self.history.diff_text.clear();
+        self.history.diff_text = SharedString::default();
         self.history
             .diff
             .update(cx, |state, cx| state.set_files(Vec::new(), cx));
@@ -1312,27 +1342,24 @@ impl RepoView {
                 }
             }
             let fetch_time = started.elapsed();
+            let parsed = match out {
+                Ok(bytes) => Ok(cx
+                    .background_spawn(async move { parse_details(bytes, plain) })
+                    .await),
+                Err(err) => Err(err),
+            };
             this.update(cx, |this, cx| {
-                match out {
+                match parsed {
                     Err(err) => {
                         this.history.diff_info =
                             tf!("读取改动失败：{err}", err = format!("{:#}", err)).into()
                     }
-                    Ok(bytes) => {
-                        let started = Instant::now();
-                        let (details, patch) = show::parse(&bytes);
-                        this.history.details = Some(details);
-                        this.history.ws_note = plain
-                            .as_deref()
-                            .map(|plain| diff_tools::ws_note(show::parse(plain).1, patch));
-                        let text = crate::text::decode(patch);
-                        match DiffFile::parse(&text) {
-                            Err(err) => {
-                                this.history.diff_info =
-                                    tf!("diff 解析失败：{message}", message = err.message()).into()
-                            }
+                    Ok(parsed) => {
+                        this.history.details = Some(parsed.details);
+                        this.history.ws_note = parsed.ws_note;
+                        match parsed.files {
+                            Err(message) => this.history.diff_info = message,
                             Ok(files) => {
-                                let parse_time = started.elapsed();
                                 let additions: usize = files.iter().map(|f| f.additions()).sum();
                                 let deletions: usize = files.iter().map(|f| f.deletions()).sum();
                                 this.history.files = files
@@ -1369,13 +1396,13 @@ impl RepoView {
                                     this.entry.path,
                                     this.history.diff_info,
                                     fetch_time.as_millis(),
-                                    patch.len() as f64 / 1024.,
-                                    parse_time.as_millis()
+                                    parsed.size as f64 / 1024.,
+                                    parsed.took.as_millis()
                                 );
                                 this.history
                                     .diff
                                     .update(cx, |state, cx| state.set_files(files, cx));
-                                this.history.diff_text = text.into_owned();
+                                this.history.diff_text = parsed.text.into();
                             }
                         }
                     }
@@ -1579,6 +1606,7 @@ impl RepoView {
                         data.graph.segments(ix).to_vec(),
                         row.lane,
                         row.color,
+                        row.clipped,
                         graph_width,
                     ))
                     .child(
@@ -1743,19 +1771,25 @@ impl RepoView {
                     true => file_tree::split_name(&file.path).1.to_string().into(),
                     false => file.path.clone(),
                 };
+                // 行里写的就是全路径（平铺、根目录下的）：提示只在被省略时弹
+                let bare = label == file.path;
                 Some(
                     h_flex()
                         .id(("changed-file", row_ix))
                         .h(px(22.))
                         .pl(indent(depth))
                         .pr_1()
-                        .gap_2()
+                        // 树形里：前面空出箭头那么宽，字母落在目录图标的中间、名字对着目录的名字
+                        .gap(px(if tree { 7. } else { 8. }))
                         .rounded_sm()
                         .text_xs()
                         .cursor_pointer()
                         .when(opened, |row| row.bg(colors.selected))
                         .when(!opened, |row| row.hover(|s| s.bg(colors.hover)))
                         .on_click(cx.listener(move |this, _, _, cx| this.open_changed_file(ix, cx)))
+                        .when(tree, |row| {
+                            row.child(div().flex_none().w(px(file_tree::FILE_LEAD)))
+                        })
                         .child(
                             div()
                                 .w(px(10.))
@@ -1764,24 +1798,29 @@ impl RepoView {
                                 .text_color(color)
                                 .child(file.letter),
                         )
-                        .child(
-                            div()
+                        .child(match bare {
+                            true => ui::clipped(("changed-file-name", row_ix), label)
+                                .flex_1()
+                                .text_ellipsis_start()
+                                .into_any_element(),
+                            false => div()
                                 .flex_1()
                                 .min_w_0()
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis_start()
-                                .child(label),
-                        )
+                                .child(ui::one_line(label))
+                                .into_any_element(),
+                        })
                         .child(
                             div()
                                 .flex_none()
                                 .text_color(colors.muted)
                                 .child(format!("+{} −{}", file.additions, file.deletions)),
                         )
-                        .tooltip({
+                        .when(!bare, |row| {
                             let path = file.path.clone();
-                            move |window, cx| ui::tip(path.clone(), window, cx)
+                            row.tooltip(move |window, cx| ui::tip(path.clone(), window, cx))
                         })
                         .context_menu(menu)
                         .into_any_element(),

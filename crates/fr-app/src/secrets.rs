@@ -16,7 +16,20 @@ fn target(server_id: &str) -> String {
 
 /// 这台服务器存着的密码或口令；没存、读不了都是 None。
 pub fn get(server_id: &str) -> Option<String> {
-    imp::read(&target(server_id))
+    imp::read(&target(server_id)).map(|(secret, _)| secret)
+}
+
+/// 连接这台服务器时用的密码或口令。密码只交给存它时的那个地址（存的时候记在「用户名」一栏）：
+/// 地址改过就不用，连接时再问，不然旧密码会自动交给新地址（表单里改地址时已经删掉了，这里防的
+/// 是别处改的，比如手改了设置文件）。私钥口令只用来解本机的私钥，不发给服务器，不看地址。
+pub fn for_server(server: &crate::settings::Server) -> Option<String> {
+    let (secret, account) = imp::read(&target(&server.id))?;
+    usable(server, &account).then_some(secret)
+}
+
+/// 存着的（存的时候记下的地址是 `account`）能不能给这台服务器用（见 [`for_server`]）。
+fn usable(server: &crate::settings::Server, account: &str) -> bool {
+    server.auth != crate::settings::Auth::Password || account == server.destination
 }
 
 /// 存下（已有就换掉）。`account` 只是给人看的：凭据管理器里显示在「用户名」那一栏。
@@ -121,7 +134,8 @@ mod imp {
         }
     }
 
-    pub fn read(target: &str) -> Option<String> {
+    /// 存着的内容和「用户名」一栏。
+    pub fn read(target: &str) -> Option<(String, String)> {
         let target = wide(target);
         let mut found: *mut Credential = null_mut();
         // SAFETY：成功时 found 指向系统分配的一条凭据，读完用 CredFree 还回去
@@ -143,8 +157,9 @@ mod imp {
                 .map(|pair| u16::from_le_bytes(*pair))
                 .collect();
             let secret = String::from_utf16(&units).ok();
+            let account = from_wide(credential.user_name).unwrap_or_default();
             CredFree(found.cast());
-            secret
+            Some((secret?, account))
         }
     }
 
@@ -195,7 +210,7 @@ mod imp {
     pub fn write(_: &str, _: &str, _: &str) -> Result<(), String> {
         Err(fr_core::i18n::tr("当前系统不支持保存密码").into())
     }
-    pub fn read(_: &str) -> Option<String> {
+    pub fn read(_: &str) -> Option<(String, String)> {
         None
     }
     pub fn delete(_: &str) {}
@@ -206,7 +221,22 @@ mod imp {
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::imp;
+    use super::{imp, usable};
+    use crate::settings::{Auth, Server};
+
+    #[test]
+    fn 密码只交给存它时的地址() {
+        let mut server = Server {
+            destination: "me@10.0.0.1".into(),
+            auth: Auth::Password,
+            ..Default::default()
+        };
+        assert!(usable(&server, "me@10.0.0.1"));
+        assert!(!usable(&server, "me@10.0.0.2"));
+        // 私钥口令不发给服务器，不看地址
+        server.auth = Auth::Key;
+        assert!(usable(&server, "me@10.0.0.2"));
+    }
 
     /// 直接给名字，不经 `target()`：测试并行跑，不去改环境变量。
     #[test]
@@ -216,10 +246,16 @@ mod tests {
         assert_eq!(imp::read(&name), None);
 
         imp::write(&name, "tester@example", "p@ss 字 🔑").unwrap();
-        assert_eq!(imp::read(&name).as_deref(), Some("p@ss 字 🔑"));
+        assert_eq!(
+            imp::read(&name),
+            Some(("p@ss 字 🔑".to_string(), "tester@example".to_string()))
+        );
         // 再存一次是换掉
-        imp::write(&name, "tester@example", "second").unwrap();
-        assert_eq!(imp::read(&name).as_deref(), Some("second"));
+        imp::write(&name, "tester@other", "second").unwrap();
+        assert_eq!(
+            imp::read(&name),
+            Some(("second".to_string(), "tester@other".to_string()))
+        );
 
         imp::delete(&name);
         assert_eq!(imp::read(&name), None);

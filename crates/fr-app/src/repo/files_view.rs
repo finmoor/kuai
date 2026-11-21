@@ -12,16 +12,17 @@ use fr_core::tf;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, Input};
-use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use super::files::{Body, ImageDoc, Opaque, OpaqueDoc, OpenFile, TextDoc, human_size};
-use super::files_ops::tree_menu;
+use super::files::{Body, ImageDoc, Opaque, OpaqueDoc, OpenFile, TextDoc};
+use super::files_ops::{tree_menu, view_item};
 use super::rail::rail_button;
 use super::{Page, RepoView, TOOLBAR_HEIGHT, tool_button};
+use crate::text::human_size;
 use crate::ui;
 
 /// 树里一行的高度
@@ -226,13 +227,7 @@ impl RepoView {
                 let this = this.read(cx);
                 (this.target_dir(), this.files.show_ignored)
             };
-            let item = |label: &'static str,
-                        run: Box<dyn Fn(&mut RepoView, &mut Window, &mut Context<RepoView>)>| {
-                let view = view.clone();
-                PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                    view.update(cx, |this, cx| run(this, window, cx)).ok();
-                })
-            };
+            let item = |label, run| view_item(&view, label, run);
             let (new_file, new_folder, upload) = (dir.clone(), dir.clone(), dir.clone());
             let place: SharedString = match dir.is_empty() {
                 true => tr("位置：仓库根目录").into(),
@@ -284,13 +279,12 @@ impl RepoView {
     fn render_tree_rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let rows = self.files.rows();
         let theme = cx.theme();
-        let (fg, muted, active, hover, accent, folder) = (
+        let (fg, muted, active, hover, accent) = (
             theme.sidebar_foreground,
             theme.muted_foreground,
             theme.sidebar_accent,
             theme.list_hover,
             theme.primary,
-            theme.info,
         );
         let view = cx.entity().downgrade();
         range
@@ -356,7 +350,7 @@ impl RepoView {
                             .children(chevron.map(ui::icon_small)),
                     )
                     .child(ui::icon(glyph).flex_none().text_color(if row.dir {
-                        folder.opacity(0.85)
+                        ui::folder_color(cx)
                     } else {
                         muted
                     }))
@@ -664,7 +658,7 @@ impl RepoView {
                             .when(!last, |d| d.flex_shrink(4.).min_w(px(18.)).truncate())
                             .cursor_pointer()
                             .hover(|s| s.bg(hover).text_color(fg))
-                            .child(part.to_string())
+                            .child(ui::one_line(part.to_string()))
                             .tooltip(|window, cx| ui::tip(tr("在目录树中显示"), window, cx))
                             .on_click(
                                 cx.listener(move |this, _, _, cx| this.reveal_in_tree(&target, cx)),
@@ -822,15 +816,7 @@ impl RepoView {
                     return menu;
                 };
                 let full_remote = format!("{}/{path}", root.trim_end_matches('/'));
-                let item = |label: &'static str,
-                            run: Box<
-                    dyn Fn(&mut RepoView, &mut Window, &mut Context<RepoView>),
-                >| {
-                    let view = view.clone();
-                    PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                        view.update(cx, |this, cx| run(this, window, cx)).ok();
-                    })
-                };
+                let item = |label, run| view_item(&view, label, run);
                 let (blame, full, relative, download, reveal, vscode, rename, delete) = (
                     path.clone(),
                     path.clone(),
@@ -895,7 +881,7 @@ impl RepoView {
                             }),
                         )),
                 };
-                // 经别的服务器连的（156>91）：本机连不到它，VS Code 打不开
+                // 经别的服务器连的（A>B）：本机连不到它，VS Code 打不开
                 let relayed = remote && server.is_none();
                 menu.when(!relayed, |menu| {
                     menu.item(item(
@@ -1010,7 +996,7 @@ impl RepoView {
                         .truncate()
                         .when(tab.preview, |d| d.italic())
                         .when(tab.deleted, |d| d.line_through())
-                        .child(tab.name().to_string()),
+                        .child(ui::one_line(tab.name().to_string())),
                 )
                 .child(close)
                 .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
@@ -1302,7 +1288,7 @@ impl RepoView {
                             .flex_1()
                             .min_w_0()
                             .whitespace_normal()
-                            .child(tr("本机副本已修改，服务器上的文件尚未更新。")),
+                            .child(tr("本机副本已修改，远程主机上的文件尚未更新。")),
                     )
                     .child(
                         Button::new("opaque-upload-back")
@@ -1379,7 +1365,7 @@ impl RepoView {
                         match remote {
                             true => SharedString::from(format!(
                                 "{why}{}",
-                                tr("服务器上的文件将先下载到本机的临时目录。")
+                                tr("远程主机上的文件将先下载到本机的临时目录。")
                             )),
                             false => why,
                         },

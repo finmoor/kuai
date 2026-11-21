@@ -4,7 +4,6 @@
 //! 用户取消或者关掉弹窗就回答「取消」，对应的 git 或 ssh 会放弃这次认证。
 
 use fr_core::i18n::tr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 
 use futures::StreamExt as _;
@@ -27,35 +26,12 @@ pub struct Request {
 /// 等界面处理的密码请求。
 pub type Prompts = UnboundedReceiver<Request>;
 
-/// 有几个「不许弹窗」的操作正在做（自动获取）。
-static QUIET: AtomicUsize = AtomicUsize::new(0);
-
-/// 留着它的这段时间里，来的密码请求一律当作取消，不弹窗。
-///
-/// 自动获取是程序自己在后台做的：要密码的话让它这一次失败就行了，不能隔一会儿就弹个窗出来。
-/// 请求里不带「是哪条 git 命令要的」，所以这段时间里别的操作要密码也会被当作取消——自动获取只在
-/// 用户正看着的那个仓库上做，用户一动手做别的操作就先把它停掉，两者不会同时进行。
-pub struct Quiet(());
-
-pub fn quiet() -> Quiet {
-    QUIET.fetch_add(1, Ordering::SeqCst);
-    Quiet(())
-}
-
-impl Drop for Quiet {
-    fn drop(&mut self) {
-        QUIET.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 /// 程序启动时调用：登记密码请求的处理函数，返回界面这头接收请求的口子。
 pub fn init() -> Prompts {
     let (tx, rx) = mpsc::unbounded();
+    // 不许弹窗的（自动获取、自己在重连）在发问的那一头就当作取消了，到不了这里：见
+    // `fr_core::askpass::NO_PROMPT` 和 `ConnectOptions::no_prompt`
     let started = fr_channel::init_prompts(move |prompt, jump| {
-        if QUIET.load(Ordering::SeqCst) > 0 {
-            log::info!("自动获取要密码，这一次不问：{}", prompt.trim());
-            return None;
-        }
         let (reply, answer) = std::sync::mpsc::channel();
         tx.unbounded_send(Request {
             prompt: prompt.to_string(),

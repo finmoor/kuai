@@ -10,6 +10,11 @@
 
 use crate::log::Commit;
 
+/// 提交图那一列最多画这么多条泳道，更右边的截掉。截掉的泳道上的线段不存，只记这一行有截掉的：
+/// 分叉很多的历史里同时活跃的泳道可能上千条，每行每条都存一段直通的线，二十万行能存到上 GB，
+/// 又都画不出来。
+pub const MAX_LANES: u16 = 40;
+
 /// 一行里的一条线段。坐标用泳道编号表示，界面层再换算成像素。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Segment {
@@ -38,6 +43,8 @@ pub struct Row {
     /// 提交节点所在泳道
     pub lane: u16,
     pub color: u8,
+    /// 这一行有画不下的（节点或线在 [`MAX_LANES`] 条以外），界面在右边标一下
+    pub clipped: bool,
     seg_start: u32,
     seg_len: u16,
 }
@@ -95,24 +102,26 @@ impl Graph {
                 }
             };
             let color = colors[lane];
+            let mut clipped = lane >= MAX_LANES as usize;
 
             // 上半行：在等本提交的泳道汇入节点，其余活跃泳道直通
             for (l, slot) in lanes.iter().enumerate() {
-                match *slot {
-                    None => {}
-                    Some(c) if c == index => segments.push(Segment {
+                let segment = match *slot {
+                    None => continue,
+                    Some(c) if c == index => Segment {
                         kind: ToNode,
                         from: l as u16,
                         to: lane as u16,
                         color: colors[l],
-                    }),
-                    Some(_) => segments.push(Segment {
+                    },
+                    Some(_) => Segment {
                         kind: Through,
                         from: l as u16,
                         to: l as u16,
                         color: colors[l],
-                    }),
-                }
+                    },
+                };
+                keep(&mut segments, &mut clipped, segment);
             }
             for &l in waiting.iter().skip(1) {
                 lanes[l] = None;
@@ -123,12 +132,13 @@ impl Graph {
                 None => lanes[lane] = None,
                 Some((&first, rest)) => {
                     lanes[lane] = Some(first);
-                    segments.push(Segment {
+                    let segment = Segment {
                         kind: FromNode,
                         from: lane as u16,
                         to: lane as u16,
                         color,
-                    });
+                    };
+                    keep(&mut segments, &mut clipped, segment);
                     for &parent in rest {
                         let target = match lanes.iter().position(|s| *s == Some(parent)) {
                             Some(l) => l,
@@ -139,12 +149,13 @@ impl Graph {
                                 l
                             }
                         };
-                        segments.push(Segment {
+                        let segment = Segment {
                             kind: FromNode,
                             from: lane as u16,
                             to: target as u16,
                             color: colors[target],
-                        });
+                        };
+                        keep(&mut segments, &mut clipped, segment);
                     }
                 }
             }
@@ -158,6 +169,7 @@ impl Graph {
             rows.push(Row {
                 lane: lane as u16,
                 color,
+                clipped,
                 seg_start,
                 seg_len: (segments.len() as u32 - seg_start) as u16,
             });
@@ -168,6 +180,14 @@ impl Graph {
             segments,
             max_lanes: max_lanes as u16,
         }
+    }
+}
+
+/// 画得出来的线段（两头都在前 [`MAX_LANES`] 条泳道里）才存，画不出来的只记下这一行有截掉的。
+fn keep(segments: &mut Vec<Segment>, clipped: &mut bool, segment: Segment) {
+    match segment.from < MAX_LANES && segment.to < MAX_LANES {
+        true => segments.push(segment),
+        false => *clipped = true,
     }
 }
 
@@ -241,6 +261,31 @@ mod tests {
         );
         assert_eq!(g.rows[3].lane, 0);
         assert_eq!(kinds(&g, 3), vec![(ToNode, 0, 0), (ToNode, 1, 0)]);
+    }
+
+    #[test]
+    fn 泳道多到画不下时_画不出来的线段不存() {
+        // 50 个分支都从同一个提交（第 50 个）分出来：越往下同时活跃的泳道越多
+        let mut commits: Vec<Commit> = (0..50).map(|_| commit(&[50])).collect();
+        commits.push(commit(&[]));
+        let g = Graph::build(&commits);
+        assert_eq!(g.max_lanes, 50);
+        let max = MAX_LANES as usize;
+        for row in 0..commits.len() {
+            assert!(
+                g.segments(row)
+                    .iter()
+                    .all(|s| s.from < MAX_LANES && s.to < MAX_LANES)
+            );
+        }
+        // 前 40 个分支画得下；之后的节点在 40 条以外，这一行标成截掉
+        assert!(!g.rows[max - 1].clipped);
+        assert!(g.rows[max].clipped);
+        // 每行最多存 40 段直通的线（原来第 49 行存 49 段）
+        assert_eq!(g.segments(49).len(), max);
+        // 根上 50 条线汇进来，画得出的 40 条
+        assert!(g.rows[50].clipped);
+        assert_eq!(g.segments(50).len(), max);
     }
 
     #[test]

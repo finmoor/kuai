@@ -15,7 +15,7 @@
 //! - 画法在 [`super::files_view`]，新建、改名、删除、上传、下载在 [`super::files_ops`]。
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fr_channel::{Channel, FsEntry, FsStat, FsWrite};
@@ -129,11 +129,14 @@ pub(super) fn decode(bytes: &[u8]) -> Option<Decoded> {
     })
 }
 
-/// 把编辑器里的文字变回要写进文件的字节。
+/// 把编辑器里的文字变回要写进文件的字节。读进来时换行已经统一成 `\n`，但粘贴进来的文字（Windows
+/// 剪贴板里一般是 `\r\n`）编辑器不改：先统一成 `\n`，不然 CRLF 文件里会写出 `\r\r\n`、LF 文件里
+/// 混进 `\r\n`。
 pub(super) fn encode(text: &str, encoding: Encoding, bom: bool, crlf: bool) -> Vec<u8> {
-    let text = match crlf {
-        true => std::borrow::Cow::Owned(text.replace('\n', "\r\n")),
-        false => std::borrow::Cow::Borrowed(text),
+    let text = match (crlf, text.contains("\r\n")) {
+        (true, _) => std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\n', "\r\n")),
+        (false, true) => std::borrow::Cow::Owned(text.replace("\r\n", "\n")),
+        (false, false) => std::borrow::Cow::Borrowed(text),
     };
     let mut bytes = Vec::with_capacity(text.len() + 3);
     match encoding {
@@ -327,6 +330,73 @@ pub(super) struct LocalCopy {
     /// 下载好时的修改时间，之后变了就是在本机改过
     pub mtime: Option<std::time::SystemTime>,
     pub changed: bool,
+    /// 下载（或者传回去）时主机上那份的属性：之后再看到的和它不一样，就是在主机上被改过
+    pub remote: FsStat,
+}
+
+impl LocalCopy {
+    /// 下载以后在本机改过（还没传回去）。
+    pub(super) fn edited(&self) -> bool {
+        self.changed || modified(&self.path) != self.mtime
+    }
+}
+
+/// 本机文件的修改时间。
+pub(super) fn modified(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// 「用默认程序打开」下载的副本都放在这个目录下面，每次下载一个子目录。
+pub(super) fn copies_dir() -> PathBuf {
+    std::env::temp_dir().join("kuai-open")
+}
+
+/// 删掉一份副本所在的子目录。只删 [`copies_dir`] 下面的子目录，路径不对就不动。
+pub(super) fn remove_copy(copy: &LocalCopy) {
+    let root = copies_dir();
+    if let Some(dir) = copy.path.parent()
+        && dir.parent() == Some(root.as_path())
+    {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// 主机上的文件名变成本机能用的文件名。主机多半是 Linux，文件名里可以有 `\`、`:`、`*` 这些，
+/// 原样拼到本机路径上会落到下载目录外面（`..\`、`C:\…`），或者建不出来；保留的设备名（CON、
+/// NUL、COM1……）前面加 `_`，结尾的点和空格去掉（Windows 会自己去掉，那就不是同一个文件了）。
+pub(super) fn local_file_name(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    while out.ends_with(['.', ' ']) {
+        out.pop();
+    }
+    if out.is_empty() {
+        return "file".into();
+    }
+    let stem = out
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let numbered = |prefix: &str| {
+        stem.strip_prefix(prefix)
+            .is_some_and(|n| n.len() == 1 && n.as_bytes()[0].is_ascii_digit() && n != "0")
+    };
+    if ["CON", "PRN", "AUX", "NUL"].contains(&stem.as_str()) || numbered("COM") || numbered("LPT") {
+        out.insert(0, '_');
+    }
+    out
+}
+
+/// 两次看到的是不是同一版：有没有、大小、修改时间都一样。
+pub(super) fn same_version(a: &FsStat, b: &FsStat) -> bool {
+    a.exists == b.exists && a.size == b.size && a.mtime == b.mtime
 }
 
 /// 不在这里显示的文件：一张卡片，给出「用默认程序打开」「下载」。
@@ -674,21 +744,6 @@ pub(super) fn join(dir: &str, name: &str) -> String {
 /// 目录在前，名字不分大小写地排。
 fn sort_entries(entries: &mut [FsEntry]) {
     entries.sort_by_cached_key(|entry| (!entry.dir, entry.name.to_lowercase()));
-}
-
-/// 文件大小写成人看的：`812 B`、`3.4 KB`、`12.0 MB`。
-pub(super) fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64 / 1024.;
-    let mut unit = 0;
-    while value >= 1024. && unit < UNITS.len() - 1 {
-        value /= 1024.;
-        unit += 1;
-    }
-    format!("{value:.1} {}", UNITS[unit])
 }
 
 impl RepoView {
@@ -1213,29 +1268,41 @@ impl RepoView {
         };
         tab.stat = stat;
         tab.deleted = false;
-        let opaque = |reason| {
-            Body::Opaque(OpaqueDoc {
-                reason,
-                busy: None,
-                local: None,
-                task: None,
-                poll: None,
-            })
+        // 显示成卡片。卡片已经在了（重新读了一遍）：只换原因，下载好的本机副本留着
+        let opaque = |tab: &mut OpenFile, reason| match &mut tab.body {
+            Body::Opaque(doc) => doc.reason = reason,
+            body => {
+                *body = Body::Opaque(OpaqueDoc {
+                    reason,
+                    busy: None,
+                    local: None,
+                    task: None,
+                    poll: None,
+                })
+            }
         };
         let limit = match class {
             Class::Image(_) => IMAGE_LIMIT,
             _ => TEXT_LIMIT,
         };
+        // 不再显示成卡片了（比如文件改小了，能直接显示了）：本机没改过的副本删掉；改过的留着，
+        // 免得丢了还没传回去的修改
+        let to_card = matches!(class, Class::Opaque(_)) || stat.size > limit;
+        if !to_card
+            && let Body::Opaque(OpaqueDoc {
+                local: Some(copy), ..
+            }) = &tab.body
+            && !copy.edited()
+        {
+            remove_copy(copy);
+        }
         let decoded = match class {
             Class::Opaque(kind) => {
-                // 卡片已经在了（重新查了一遍大小）：下载好的本机副本留着
-                if !matches!(tab.body, Body::Opaque(_)) {
-                    tab.body = opaque(Opaque::Kind(kind));
-                }
+                opaque(tab, Opaque::Kind(kind));
                 return;
             }
             _ if stat.size > limit => {
-                tab.body = opaque(Opaque::Large);
+                opaque(tab, Opaque::Large);
                 return;
             }
             Class::Image(format) => {
@@ -1252,7 +1319,7 @@ impl RepoView {
             Class::Text => match decode(&bytes) {
                 Some(decoded) => decoded,
                 None => {
-                    tab.body = opaque(Opaque::Binary);
+                    opaque(tab, Opaque::Binary);
                     return;
                 }
             },
@@ -1261,6 +1328,12 @@ impl RepoView {
         let text: SharedString = decoded.text.into();
         // 已经开着：换内容，光标和滚动的位置尽量留在原处
         if let Some(doc) = tab.text_mut() {
+            // 读的这段时间里又打了字（开始读时是没有修改的）：不拿磁盘上的盖掉，和磁盘被别的程序
+            // 改了、这里又有修改时一样，提示冲突让用户选
+            if doc.dirty {
+                doc.conflict = true;
+                return;
+            }
             let editor = doc.editor.clone();
             doc.saved = text.clone();
             doc.dirty = false;
@@ -1426,9 +1499,8 @@ impl RepoView {
         if let Body::Opaque(OpaqueDoc {
             local: Some(copy), ..
         }) = &tab.body
-            && let Some(dir) = copy.path.parent()
         {
-            let _ = std::fs::remove_dir_all(dir);
+            remove_copy(copy);
         }
     }
 
@@ -1629,10 +1701,38 @@ impl RepoView {
 mod tests {
     // 不能 `use super::*`：界面库也有一个叫 test 的宏，会盖掉标准的 #[test]
     use super::{
-        Class, Encoding, classify, decode, encode, extension, human_size, indent_of, language,
+        Class, Encoding, classify, decode, encode, extension, indent_of, language, local_file_name,
     };
     use fr_core::i18n::tr;
     use gpui_kit::ImageFormat;
+
+    #[test]
+    fn 粘贴进来的_crlf_保存时不会翻倍() {
+        // CRLF 文件：编辑器里有粘贴进来的 \r\n，也只写一个 \r
+        assert_eq!(
+            encode("a\r\nb\nc", Encoding::Utf8, false, true),
+            b"a\r\nb\r\nc"
+        );
+        // LF 文件：粘贴进来的 \r\n 统一成 \n
+        assert_eq!(encode("a\r\nb\n", Encoding::Utf8, false, false), b"a\nb\n");
+    }
+
+    #[test]
+    fn 主机上的文件名变成本机能用的() {
+        assert_eq!(local_file_name("报表.xlsx"), "报表.xlsx");
+        // 拼到本机路径上会跑出下载目录的
+        assert_eq!(local_file_name(r"..\..\evil.exe"), ".._.._evil.exe");
+        assert_eq!(local_file_name(r"C:\Windows\x.dll"), "C__Windows_x.dll");
+        assert_eq!(local_file_name(".."), "file");
+        assert_eq!(local_file_name("."), "file");
+        // 建不出来的
+        assert_eq!(local_file_name("a:b*c?.txt"), "a_b_c_.txt");
+        assert_eq!(local_file_name("结尾有点. "), "结尾有点");
+        assert_eq!(local_file_name("con.txt"), "_con.txt");
+        assert_eq!(local_file_name("COM1"), "_COM1");
+        assert_eq!(local_file_name("com10.txt"), "com10.txt");
+        assert_eq!(local_file_name("console.log"), "console.log");
+    }
 
     #[test]
     fn 按扩展名分类() {
@@ -1694,12 +1794,5 @@ mod tests {
         let four = indent_of("fn a() {\n    let x = 1;\n    if x {\n        y();\n    }\n}\n");
         assert_eq!((four.tab_size, four.hard_tabs), (4, false));
         assert!(indent_of("a {\n\tb;\n\tc;\n}\n").hard_tabs);
-    }
-
-    #[test]
-    fn 大小写成人看的() {
-        assert_eq!(human_size(812), "812 B");
-        assert_eq!(human_size(3482), "3.4 KB");
-        assert_eq!(human_size(12 << 20), "12.0 MB");
     }
 }

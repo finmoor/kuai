@@ -1,4 +1,4 @@
-//! 升级在界面上的样子（原型和选定记录在 design/update/，选的是 A）：
+//! 升级在界面上的样子（原型在 docs/design/update/，选的是 A）：
 //! 标题栏齿轮左边的小牌，点开一个小窗看说明、升级；「设置 → 关于」里的版本那一行。
 //! 逻辑在 `update.rs`。
 
@@ -14,6 +14,7 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+use crate::text::human_size;
 use crate::ui;
 use crate::update::{self, Problem, Release, Stage, Updater};
 
@@ -99,7 +100,7 @@ fn popover_body(
                         div()
                             .text_xs()
                             .text_color(muted)
-                            .child(tr("更新需要重启 Kuai，服务器上的终端不受影响。")),
+                            .child(tr("更新需要重启 Kuai，远程主机上的终端不受影响。")),
                     ),
             )
             .child(
@@ -132,7 +133,11 @@ fn popover_body(
                             .justify_between()
                             .text_xs()
                             .text_color(muted)
-                            .child(format!("{} / {} MB", mb(got), mb(release.asset.size)))
+                            .child(format!(
+                                "{} / {}",
+                                human_size(got),
+                                human_size(release.asset.size)
+                            ))
                             .child(format!("{}%", percent(got, release.asset.size))),
                     ),
             )
@@ -249,7 +254,10 @@ pub fn about_version(updater: &Entity<Updater>, cx: &App) -> AnyElement {
                 .max_w(px(360.))
                 .text_sm()
                 .text_color(danger)
-                .child(ui::clipped("update-problem", format!("{title}：{detail}")));
+                .child(ui::clipped(
+                    "update-problem",
+                    tf!("{title}：{detail}", title, detail),
+                ));
             match problem {
                 Problem::Check(_) => right.child(text).child(check_button()),
                 Problem::NotWritable(_) | Problem::DevBuild => {
@@ -305,7 +313,7 @@ pub fn about_version(updater: &Entity<Updater>, cx: &App) -> AnyElement {
                                 .child(tf!("版本 {version}", version = env!("CARGO_PKG_VERSION"))),
                         )
                         .child(div().text_xs().text_color(muted).child(tr(
-                            "可打开服务器上仓库的 Git 客户端，本机和服务器上的仓库使用同一界面。",
+                            "远程开发工具：在同一界面中管理本机和远程主机上仓库的 Git、终端和文件。",
                         ))),
                 )
                 .child(right),
@@ -449,7 +457,7 @@ fn notes(release: &Release, cx: &App) -> Div {
 
 /// 「11 月 20 日发布 · 18.4 MB」那一行。
 fn release_meta(release: &Release) -> SharedString {
-    let size = format!("{} MB", mb(release.asset.size));
+    let size = human_size(release.asset.size);
     match &release.date {
         Some(date) => tf!("{date} 发布 · {size}", date = date.as_str(), size).into(),
         None => size.into(),
@@ -537,10 +545,6 @@ fn fraction(got: u64, total: u64) -> f32 {
 
 fn percent(got: u64, total: u64) -> u64 {
     (fraction(got, total) * 100.).round() as u64
-}
-
-fn mb(bytes: u64) -> String {
-    format!("{:.1}", bytes as f64 / 1024. / 1024.)
 }
 
 /// 「刚才」「5 分钟前」「3 小时前」。

@@ -13,6 +13,8 @@ use std::hash::{BuildHasher as _, Hasher as _};
 use std::io::{BufRead as _, BufReader, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -24,6 +26,23 @@ const ENV_TOKEN: &str = "FR_ASKPASS_TOKEN";
 pub const TAG_ENV: &str = "FR_ASKPASS_TAG";
 /// 提示文字最长这么多，超过的不理会
 const MAX_PROMPT: u64 = 16 * 1024;
+/// 连上来以后这么久还没把请求说完就断开；同时在说请求（还没对上口令）的最多这么多个，多了的
+/// 直接断开。本机别的程序连上来不说话、一个字节一个字节慢慢发，都占不住线程
+const ASK_LIMIT: Duration = match cfg!(test) {
+    true => Duration::from_millis(300),
+    false => Duration::from_secs(10),
+};
+const MAX_PENDING: usize = 16;
+/// 加在不许弹窗的那一条 git 命令前面（自动获取）：要密码、口令时当作取消。git 把 `-c` 的设置经
+/// 环境变量 `GIT_CONFIG_PARAMETERS` 传给它启动的程序，askpass（git 直接启动的，或者经 ssh 启动的）
+/// 看到它就不去问主进程（见 [`run_helper`]）。只管这一条命令：同时在做的别的操作照常弹窗（原来是
+/// 进程级的开关，自动获取期间别的仓库推拉、连别的主机要密码也被当作取消）。
+pub const NO_PROMPT: [&str; 2] = ["-c", "kuai.noprompt=true"];
+
+/// 发问的 git 命令带着 [`NO_PROMPT`]。
+fn no_prompt(config_parameters: Option<&str>) -> bool {
+    config_parameters.is_some_and(|params| params.contains("'kuai.noprompt"))
+}
 
 #[derive(Serialize, Deserialize)]
 struct Ask {
@@ -68,6 +87,7 @@ pub fn serve_tagged_in(
     let (listener, addr) = Listener::bind(dir)?;
     let on_prompt = Arc::new(on_prompt);
     let expected = token.clone();
+    let pending = Arc::new(AtomicUsize::new(0));
     std::thread::Builder::new()
         .name("fr-askpass".into())
         .spawn(move || {
@@ -77,9 +97,14 @@ pub fn serve_tagged_in(
                     std::thread::sleep(std::time::Duration::from_millis(200));
                     continue;
                 };
+                if pending.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING {
+                    pending.fetch_sub(1, Ordering::AcqRel);
+                    continue;
+                }
+                let waiting = Pending(pending.clone());
                 let (on_prompt, expected) = (on_prompt.clone(), expected.clone());
                 std::thread::spawn(move || {
-                    let _ = answer_one(stream, &expected, &*on_prompt);
+                    let _ = answer_one(stream, waiting, &expected, &*on_prompt);
                 });
             }
         })
@@ -95,22 +120,56 @@ pub fn serve_tagged_in(
     ])
 }
 
+/// 一个还在说请求的连接；放掉就少一个（见 [`MAX_PENDING`]）。
+struct Pending(Arc<AtomicUsize>);
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// 在期限之前读：每次读之前把读超时设成剩下的时间（读超时管的只是一次读）。
+struct Deadline<'a> {
+    stream: &'a mut dyn Stream,
+    until: Instant,
+}
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        self.stream.read_timeout(Some(left))?;
+        self.stream.read(buf)
+    }
+}
+
 fn answer_one(
-    stream: Box<dyn Stream>,
+    mut stream: Box<dyn Stream>,
+    waiting: Pending,
     expected: &str,
     on_prompt: &(dyn Fn(&str, Option<&str>) -> Option<String> + Send + Sync),
 ) -> Result<()> {
-    let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    (&mut reader).take(MAX_PROMPT).read_line(&mut line)?;
+    let deadline = Deadline {
+        stream: &mut *stream,
+        until: Instant::now() + ASK_LIMIT,
+    };
+    BufReader::new(deadline)
+        .take(MAX_PROMPT)
+        .read_line(&mut line)?;
     let ask: Ask = serde_json::from_str(&line)?;
     if ask.token != expected {
         anyhow::bail!(tr("口令错误"));
     }
+    // 对上口令了：等用户回答可以等很久，不算还在说请求的
+    drop(waiting);
+    stream.read_timeout(None)?;
     let answer = Answer {
         answer: on_prompt(&ask.prompt, ask.tag.as_deref()),
     };
-    let mut stream = reader.into_inner();
     serde_json::to_writer(&mut stream, &answer)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
@@ -129,6 +188,10 @@ pub fn run_helper() -> Option<i32> {
     // 程序自己的选项（--stdio 之类）不是提示文字
     if prompt.starts_with("--") {
         return None;
+    }
+    // 不许弹窗的那条命令在问：当作取消
+    if no_prompt(std::env::var("GIT_CONFIG_PARAMETERS").ok().as_deref()) {
+        return Some(1);
     }
     let ask = || -> Result<Option<String>> {
         let mut stream = connect(&addr)?;
@@ -151,8 +214,23 @@ pub fn run_helper() -> Option<i32> {
     }
 }
 
-trait Stream: Read + Write + Send {}
-impl<T: Read + Write + Send> Stream for T {}
+trait Stream: Read + Write + Send {
+    /// 一次读最多等多久，None 是一直等
+    fn read_timeout(&self, limit: Option<Duration>) -> std::io::Result<()>;
+}
+
+impl Stream for std::net::TcpStream {
+    fn read_timeout(&self, limit: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(limit)
+    }
+}
+
+#[cfg(unix)]
+impl Stream for std::os::unix::net::UnixStream {
+    fn read_timeout(&self, limit: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(limit)
+    }
+}
 
 enum Listener {
     #[cfg(not(unix))]
@@ -284,6 +362,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn 认出不许弹窗的命令() {
+        // git 2.31 起的写法，和更早的写法
+        assert!(no_prompt(Some(
+            "'credential.helper'='' 'kuai.noprompt'='true'"
+        )));
+        assert!(no_prompt(Some("'kuai.noprompt=true'")));
+        assert!(!no_prompt(Some("'core.quotepath'='false'")));
+        assert!(!no_prompt(None));
+        assert_eq!(NO_PROMPT[1], "kuai.noprompt=true");
+    }
+
+    #[test]
     fn 口令每次不同() {
         let (a, b) = (random_token(), random_token());
         assert_eq!(a.len(), 32);
@@ -347,6 +437,37 @@ mod tests {
         };
         assert_eq!(ask(Some("t1")).as_deref(), Some("问/t1"));
         assert_eq!(ask(None).as_deref(), Some("问/无"));
+    }
+
+    #[test]
+    fn 连上来不说话_慢慢发的_到时间就断开() {
+        let _serial = SERIAL.lock().unwrap_or_else(|err| err.into_inner());
+        let dir = std::env::temp_dir();
+        let env = serve(&dir.join("fr-askpass-test-helper"), |_| Some("答".into())).unwrap();
+        let addr = env.iter().find(|(k, _)| k == ENV_ADDR).unwrap().1.clone();
+        // 一个字节一个字节慢慢发：每次读都不超时，总期限到了照样断开
+        let mut slow = connect(&addr).unwrap();
+        let started = Instant::now();
+        let mut cut = false;
+        while started.elapsed() < Duration::from_secs(5) {
+            if slow.write_all(b"{").is_err() {
+                cut = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(cut, "慢慢发的应该被断开");
+        // 不说话的：读得到对方已经关了，不是一直等
+        let mut silent = connect(&addr).unwrap();
+        silent.read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let started = Instant::now();
+        let mut byte = [0u8; 1];
+        let _ = silent.read(&mut byte);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

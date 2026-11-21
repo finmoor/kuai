@@ -22,8 +22,8 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -67,6 +67,15 @@ const DONE_MARK: &str = "just-updated";
 const SETUP_EXE: &str = "kuai-setup.exe";
 /// 安装版：后台跑安装程序时它写的记录
 const SETUP_LOG: &str = "setup.log";
+/// 启动时换上暂存的新版本没成：记下哪个版本、为什么，界面起来以后告诉人（[`Updater::new`]）
+const STARTUP_FAILED: &str = "startup-failed";
+/// 每次下载自己的工作目录的前缀（见 [`fetch_and_stage`]）
+const WORK_PREFIX: &str = "download-";
+
+/// 每次下载的编号：取消以后马上重下，新的一次用新的工作目录，旧线程还在写也碰不到它。
+static NEXT_DOWNLOAD: AtomicU64 = AtomicU64::new(0);
+/// 「放进暂存目录」和「取消」互斥：取消了的那次不会再放进去（下次启动会把它换上）。
+static PUBLISH: Mutex<()> = Mutex::new(());
 
 /// 正在运行的版本。
 pub fn current_version() -> Version {
@@ -225,6 +234,14 @@ impl Updater {
         };
         if updated_from.is_some() {
             clean_old_downloads();
+        }
+        // 启动时换上暂存的新版本没成：那一份已经删了，不再自动重试；告诉人，重新下载就是重试
+        if let Some((version, err)) = take_startup_failure() {
+            let text = tf!("启动时安装 {version} 失败：{err}", version, err);
+            stage = Stage::Failed {
+                release: None,
+                problem: Problem::Install(text),
+            };
         }
         Self {
             app,
@@ -459,7 +476,10 @@ impl Updater {
             release, cancel, ..
         } = &self.stage
         {
+            // 和放进暂存目录互斥：取消以后那个线程不会再把它放进去
+            let publishing = PUBLISH.lock();
             cancel.store(true, Ordering::Relaxed);
+            drop(publishing);
             self.stage = Stage::Available(release.clone());
             self._work = None;
             cx.notify();
@@ -510,10 +530,24 @@ pub fn apply_staged_at_startup() -> bool {
     match install_and_launch(&staging_dir(&version)) {
         Ok(()) => true,
         Err(err) => {
+            // 原来只记日志、暂存的留着，每次启动都再试一遍同一个版本，界面上什么都看不到。
+            // 记下原因、删掉暂存的，界面起来以后告诉人，要重试就重新下载
             log::warn!("启动时换上新版本没成：{err:#}");
+            let text = format!("{version}\n{err:#}");
+            let _ = fs::write(update_dir().join(STARTUP_FAILED), text);
+            discard_staged();
             false
         }
     }
+}
+
+/// 启动时换新版本没成时记下的（版本、原因），读完删掉。
+fn take_startup_failure() -> Option<(String, String)> {
+    let path = update_dir().join(STARTUP_FAILED);
+    let text = fs::read_to_string(&path).ok()?;
+    let _ = fs::remove_file(&path);
+    let (version, err) = text.split_once('\n').unwrap_or((text.as_str(), ""));
+    Some((version.trim().to_string(), err.trim().to_string()))
 }
 
 // ---------- 问 GitHub ----------
@@ -711,24 +745,50 @@ fn fetch_and_stage(release: &Release, got: &AtomicU64, cancel: &AtomicBool) -> R
             tr("GitHub 未提供此文件的校验值").into(),
         ));
     };
-    let dir = update_dir();
-    fs::create_dir_all(&dir).map_err(|err| Problem::Install(err.to_string()))?;
-    let zip = dir.join(&release.asset.name);
-    let part = dir.join(format!("{}.part", release.asset.name));
+    // 这一次自己的工作目录：下载、核对、解压都在里面，做完整个目录一次改名放进暂存目录。原来
+    // 几次下载共用同一个 .part、zip 和暂存目录，取消以后马上重下，旧线程还在写、删、解压同一份
+    let n = NEXT_DOWNLOAD.fetch_add(1, Ordering::Relaxed);
+    let work = update_dir().join(format!("{WORK_PREFIX}{}-{n}", std::process::id()));
+    let _ = fs::remove_dir_all(&work);
+    fs::create_dir_all(&work).map_err(|err| Problem::Install(err.to_string()))?;
+    let staged = work.join("staged");
+    let result = fetch_into(release, expected, &work, &staged, got, cancel).and_then(|()| {
+        let _publishing = PUBLISH.lock();
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Problem::Download(tr("已取消").into()));
+        }
+        let staging = staging_dir(&release.version);
+        if staging.exists() {
+            fs::remove_dir_all(&staging).map_err(|err| Problem::Install(err.to_string()))?;
+        }
+        fs::rename(&staged, &staging).map_err(|err| Problem::Install(err.to_string()))
+    });
+    let _ = fs::remove_dir_all(&work);
+    result
+}
+
+/// 下到 `work` 里、核对校验值，在 `staged` 里摆好要换上的东西（安装程序直接放，zip 解压）。
+/// 核对的就是要放进去的那一份文件。
+fn fetch_into(
+    release: &Release,
+    expected: &str,
+    work: &Path,
+    staged: &Path,
+    got: &AtomicU64,
+    cancel: &AtomicBool,
+) -> Result<(), Problem> {
+    let zip = work.join(&release.asset.name);
+    let part = work.join(format!("{}.part", release.asset.name));
     let actual = download(&release.asset.url, &part, got, cancel)
         .map_err(|err| Problem::Download(format!("{err:#}")))?;
-    if &actual != expected {
-        let _ = fs::remove_file(&part);
+    if actual != expected {
         return Err(Problem::Digest);
     }
-    let staging = staging_dir(&release.version);
     if is_setup(&release.asset.name) {
-        return stage_setup(&part, &staging).map_err(|err| Problem::Install(format!("{err:#}")));
+        return stage_setup(&part, staged).map_err(|err| Problem::Install(format!("{err:#}")));
     }
     fs::rename(&part, &zip).map_err(|err| Problem::Install(err.to_string()))?;
-    let result = extract(&zip, &staging);
-    let _ = fs::remove_file(&zip);
-    result.map_err(|err| Problem::Install(format!("{err:#}")))
+    extract(&zip, staged).map_err(|err| Problem::Install(format!("{err:#}")))
 }
 
 /// 下好的安装程序挪进暂存目录。
@@ -738,7 +798,63 @@ fn stage_setup(downloaded: &Path, out: &Path) -> Result<()> {
     }
     fs::create_dir_all(out)?;
     fs::rename(downloaded, out.join(SETUP_EXE))?;
-    fs::write(out.join(READY_MARK), b"")?;
+    write_ready(out)
+}
+
+/// 写暂存目录的就绪记号：里面每个文件一行「SHA-256 相对路径」（路径用 `/`），按路径排。
+/// 换上之前照它再核对一遍（[`verify_staged`]）：暂存目录被改过、多了别的文件、没摆全都不换。
+fn write_ready(out: &Path) -> Result<()> {
+    let lines = staged_files(out)?;
+    fs::write(out.join(READY_MARK), lines.join("\n"))?;
+    Ok(())
+}
+
+/// 暂存目录里的文件（就绪记号除外）：「SHA-256 相对路径」，按路径排。
+fn staged_files(root: &Path) -> Result<Vec<String>> {
+    fn walk(root: &Path, dir: &Path, lines: &mut Vec<String>) -> Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                walk(root, &path, lines)?;
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel == READY_MARK {
+                continue;
+            }
+            let mut hasher = Sha256::new();
+            io::copy(&mut File::open(&path)?, &mut hasher)?;
+            let digest: String = hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            lines.push(format!("{digest} {rel}"));
+        }
+        Ok(())
+    }
+    let mut lines = Vec::new();
+    walk(root, root, &mut lines)?;
+    lines.sort_by(|a, b| {
+        a.split_once(' ')
+            .map(|x| x.1)
+            .cmp(&b.split_once(' ').map(|x| x.1))
+    });
+    Ok(lines)
+}
+
+/// 换上之前核对暂存目录：和就绪记号里记的一模一样（同样的文件、同样的内容）才换。
+fn verify_staged(staging: &Path) -> Result<()> {
+    let mark = fs::read_to_string(staging.join(READY_MARK)).context(tr("新版本未下载完成"))?;
+    let recorded: Vec<&str> = mark.lines().filter(|line| !line.is_empty()).collect();
+    let actual = staged_files(staging)?;
+    if recorded.is_empty() || recorded != actual {
+        bail!(tr("暂存的新版本与下载时核对的不一致，请重新下载"));
+    }
     Ok(())
 }
 
@@ -812,8 +928,7 @@ fn extract(zip: &Path, out: &Path) -> Result<()> {
     if !out.join("kuai.exe").is_file() {
         bail!(tr("发布包中缺少 kuai.exe"));
     }
-    fs::write(out.join(READY_MARK), b"")?;
-    Ok(())
+    write_ready(out)
 }
 
 /// 所有条目都在同一个最外层文件夹里：返回它。
@@ -830,9 +945,7 @@ fn common_top(entries: &[(PathBuf, bool)]) -> Option<PathBuf> {
 
 /// 换上暂存目录里的新版本，打开新的 Kuai。成功后调用方马上退出。
 fn install_and_launch(staging: &Path) -> Result<()> {
-    if !staging.join(READY_MARK).is_file() {
-        bail!(tr("新版本未下载完成"));
-    }
+    verify_staged(staging)?;
     let setup = staging.join(SETUP_EXE);
     if setup.is_file() {
         return run_setup(&setup);
@@ -850,27 +963,39 @@ fn run_setup(setup: &Path) -> Result<()> {
     let dir = dir.to_string_lossy();
     let dir = dir.strip_prefix(r"\\?\").unwrap_or(&dir);
     let _ = fs::write(update_dir().join(DONE_MARK), env!("CARGO_PKG_VERSION"));
-    std::process::Command::new(setup)
-        .args([
-            "/VERYSILENT",
-            "/SUPPRESSMSGBOXES",
-            "/NORESTART",
-            "/relaunch=1",
-        ])
-        .arg(format!("/DIR={dir}"))
-        .arg(format!("/LOG={}", update_dir().join(SETUP_LOG).display()))
+    let mut command = std::process::Command::new(setup);
+    command.args([
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/relaunch=1",
+    ]);
+    // 带空格的路径照 Inno Setup 文档写成 /DIR="…"（交给 arg 的话整个参数外面加引号，成了
+    // "/DIR=…"；Inno 解析时也会去掉，但不是文档写的格式）。Windows 路径里不会有引号
+    let log = update_dir().join(SETUP_LOG);
+    raw_switch(&mut command, "DIR", dir);
+    raw_switch(&mut command, "LOG", &log.to_string_lossy());
+    command
         .arg(format!("/waitpid={}", std::process::id()))
         .spawn()
         .context(tr("无法启动安装程序"))?;
     Ok(())
 }
 
-/// 解压版：把暂存目录里的新版本换到程序所在的文件夹：别的文件直接覆盖，kuai.exe 最后换。
-/// 返回 exe 的路径（已经是新版本了）。
-fn install(staging: &Path) -> Result<PathBuf> {
-    if !staging.join(READY_MARK).is_file() {
-        bail!(tr("新版本未下载完成"));
+/// 给安装程序加一个 `/名字="值"` 的开关。
+fn raw_switch(command: &mut std::process::Command, name: &str, value: &str) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.raw_arg(format!("/{name}=\"{value}\""));
     }
+    #[cfg(not(windows))]
+    command.arg(format!("/{name}={value}"));
+}
+
+/// 解压版：把暂存目录里的新版本换到程序所在的文件夹：别的文件直接覆盖，kuai.exe 最后换。
+/// 返回 exe 的路径（已经是新版本了）。调用方先核对过暂存目录（[`verify_staged`]）。
+fn install(staging: &Path) -> Result<PathBuf> {
     let exe = std::env::current_exe()?;
     let dir = exe.parent().context(tr("未找到程序所在的文件夹"))?;
     copy_tree(staging, staging, dir)?;
@@ -964,7 +1089,7 @@ fn clean_old_downloads() {
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         let old = Version::parse(&name).is_ok_and(|v| v <= current);
-        if old {
+        if old || name.starts_with(WORK_PREFIX) {
             let _ = fs::remove_dir_all(entry.path());
         } else if name.ends_with(".part") || name.ends_with(".zip") {
             let _ = fs::remove_file(entry.path());
@@ -976,7 +1101,10 @@ fn clean_old_downloads() {
 mod tests {
     // 不能 `use super::*`：gpui_kit 里也有个叫 test 的属性宏，会盖住标准库的 #[test]
     use super::{CHECK_EVERY, wait_before_next};
-    use super::{GhAsset, GhRelease, Kind, READY_MARK, Version, common_top, copy_tree, extract};
+    use super::{
+        GhAsset, GhRelease, Kind, READY_MARK, Version, common_top, copy_tree, extract, stage_setup,
+        verify_staged,
+    };
     use super::{parse_release, plain};
     use std::fs::{self, File};
     use std::io::Write as _;
@@ -1116,6 +1244,7 @@ mod tests {
         extract(&zip_path, &staging).unwrap();
         assert_eq!(fs::read(staging.join("kuai.exe")).unwrap(), b"new exe");
         assert!(staging.join(READY_MARK).is_file());
+        verify_staged(&staging).unwrap();
 
         // 别的文件覆盖到安装目录，kuai.exe 和记号不动（exe 由 self-replace 换）
         let installed = root.join("installed");
@@ -1131,6 +1260,32 @@ mod tests {
         assert_eq!(fs::read(kuaid).unwrap(), b"new kuaid");
         assert_eq!(fs::read(installed.join("kuai.exe")).unwrap(), b"old exe");
         assert!(!installed.join(READY_MARK).exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 换上之前核对暂存的文件() {
+        let root = std::env::temp_dir().join(format!("kuai-update-verify-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let downloaded = root.join("setup.part");
+        fs::write(&downloaded, b"installer").unwrap();
+        let staging = root.join("9.9.9");
+        stage_setup(&downloaded, &staging).unwrap();
+        verify_staged(&staging).unwrap();
+        // 改了内容、多了文件、少了文件、记号是空的（旧版本留下的）都不换
+        let setup = staging.join(super::SETUP_EXE);
+        fs::write(&setup, b"tampered").unwrap();
+        assert!(verify_staged(&staging).is_err());
+        fs::write(&setup, b"installer").unwrap();
+        fs::write(staging.join("extra.dll"), b"x").unwrap();
+        assert!(verify_staged(&staging).is_err());
+        fs::remove_file(staging.join("extra.dll")).unwrap();
+        verify_staged(&staging).unwrap();
+        fs::remove_file(&setup).unwrap();
+        assert!(verify_staged(&staging).is_err());
+        fs::write(staging.join(READY_MARK), b"").unwrap();
+        assert!(verify_staged(&staging).is_err());
         let _ = fs::remove_dir_all(&root);
     }
 

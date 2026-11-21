@@ -7,7 +7,7 @@
 //! 从哪开始：打开仓库时是上次打开的仓库所在的目录，没有就是这台服务器的初始目录，再没有是主目录
 //! （[`crate::settings::Server::browse_starts`]）；前一个进不去（目录删了）就试下一个。
 //!
-//! 可以一次打开几个（2026-11-15 Feng 要的）：标有「仓库」的目录前面有勾选框，勾上的跨目录记着，
+//! 可以一次打开几个：标有「仓库」的目录前面有勾选框，勾上的跨目录记着，
 //! 一个目录里有几个仓库时可以全选；勾了以后按钮变成「打开 N 个仓库」。
 
 use fr_channel::DirListing;
@@ -100,7 +100,7 @@ impl RemoteBrowser {
         let mut starts = starts.into_iter();
         let start = starts.next().unwrap_or_default();
         let input =
-            cx.new(|cx| InputState::new(window, cx).placeholder(tr("服务器上的路径，按 Enter 前往")));
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("主机上的路径，按 Enter 前往")));
         let subscription = cx.subscribe_in(
             &input,
             window,
@@ -138,7 +138,7 @@ impl RemoteBrowser {
             if connected {
                 tr("正在读取…")
             } else {
-                tr("正在连接服务器…")
+                tr("正在连接主机…")
             }
             .into(),
             false,
@@ -378,7 +378,8 @@ impl Render for RemoteBrowser {
             theme.list_hover,
             theme.danger,
         );
-        let repo_color: Hsla = rgb(0x27ae60).into();
+        // 「仓库」标签用主题的绿色：换主题跟着换
+        let repo_color = theme.success;
         // 打开仓库时，标有「仓库」的目录前面有勾选框；其他行留出同样宽的一格，目录名对齐
         let pickable = !self.pick_dir;
         let slot = || div().w(px(16.)).flex_shrink_0();
@@ -470,7 +471,7 @@ impl Render for RemoteBrowser {
                     .iter()
                     .map(|path| crate::settings::base_name(path))
                     .collect::<Vec<_>>()
-                    .join("、");
+                    .join(tr("、"));
                 tf!("已选 {n} 个仓库：{names}", n = picked, names).into()
             }
             (None, true) => tr("此目录是仓库，可以打开").into(),

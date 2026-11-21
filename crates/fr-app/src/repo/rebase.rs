@@ -19,6 +19,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::RepoView;
+use super::ops::Step;
 use crate::ui;
 
 /// 一次最多整理这么多个提交：再多对话框里也看不过来
@@ -82,8 +83,6 @@ pub(super) struct RebaseEditor {
     rows: Vec<Row>,
     /// 打开时的顺序，用来看是不是什么都没改
     original: Vec<String>,
-    /// 工作区有改动：变基时带上 `--autostash`
-    autostash: bool,
     problem: Option<SharedString>,
 }
 
@@ -175,10 +174,10 @@ impl RebaseEditor {
             return;
         }
         window.close_dialog(cx);
-        let (base, autostash) = (self.base.clone(), self.autostash);
+        let (base, original) = (self.base.clone(), self.original.clone());
         self.repo
             .update(cx, |repo, cx| {
-                repo.run_interactive_rebase(base, items, autostash, window, cx)
+                repo.run_interactive_rebase(base, items, original, window, cx)
             })
             .ok();
     }
@@ -187,20 +186,18 @@ impl RebaseEditor {
 impl Render for RebaseEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let list_height = (window.viewport_size().height - px(300.)).clamp(px(140.), px(520.));
+        let dirty = self
+            .repo
+            .upgrade()
+            .is_some_and(|repo| repo.read(cx).has_tracked_changes());
         let theme = cx.theme();
-        let (muted, border, danger, warning, panel) = (
+        let (muted, border, danger, panel) = (
             theme.muted_foreground,
             theme.border,
             theme.danger,
-            theme.warning,
             theme.muted,
         );
         let count = self.rows.len();
-        let merges = self
-            .rows
-            .iter()
-            .filter(|row| row.commit.parents > 1)
-            .count();
         let rows: Vec<AnyElement> = self
             .rows
             .iter()
@@ -281,15 +278,6 @@ impl Render for RebaseEditor {
                             .text_sm()
                             .when(dropped, |d| d.line_through().text_color(muted)),
                     )
-                    .when(row.commit.parents > 1, |line| {
-                        line.child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .text_color(warning)
-                                .child(tr("合并提交")),
-                        )
-                    })
                     .child(
                         ui::clipped(
                             ("author", ix),
@@ -342,13 +330,8 @@ impl Render for RebaseEditor {
             .child(div().text_xs().text_color(muted).whitespace_normal().child(tr(
                 "最新的提交在最上方。用箭头调整顺序，在下拉列表中选择操作。提交将重新生成，已推送的需强制推送。",
             )))
-            .when(merges > 0, |d| {
-                d.child(div().text_xs().text_color(warning).whitespace_normal().child(tf!(
-                    "其中有 {merges} 个合并提交，变基后不保留合并关系。",
-                    merges
-                )))
-            })
-            .when(self.autostash, |d| {
+            // 按现在的状态说：对话框开着时工作区可能变了
+            .when(dirty, |d| {
                 d.child(div().text_xs().text_color(muted).whitespace_normal().child(tr(
                     "未提交的改动将先贮藏，完成后自动恢复（--autostash）。",
                 )))
@@ -429,7 +412,6 @@ impl RepoView {
             ],
         );
         let list = channel.git(&repo, rebase::list_args(&base));
-        let autostash = self.has_tracked_changes();
         let view = cx.entity().downgrade();
         cx.spawn_in(window, async move |_, cx| {
             let (is_ancestor, list) = futures::join!(is_ancestor, list);
@@ -439,10 +421,17 @@ impl RepoView {
                     .and_then(|out| out.ok())
                     .map(|out| rebase::parse_list(&out))
                     .unwrap_or_default();
+                // 清单里的 pick 重放不了合并提交（见 fr_core::rebase）
+                let merges = commits.iter().filter(|c| c.parents > 1).count();
                 let problem = if !on_branch {
                     Some(tr("此提交不在当前分支上。请先切换到包含该提交的分支。").to_string())
                 } else if commits.is_empty() {
                     Some(tr("此提交之后没有其他提交，无需整理。").to_string())
+                } else if merges > 0 {
+                    Some(tf!(
+                        "此提交之后有 {merges} 个合并提交，整理时无法保留合并关系。请选择最后一次合并之后的提交。",
+                        merges
+                    ))
                 } else if commits.len() > MAX_COMMITS {
                     Some(tf!(
                         "此提交之后有 {n} 个提交，一次最多整理 {max} 个。请选择更近的提交。",
@@ -470,7 +459,6 @@ impl RepoView {
                         })
                         .collect(),
                     original,
-                    autostash,
                     problem: None,
                 });
                 window.open_dialog(cx, move |dialog, _, _| {
@@ -485,26 +473,31 @@ impl RepoView {
         .detach();
     }
 
+    /// `original` 是打开对话框时读到的那几个提交（新的在前，和 `git rev-list` 一样）：开始之前核对
+    /// 现在还是这几个。对话框开着时别处又提交了，清单里没有新的那个，原来照旧清单变基，它就从分支上
+    /// 掉了（reflog 里还找得到）。
     fn run_interactive_rebase(
         &mut self,
         base: String,
         items: Vec<Item>,
-        autostash: bool,
+        original: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut args = rebase::args(&base, &items);
-        if autostash {
-            // 选项放在起点前面
-            args.insert(args.len() - 1, "--autostash".into());
-        }
+        // 参数里总带着 --autostash：不按打开对话框时的状态决定，开着的这一会儿工作区可能变了
+        let step =
+            Step::input(rebase::args(&base), rebase::input(&items)).shown(rebase::shown(&base));
         let kept = items
             .iter()
             .filter(|item| matches!(item.action, Action::Pick | Action::Reword(_)))
             .count();
-        self.run_op(tr("变基"), args, None, window, cx, move |_, _, w, cx| {
-            let text = tf!("整理完成，该范围现有 {kept} 个提交", kept);
-            w.push_notification(Notification::success(text), cx);
+        let listed = vec!["rev-list".into(), format!("{base}..HEAD"), "--".into()];
+        let checks = vec![(listed, Some(original.join("\n")))];
+        self.verify_then(checks, window, cx, move |this, window, cx| {
+            this.run_seq(tr("变基"), vec![step], window, cx, move |_, _, w, cx| {
+                let text = tf!("整理完成，该范围现有 {kept} 个提交", kept);
+                w.push_notification(Notification::success(text), cx);
+            });
         });
     }
 }

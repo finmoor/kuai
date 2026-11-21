@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result, bail};
@@ -105,10 +106,6 @@ impl Uploads {
     fn begin(&mut self, params: &FilePut) -> Result<String> {
         let id = format!("u{}", self.next);
         self.next += 1;
-        let part_name = format!(
-            "{PARTIAL_PREFIX}{}-{id}{PARTIAL_SUFFIX}",
-            std::process::id()
-        );
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         let (part, dest) = match params.repo.is_empty() {
@@ -120,7 +117,7 @@ impl Uploads {
                     // 可能是截图、日志这类东西，只有本人能读
                     options.mode(0o600);
                 }
-                (self.dir.join(part_name), None)
+                (self.dir.clone(), None)
             }
             false => {
                 let target = fr_core::files::resolve_inside(&params.repo, &params.path)?;
@@ -133,14 +130,10 @@ impl Uploads {
                 let dir = target.parent().context("路径无效")?;
                 std::fs::create_dir_all(dir)
                     .with_context(|| format!("无法创建 {}", dir.display()))?;
-                (dir.join(part_name), Some((target, params.overwrite)))
+                (dir.to_path_buf(), Some((target, params.overwrite)))
             }
         };
-        // 上一个同进程号的进程剩下的：换掉
-        let _ = std::fs::remove_file(&part);
-        let file = options
-            .open(&part)
-            .with_context(|| format!("无法创建 {}", part.display()))?;
+        let (part, file) = create_part(&part, &options)?;
         self.open.insert(
             id.clone(),
             Upload {
@@ -155,6 +148,29 @@ impl Uploads {
     }
 }
 
+/// 没传完的文件的序号：整个常驻进程一份。原来用的是每条连接自己从 u1 数起的上传编号，两个客户端
+/// 同时往同一个目录传就撞名：后来的先删掉前一个正在写的文件再建，前一个传完时发布的是后一个的内容，
+/// 或者整个丢掉。
+static NEXT_PART: AtomicU64 = AtomicU64::new(1);
+
+/// 在 `dir` 里独占地建一个没传完的文件 `.kuai-<进程号>-<序号>.part`。名字已经有东西了（上一个同
+/// 进程号的进程剩下的）就换个序号，不删它：剩下的过一天由 [`sweep`] 清掉。
+fn create_part(dir: &Path, options: &OpenOptions) -> Result<(PathBuf, File)> {
+    for _ in 0..100 {
+        let seq = NEXT_PART.fetch_add(1, Ordering::Relaxed);
+        let part = dir.join(format!(
+            "{PARTIAL_PREFIX}{}-{seq}{PARTIAL_SUFFIX}",
+            std::process::id()
+        ));
+        match options.open(&part) {
+            Ok(file) => return Ok((part, file)),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err).with_context(|| format!("无法创建 {}", part.display())),
+        }
+    }
+    bail!("无法在 {} 里建临时文件", dir.display())
+}
+
 impl Upload {
     /// 传完了：给它起正式的名字，返回完整路径。重名的在后面加 -2、-3……
     fn finish(self, dir: &Path) -> Result<String> {
@@ -166,11 +182,8 @@ impl Upload {
                 // 再起一个名字指向同一个文件：传的这段时间里别人建了同名的，不盖掉它
                 false => std::fs::hard_link(&self.part, target).or_else(|err| match err.kind() {
                     ErrorKind::AlreadyExists => Err(err),
-                    // 这个文件系统不支持硬链接：改名
-                    _ if std::fs::symlink_metadata(target).is_err() => {
-                        std::fs::rename(&self.part, target)
-                    }
-                    _ => Err(err),
+                    // 这个文件系统不支持硬链接：用不覆盖的改名（一步完成，不是先看再改）
+                    _ => fr_core::files::rename_noreplace(&self.part, target),
                 }),
             };
             placed.with_context(|| format!("无法保存到 {shown}"))?;
@@ -331,7 +344,7 @@ pub(crate) mod tests {
     #[test]
     fn 文件名变成能直接贴进_shell_的() {
         assert_eq!(safe_name("截图 2026-11-12 (1).png"), "截图_2026-11-12__1_.png");
-        assert_eq!(safe_name(r"C:\Users\Feng\a b.txt"), "a_b.txt");
+        assert_eq!(safe_name(r"C:\Users\me\a b.txt"), "a_b.txt");
         assert_eq!(safe_name("/etc/../x'y\"z;$(rm).sh"), "x_y_z___rm_.sh");
         assert_eq!(safe_name("..hidden"), "hidden");
         assert_eq!(safe_name("-rf"), "rf");
@@ -398,6 +411,22 @@ pub(crate) mod tests {
             uploads.put(put, b"x").unwrap();
         }
         assert!(dir.names().contains(&"LICENSE-2".to_string()));
+    }
+
+    #[test]
+    fn 两个客户端同时往同一个目录传_各是各的() {
+        let dir = TempDir::new();
+        // 两条连接各有一份，上传编号都从 u1 起
+        let (mut one, mut two) = (Uploads::new(dir.0.clone()), Uploads::new(dir.0.clone()));
+        let a = one.put(first("a.txt"), b"from ").unwrap();
+        let b = two.put(first("b.txt"), b"other ").unwrap();
+        assert_eq!(a.upload, b.upload, "编号一样");
+        assert_eq!(dir.names().len(), 2, "没传完的文件不是同一个");
+        let a = one.put(more(&a.upload, true), b"one").unwrap();
+        let b = two.put(more(&b.upload, true), b"two").unwrap();
+        assert_eq!(std::fs::read(a.path.unwrap()).unwrap(), b"from one");
+        assert_eq!(std::fs::read(b.path.unwrap()).unwrap(), b"other two");
+        assert_eq!(dir.names(), ["a.txt", "b.txt"]);
     }
 
     #[test]

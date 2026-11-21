@@ -203,7 +203,7 @@ mod imp {
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
     use std::ptr::{null, null_mut};
     use std::sync::mpsc::sync_channel;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use futures::channel::mpsc::UnboundedSender;
 
@@ -225,6 +225,14 @@ mod imp {
             attributes: *const c_void,
         ) -> *mut c_void;
         fn ConnectNamedPipe(pipe: *mut c_void, overlapped: *mut c_void) -> i32;
+        fn PeekNamedPipe(
+            pipe: *mut c_void,
+            buffer: *mut c_void,
+            size: u32,
+            read: *mut u32,
+            available: *mut u32,
+            left: *mut u32,
+        ) -> i32;
         fn GetNamedPipeServerProcessId(pipe: *mut c_void, pid: *mut u32) -> i32;
         fn ProcessIdToSessionId(pid: u32, session: *mut u32) -> i32;
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
@@ -248,6 +256,9 @@ mod imp {
     const MB_ICONWARNING: u32 = 0x30;
     /// 一条请求最长这么多字节（一个路径用不了这么多）
     const MAX_REQUEST: usize = 64 * 1024;
+    /// 连上来以后最多等这么久把请求说完、等这么久把回答读走：连上来不说话、不读的占不住线程和管道实例
+    const READ_LIMIT: Duration = Duration::from_secs(3);
+    const REPLY_LIMIT: Duration = Duration::from_secs(3);
 
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain([0]).collect()
@@ -299,6 +310,7 @@ mod imp {
             .name("kuai-instance".into())
             .spawn(move || {
                 let mut mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE;
+                let mut retry = Duration::from_millis(500);
                 while !tx.is_closed() {
                     // SAFETY：名字以 0 结尾；返回的句柄交给 File 管
                     let pipe = unsafe {
@@ -313,10 +325,15 @@ mod imp {
                             null(),
                         )
                     };
+                    // 建不出来（实例暂时用完了之类）：歇一会儿再建。原来就此不守了，之后再启动的
+                    // Kuai 都交不过来
                     if pipe == INVALID_HANDLE_VALUE {
                         log::warn!("无法创建管道：{}", std::io::Error::last_os_error());
-                        return;
+                        std::thread::sleep(retry);
+                        retry = (retry * 2).min(Duration::from_secs(30));
+                        continue;
                     }
+                    retry = Duration::from_millis(500);
                     mode = PIPE_ACCESS_DUPLEX;
                     // SAFETY：pipe 是刚建的、有效的句柄
                     let connected = unsafe {
@@ -336,16 +353,61 @@ mod imp {
         }
     }
 
-    /// 读一条请求，交给界面线程，等它处理完再回一个字节。
-    fn serve(mut file: File, tx: UnboundedSender<Incoming>) {
+    /// 管道里有几个字节可以读；对方已经断开时是 None。管道是同步的，`read` 没有期限：先问一声，
+    /// 有了才读。
+    fn available(file: &File) -> Option<u32> {
+        let mut available = 0u32;
+        // SAFETY：句柄是有效的管道；只拿可读的字节数，不读走
+        let ok = unsafe {
+            PeekNamedPipe(
+                file.as_raw_handle(),
+                null_mut(),
+                0,
+                null_mut(),
+                &mut available,
+                null_mut(),
+            )
+        };
+        (ok != 0).then_some(available)
+    }
+
+    /// 读一条请求（到换行为止），最多等 [`READ_LIMIT`]。
+    fn read_request(file: &mut File) -> Vec<u8> {
+        let deadline = Instant::now() + READ_LIMIT;
         let mut buf = Vec::new();
         let mut chunk = [0u8; 1024];
         while !buf.contains(&b'\n') && buf.len() < MAX_REQUEST {
-            match file.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            match available(file) {
+                None => break,
+                Some(0) if Instant::now() >= deadline => break,
+                Some(0) => std::thread::sleep(Duration::from_millis(10)),
+                Some(count) => {
+                    let want = (count as usize).min(chunk.len());
+                    match file.read(&mut chunk[..want]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => buf.extend_from_slice(&chunk[..read]),
+                    }
+                }
             }
         }
+        buf
+    }
+
+    /// 回一个字节，等对方读走（它读完就关）再返回，最多等 [`REPLY_LIMIT`]：先关的话没读的会被丢掉。
+    /// 原来用 FlushFileBuffers 等，对方一直不读就一直等。
+    fn reply(file: &mut File) {
+        if file.write_all(b"1").is_err() {
+            return;
+        }
+        let deadline = Instant::now() + REPLY_LIMIT;
+        while available(file).is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// 读一条请求，交给界面线程，等它处理完再回一个字节。
+    fn serve(mut file: File, tx: UnboundedSender<Incoming>) {
+        let buf = read_request(&mut file);
         let line = buf.split(|byte| *byte == b'\n').next().unwrap_or_default();
         let Ok(request) = serde_json::from_slice::<Request>(line) else {
             return;
@@ -353,8 +415,7 @@ mod imp {
         // kuaid 的转接程序请我们拉起常驻进程：就在这个线程上办，用不着界面
         if let Some(exe) = &request.daemon {
             if super::start_daemon(exe, request.resume.as_deref()) {
-                let _ = file.write_all(b"1");
-                let _ = file.sync_all();
+                reply(&mut file);
             }
             return;
         }
@@ -364,9 +425,7 @@ mod imp {
         }
         // 界面线程卡住或者正在退出时不回：那边会再试，等这个进程退出以后自己接手
         if handled.recv_timeout(Duration::from_secs(3)).is_ok() {
-            let _ = file.write_all(b"1");
-            // 等对方读走再关，不然没读的数据会被丢掉
-            let _ = file.sync_all();
+            reply(&mut file);
         }
     }
 
@@ -447,13 +506,54 @@ mod imp {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn 管道一来一回_连上不说话的挡不住别人() {
+        use futures::StreamExt as _;
+        let key = format!("test-{}", std::process::id());
+        let (tx, mut rx) = mpsc::unbounded();
+        imp::listen(&key, tx);
+        // 界面那头：收到就算处理完
+        std::thread::spawn(move || {
+            while let Some(incoming) = futures::executor::block_on(rx.next()) {
+                let _ = incoming.done.send(());
+            }
+        });
+        let name = imp::pipe_name(&key).unwrap();
+        // 一个连上来不说话的（原来它占着的线程一直读下去）
+        let started = Instant::now();
+        let silent = loop {
+            match std::fs::File::options().read(true).write(true).open(&name) {
+                Ok(file) => break file,
+                Err(_) if started.elapsed() < Duration::from_secs(5) => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(err) => panic!("连不上管道：{err}"),
+            }
+        };
+        // 另一个照样交得过去：守管道的线程接着建下一个实例
+        let request = Request {
+            show: true,
+            ..Default::default()
+        };
+        let forwarded = (0..100).any(|_| {
+            let done = imp::forward(&key, &request);
+            if !done {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            done
+        });
+        assert!(forwarded);
+        drop(silent);
+    }
+
     #[test]
     fn 设置文件路径不分大小写() {
         let a = key(std::path::Path::new(
-            r"C:\Users\Feng\AppData\Roaming\kuai\settings.json",
+            r"C:\Users\me\AppData\Roaming\kuai\settings.json",
         ));
         let b = key(std::path::Path::new(
-            r"c:\users\feng\appdata\roaming\KUAI\settings.json",
+            r"c:\users\me\appdata\roaming\KUAI\settings.json",
         ));
         let c = key(std::path::Path::new(r"C:\Temp\test-settings.json"));
         assert_eq!(a, b);
@@ -492,9 +592,9 @@ mod tests {
         use super::same_path;
         use std::path::Path;
         let same = |a: &str, b: &str| same_path(Path::new(a), Path::new(b));
-        assert!(same(r"C:\Users\Feng\.kuai", "c:/users/feng/.kuai/"));
-        assert!(same(r"\\?\C:\Users\Feng\.kuai", r"C:\Users\Feng\.kuai"));
-        assert!(!same(r"C:\Users\Feng\.kuai", r"C:\Users\Feng\.kuai2"));
+        assert!(same(r"C:\Users\me\.kuai", "c:/users/me/.kuai/"));
+        assert!(same(r"\\?\C:\Users\me\.kuai", r"C:\Users\me\.kuai"));
+        assert!(!same(r"C:\Users\me\.kuai", r"C:\Users\me\.kuai2"));
         // 带 .. 的不认：绕出去再绕回来也不行
         assert!(!same(r"C:\a\..\a", r"C:\a\..\a"));
     }

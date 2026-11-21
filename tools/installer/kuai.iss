@@ -73,8 +73,8 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 Name: "zh"; MessagesFile: "ChineseSimplified.isl"
 
 [CustomMessages]
-en.ForgetPasswords=Also delete the server passwords and key passphrases Kuai saved in Windows Credential Manager?
-zh.ForgetPasswords=是否同时删除 Kuai 保存在 Windows 凭据管理器中的服务器密码和私钥口令？
+en.ForgetPasswords=Also delete the host passwords and key passphrases Kuai saved in Windows Credential Manager?
+zh.ForgetPasswords=是否同时删除 Kuai 保存在 Windows 凭据管理器中的主机密码和私钥口令？
 en.CloseKuai=Kuai is running. Quit Kuai (including from the system tray), then click Retry.
 zh.CloseKuai=Kuai 正在运行。请先退出 Kuai（包括托盘中的 Kuai），然后点击「重试」。
 

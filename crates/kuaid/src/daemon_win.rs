@@ -118,13 +118,18 @@ fn greeting(token: &str) -> String {
     format!("KUAID {token}\n")
 }
 
-/// 读连接开头的那一行，对上口令才算数。一个字节一个字节地读：后面的字节是协议的。
+/// 读连接开头的那一行，对上口令才算数。一个字节一个字节地读：后面的字节是协议的。整行共用
+/// 一个期限：读超时管的只是一次读，一个字节一个字节慢慢发的能把线程一直占着。
 fn greeted(stream: &mut TcpStream, token: &str) -> bool {
-    let _ = stream.set_read_timeout(Some(GREETING_WAIT));
     let expected = greeting(token);
+    let deadline = Instant::now() + GREETING_WAIT;
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     while line.len() <= expected.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            return false;
+        }
         match stream.read(&mut byte) {
             Ok(1) => {
                 line.push(byte[0]);
@@ -206,8 +211,16 @@ impl Control for Daemon {
         }
         log(&format!("升级：替换为 {}", exe.display()));
         shared.kill_git();
-        // 从这里起托管进程不再发输出：程序写的东西留在它们手里，新程序连上去接着收
-        shared.terms.pause_all();
+        // 不再开新的终端，正在开的开完（暂停、拍快照都包括它）
+        shared.terms.hold_opens();
+        // 从这里起托管进程不再发输出：程序写的东西留在它们手里，新程序连上去接着收。有一个没
+        // 确认停下就不换：交接出去的屏幕会缺一段
+        if !shared.terms.pause_all() {
+            shared.terms.release_opens();
+            self.upgrading.store(false, Ordering::Release);
+            log("升级失败：终端托管进程没有确认暂停");
+            return anyhow!("终端托管进程没有确认暂停，未升级");
+        }
         let (next_term, frozen) = shared.terms.freeze();
         let path = self.paths.handoff();
         let started = write_handoff(&path, &self.host_token, next_term, &frozen).and_then(|()| {
@@ -230,6 +243,7 @@ impl Control for Daemon {
             Err(failed) => {
                 let _ = std::fs::remove_file(&path);
                 shared.terms.resume_all();
+                shared.terms.release_opens();
                 self.upgrading.store(false, Ordering::Release);
                 log(&format!("升级失败：{failed:#}"));
                 failed
@@ -239,12 +253,8 @@ impl Control for Daemon {
 
     fn shutdown(&self, shared: &Shared) -> ! {
         log("收到退出请求");
-        shared.terms.close_all();
-        // 等终端里的程序退出
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while shared.terms.alive() > 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        // 等终端里的程序退出，不理的等它被强杀
+        shared.terms.close_all(Duration::from_secs(3));
         self.paths.clear();
         log("退出");
         std::process::exit(0);
@@ -371,13 +381,20 @@ pub fn run(resume: Option<&str>) -> Result<()> {
                 continue;
             }
         };
+        // 还没对上口令的连接太多：新来的直接断开（本机别的用户也连得到这个端口）
+        if GREETING.fetch_add(1, Ordering::AcqRel) >= MAX_GREETING {
+            GREETING.fetch_sub(1, Ordering::AcqRel);
+            continue;
+        }
         let (shared, token) = (shared.clone(), token.clone());
         let spawned = std::thread::Builder::new()
             .name("kuaid-conn".into())
             .spawn(move || {
                 let _ = stream.set_nodelay(true);
                 // 本机上别的用户也连得到这个端口：口令不对的不理
-                if !greeted(&mut stream, &token) {
+                let ok = greeted(&mut stream, &token);
+                GREETING.fetch_sub(1, Ordering::AcqRel);
+                if !ok {
                     return;
                 }
                 match stream.try_clone() {
@@ -386,11 +403,16 @@ pub fn run(resume: Option<&str>) -> Result<()> {
                 }
             });
         if let Err(err) = spawned {
+            GREETING.fetch_sub(1, Ordering::AcqRel);
             log(&format!("无法创建线程：{err}"));
         }
     }
     Ok(())
 }
+
+/// 正在读开头那一行（还没对上口令）的连接有几个；最多 [`MAX_GREETING`] 个。
+static GREETING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const MAX_GREETING: usize = 16;
 
 /// 独占打开锁文件：开着就是锁着，进程一结束系统自己放开。已经被别的常驻进程拿着时返回 None。
 fn try_lock(paths: &Paths) -> Option<File> {

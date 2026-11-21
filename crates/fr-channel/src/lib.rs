@@ -22,7 +22,7 @@ use fr_core::tf;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -77,6 +77,17 @@ pub enum StreamItem {
     Done(GitOutput),
 }
 
+/// 取消 [`Channel::git_cancellable`] 起的 git：杀掉它，请求的 future 照样等到它真的退出才完成
+/// （丢弃 future 也能取消，但不知道那边什么时候停下）。
+#[derive(Clone)]
+pub struct GitCancel(Arc<dyn Fn() + Send + Sync>);
+
+impl GitCancel {
+    pub fn cancel(&self) {
+        (self.0)()
+    }
+}
+
 /// git 的流式输出。丢弃时取消。
 pub struct GitStream {
     rx: mpsc::UnboundedReceiver<Result<StreamItem>>,
@@ -92,7 +103,7 @@ impl Stream for GitStream {
 }
 
 /// 仓库的变化通知：工作区的文件、HEAD、暂存区或引用变了就来一项，不带内容。丢弃时停止监听。
-/// 监听装不上或者连接断了，流就结束。
+/// 监听装不上、仓库目录被删掉或换成了另一个、连接断了，流就结束。
 pub struct ChangeStream {
     rx: mpsc::UnboundedReceiver<()>,
     _cancel: Box<dyn Send>,
@@ -114,11 +125,52 @@ pub enum TermItem {
     Output(Vec<u8>),
     /// 程序结束了：退出码
     Exited(Option<i32>),
+    /// 取得太慢，积着没取走的输出超过了 [`TERM_BACKLOG`]：流到此为止，已经不从 kuaid 收了，积着的
+    /// 也不要了。里面的程序接着跑，要接着看就按编号重新接（kuaid 先给一份现在的屏幕）
+    Lagging,
 }
 
-/// 一个终端的输出。丢弃时从终端上断开，里面的程序接着跑。连接断了，流以一个错误结束。
+/// 一个终端流里积着、还没取走的输出最多这么多字节，再多就不收了（见 [`TermItem::Lagging`]）。比接上
+/// 时还原屏幕的那一段（往回翻的 2000 行连同样式）大得多：不会刚接上就因为它又落后
+pub const TERM_BACKLOG: usize = 64 << 20;
+
+/// 终端流里积着、还没取走的输出有多少（见 [`TERM_BACKLOG`]）：收的线程记上，取走时减掉。
+#[derive(Default)]
+pub(crate) struct Backlog {
+    bytes: AtomicUsize,
+    lagging: AtomicBool,
+}
+
+impl Backlog {
+    /// 收到了 `len` 字节输出：加上它没超过上限就记上，返回 true；超过了就记下落后了，返回 false，
+    /// 之后也都是 false。
+    pub(crate) fn add(&self, len: usize) -> bool {
+        if self.lagging() {
+            return false;
+        }
+        if self.bytes.fetch_add(len, Ordering::AcqRel) + len > TERM_BACKLOG {
+            self.lagging.store(true, Ordering::Release);
+            return false;
+        }
+        true
+    }
+
+    fn take(&self, len: usize) {
+        self.bytes.fetch_sub(len, Ordering::AcqRel);
+    }
+
+    fn lagging(&self) -> bool {
+        self.lagging.load(Ordering::Acquire)
+    }
+}
+
+/// 一个终端的输出。丢弃时从终端上断开，里面的程序接着跑。连接断了，流以一个错误结束；取得太慢，
+/// 以 [`TermItem::Lagging`] 结束。
 pub struct TermStream {
     rx: mpsc::UnboundedReceiver<Result<TermItem>>,
+    backlog: Arc<Backlog>,
+    /// [`TermItem::Lagging`] 给出去了，之后什么都没有
+    ended: bool,
     _cancel: Box<dyn Send>,
 }
 
@@ -126,7 +178,21 @@ impl Stream for TermStream {
     type Item = Result<TermItem>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.rx).poll_next(cx)
+        if self.ended {
+            return Poll::Ready(None);
+        }
+        // 落后了：积着的不用再取（重新接时 kuaid 给的是现在的屏幕）
+        if self.backlog.lagging() {
+            self.ended = true;
+            return Poll::Ready(Some(Ok(TermItem::Lagging)));
+        }
+        let item = std::task::ready!(Pin::new(&mut self.rx).poll_next(cx));
+        match &item {
+            Some(Ok(TermItem::Output(bytes))) => self.backlog.take(bytes.len()),
+            Some(Ok(TermItem::Lagging)) => self.ended = true,
+            _ => {}
+        }
+        Poll::Ready(item)
     }
 }
 
@@ -341,10 +407,20 @@ impl Drop for SavedSecret {
 }
 
 /// 这次提问能不能用存着的密码、口令回答：标记对得上、问的正是存的那一种、还没答过。
+///
+/// 私钥口令只答 ssh 自己解私钥时的那一句（`Enter passphrase for key '…'`）。带着存着的口令的 ssh
+/// 只用公钥认证（见 `remote::login`），服务器没法在键盘交互认证里问一句像这样的话骗走它；
+/// OpenSSH 8.3 起服务器问的话前面还都带「(用户@主机)」，开头也对不上。
 fn saved_answer(tag: Option<&str>, prompt: &str) -> Option<String> {
     let mut saved = SAVED.lock().unwrap();
     let entry = saved.get_mut(tag?)?;
-    if entry.used || entry.kind != fr_core::askpass::prompt_kind(prompt) {
+    let kind = fr_core::askpass::prompt_kind(prompt);
+    if entry.used || entry.kind != kind {
+        return None;
+    }
+    if kind == fr_core::askpass::PromptKind::Passphrase
+        && !prompt.trim_start().starts_with("Enter passphrase for key")
+    {
         return None;
     }
     let secret = entry.secret.clone()?;
@@ -375,6 +451,19 @@ impl Channel {
     /// 在仓库里执行 git，收齐输出。
     pub fn git(&self, repo: &str, args: Vec<String>) -> BoxFuture<'static, Result<GitOutput>> {
         self.git_with_input(repo, args, None)
+    }
+
+    /// 同 [`Self::git`]，另外给一个 [`GitCancel`]：取消以后 future 等 git 真的退出了才完成，
+    /// 接着做的事不会和它同时改仓库。
+    pub fn git_cancellable(
+        &self,
+        repo: &str,
+        args: Vec<String>,
+    ) -> (BoxFuture<'static, Result<GitOutput>>, GitCancel) {
+        match self {
+            Channel::Local => local::git_cancellable(repo, args),
+            Channel::Remote(conn) => conn.git_cancellable(repo, args),
+        }
     }
 
     /// 同 [`Self::git`]，`stdin` 写进 git 的标准输入（补丁、提交信息等）。
@@ -434,6 +523,14 @@ impl Channel {
         }
     }
 
+    /// 跑 git 的那台电脑上 git 的版本号（主机上的握手时 kuaid 报过）；认不出是 None。
+    pub fn git_version(&self) -> Option<(u32, u32, u32)> {
+        match self {
+            Channel::Local => fr_core::git::local_version(),
+            Channel::Remote(conn) => fr_core::git::parse_version(&conn.hello.git),
+        }
+    }
+
     /// 仓库目录里面还有哪些仓库（相对仓库根的路径），见 [`fr_core::files::find_repos`]。
     pub fn fs_repos(&self, repo: &str) -> BoxFuture<'static, Result<SubRepos>> {
         match self {
@@ -456,7 +553,7 @@ impl Channel {
         }
     }
 
-    /// 读出整个文件。比 `limit` 大的不读完：返回的字节数少于 [`FsStat::size`]，调用方看大小决定怎么办。
+    /// 读出整个文件。比 `limit` 大的不读：字节是空的，调用方看 [`FsStat::size`] 决定怎么办。
     pub fn fs_open(
         &self,
         repo: &str,
@@ -466,7 +563,7 @@ impl Channel {
         let (channel, repo, path) = (self.clone(), repo.to_string(), path.to_string());
         async move {
             let first = limit.min(fr_core::files::READ_MAX);
-            let (stat, mut bytes) = channel.fs_read(&repo, &path, 0, first).await?;
+            let (stat, mut bytes) = channel.fs_read(&repo, &path, 0, first, Some(limit)).await?;
             if stat.size > limit {
                 return Ok((stat, bytes));
             }
@@ -474,7 +571,7 @@ impl Channel {
             while (bytes.len() as u64) < stat.size && (bytes.len() as u64) < limit {
                 let rest = limit - bytes.len() as u64;
                 let (_, more) = channel
-                    .fs_read(&repo, &path, bytes.len() as u64, rest)
+                    .fs_read(&repo, &path, bytes.len() as u64, rest, None)
                     .await?;
                 if more.is_empty() {
                     break;
@@ -486,20 +583,22 @@ impl Channel {
         .boxed()
     }
 
-    /// 从 `offset` 起读最多 `len` 字节（一次不超过 `fr_core::files::READ_MAX`）。
+    /// 从 `offset` 起读最多 `len` 字节（一次不超过 `fr_core::files::READ_MAX`）。给了 `whole`
+    /// 而文件比它大时不读，字节是空的（见 [`fr_core::files::read`]）。
     pub fn fs_read(
         &self,
         repo: &str,
         path: &str,
         offset: u64,
         len: u64,
+        whole: Option<u64>,
     ) -> BoxFuture<'static, Result<(FsStat, Vec<u8>)>> {
         match self {
             Channel::Local => {
                 let (repo, path) = (repo.to_string(), path.to_string());
-                local::blocking(move || fr_core::files::read(&repo, &path, offset, len))
+                local::blocking(move || fr_core::files::read(&repo, &path, offset, len, whole))
             }
-            Channel::Remote(conn) => conn.fs_read(repo, path, offset, len),
+            Channel::Remote(conn) => conn.fs_read(repo, path, offset, len, whole),
         }
     }
 
@@ -609,6 +708,20 @@ impl Channel {
         }
     }
 
+    /// 把文件刷到磁盘上（见 [`fr_core::files::sync`]）。
+    pub fn fs_sync(&self, repo: &str, path: &str) -> BoxFuture<'static, Result<FsStat>> {
+        match self {
+            Channel::Local => {
+                let (repo, path) = (repo.to_string(), path.to_string());
+                local::blocking(move || fr_core::files::sync(&repo, &path))
+            }
+            Channel::Remote(conn) => {
+                let params = json!({ "repo": repo, "path": path });
+                conn.fs_call("fs_sync", params, Vec::new())
+            }
+        }
+    }
+
     /// 改文件的修改时间（1970 年起的毫秒数）。
     pub fn fs_touch(
         &self,
@@ -705,6 +818,52 @@ impl Channel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt as _;
+
+    #[test]
+    fn 终端流积着的输出超过上限就不收了_积着的也不再取() {
+        // 取走的不算积着的：一直有人取，来多少都收
+        let backlog = Backlog::default();
+        for _ in 0..3 {
+            assert!(backlog.add(TERM_BACKLOG / 2));
+            backlog.take(TERM_BACKLOG / 2);
+        }
+        // 没人取：积过上限就不收了，取走了也不再收
+        assert!(backlog.add(TERM_BACKLOG / 2));
+        assert!(backlog.add(TERM_BACKLOG / 2));
+        assert!(!backlog.add(1));
+        backlog.take(TERM_BACKLOG);
+        assert!(!backlog.add(1));
+
+        // 流：积着的一块块给，给了就不算积着的；落后以后积着的不再给，说一声落后了，然后结束
+        let backlog = Arc::new(Backlog::default());
+        let (tx, rx) = mpsc::unbounded();
+        let mut stream = TermStream {
+            rx,
+            backlog: backlog.clone(),
+            ended: false,
+            _cancel: Box::new(()),
+        };
+        // 收的线程做的事（见 remote.rs 的 dispatch）：没过上限就放进去，过了放一个 Lagging 叫醒取的那一头
+        let deliver = |len: usize| {
+            let added = backlog.add(len);
+            let item = match added {
+                true => TermItem::Output(vec![b'x'; len]),
+                false => TermItem::Lagging,
+            };
+            tx.unbounded_send(Ok(item)).unwrap();
+            added
+        };
+        let next = |stream: &mut TermStream| futures::executor::block_on(stream.next());
+        assert!(deliver(10) && deliver(20));
+        assert!(
+            matches!(next(&mut stream), Some(Ok(TermItem::Output(bytes))) if bytes.len() == 10)
+        );
+        assert_eq!(backlog.bytes.load(Ordering::Acquire), 20);
+        assert!(!deliver(TERM_BACKLOG));
+        assert!(matches!(next(&mut stream), Some(Ok(TermItem::Lagging))));
+        assert!(next(&mut stream).is_none());
+    }
 
     #[test]
     fn 存着的密码只答一次_只答问对的那一种() {
@@ -728,6 +887,15 @@ mod tests {
         let passphrase = SavedSecret::register("pp", PromptKind::Passphrase);
         let tag = passphrase.tag().to_string();
         assert_eq!(saved_answer(Some(&tag), "u@h's password: "), None);
+        // 服务器在键盘交互认证里问的（前面带着「(用户@主机)」）：不是 ssh 自己解私钥，不答
+        assert_eq!(
+            saved_answer(Some(&tag), "(u@h) Enter passphrase for key 'k': "),
+            None
+        );
+        assert_eq!(
+            saved_answer(Some(&tag), "(u@h) Verification passphrase: "),
+            None
+        );
         assert_eq!(
             saved_answer(Some(&tag), passphrase_prompt).as_deref(),
             Some("pp")

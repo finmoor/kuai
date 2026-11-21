@@ -12,9 +12,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use fr_channel::Channel;
+use fr_channel::{Channel, GitStream, StreamItem};
 use fr_core::i18n::tr;
 use fr_core::tf;
+use futures::StreamExt as _;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState, SliderValue};
@@ -22,8 +23,9 @@ use gpui_kit::component::{ActiveTheme as _, Selectable as _, Sizable as _, h_fle
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use super::files::{Class, IMAGE_LIMIT, classify, human_size};
+use super::files::{Class, IMAGE_LIMIT, classify};
 use crate::app_state::AppState;
+use crate::text::human_size;
 use crate::ui;
 
 /// 一边的图从哪取。
@@ -88,6 +90,8 @@ enum Side {
     Absent,
     Loading,
     Ready(Pane),
+    /// 超过 [`IMAGE_LIMIT`]，不显示；知道多大的话带着大小
+    TooLarge(Option<u64>),
     Failed(SharedString),
 }
 
@@ -228,13 +232,17 @@ impl ImageDiff {
         let theme = cx.theme();
         let (muted, border) = (theme.muted_foreground, theme.border);
         let describe = |side: &Side| -> Option<String> {
-            let pane = side.pane()?;
-            Some(match pane.size {
-                Some((width, height)) => {
-                    format!("{width} × {height} · {}", human_size(pane.bytes))
-                }
-                None => human_size(pane.bytes),
-            })
+            match side {
+                Side::Ready(pane) => Some(match pane.size {
+                    Some((width, height)) => {
+                        format!("{width} × {height} · {}", human_size(pane.bytes))
+                    }
+                    None => human_size(pane.bytes),
+                }),
+                Side::TooLarge(Some(bytes)) => Some(human_size(*bytes)),
+                Side::TooLarge(None) => Some(tf!("超过 {limit}", limit = human_size(IMAGE_LIMIT))),
+                _ => None,
+            }
         };
         let info: SharedString = match (describe(&self.old), describe(&self.new)) {
             (Some(old), Some(new)) if old == new => tf!("两边都是 {size}", size = old).into(),
@@ -318,6 +326,41 @@ impl ImageDiff {
                             .max_h_full()
                             .object_fit(ObjectFit::ScaleDown),
                     ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(label),
+            )
+            .into_any_element()
+    }
+
+    /// 超过上限、不显示的那一边：和图一样的框，里面一句灰字。
+    fn too_large(&self, label: &'static str, cx: &App) -> AnyElement {
+        let theme = cx.theme();
+        let text = tf!(
+            "图片超过 {limit}，不在此处显示",
+            limit = human_size(IMAGE_LIMIT)
+        );
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .items_center()
+            .justify_center()
+            .gap(px(8.))
+            .child(
+                div()
+                    .p(px(16.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .whitespace_normal()
+                    .child(text),
             )
             .child(
                 div()
@@ -485,6 +528,23 @@ impl Render for ImageDiff {
                 .child(self.framed(new, tr("新增的图片"), cx))
                 .into_any_element(),
             (Side::Absent, Side::Absent) => message(tr("没有可显示的图片").into(), muted),
+            // 有一边超过上限（另一边是图、也超过上限，或者没有）：能显示的照常显示
+            (old, new) => {
+                let mut row = h_flex().size_full().p(px(16.)).gap(px(16.));
+                let one = matches!(old, Side::Absent) || matches!(new, Side::Absent);
+                for (side, label, alone) in [
+                    (old, tr("旧"), tr("已删除的图片")),
+                    (new, tr("新"), tr("新增的图片")),
+                ] {
+                    let label = if one { alone } else { label };
+                    row = match side {
+                        Side::Ready(pane) => row.child(self.framed(pane, label, cx)),
+                        Side::TooLarge(_) => row.child(self.too_large(label, cx)),
+                        _ => row,
+                    };
+                }
+                row.into_any_element()
+            }
         };
         let room = self.room.clone();
         let view = cx.entity().downgrade();
@@ -522,29 +582,21 @@ async fn load_side(channel: &Channel, repo: &str, source: Option<&Source>) -> Si
         return Side::Absent;
     };
     let failed = |err: String| Side::Failed(tf!("读取图片失败：{err}", err).into());
-    let too_large = || {
-        Side::Failed(
-            tf!(
-                "图片超过 {size}，不在此处显示",
-                size = human_size(IMAGE_LIMIT)
-            )
-            .into(),
-        )
-    };
     let bytes = match blob_args(source) {
-        Some(args) => match channel.git(repo, args).await {
-            Ok(out) if out.success() => out.stdout,
-            Ok(out) => return failed(out.stderr),
-            Err(err) => return failed(format!("{err:#}")),
+        // 边收边数，过了上限就不收了：LFS 展开的大文件不整个传过来、放进内存
+        Some(args) => match read_limited(channel.git_stream(repo, args), IMAGE_LIMIT).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Side::TooLarge(blob_size(channel, repo, source).await),
+            Err(err) => return failed(err),
         },
         None => match channel.fs_open(repo, &source.path, IMAGE_LIMIT).await {
-            Ok((stat, _)) if stat.size > IMAGE_LIMIT => return too_large(),
+            Ok((stat, _)) if stat.size > IMAGE_LIMIT => return Side::TooLarge(Some(stat.size)),
             Ok((_, bytes)) => bytes,
             Err(err) => return failed(format!("{err:#}")),
         },
     };
     if bytes.len() as u64 > IMAGE_LIMIT {
-        return too_large();
+        return Side::TooLarge(Some(bytes.len() as u64));
     }
     let Some(format) = image_format(&source.path) else {
         return failed(tr("不是图片文件").into());
@@ -560,9 +612,41 @@ async fn load_side(channel: &Channel, repo: &str, source: Option<&Source>) -> Si
     })
 }
 
+/// 超过上限的那个版本有多大（`git cat-file -s`）。LFS 管着的图，git 里存的是一小段指针，
+/// 量出来比上限小，说明不了展开后多大，这时不写大小。
+async fn blob_size(channel: &Channel, repo: &str, source: &Source) -> Option<u64> {
+    let mut args = blob_args(source)?;
+    // cat-file --filters <对象> 换成 cat-file -s <对象>
+    args[1] = "-s".into();
+    let out = channel.git(repo, args).await.ok()?;
+    let size: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    (out.success() && size > IMAGE_LIMIT).then_some(size)
+}
+
+/// 收 git 的标准输出，最多 `limit` 个字节；超过了是 `Ok(None)`，流跟着丢掉，git 进程就被取消。
+async fn read_limited(mut stream: GitStream, limit: u64) -> Result<Option<Vec<u8>>, String> {
+    let mut bytes = Vec::new();
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(StreamItem::Chunk(chunk)) => {
+                if (bytes.len() + chunk.len()) as u64 > limit {
+                    return Ok(None);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(StreamItem::Progress(_)) => {}
+            Ok(StreamItem::Done(out)) if out.success() => return Ok(Some(bytes)),
+            Ok(StreamItem::Done(out)) => return Err(out.stderr),
+            Err(err) => return Err(format!("{err:#}")),
+        }
+    }
+    Err(tr("连接中断").into())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Blob, Source, blob_args, is_image};
+    use super::{Blob, Source, blob_args, is_image, read_limited};
+    use fr_channel::Channel;
 
     #[test]
     fn 哪些文件按图片对比() {
@@ -587,5 +671,27 @@ mod tests {
             Some("cat-file --filters :a b/图.png")
         );
         assert_eq!(args(Blob::Worktree), None);
+    }
+
+    #[test]
+    fn 取图过了上限就不收了() {
+        let dir = std::env::temp_dir().join(format!("fr-image-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| fr_core::git::run(&dir, args).unwrap();
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("big.png"), vec![7u8; 300 * 1024]).unwrap();
+        git(&["add", "big.png"]);
+        let repo = dir.to_string_lossy().to_string();
+        let read = |limit: u64| {
+            let args = blob_args(&Source::new(Blob::Index, "big.png")).unwrap();
+            futures::executor::block_on(read_limited(Channel::Local.git_stream(&repo, args), limit))
+        };
+        assert_eq!(read(100 * 1024), Ok(None));
+        assert_eq!(
+            read(1024 * 1024).unwrap().map(|bytes| bytes.len()),
+            Some(300 * 1024)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -364,9 +364,10 @@ impl RepoView {
                         )
                     }),
             )
-            // 省略前面：结尾才认得出是哪个目录。缩进放在外面一层：`clipped` 拿自己的宽度和文字比
+            // 省略前面：结尾才认得出是哪个目录。和名字对齐（图标 14、空 6）；缩进放在外面一层：
+            // `clipped` 拿自己的宽度和文字比
             .child(
-                div().pl(px(22.)).min_w_0().child(
+                div().pl(px(20.)).min_w_0().child(
                     ui::clipped_with_tip(("tree-dir", ix), place, full)
                         .text_ellipsis_start()
                         .text_size(px(11.))
@@ -1150,13 +1151,14 @@ impl RepoView {
         let Some(channel) = self.channel.clone() else {
             return;
         };
-        let read = channel.git(&self.entry.path, worktree::list_args());
+        let nul = worktree::has_nul(channel.git_version());
+        let read = channel.git(&self.entry.path, worktree::list_args(nul));
         self.worktrees.open_task = Some(cx.spawn_in(window, async move |this, cx| {
             let Ok(out) = read.await.and_then(|out| out.ok()) else {
                 return;
             };
             this.update_in(cx, |this, window, cx| {
-                this.set_worktrees(worktree::parse(&out), cx);
+                this.set_worktrees(worktree::parse(&out, nul), cx);
                 let made = this
                     .worktrees
                     .list

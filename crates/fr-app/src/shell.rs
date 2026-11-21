@@ -18,6 +18,8 @@ use crate::terminal::{Launch, LocalLaunch};
 
 /// CREATE_NO_WINDOW：不弹出控制台窗口
 const NO_WINDOW: u32 = 0x0800_0000;
+/// CREATE_NEW_CONSOLE：开在一个新的控制台窗口里（没有 Windows Terminal 时的终端）
+const NEW_CONSOLE: u32 = 0x0000_0010;
 
 /// 启动失败时弹出原因；成功就什么都不做。
 pub fn report(result: Result<(), String>, window: &mut Window, cx: &mut App) {
@@ -43,13 +45,22 @@ fn in_path(name: &str) -> bool {
 
 /// 这个程序在 PATH 里的完整路径。
 fn find_in_path(name: &str) -> Option<PathBuf> {
+    find_in_path_ext(name, &["", ".exe", ".cmd", ".bat"])
+}
+
+/// 同 [`find_in_path`]，只认这几种扩展名。
+fn find_in_path_ext(name: &str, exts: &[&str]) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths).find_map(|dir| {
-        ["", ".exe", ".cmd", ".bat"]
-            .iter()
+        exts.iter()
             .map(|ext| dir.join(format!("{name}{ext}")))
             .find(|path| path.is_file())
     })
+}
+
+/// 传给 Windows Terminal 的参数：它把分号当成几条命令之间的分隔，字面的分号要写成 `\;`。
+fn wt_arg(arg: &str) -> String {
+    arg.replace(';', "\\;")
 }
 
 /// 内置终端在本机仓库里可以开的一种 shell。
@@ -140,9 +151,9 @@ pub fn terminal_launch(
             fallback: Some(local),
         });
     };
-    // 经别的服务器连的（156>91）：连接设置在那台服务器上
+    // 经别的服务器连的（A>B）：连接设置在那台服务器上
     if !app.read(cx).knows_server(server) {
-        return Err(tr("未找到该服务器的设置").into());
+        return Err(tr("未找到该主机的设置").into());
     }
     let connecting = app.update(cx, |app, cx| app.connect(server, cx));
     Ok(Launch {
@@ -170,17 +181,48 @@ pub fn open_folder(dir: &str) -> Result<(), String> {
     spawn(cmd, tr("资源管理器"))
 }
 
-/// 用系统给这种文件设的默认程序打开它（解决冲突时用来改文件）。
+/// 用系统给这种文件设的默认程序打开它（解决冲突时用来改文件）。直接交给 ShellExecute，不经 cmd：
+/// 文件名里的 `&`、`%` 会被 cmd 当成命令分隔、变量展开，后半截被当成命令执行。
 pub fn open_file(path: &str) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
     let path = windows_path(path);
     if !Path::new(&path).is_file() {
         return Err(tf!("文件不存在：{path}", path));
     }
-    let mut cmd = Command::new("cmd.exe");
-    cmd.args(["/c", "start", "", &path])
-        .creation_flags(NO_WINDOW);
-    spawn(cmd, tr("此文件"))
+    shell_open(&path).map_err(|err| tf!("无法打开{what}：{err}", what = tr("此文件"), err))
+}
+
+/// ShellExecute 的「打开」。这种文件没有关联的程序时，像双击时一样弹出「打开方式」。
+fn shell_open(path: &str) -> Result<(), String> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{HSTRING, PCWSTR, w};
+    let file = HSTRING::from(path);
+    // 返回值大于 32 是成功，否则是错误号（SE_ERR_*）
+    let run = |verb: PCWSTR| {
+        let done = unsafe {
+            ShellExecuteW(
+                None,
+                verb,
+                &file,
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        done.0 as isize
+    };
+    // SE_ERR_NOASSOC
+    const NO_ASSOC: isize = 31;
+    let mut code = run(w!("open"));
+    if code == NO_ASSOC {
+        code = run(w!("openas"));
+    }
+    match code {
+        33.. => Ok(()),
+        // SE_ERR_ASSOCINCOMPLETE、SE_ERR_NOASSOC：错误号和系统的错误码对不上，自己说
+        27 | NO_ASSOC => Err(tr("没有可以打开此类文件的程序").into()),
+        code => Err(std::io::Error::from_raw_os_error(code as i32).to_string()),
+    }
 }
 
 /// 在默认浏览器里打开网址（只开 https 的）。不经 cmd：网址里的 `&` 会被 cmd 当成命令分隔。
@@ -193,21 +235,24 @@ pub fn open_url(url: &str) -> Result<(), String> {
     spawn(cmd, tr("浏览器"))
 }
 
-/// 在终端里打开本机目录：有 Windows Terminal 用它，没有就用 cmd。
+/// 在终端里打开本机目录：有 Windows Terminal 用它，没有就在新的控制台窗口里开 cmd。目录不拼进
+/// cmd 的命令行（`cmd /c start … cd /d 目录`）：目录名里的 `&` 会被 cmd 当成命令分隔。
 pub fn open_terminal(dir: &str) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
     let dir = windows_path(dir);
     let mut wt = Command::new("wt.exe");
-    wt.args(["-d", &dir]);
+    wt.args(["-d", &wt_arg(&dir)]);
     if wt.spawn().is_ok() {
         return Ok(());
     }
     let mut cmd = Command::new("cmd.exe");
-    cmd.args(["/c", "start", "", "cmd.exe", "/k", "cd", "/d", &dir]);
+    cmd.arg("/k").current_dir(&dir).creation_flags(NEW_CONSOLE);
     spawn(cmd, tr("终端"))
 }
 
 /// 在终端里登录服务器并进到仓库目录。指定了私钥文件的带上；密码在终端里自己输。
 pub fn open_terminal_ssh(server: &Server, dir: &str) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
     if !in_path("ssh") {
         return Err(tr(
             "PATH 中未找到 ssh。请在「设置 › 系统 › 可选功能」中安装「OpenSSH 客户端」后重试。",
@@ -223,12 +268,14 @@ pub fn open_terminal_ssh(server: &Server, dir: &str) -> Result<(), String> {
     }
     ssh.extend(["--", &server.destination, &remote]);
     let mut wt = Command::new("wt.exe");
-    wt.args(&ssh);
+    wt.args(ssh.iter().map(|arg| wt_arg(arg)));
     if wt.spawn().is_ok() {
         return Ok(());
     }
-    let mut cmd = Command::new("cmd.exe");
-    cmd.args(["/c", "start", ""]).args(&ssh);
+    // 没有 Windows Terminal：在新的控制台窗口里直接起 ssh，不经 `cmd /c start`（目录里的 `&`、
+    // 引号会被 cmd 解释）
+    let mut cmd = Command::new("ssh.exe");
+    cmd.args(&ssh[1..]).creation_flags(NEW_CONSOLE);
     spawn(cmd, tr("终端"))
 }
 
@@ -236,34 +283,29 @@ fn no_code() -> &'static str {
     tr("未找到 VS Code 命令行工具（code）。请安装 VS Code 时勾选「添加到 PATH」，并重启 Kuai。")
 }
 
-/// 用 VS Code 打开本机的目录或文件。`code` 是个 cmd 脚本，要经 cmd 启动。
-pub fn open_vscode(path: &str) -> Result<(), String> {
+/// VS Code 的命令行工具 `code.cmd`。PATH 里它旁边还有一个没有扩展名的 `code`，是给 Git Bash 用的
+/// shell 脚本，起不了。
+fn code_cmd() -> Result<PathBuf, String> {
+    find_in_path_ext("code", &[".cmd", ".exe"]).ok_or_else(|| no_code().to_string())
+}
+
+/// 起 VS Code 的命令行工具。直接起 `code.cmd`，不写成 `cmd /c code …`：标准库起批处理文件时会给
+/// 参数加引号、转义 `%`，路径里的 `&` 不会被 cmd 当成命令分隔。
+fn run_code(args: &[&str]) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
-    if !in_path("code") {
-        return Err(no_code().into());
-    }
-    let mut cmd = Command::new("cmd.exe");
-    cmd.args(["/c", "code", &windows_path(path)])
-        .creation_flags(NO_WINDOW);
+    let mut cmd = Command::new(code_cmd()?);
+    cmd.args(args).creation_flags(NO_WINDOW);
     spawn(cmd, " VS Code")
+}
+
+/// 用 VS Code 打开本机的目录或文件。
+pub fn open_vscode(path: &str) -> Result<(), String> {
+    run_code(&[&windows_path(path)])
 }
 
 /// 用 VS Code 的 Remote-SSH 打开服务器上的目录或文件。
 pub fn open_vscode_remote(destination: &str, path: &str) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    if !in_path("code") {
-        return Err(no_code().into());
-    }
     // Remote-SSH 不认 ssh:// 的写法，端口要写成 user@host:port
     let host = Target::parse(destination).authority();
-    let mut cmd = Command::new("cmd.exe");
-    cmd.args([
-        "/c",
-        "code",
-        "--remote",
-        &format!("ssh-remote+{host}"),
-        path,
-    ])
-    .creation_flags(NO_WINDOW);
-    spawn(cmd, " VS Code")
+    run_code(&["--remote", &format!("ssh-remote+{host}"), path])
 }

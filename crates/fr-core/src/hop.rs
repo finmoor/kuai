@@ -146,7 +146,7 @@ mod tests {
                 tag: Some("t0".into()),
             },
             Hop {
-                destination: "ssh://feng@10.0.0.5:2222".into(),
+                destination: "ssh://me@10.0.0.5:2222".into(),
                 args: vec![],
                 tag: None,
             },
@@ -184,7 +184,7 @@ mod tests {
         assert!(!second.iter().any(|arg| arg.starts_with("ConnectTimeout")));
         assert_eq!(
             second[second.len() - 4..],
-            ["-W", "[fd00::7]:22", "--", "ssh://feng@10.0.0.5:2222"]
+            ["-W", "[fd00::7]:22", "--", "ssh://me@10.0.0.5:2222"]
         );
     }
 }

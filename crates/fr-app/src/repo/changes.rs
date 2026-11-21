@@ -90,6 +90,9 @@ pub(super) struct Changes {
     image: Option<Entity<ImageDiff>>,
     /// 显示的改动可能已经过时（刚做完操作、正在重读），这时不能按块、按行操作
     diff_stale: bool,
+    /// 做完写操作就加一：之前发出去的读改动请求回来时不算数，不能把过时标记清掉（不然拿操作前的
+    /// 那份改动生成补丁），等操作以后重读的那一份
+    diff_gen: u64,
     diff_task: Option<Task<()>>,
     message: Entity<TextareaState>,
     amend: bool,
@@ -178,6 +181,7 @@ impl Changes {
             ws_note: None,
             image: None,
             diff_stale: false,
+            diff_gen: 0,
             diff_task: None,
             message,
             amend: false,
@@ -194,16 +198,13 @@ impl Changes {
         }
     }
 
-    /// 刚做完写操作：显示的改动先当作过时，等刷新完再允许按块、按行操作。
+    /// 刚做完写操作：显示的改动先当作过时，等刷新完、重读了改动再允许按块、按行操作。刷新失败时
+    /// 也不解除（原来解除了，按钮又能点，生成补丁用的是操作前的行号），按 F5 重新读过才行。
     pub(super) fn mark_stale(&mut self) {
+        self.diff_gen += 1;
         if self.diff.is_some() {
             self.diff_stale = true;
         }
-    }
-
-    /// 刷新失败时解除过时标记，免得按钮一直不能点。
-    pub(super) fn settle(&mut self) {
-        self.diff_stale = false;
     }
 
     /// 提交说明框里现在的内容（去掉首尾空白）。
@@ -871,16 +872,15 @@ impl RepoView {
             move |this, window, cx| {
                 let mut steps = Vec::new();
                 if !tracked.is_empty() {
-                    steps.push(Step {
-                        args: vec![
+                    steps.push(Step::input(
+                        vec![
                             "checkout".into(),
                             "-q".into(),
                             "--pathspec-from-file=-".into(),
                             "--pathspec-file-nul".into(),
                         ],
-                        stdin: Some(nul_paths(tracked.iter().map(|e| e.path.as_str()))),
-                        net: false,
-                    });
+                        nul_paths(tracked.iter().map(|e| e.path.as_str())),
+                    ));
                 }
                 if !untracked.is_empty() {
                     // -d：未跟踪的目录在状态里是一项，要连目录一起删
@@ -950,6 +950,7 @@ impl RepoView {
             .unwrap_or_default();
         let request = channel.git(&self.entry.path, args);
         self.changes.diff_stale = true;
+        let generation = self.changes.diff_gen;
         self.changes.diff_task = Some(cx.spawn(async move |this, cx| {
             let result = request.await;
             let plain = diff_tools::plain_out(plain).await;
@@ -958,7 +959,8 @@ impl RepoView {
                 if this.changes.selected.as_ref() != Some(&(area, entry.path.clone())) {
                     return;
                 }
-                this.changes.diff_stale = false;
+                // 发出去以后又做过写操作：读到的可能是操作前的，照样显示，但还算过时
+                this.changes.diff_stale = this.changes.diff_gen != generation;
                 this.changes.ws_note = match (&plain, &result) {
                     (Some(plain), Ok(out)) => Some(diff_tools::ws_note(plain, &out.stdout)),
                     _ => None,
@@ -1163,9 +1165,23 @@ impl RepoView {
         // 藏起来的未跟踪文件也不跟着暂存：看不见的东西不该被加进去
         let hide = self.hidden_untracked(cx) > 0;
         if conflicts {
-            let mut entries = self.changes.unstaged.clone();
+            // 冲突的在这里就挑出去：交给 stage_files 的要是只剩一个，它会直接 git add，冲突的那个
+            // 也就被标成已解决了（只有一个文件冲突时就是这样）
+            let (conflicted, mut entries): (Vec<Entry>, Vec<Entry>) = self
+                .changes
+                .unstaged
+                .iter()
+                .cloned()
+                .partition(|e| e.unstaged == Some(Kind::Conflicted));
             entries.retain(|e| !(hide && e.unstaged == Some(Kind::Untracked)));
-            self.stage_files(entries, window, cx);
+            let text = tf!(
+                "{skipped} 个文件存在冲突，未暂存。解决后请右键选择「标记为已解决」。",
+                skipped = conflicted.len()
+            );
+            window.push_notification(Notification::warning(text), cx);
+            if !entries.is_empty() {
+                self.stage_files(entries, window, cx);
+            }
             return;
         }
         // `-u`：只暂存已跟踪的文件
@@ -1189,7 +1205,8 @@ impl RepoView {
         if self.changes.diff_stale || self.ignore_ws {
             return;
         }
-        let Some(diff) = &self.changes.diff else {
+        // 只能整个文件操作的（二进制、冲突、类型改了）不生成补丁
+        let Some(diff) = self.changes.diff.as_ref().filter(|diff| diff.editable()) else {
             return;
         };
         let reverse = diff.area == Area::Staged;
@@ -1221,7 +1238,7 @@ impl RepoView {
         if self.changes.diff_stale || self.ignore_ws {
             return;
         }
-        let Some(diff) = &self.changes.diff else {
+        let Some(diff) = self.changes.diff.as_ref().filter(|diff| diff.editable()) else {
             return;
         };
         if diff.area != Area::Unstaged {
@@ -1239,6 +1256,9 @@ impl RepoView {
             path = diff.entry.path,
             count
         );
+        // 补丁是按现在这份改动生成的：确认框开着的这一会儿改动变了（刷新、在外面改了文件），不能
+        // 拿它去丢弃，行号对不上可能丢到别的地方
+        let (area, path, source) = (diff.area, diff.entry.path.clone(), diff.source.clone());
         self.confirm(
             tr("丢弃改动？"),
             description,
@@ -1246,6 +1266,17 @@ impl RepoView {
             window,
             cx,
             move |this, window, cx| {
+                let same = !this.changes.diff_stale
+                    && this
+                        .changes
+                        .diff
+                        .as_ref()
+                        .is_some_and(|diff| diff.same_source(area, &path, &source));
+                if !same {
+                    let text = tr("改动已经变了，请重新选择要丢弃的行。");
+                    window.push_notification(Notification::warning(text), cx);
+                    return;
+                }
                 this.run_op(
                     tr("丢弃"),
                     patch::discard_args(),
@@ -1767,6 +1798,12 @@ impl RepoView {
                     Some((dir, name)) => (dir.to_string(), name.to_string()),
                     None => (String::new(), entry.path.clone()),
                 };
+                let full: SharedString = match &entry.orig_path {
+                    Some(orig) => format!("{orig} → {}", entry.path).into(),
+                    None => entry.path.clone().into(),
+                };
+                // 根目录下、没改名的：提示里的全名就是行里的名字，只在名字被省略时弹
+                let bare = dir.is_empty() && entry.orig_path.is_none();
                 let path = entry.path.clone();
                 let menu = if in_multi {
                     self.multi_file_menu(area, cx)
@@ -1797,7 +1834,9 @@ impl RepoView {
                         .w_full()
                         .pl(indent(depth))
                         .pr_2()
-                        .gap_2()
+                        // 树形里：前面空出箭头那么宽，小方块对着目录的图标、名字对着目录的名字
+                        // （目录那一行箭头和图标、图标和名字之间各空 5，这一行左边多一条 2 宽的色带）
+                        .gap(px(if tree { 3. } else { 8. }))
                         .text_sm()
                         .cursor_pointer()
                         .when(is_selected, |d| d.bg(c.selected))
@@ -1823,18 +1862,26 @@ impl RepoView {
                                 );
                             }
                         }))
+                        .when(tree, |row| {
+                            row.child(div().flex_none().w(px(file_tree::FILE_LEAD)))
+                        })
                         .child(file_tree::kind_badge(kind.letter(), kind_color(kind, c)))
                         // 名字先占地方，放不下时省略中间：开头、结尾和扩展名都看得到。
                         // 目录用剩下的，至少留一点让人知道还有目录
-                        .child(
-                            div()
+                        .child(match bare {
+                            true => ui::clipped(("change-name", row_ix), name)
+                                .flex_shrink(1.)
+                                .text_ellipsis_middle()
+                                .into_any_element(),
+                            false => div()
                                 .flex_shrink(1.)
                                 .min_w_0()
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis_middle()
-                                .child(name),
-                        )
+                                .child(ui::one_line(name))
+                                .into_any_element(),
+                        })
                         // 树形里目录在上面的行里，这里不再写
                         .child(
                             div()
@@ -1843,14 +1890,10 @@ impl RepoView {
                                 .truncate()
                                 .text_xs()
                                 .text_color(c.muted)
-                                .when(!tree, |cell| cell.child(dir)),
+                                .when(!tree, |cell| cell.child(ui::one_line(dir))),
                         )
-                        .tooltip({
-                            let full: SharedString = match &entry.orig_path {
-                                Some(orig) => format!("{orig} → {}", entry.path).into(),
-                                None => entry.path.clone().into(),
-                            };
-                            move |window, cx| ui::tip(full.clone(), window, cx)
+                        .when(!bare, |row| {
+                            row.tooltip(move |window, cx| ui::tip(full.clone(), window, cx))
                         })
                         .context_menu(menu)
                         .into_any_element(),
@@ -2096,7 +2139,7 @@ impl RepoView {
                     .text_ellipsis_start()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(title.clone())
+                    .child(ui::one_line(title.clone()))
                     .tooltip({
                         let title: SharedString = title.into();
                         move |window, cx| ui::tip(title.clone(), window, cx)

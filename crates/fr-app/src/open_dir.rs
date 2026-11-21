@@ -5,8 +5,8 @@
 //!
 //! 怎么判断「不是仓库」：`rev-parse --show-toplevel` 失败后，带上 `safe.directory=*` 再执行一次
 //! `rev-parse --git-dir`。这次成功说明是仓库、只是打不开（所有者不是当前用户、裸仓库、选的是
-//! `.git` 目录本身），照 git 的原话报错；仍然失败才是不在仓库中。不按报错的文字判断：git 的报错
-//! 会随系统语言翻译。
+//! `.git` 目录本身），照 git 的原话报错；仍然失败，再看目录进不进得去（`git version` 不找仓库，
+//! 进得去目录就成功），进得去才是不在仓库中。不按报错的文字判断：git 的报错会随系统语言翻译。
 
 use std::cell::Cell;
 use std::path::Path;
@@ -123,7 +123,7 @@ pub fn open_dirs<T: 'static>(
                 window.push_notification(Notification::error(err), cx);
             }
             if !not_repos.is_empty() {
-                let dirs = not_repos.join("、");
+                let dirs = not_repos.join(tr("、"));
                 let text = tf!(
                     "{dirs} 不是 Git 仓库，未添加。如需初始化，请单独选择该目录。",
                     dirs
@@ -157,10 +157,18 @@ pub async fn find(channel: &Channel, dir: &str) -> Result<Found, String> {
             args(&["-c", "safe.directory=*", "rev-parse", "--git-dir"]),
         )
         .await;
-    match probe {
-        Ok(probe) if probe.code.is_some() && !probe.success() => Ok(Found::NotRepo),
-        // 是仓库，只是打不开；或者第二次没执行成：都照第一次 git 的原话报
-        _ => Err(cannot_open(&out.stderr.trim())),
+    let not_repo = matches!(&probe, Ok(probe) if probe.code.is_some() && !probe.success());
+    // 两次都失败也可能是目录进不去（服务器上的目录刚被删、没有权限）：`git -C` 进不去时也是 128，
+    // 当成不是仓库会问要不要初始化，而 `git init` 会把不在的目录建出来
+    let reachable = not_repo
+        && channel
+            .git(dir, args(&["version"]))
+            .await
+            .is_ok_and(|out| out.success());
+    match reachable {
+        true => Ok(Found::NotRepo),
+        // 是仓库只是打不开、目录进不去，或者第二次没执行成：都照第一次 git 的原话报
+        false => Err(cannot_open(&out.stderr.trim())),
     }
 }
 
@@ -255,7 +263,8 @@ async fn init(channel: &Channel, dir: &str) -> Result<String, String> {
 }
 
 /// 仓库列表里的一项。本机的路径换成 Windows 的写法，和以前加进来的一致。
-fn entry(server: Option<String>, root: &str) -> RepoEntry {
+/// git 给的仓库根目录（`rev-parse --show-toplevel`）在列表里的写法：本机换成反斜杠。
+pub(crate) fn entry(server: Option<String>, root: &str) -> RepoEntry {
     let path = match server {
         None => root.replace('/', "\\"),
         Some(_) => root.to_string(),
@@ -338,13 +347,24 @@ mod tests {
         let bare = temp.path("bare.git");
         std::fs::create_dir_all(&bare).unwrap();
         git(&bare, &["init", "-q", "--bare"]);
-        assert!(matches!(block_on(find(&Channel::Local, &bare)), Err(_)));
+        assert!(block_on(find(&Channel::Local, &bare)).is_err());
 
         // 选的是 .git 目录本身
         let work = temp.path("work");
         std::fs::create_dir_all(&work).unwrap();
         git(&work, &["init", "-q"]);
         let dot_git = temp.path("work/.git");
-        assert!(matches!(block_on(find(&Channel::Local, &dot_git)), Err(_)));
+        assert!(block_on(find(&Channel::Local, &dot_git)).is_err());
+    }
+
+    #[test]
+    fn 目录不在了_报错_不问初始化() {
+        let temp = Temp::new("gone");
+        let gone = temp.path("gone");
+        let Err(err) = block_on(find(&Channel::Local, &gone)) else {
+            panic!("不在的目录不该当成可以初始化");
+        };
+        assert!(err.contains(&gone), "{err}");
+        assert!(!temp.0.join("gone").exists());
     }
 }

@@ -17,6 +17,17 @@ use crate::settings::{self, Auth, Layout, RepoEntry, RepoMemo, Server, Settings,
 /// 正在进行或已经结束的连接；多处等同一个连接时共用。
 pub(crate) type Connecting = Shared<Task<Result<Arc<Connection>, SharedString>>>;
 
+/// 存设置失败的原因往这里送（见 [`AppState::save`]）。
+static SAVE_FAILED: std::sync::OnceLock<futures::channel::mpsc::UnboundedSender<String>> =
+    std::sync::OnceLock::new();
+
+/// 收存设置失败的原因（主窗口收，弹通知）。只能要一次。
+pub fn save_failures() -> futures::channel::mpsc::UnboundedReceiver<String> {
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+    let _ = SAVE_FAILED.set(tx);
+    rx
+}
+
 /// 一台服务器的连接状态。
 pub enum ConnStatus {
     Idle,
@@ -50,11 +61,18 @@ pub struct AppState {
     pub(crate) local_machine: Option<String>,
     /// 这次运行里连上的各台电脑握手时报的标识（直接配置的、经别的电脑连的都记）
     pub(crate) machine_ids: HashMap<String, String>,
+    /// 启动时读设置文件出的问题（见 [`settings::LoadIssue`]）
+    pub(crate) load_issue: Option<settings::LoadIssue>,
 }
 
 impl AppState {
-    pub fn new(settings: Settings, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        settings: Settings,
+        load_issue: Option<settings::LoadIssue>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut this = Self {
+            load_issue,
             settings,
             conns: HashMap::new(),
             stages: HashMap::new(),
@@ -161,7 +179,7 @@ impl AppState {
     }
 
     /// 连接服务器；已经连上或正在连就沿用。返回等连接结果的 future。
-    /// `id` 可以是经别的电脑连的服务器（`156的id>91的id`，见 `machines`）：先连那台，再请它的 kuaid 转接。
+    /// `id` 可以是经别的电脑连的服务器（`A 的 id>B 的 id`，见 `machines`）：先连那台，再请它的 kuaid 转接。
     pub fn connect(&mut self, id: &str, cx: &mut Context<Self>) -> Connecting {
         self.connect_with(id, false, cx)
     }
@@ -235,7 +253,7 @@ impl AppState {
                 cx.background_executor()
                     .spawn(async move {
                         let server =
-                            server.ok_or_else(|| SharedString::from(tr("未找到该服务器的设置")))?;
+                            server.ok_or_else(|| SharedString::from(tr("未找到该主机的设置")))?;
                         let mut options = connect_options(&server);
                         options.jumps = route.iter().map(jump_options).collect();
                         options.on_stage = (!route.is_empty()).then_some(on_stage);
@@ -356,15 +374,55 @@ impl AppState {
         old.mappings = mappings;
         old.machine = machine;
         if !same_target {
-            self.machine_ids.remove(&id);
+            // 可能换了一台电脑：原来那台的东西都不能接着用（经它连的那几台也是），映射着的断开，
+            // 盘上打开的文件不会再读写到新地址那台的同名文件上
+            self.forget_target(&id, true, cx);
+            self.unmount_server(&id, cx);
         }
         if reconnect {
-            self.conns.remove(&id);
+            self.drop_conns(|key| *key == id, cx);
         }
         self.save();
         self.push_servers(cx);
         cx.notify();
         reconnect
+    }
+
+    /// 键是 `key` 的电脑换了（改了地址、跳板机，或者删掉了）：原来那台握手时报的标识、读到的仓库
+    /// 列表和工作区、接好的连接和订阅都是原来那台的，丢掉，等连上新的那台再来。`and_relayed` 为真时
+    /// 经它连的那几台（`key>…`）也一样。原来只清标识，界面照旧显示原来那台的仓库，改动也还交给它。
+    pub(crate) fn forget_target(&mut self, key: &str, and_relayed: bool, cx: &mut Context<Self>) {
+        let relayed = format!("{key}>");
+        let gone = |k: &String| k == key || (and_relayed && k.starts_with(&relayed));
+        self.machine_ids.retain(|k, _| !gone(k));
+        self.machines.retain(|k, _| !gone(k));
+        self.links.retain(|k, _| !gone(k));
+        self.watches.retain(|k, _| !gone(k));
+        self.drop_conns(gone, cx);
+    }
+
+    /// 丢掉键满足 `gone` 的连接，并且断开（[`Connection::close`]）：打开着的仓库、终端手里还拿着
+    /// 它的话，原来一直连着原来那台，现在看到断开，按新的设置重连。还在连的，连上以后断开。
+    fn drop_conns(&mut self, gone: impl Fn(&String) -> bool, cx: &mut Context<Self>) {
+        let keys: Vec<String> = self.conns.keys().filter(|key| gone(key)).cloned().collect();
+        for key in keys {
+            let Some(connecting) = self.conns.remove(&key) else {
+                continue;
+            };
+            let reason = || tr("主机设置已更改，已断开").to_string();
+            match connecting.peek() {
+                Some(Ok(conn)) => conn.close(reason()),
+                Some(Err(_)) => {}
+                None => cx
+                    .background_executor()
+                    .spawn(async move {
+                        if let Ok(conn) = connecting.await {
+                            conn.close(reason());
+                        }
+                    })
+                    .detach(),
+            }
+        }
     }
 
     /// 从列表里去掉服务器；服务器上的东西不动。本机工作区里它上面的仓库跟着去掉，
@@ -382,7 +440,7 @@ impl AppState {
         // 它的连接，和经它连的那几台的
         let relayed = format!("{id}>");
         let gone = |key: &String| key == id || key.starts_with(&relayed);
-        self.conns.retain(|key, _| !gone(key));
+        self.drop_conns(gone, cx);
         self.links.retain(|key, _| !gone(key));
         self.machines.retain(|key, _| !gone(key));
         self.pending.retain(|key, _| !gone(key));
@@ -476,9 +534,26 @@ impl AppState {
         self.save_soon(cx);
     }
 
+    /// 存设置。存不了时记日志，在界面上说一声（主窗口收着 [`save_failures`] 弹通知）：原来只写
+    /// 日志，设置页上改了照样生效，重启以后全没了，用户不知道。同一个原因连着出只说一次；读设置时
+    /// 就出了问题、这次不写的，启动时已经说过了，不再说。
     pub(crate) fn save(&self) {
-        if let Err(err) = settings::save(&self.settings) {
-            log::error!("{err:#}");
+        let Err(err) = settings::save(&self.settings) else {
+            return;
+        };
+        let text = format!("{err:#}");
+        log::error!("{text}");
+        if settings::read_only() {
+            return;
+        }
+        thread_local! {
+            static TOLD: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+        }
+        if TOLD.with(|told| told.replace(Some(text.clone())).as_deref() == Some(text.as_str())) {
+            return;
+        }
+        if let Some(tx) = SAVE_FAILED.get() {
+            let _ = tx.unbounded_send(text);
         }
     }
 }
@@ -489,7 +564,7 @@ pub(crate) fn connect_options(server: &Server) -> ConnectOptions {
         forward_agent: server.forward_agent,
         identity_file: server.key_file().map(str::to_string),
         password_auth: server.auth == Auth::Password,
-        secret: crate::secrets::get(&server.id),
+        secret: crate::secrets::for_server(server),
         ..ConnectOptions::default()
     }
 }
@@ -501,6 +576,6 @@ pub(crate) fn jump_options(server: &Server) -> Jump {
         destination: server.destination.clone(),
         identity_file: server.key_file().map(str::to_string),
         password_auth: server.auth == Auth::Password,
-        secret: crate::secrets::get(&server.id),
+        secret: crate::secrets::for_server(server),
     }
 }

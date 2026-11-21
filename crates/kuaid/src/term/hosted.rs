@@ -118,8 +118,8 @@ impl Hosted {
         })
     }
 
-    fn send(&self, kind: u8, payload: &[u8]) {
-        let _ = wire::write_frame(&mut *self.writer.lock().unwrap(), kind, payload);
+    fn send(&self, kind: u8, payload: &[u8]) -> bool {
+        wire::write_frame(&mut *self.writer.lock().unwrap(), kind, payload).is_ok()
     }
 }
 
@@ -144,7 +144,9 @@ impl Backend for Hosted {
     fn write(&self, bytes: Vec<u8>) {
         // 一帧有长度上限：贴进来一大段时分开发
         for part in bytes.chunks(wire::MAX_FRAME / 2) {
-            self.send(wire::INPUT, part);
+            if !self.send(wire::INPUT, part) {
+                return;
+            }
         }
     }
 
@@ -159,19 +161,30 @@ impl Backend for Hosted {
         self.send(wire::KILL, &[]);
     }
 
+    fn programs(&self, procs: &super::programs::Procs) -> Vec<String> {
+        super::programs::children(procs, self.pid)
+    }
+
     fn handle(&self) -> Option<(i32, i32)> {
         Some((i32::from(self.port), self.pid as i32))
     }
 
-    fn pause(&self) {
-        // 读线程没起来（或者已经结束）的不用等
+    fn pause(&self) -> bool {
+        // 读线程没起来的不用等
         if self.reader.lock().unwrap().is_some() {
-            return;
+            return true;
         }
         let paused = self.paused_rx.lock().unwrap();
         while paused.try_recv().is_ok() {}
-        self.send(wire::PAUSE, &[]);
-        let _ = paused.recv_timeout(PAUSE_WAIT);
+        if !self.send(wire::PAUSE, &[]) {
+            return false;
+        }
+        match paused.recv_timeout(PAUSE_WAIT) {
+            Ok(()) => true,
+            // 读线程已经结束（程序退出了）：没有再要收的输出
+            Err(mpsc::RecvTimeoutError::Disconnected) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+        }
     }
 
     fn resume(&self) {

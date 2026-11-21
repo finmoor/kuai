@@ -5,11 +5,27 @@
 //! 本机和服务器上都能用，kuaid 不用为此加功能。
 
 /// 追加一行的 shell 函数：`.gitignore` 末尾没有换行时先补一个。规则作为参数传进去，不拼进脚本。
-const ALIAS: &str = r#"alias.fr-ignore=!f(){ if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then echo >> .gitignore; fi; printf '%s\n' "$1" >> .gitignore; }; f"#;
+/// `.gitignore` 是符号链接、不是普通文件时不写（`>>` 会顺着链接写到仓库外面去），把第二个参数
+/// （报错的话）写到 stderr。
+const ALIAS: &str = r#"alias.fr-ignore=!f(){ if [ -L .gitignore ] || { [ -e .gitignore ] && [ ! -f .gitignore ]; }; then printf '%s\n' "$2" >&2; return 1; fi; if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then echo >> .gitignore; fi; printf '%s\n' "$1" >> .gitignore; }; f"#;
 
 /// 把 `path`（相对仓库根，`git status` 给的那种）加到 `.gitignore` 的 git 参数。
 pub fn args(path: &str) -> Vec<String> {
-    vec!["-c".into(), ALIAS.into(), "fr-ignore".into(), pattern(path)]
+    vec![
+        "-c".into(),
+        ALIAS.into(),
+        "fr-ignore".into(),
+        pattern(path),
+        crate::i18n::tr(".gitignore 是符号链接或不是普通文件，没有修改。").into(),
+    ]
+}
+
+/// [`args`] 给人看的写法（活动记录、失败的详情）：等价的 shell 命令，不露出别名那段脚本。
+pub fn shown(path: &str) -> String {
+    format!(
+        "echo {} >> .gitignore",
+        crate::git::sh_quote(&pattern(path))
+    )
 }
 
 /// 路径对应的忽略规则：开头加 `/` 表示从仓库根算起，通配符按字面转义。
@@ -32,6 +48,12 @@ pub fn pattern(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 给人看的写法() {
+        assert_eq!(shown("target/"), "echo /target/ >> .gitignore");
+        assert_eq!(shown("a b's.txt"), r"echo '/a b'\''s.txt' >> .gitignore");
+    }
 
     #[test]
     fn 规则从根算起并转义通配符() {
@@ -61,6 +83,26 @@ mod tests {
         assert_eq!(text, "*.log\n/a \\[1\\].txt\n/新文件.txt\n");
         let status = crate::git::run(&dir, &["status", "--porcelain"]).unwrap();
         assert_eq!(String::from_utf8_lossy(&status).trim(), "?? .gitignore");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gitignore_是符号链接时不写() {
+        let dir = std::env::temp_dir().join(format!("fr-ignore-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("repo")).unwrap();
+        let repo = dir.join("repo");
+        crate::git::run(&repo, &["init", "-q"]).unwrap();
+        std::fs::write(dir.join("outside"), "keep\n").unwrap();
+        std::os::unix::fs::symlink("../outside", repo.join(".gitignore")).unwrap();
+        let args = args("x.txt");
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert!(crate::git::run(&repo, &args).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("outside")).unwrap(),
+            "keep\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

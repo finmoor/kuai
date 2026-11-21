@@ -2,9 +2,9 @@
 //! 仓库，每个仓库下面列出它的子仓库。点仓库、子仓库在标签页中打开（已经开着就切过去）。设计见
 //! `design/server-workspace/`（第二版）。
 //!
-//! 工作区只是一组常一起看的仓库：没有「当前工作区」，选中一个也不动标题栏上的标签页（2026-11-19
-//! Feng：「标签……跟选择的服务器、工作区都无关」）。右上角「全部打开」把它的仓库连同子仓库一次开成
-//! 标签页（Feng：「全部打开，打开子仓库」）；子仓库还没找完的，找完了接着开。
+//! 工作区只是一组常一起看的仓库：没有「当前工作区」，选中一个也不动标题栏上的标签页（标签页和
+//! 选了哪台服务器、哪个工作区都无关）。右上角「全部打开」把它的仓库连同子仓库一次开成标签页；
+//! 子仓库还没找完的，找完了接着开。
 //!
 //! 仓库那一行写分支、改动数、已打开、终端个数（点了到终端页），鼠标移上去出「新建终端」「移出工作区」；
 //! 子仓库默认展开，左边的小箭头收起（记在设置里，只在这台电脑上）。行的样子见 `repo_rows`。
@@ -66,12 +66,8 @@ pub struct WorkspacePage {
 impl EventEmitter<PageEvent> for WorkspacePage {}
 
 /// 一个仓库的终端：几个还在的，和最要紧的那个的状态（已停下比运行中要紧，运行中比空闲要紧）。
-pub(crate) fn terminal_summary(
-    board: &TermBoard,
-    entry: &RepoEntry,
-    cx: &App,
-) -> Option<(usize, TermState)> {
-    let rows = board.terms_of(entry, cx)?;
+pub(crate) fn terminal_summary(board: &TermBoard, entry: &RepoEntry) -> Option<(usize, TermState)> {
+    let rows = board.terms_of(entry)?;
     let alive: Vec<_> = rows.iter().filter(|row| row.alive).collect();
     let rank = |state: TermState| match state {
         TermState::Stopped => 0,
@@ -202,7 +198,13 @@ impl WorkspacePage {
                 None => {}
             }
         }
-        self.open_later = later;
+        // 接在还没补开完的后面（同一个不重复）：原来是换掉，连着对两个工作区「全部打开」时，
+        // 前一个还没找完的子仓库就不开了
+        for root in later {
+            if !self.open_later.contains(&root) {
+                self.open_later.push(root);
+            }
+        }
         if !entries.is_empty() {
             cx.emit(PageEvent::OpenAll {
                 entries,
@@ -458,6 +460,7 @@ impl WorkspacePage {
         );
         let app = self.app.read(cx);
         let list = app.workspaces_on(machine);
+        let hues = app.workspace_hues();
         let summary: SharedString = match &list {
             Some(list) => tf!("{n} 个工作区", n = list.len()).into(),
             None => crate::workspace::machine_status(app, machine, cx).0,
@@ -469,6 +472,7 @@ impl WorkspacePage {
             .enumerate()
             .map(|(ix, (key, name, count))| {
                 let on = selected == Some(&key);
+                let hue = hues.get(&key).map_or(muted, |slot| ui::hue(*slot, cx));
                 let (pick, menu_key) = (key.clone(), key.clone());
                 let this = cx.entity().downgrade();
                 h_flex()
@@ -484,10 +488,13 @@ impl WorkspacePage {
                     .when(on, |row| row.bg(selected_bg))
                     .when(!on, |row| row.hover(|s| s.bg(hover)))
                     .on_click(cx.listener(move |this, _, _, cx| this.pick(pick.clone(), cx)))
+                    // 工作区的色块：和终端页侧栏的分节标题同一个颜色
                     .child(
-                        ui::icon_small(IconName::Layers)
+                        h_flex()
                             .flex_none()
-                            .text_color(muted),
+                            .w(px(12.))
+                            .justify_center()
+                            .child(ui::hue_mark(hue, 8.)),
                     )
                     .child(ui::clipped(("ws-name", ix), name).flex_1())
                     .child(
@@ -531,7 +538,7 @@ impl WorkspacePage {
                     .text_xs()
                     .text_color(muted)
                     .text_center()
-                    .child(tr("这台服务器上没有工作区。"))
+                    .child(tr("这台主机上没有工作区。"))
                     .into_any_element(),
             ),
             Some(_) => None,
@@ -540,6 +547,7 @@ impl WorkspacePage {
         v_flex()
             .w(px(width))
             .flex_none()
+            .relative()
             .h_full()
             .bg(panel)
             .border_r_1()
@@ -568,10 +576,9 @@ impl WorkspacePage {
                             .flex_1()
                             .min_w_0()
                             .child(
-                                div()
+                                ui::clipped("ws-title", trc("页面", "工作区"))
                                     .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(trc("页面", "工作区")),
+                                    .font_weight(FontWeight::SEMIBOLD),
                             )
                             .child(
                                 ui::clipped("ws-summary", summary)
@@ -603,6 +610,7 @@ impl WorkspacePage {
                     .children(rows)
                     .children(empty),
             )
+            .child(crate::side_split::handle("ws-side-split", &self.app))
     }
 
     /// 侧栏上的电脑下拉：本机和各台服务器，右边写有几个工作区或者连没连上。没有配置服务器时没有它。
@@ -636,7 +644,7 @@ impl WorkspacePage {
         let (icon, name) = choices
             .iter()
             .find(|choice| choice.0 == machine)
-            .map(|choice| (choice.1.clone(), choice.2.clone()))?;
+            .map(|choice| (choice.1, choice.2.clone()))?;
         let now = machine.to_string();
         let this = cx.entity().downgrade();
         let button = Button::new("ws-machine")
@@ -653,18 +661,18 @@ impl WorkspacePage {
                     .children(dot.map(|dot| div().flex_none().size(px(6.)).rounded_full().bg(dot))),
             )
             .dropdown_caret(true)
-            .tooltip(tr("列出所选服务器上的工作区"))
+            .tooltip(tr("列出所选主机上的工作区"))
             .dropdown_menu(move |mut menu, _, _| {
                 menu = menu.min_w(px(232.));
                 for (id, icon, name, note) in &choices {
                     let (this, to) = (this.clone(), id.clone());
-                    let (icon, name, note) = (icon.clone(), name.clone(), note.clone());
+                    let (icon, name, note) = (*icon, name.clone(), note.clone());
                     menu = menu.item(
                         PopupMenuItem::element(move |_, _| {
                             h_flex()
                                 .w_full()
                                 .gap(px(8.))
-                                .child(ui::icon_small(icon.clone()).flex_none())
+                                .child(ui::icon_small(icon).flex_none())
                                 .child(div().flex_1().min_w_0().truncate().child(name.clone()))
                                 .child(
                                     div()
@@ -712,7 +720,7 @@ impl WorkspacePage {
             .items_center()
             .text_xs()
             .text_color(muted)
-            .child(tr("尚未连接此服务器，连接后显示其中的工作区。"))
+            .child(tr("尚未连接此主机，连接后显示其中的工作区。"))
             .children(failed.map(|err| {
                 v_flex()
                     .w_full()
@@ -743,9 +751,8 @@ impl WorkspacePage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let (muted, accent, border, panel, warning) = (
+        let (muted, border, panel, warning) = (
             theme.muted_foreground,
-            theme.primary,
             theme.border,
             theme.sidebar,
             theme.warning,
@@ -753,8 +760,8 @@ impl WorkspacePage {
         let app = self.app.read(cx);
         let Some(key) = key else {
             let (icon, text) = match app.workspaces_on(machine) {
-                None => (IconName::Plug, tr("尚未连接此服务器")),
-                Some(_) => (IconName::Layers, tr("这台服务器上没有工作区")),
+                None => (IconName::Plug, tr("尚未连接此主机")),
+                Some(_) => (IconName::Layers, tr("这台主机上没有工作区")),
             };
             return blank(icon, text, cx).into_any_element();
         };
@@ -788,6 +795,8 @@ impl WorkspacePage {
         });
         let writable = app.writable(&key.machine);
         let name = app.workspace_name(&key);
+        // 工作区的颜色（和侧栏、终端页的一样）
+        let hue = ui::hue(app.workspace_hue(&key), cx);
         // 断开着：只能看、能打开，不能改
         let banner = (!writable).then(|| {
             let id = key.machine.clone();
@@ -879,11 +888,11 @@ impl WorkspacePage {
                     .flex_none()
                     .size(px(40.))
                     .rounded(px(9.))
-                    .bg(accent.opacity(0.14))
+                    .bg(hue.opacity(0.14))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(Icon::new(IconName::Layers).size_4().text_color(accent)),
+                    .child(Icon::new(IconName::Layers).size_4().text_color(hue)),
             )
             .child(
                 v_flex()
@@ -1045,7 +1054,7 @@ impl WorkspacePage {
                     offline,
                     folded: app.settings.folded_subs.contains(entry),
                     open: open.clone(),
-                    terms: terminal_summary(board, entry, cx),
+                    terms: terminal_summary(board, entry),
                     chips: Vec::new(),
                 }
             };
@@ -1117,6 +1126,13 @@ impl Render for WorkspacePage {
         h_flex()
             .size_full()
             .bg(background)
+            // 拖左边那一栏的分隔条，见 side_split
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<crate::side_split::DragSide>, window, cx| {
+                    crate::side_split::drag(&this.app, event, window, cx);
+                    cx.notify();
+                },
+            ))
             .child(self.render_side(&machine, key.as_ref(), width, cx))
             .child(self.render_main(
                 &machine,
@@ -1270,7 +1286,7 @@ impl Render for AddRepos {
                 div()
                     .text_xs()
                     .text_color(muted)
-                    .child(tr("勾选即加入此工作区；新仓库请先在服务器页中添加。")),
+                    .child(tr("勾选即加入此工作区；新仓库请先在主机页中添加。")),
             )
     }
 }

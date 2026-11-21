@@ -36,13 +36,46 @@ pub(super) struct Ask {
     pub value: String,
     /// 第二个输入框的占位文字；`None` 时只有一个输入框
     pub second: Option<SharedString>,
-    pub hint: SharedString,
+    pub hint: Hint,
     pub ok: &'static str,
     /// 勾选项：文字和默认是否勾上
     pub checks: Vec<(SharedString, bool)>,
     /// 第一个输入框可以不填
     pub allow_empty: bool,
     pub validate: Option<Validate>,
+}
+
+/// 对话框最下面那行说明：固定的一句，或者随勾选项变（见 [`ByChecks`]）。
+pub(super) enum Hint {
+    Text(SharedString),
+    ByChecks(ByChecks),
+}
+
+/// 按各勾选项现在勾没勾（参数）算出那行说明。
+pub(super) type ByChecks = Box<dyn Fn(&[bool]) -> SharedString>;
+
+impl Default for Hint {
+    fn default() -> Self {
+        Self::Text(SharedString::default())
+    }
+}
+
+impl From<SharedString> for Hint {
+    fn from(text: SharedString) -> Self {
+        Self::Text(text)
+    }
+}
+
+impl From<&'static str> for Hint {
+    fn from(text: &'static str) -> Self {
+        Self::Text(text.into())
+    }
+}
+
+impl From<String> for Hint {
+    fn from(text: String) -> Self {
+        Self::Text(text.into())
+    }
 }
 
 /// 「几样里选一样」对话框的内容。
@@ -182,8 +215,12 @@ impl RepoView {
             if let Some(found) = problem.borrow().clone() {
                 body = body.child(div().text_sm().text_color(danger).child(found));
             }
+            let hint = match &hint {
+                Hint::Text(text) => text.clone(),
+                Hint::ByChecks(text) => text(&states.iter().map(Cell::get).collect::<Vec<_>>()),
+            };
             if !hint.is_empty() {
-                body = body.child(div().text_xs().text_color(muted).child(hint.clone()));
+                body = body.child(div().text_xs().text_color(muted).child(hint));
             }
             let (submit, on_enter) = (submit.clone(), submit.clone());
             dialog
@@ -418,13 +455,16 @@ impl RepoView {
         let ask = Ask {
             title: tr("贮藏改动").into(),
             placeholder: tr("说明（可选）").into(),
-            hint: match only_picked {
-                true => {
-                    tr("仅贮藏选中的文件时，其中未跟踪的文件会一并贮藏；其余改动保留在工作区。")
+            // 第二个勾选项「仅贮藏选中的 N 个文件」勾着时说明换成只贮藏一部分的
+            hint: Hint::ByChecks(Box::new(move |checks| {
+                match only_picked && checks.get(1).copied().unwrap_or(false) {
+                    true => {
+                        tr("仅贮藏选中的文件时，其中未跟踪的文件会一并贮藏；其余改动保留在工作区。")
+                    }
+                    false => tr("贮藏改动，使工作区恢复干净；可在侧栏的「贮藏」中恢复。"),
                 }
-                false => tr("贮藏改动，使工作区恢复干净；可在侧栏的「贮藏」中恢复。"),
-            }
-            .into(),
+                .into()
+            })),
             ok: tr("贮藏"),
             checks,
             allow_empty: true,

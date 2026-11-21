@@ -9,10 +9,7 @@ fn main() {
     resource
         .set_icon("assets/icon.ico")
         .set("ProductName", "Kuai")
-        .set(
-            "FileDescription",
-            "Kuai：能打开服务器上仓库的 Git 客户端",
-        );
+        .set("FileDescription", "Kuai：远程开发工具");
     if let Err(err) = resource.compile() {
         // 没装 Windows SDK 时嵌不了图标，程序照样能用
         println!("cargo:warning=没有嵌入图标：{err}");

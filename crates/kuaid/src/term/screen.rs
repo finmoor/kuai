@@ -192,6 +192,14 @@ impl Screen {
         }
     }
 
+    /// 把现在的屏幕写成一串终端输出，给已经画着别的东西的客户端（它收得太慢，中间的输出没发给它，
+    /// 见 `Session::output`）：先把它的终端整个重置成空白的（[`RESET`]），再是 [`Self::dump`]。
+    pub fn redump(&mut self) -> Vec<u8> {
+        let mut out = RESET.to_vec();
+        out.extend_from_slice(&self.dump());
+        out
+    }
+
     /// 把现在的屏幕写成一串终端输出，给刚接上来的客户端（它的终端是空白的）。
     pub fn dump(&mut self) -> Vec<u8> {
         // 同步刷新攒着没画的先画上，不然拍下来的是旧画面
@@ -230,6 +238,15 @@ impl Screen {
         out
     }
 }
+
+/// 把一个画着别的东西、解析停在哪都不知道的终端重置成空白的（见 [`Screen::redump`]）：
+///
+/// - CAN：没写完的转义序列作废；
+/// - `CSI ? 2026 l`：结束「同步刷新」，攒着的照常处理（不然后面的都攒着，等超时才画）；
+/// - RIS（`ESC c`）：内容、往回翻的、模式、光标的样子都回到初始；
+/// - OSC 104、110、111、112：改过的调色板和前景、背景、光标的颜色还原（RIS 不管颜色）。
+const RESET: &[u8] =
+    b"\x18\x1b[?2026l\x1bc\x1b]104\x1b\\\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\";
 
 /// 一格的样式。
 #[derive(Clone, PartialEq)]
@@ -662,6 +679,48 @@ mod tests {
         assert_eq!(screen.last_text(), "需要提交吗？");
         screen.advance(b"  ? for shortcuts  ");
         assert_eq!(screen.last_text(), "? for shortcuts");
+    }
+
+    #[test]
+    fn 画着别的东西的终端先重置再还原_和空白的终端一样() {
+        let size = Size::new(30, 5);
+        // kuaid 这边收到的全部
+        let mut seen = Vec::new();
+        for n in 0..40 {
+            seen.extend_from_slice(format!("\x1b[3{}mline {n}\x1b[m\r\n", n % 8).as_bytes());
+        }
+        seen.extend_from_slice(b"\x1b]2;now\x07\x1b[?2004h$ ");
+        let mut original = Screen::new(size);
+        original.advance(&seen);
+        let dump = original.redump();
+        // 客户端只收到了前面一截（后面的因为它收得慢没发给它）：在备用屏里，开着鼠标和同步刷新，
+        // 改过调色板和背景色、设过标题，停在一条没写完的转义序列中间
+        let mut client = Screen::new(size);
+        client.advance(b"old 1\r\nold 2\r\n\x1b]2;old\x07\x1b]4;1;rgb:12/34/56\x1b\\\x1b]11;rgb:01/02/03\x1b\\");
+        client.advance(
+            b"\x1b[?1049h\x1b[?1000h\x1b[5 q\x1b[2J\x1b[Hfull screen\x1b[?2026hhidden\x1b[38;5",
+        );
+        client.advance(&dump);
+        let mut fresh = Screen::new(size);
+        fresh.advance(&original.dump());
+        assert_same(&fresh, &client, "重置再还原后");
+        assert_same(&original, &client, "和原来比");
+        assert_eq!(
+            client.term.cursor_style(),
+            fresh.term.cursor_style(),
+            "光标的样子"
+        );
+        for index in 0..269 {
+            assert_eq!(
+                client.term.colors()[index],
+                fresh.term.colors()[index],
+                "第 {index} 号颜色"
+            );
+        }
+        // 之后的输出两边接着一样
+        original.advance(b"git status\r\n");
+        client.advance(b"git status\r\n");
+        assert_same(&original, &client, "接着输出后");
     }
 
     #[test]

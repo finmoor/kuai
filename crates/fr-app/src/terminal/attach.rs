@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Local};
+use fr_channel::UploadSource;
 use fr_core::i18n::tr;
 use fr_core::tf;
 use gpui_kit::{Image, ImageFormat};
@@ -26,8 +27,8 @@ const KEEP_LOCAL: Duration = Duration::from_secs(7 * 24 * 3600);
 pub enum Attachment {
     /// 本机的一个文件
     File(PathBuf),
-    /// 内存里的一张图（剪贴板里的）：起好的文件名和编码好的内容
-    Image { name: String, bytes: Vec<u8> },
+    /// 剪贴板里的一张图：起好的文件名和原图。发之前在后台转格式（见 [`image_bytes`]）
+    Image { name: String, image: Image },
 }
 
 impl Attachment {
@@ -43,21 +44,51 @@ impl Attachment {
     }
 }
 
-/// 剪贴板里的图片变成要发的东西。PNG、JPEG、GIF、WebP 原样用（那些程序认这几种），
-/// 别的（截图常见的是位图）转成 PNG。
-pub fn image_attachment(image: &Image, now: DateTime<Local>) -> Result<Attachment, String> {
-    let (ext, bytes) = match image.format {
-        ImageFormat::Png => ("png", image.bytes.clone()),
-        ImageFormat::Jpeg => ("jpg", image.bytes.clone()),
-        ImageFormat::Gif => ("gif", image.bytes.clone()),
-        ImageFormat::Webp => ("webp", image.bytes.clone()),
-        ImageFormat::Svg => ("svg", image.bytes.clone()),
-        _ => ("png", to_png(&image.bytes)?),
+/// 剪贴板里的图片变成要发的东西：这里只起名字，转格式放到后台（见 [`image_bytes`]）。
+pub fn image_attachment(image: &Image, now: DateTime<Local>) -> Attachment {
+    let ext = match image.format {
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Webp => "webp",
+        ImageFormat::Svg => "svg",
+        _ => "png",
     };
-    Ok(Attachment::Image {
+    Attachment::Image {
         name: format!("paste-{}.{ext}", now.format("%m%d-%H%M%S")),
-        bytes,
-    })
+        image: image.clone(),
+    }
+}
+
+/// 剪贴板里的图片要发的内容。PNG、JPEG、GIF、WebP 原样用（那些程序认这几种），别的（截图常见的
+/// 是位图）转成 PNG：大截图要几十到几百毫秒，不在界面线程上调。
+fn image_bytes(image: Image) -> Result<Vec<u8>, String> {
+    match image.format {
+        ImageFormat::Png
+        | ImageFormat::Jpeg
+        | ImageFormat::Gif
+        | ImageFormat::Webp
+        | ImageFormat::Svg => Ok(image.bytes),
+        _ => to_png(&image.bytes),
+    }
+}
+
+/// [`uploads`] 的结果：要传的（名字和内容），和停在哪个文件夹前面。
+pub type Uploads = (Vec<(String, UploadSource)>, Option<String>);
+
+/// 要传到服务器上的：名字和内容。在后台调：剪贴板里的图片要转格式，网络盘上看一眼是不是文件夹也
+/// 可能慢。文件夹传不了，停在第一个文件夹前面：返回它前面的那些，和它的名字。
+pub fn uploads(items: Vec<Attachment>) -> Result<Uploads, String> {
+    let mut ready = Vec::with_capacity(items.len());
+    for item in items {
+        let name = item.name();
+        let source = match item {
+            Attachment::File(path) if path.is_dir() => return Ok((ready, Some(name))),
+            Attachment::File(path) => UploadSource::File(path),
+            Attachment::Image { image, .. } => UploadSource::Bytes(image_bytes(image)?),
+        };
+        ready.push((name, source));
+    }
+    Ok((ready, None))
 }
 
 fn to_png(bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -70,14 +101,16 @@ fn to_png(bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(png)
 }
 
-/// 本机终端：每样东西在本机的路径。图片存到临时目录里（顺手清掉以前存的、已经过期的）。
+/// 本机终端：每样东西在本机的路径。图片转好格式存到临时目录里（顺手清掉以前存的、已经过期的）。
+/// 在后台调。
 pub fn local_paths(items: Vec<Attachment>) -> Result<Vec<String>, String> {
     let dir = std::env::temp_dir().join("kuai").join("paste");
     items
         .into_iter()
         .map(|item| match item {
             Attachment::File(path) => Ok(path.to_string_lossy().into_owned()),
-            Attachment::Image { name, bytes } => {
+            Attachment::Image { name, image } => {
+                let bytes = image_bytes(image)?;
                 let path = save_image(&dir, &name, &bytes)
                     .map_err(|err| tf!("无法保存图片：{err}", err))?;
                 Ok(path.to_string_lossy().into_owned())
@@ -143,33 +176,19 @@ pub fn paste_paths(paths: &[String], bracketed: bool, windows: bool) -> Vec<u8> 
 /// 路径里有空格、引号这些就加引号，没有就原样。
 fn quote(path: &str, windows: bool) -> String {
     if windows {
-        // 和 Windows 终端拖文件进去一样：有空格（或者 shell 里有特殊意思的字符）才加双引号
+        // PowerShell（和 Git Bash）的双引号里 `$(…)`、`$变量`、反引号会被展开执行：带这两个字符的
+        // 用单引号，里面的单引号写两遍，原样不展开
+        if path.contains(['$', '`']) {
+            return format!("'{}'", path.replace('\'', "''"));
+        }
+        // 别的和 Windows 终端拖文件进去一样：有空格（或者 shell 里有特殊意思的字符）才加双引号
         let special = |c: char| c.is_whitespace() || "&()^;'`$,{}[]".contains(c);
         return match path.contains(special) {
             true => format!("\"{path}\""),
             false => path.to_string(),
         };
     }
-    let plain = |c: char| c.is_alphanumeric() || "_./+@=,:-%".contains(c);
-    match path.chars().all(plain) && !path.is_empty() {
-        true => path.to_string(),
-        false => format!("'{}'", path.replace('\'', "'\\''")),
-    }
-}
-
-/// 把字节数写成人看的大小。
-pub fn human_size(bytes: u64) -> String {
-    const KB: f64 = 1024.;
-    let size = bytes as f64;
-    if size < KB {
-        format!("{bytes} B")
-    } else if size < KB * KB {
-        format!("{:.0} KB", size / KB)
-    } else if size < KB * KB * KB {
-        format!("{:.1} MB", size / KB / KB)
-    } else {
-        format!("{:.2} GB", size / KB / KB / KB)
-    }
+    fr_core::git::sh_quote(path)
 }
 
 #[cfg(test)]
@@ -198,9 +217,12 @@ mod tests {
         assert_eq!(quote("/a/it's here.png", false), r"'/a/it'\''s here.png'");
         assert_eq!(quote("/a/$(x).png", false), "'/a/$(x).png'");
         // 本机（Windows）
-        assert_eq!(quote(r"C:\Users\Feng\a.png", true), r"C:\Users\Feng\a.png");
-        assert_eq!(quote(r"C:\Users\Feng\图 1.png", true), "\"C:\\Users\\Feng\\图 1.png\"");
+        assert_eq!(quote(r"C:\Users\me\a.png", true), r"C:\Users\me\a.png");
+        assert_eq!(quote(r"C:\Users\me\图 1.png", true), "\"C:\\Users\\me\\图 1.png\"");
         assert_eq!(quote(r"D:\a&b\c.txt", true), "\"D:\\a&b\\c.txt\"");
+        // PowerShell 的双引号里会展开的：用单引号，单引号写两遍
+        assert_eq!(quote(r"D:\a$(calc).txt", true), r"'D:\a$(calc).txt'");
+        assert_eq!(quote(r"D:\it's `x`.txt", true), r"'D:\it''s `x`.txt'");
     }
 
     #[test]
@@ -213,22 +235,46 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut bmp), image::ImageFormat::Bmp)
             .unwrap();
         let image = Image::from_bytes(ImageFormat::Bmp, bmp);
-        let Attachment::Image { name, bytes } = image_attachment(&image, now).unwrap() else {
+        let Attachment::Image { name, image } = image_attachment(&image, now) else {
             panic!("应该是图片");
         };
         assert_eq!(name, "paste-1112-130405.png");
+        let bytes = image_bytes(image).unwrap();
         assert!(bytes.starts_with(b"\x89PNG"));
         let back = image::load_from_memory(&bytes).unwrap().to_rgb8();
         assert_eq!(back.into_raw(), [255, 0, 0, 0, 0, 255]);
 
         let jpeg = Image::from_bytes(ImageFormat::Jpeg, b"jpeg-bytes".to_vec());
-        let Attachment::Image { name, bytes } = image_attachment(&jpeg, now).unwrap() else {
+        let Attachment::Image { name, image } = image_attachment(&jpeg, now) else {
             panic!("应该是图片");
         };
-        assert_eq!((name.as_str(), &bytes[..]), ("paste-1112-130405.jpg", &b"jpeg-bytes"[..]));
+        assert_eq!(name, "paste-1112-130405.jpg");
+        assert_eq!(image_bytes(image).unwrap(), b"jpeg-bytes");
         // 坏的图片：报错，不是崩
         let broken = Image::from_bytes(ImageFormat::Bmp, b"not a bitmap".to_vec());
-        assert!(image_attachment(&broken, now).is_err());
+        assert!(image_bytes(broken).is_err());
+    }
+
+    #[test]
+    fn 传到服务器时停在文件夹前面() {
+        let dir = std::env::temp_dir().join(format!("kuai-upload-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        let png = Image::from_bytes(ImageFormat::Png, b"png-bytes".to_vec());
+        let items = vec![
+            Attachment::File(dir.join("a.txt")),
+            image_attachment(&png, Local::now()),
+            Attachment::File(dir.join("folder")),
+            Attachment::File(dir.join("b.txt")),
+        ];
+        let (ready, folder) = uploads(items).unwrap();
+        let names: Vec<&str> = ready.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0], "a.txt");
+        assert!(matches!(&ready[1].1, UploadSource::Bytes(bytes) if bytes == b"png-bytes"));
+        assert_eq!(folder.as_deref(), Some("folder"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -252,20 +298,11 @@ mod tests {
     }
 
     #[test]
-    fn 大小写成人看的() {
-        assert_eq!(human_size(0), "0 B");
-        assert_eq!(human_size(1023), "1023 B");
-        assert_eq!(human_size(340 * 1024), "340 KB");
-        assert_eq!(human_size(5 * 1024 * 1024 + 300 * 1024), "5.3 MB");
-        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.00 GB");
-    }
-
-    #[test]
     fn 名字() {
         assert_eq!(Attachment::File(r"C:\a\图 1.png".into()).name(), "图 1.png");
         let image = Attachment::Image {
             name: "paste-1.png".into(),
-            bytes: Vec::new(),
+            image: Image::from_bytes(ImageFormat::Png, Vec::new()),
         };
         assert_eq!(image.name(), "paste-1.png");
     }

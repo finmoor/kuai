@@ -6,7 +6,8 @@ use fr_core::i18n::tr;
 use fr_core::tf;
 use std::rc::Rc;
 
-use fr_channel::{GitOutput, StreamItem};
+use fr_channel::{Channel, GitOutput, StreamItem};
+use fr_core::pull;
 use fr_core::state;
 use futures::channel::oneshot;
 use futures::{FutureExt as _, StreamExt as _};
@@ -28,6 +29,9 @@ pub(super) struct Step {
     /// 联网的命令：边做边显示 git 报的进度，可以取消。别的命令会改暂存区和工作区，
     /// 中途杀掉会留下锁文件，所以不给取消。
     pub net: bool,
+    /// 给人看的写法（活动记录、失败的详情）：借 shell 别名的命令写成等价的命令，不露出别名那段
+    /// 脚本。空着就照 `args` 写
+    pub shown: Option<String>,
 }
 
 impl Step {
@@ -36,22 +40,112 @@ impl Step {
             args,
             stdin: None,
             net: false,
+            shown: None,
         }
     }
 
     pub fn net(args: Vec<String>) -> Self {
         Self {
-            args,
-            stdin: None,
             net: true,
+            ..Self::local(args)
         }
+    }
+
+    /// 从标准输入喂内容的本地命令。
+    pub fn input(args: Vec<String>, stdin: Vec<u8>) -> Self {
+        Self {
+            stdin: Some(stdin),
+            ..Self::local(args)
+        }
+    }
+
+    pub fn shown(self, text: String) -> Self {
+        Self {
+            shown: Some(text),
+            ..self
+        }
+    }
+
+    /// 活动记录里写的命令：给了 [`Self::shown`] 用它，没给照参数写全（`-c` 也写上）。
+    fn logged(&self) -> String {
+        match &self.shown {
+            Some(text) => text.clone(),
+            None => format!("git {}", self.args.join(" ")),
+        }
+    }
+
+    /// `--` 后面的路径里有认不出的字符：文件名不是 UTF-8，读状态时换成了 U+FFFD。交给 git 的名字
+    /// 和真的对不上，碰巧和别的文件同名还会改错文件。
+    fn lossy_path(&self) -> bool {
+        self.args
+            .iter()
+            .skip_while(|arg| *arg != "--")
+            .any(|arg| arg.contains(char::REPLACEMENT_CHARACTER))
     }
 }
 
 type OnDone =
     Box<dyn FnOnce(&mut RepoView, Result<GitOutput, String>, &mut Window, &mut Context<RepoView>)>;
 
+/// 动手之前要再核对一遍的一项（见 [`RepoView::verify_then`]）：git 参数，和确认时看到的输出
+/// （去掉首尾空白；命令失败算 None）。
+pub(super) type Check = (Vec<String>, Option<String>);
+
 impl RepoView {
+    /// HEAD 现在的样子：在哪个分支上、指向哪个提交（按读到的状态）。给 [`Self::verify_then`] 核对用。
+    pub(super) fn head_checks(&self) -> Vec<Check> {
+        let status = self.status.as_ref();
+        let branch = status
+            .and_then(|status| status.branch.as_ref())
+            .map(|branch| format!("refs/heads/{branch}"));
+        let head = status.and_then(|status| status.head.clone());
+        vec![
+            (args(&["symbolic-ref", "-q", "HEAD"]), branch),
+            (args(&["rev-parse", "-q", "--verify", "HEAD"]), head),
+        ]
+    }
+
+    /// 确认框开着的这一会儿仓库可能变了（别的窗口、终端里的 git、自动获取）：动手之前把 `checks`
+    /// 再读一遍，都和确认时看到的一样才做 `then`；不一样就不做，说一声，重新读状态。原来照确认前
+    /// 记下的分支名、贮藏的编号直接执行，可能作用到确认框里没写的分支、贮藏上。读和做之间还有很短
+    /// 的空当，没有锁。
+    pub(super) fn verify_then(
+        &mut self,
+        checks: Vec<Check>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        let repo = self.entry.path.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let mut same = true;
+            for (args, expect) in checks {
+                let out = channel.git(&repo, args).await;
+                let got = out
+                    .ok()
+                    .filter(GitOutput::success)
+                    .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                    .filter(|text| !text.is_empty());
+                if got != expect {
+                    same = false;
+                    break;
+                }
+            }
+            this.update_in(cx, |this, window, cx| {
+                if same {
+                    return then(this, window, cx);
+                }
+                let text = tr("仓库在确认期间有了变化，没有执行。请查看最新状态后重试。");
+                window.push_notification(Notification::warning(text), cx);
+                this.refresh(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
     /// 执行一个写操作。成功时调用 `on_success`，失败时弹出 git 的报错；无论成败都刷新状态。
     pub(super) fn run_op(
         &mut self,
@@ -63,9 +157,8 @@ impl RepoView {
         on_success: impl FnOnce(&mut Self, &GitOutput, &mut Window, &mut Context<Self>) + 'static,
     ) {
         let step = Step {
-            args,
             stdin,
-            net: false,
+            ..Step::local(args)
         };
         self.run_seq(label, vec![step], window, cx, on_success);
     }
@@ -155,13 +248,49 @@ impl RepoView {
         let Some(channel) = self.channel.clone() else {
             return;
         };
-        // 后台的自动获取让路：用户要做的事优先，两条 git 也不会抢同一个引用的锁
-        self.stop_auto_fetch();
+        if steps.iter().any(Step::lossy_path) {
+            let text =
+                tr("文件名里有无法识别的字符（不是 UTF-8 编码），无法操作，请在终端中处理。");
+            window.push_notification(Notification::warning(text), cx);
+            return;
+        }
+        // 同一个仓库在别的页面里正在写（子仓库页、另开的标签页、总览的批量操作）
+        let key = writing_key(self.entry.server.as_deref(), &self.entry.path);
+        let writing = match Writing::take(key, label.clone()) {
+            Ok(writing) => writing,
+            Err(running) => {
+                let text = tf!(
+                    "该仓库正在另一个页面中执行「{running}」，请等待完成后重试",
+                    running
+                );
+                window.push_notification(Notification::warning(text), cx);
+                return;
+            }
+        };
+        // 后台的自动获取让路：用户要做的事优先。等它的 git 真的停了再开始，两条 git 不会抢同一个引用的锁
+        let stopping = self.stop_auto_fetch();
         for step in &steps {
-            log::info!("{}：git {}", self.entry.path, step.args.join(" "));
+            let command = step.args.join(" ");
+            log::info!(
+                "{}：git {}",
+                self.entry.path,
+                fr_core::git::redact_urls(&command)
+            );
         }
         let repo = self.entry.path.clone();
         let was_in_progress = self.in_progress.is_some();
+        // 用了 git 自己的自动贮藏，或者停在一半的合并、变基这次可能做完（git 那时才放回改动）：做完看
+        // 贮藏列表里有没有多出它放不回去时留下的那一份（见 [`kept_autostash`]）
+        let autostash = was_in_progress
+            || steps
+                .iter()
+                .any(|step| step.args.iter().any(|arg| arg == "--autostash"));
+        let stashed: Vec<String> = self
+            .refs
+            .stashes
+            .iter()
+            .map(|stash| stash.target.clone())
+            .collect();
         // 继续、跳过之后又停下，说明后面的提交也停住了，不算出错
         // 按标签认：和 `continue_in_progress`、`skip_in_progress` 里起的标签是同一句话
         let resuming = was_in_progress
@@ -171,9 +300,17 @@ impl RepoView {
             });
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
         self.op = Some(label.clone());
+        self.op_writing = Some(writing);
         self.op_progress = None;
         self.op_cancel = Some(cancel_tx);
         self.op_task = Some(cx.spawn_in(window, async move |this, cx| {
+            if let Some(stopping) = stopping {
+                // 最多等 10 秒：连接卡住、kuaid 不回话时照样往下做
+                let limit = cx
+                    .background_executor()
+                    .timer(std::time::Duration::from_secs(10));
+                futures::future::select(stopping, Box::pin(limit)).await;
+            }
             let mut cancel_rx = cancel_rx.fuse();
             let mut result = Ok(GitOutput {
                 code: Some(0),
@@ -184,13 +321,16 @@ impl RepoView {
             let mut failed_step = String::new();
             let mut cancelled = false;
             for step in steps {
-                let shown = command_line(&step.args);
+                let shown = match &step.shown {
+                    Some(text) => clip(text.clone()),
+                    None => command_line(&step.args),
+                };
                 // 工具栏上有没有「取消」，跟着这一步走
                 let net = step.net;
                 let marked = this.update(cx, |this, cx| {
                     this.op_progress = net.then(SharedString::default);
                     cx.notify();
-                    this.activity.begin(label.clone(), &step.args)
+                    this.activity.begin(label.clone(), step.logged())
                 });
                 let Ok(activity) = marked else {
                     return;
@@ -264,8 +404,17 @@ impl RepoView {
             } else {
                 None
             };
+            let kept = match autostash && !cancelled {
+                true => channel
+                    .git(&repo, fr_core::refs::stash_args())
+                    .await
+                    .ok()
+                    .is_some_and(|out| kept_autostash(&out.stdout, &stashed)),
+                false => false,
+            };
             this.update_in(cx, |this, window, cx| {
                 this.op = None;
+                this.op_writing = None;
                 this.op_progress = None;
                 this.op_cancel = None;
                 this.changes.mark_stale();
@@ -323,6 +472,15 @@ impl RepoView {
                         });
                         on_done(this, result, window, cx);
                     }
+                }
+                if kept {
+                    this.show_changes(cx);
+                    let note = Notification::warning(tr(
+                        "改动仍保存在侧栏的贮藏「autostash」中。请在「本地修改」中处理冲突，确认无遗漏后再删除该贮藏。",
+                    ))
+                    .title(tr("自动贮藏的改动未能完整恢复"))
+                    .autohide(false);
+                    window.push_notification(note, cx);
                 }
                 this.refresh(cx);
                 cx.notify();
@@ -504,7 +662,8 @@ impl RepoView {
         );
     }
 
-    /// 拉取分两步：先获取（联网，可以取消），再合并或变基（改工作区，不能中途杀掉）。
+    /// 拉取分两步：先获取（联网，可以取消），再照配置合并或变基（改工作区，不能中途杀掉，也不再
+    /// 联网；原来第二步是 `git pull`，它又获取一次，这一次取消不了）。见 [`pull`]。
     fn run_pull_now(
         &mut self,
         mut steps: Vec<Step>,
@@ -513,30 +672,42 @@ impl RepoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        steps.push(Step::net(args(&["fetch", "--progress"])));
-        // --no-edit：要合并时直接用默认的合并说明，不弹编辑器
-        let mut merge = args(&["pull", "--no-edit"]);
-        if rebase {
-            merge.push("--rebase".into());
-        }
-        if autostash {
-            merge.push("--autostash".into());
-        }
-        steps.push(Step::local(merge));
-        self.run_seq(
-            tr("拉取"),
-            steps,
-            window,
-            cx,
-            move |_, out, window, cx| {
-                let title = if rebase {
-                    tr("拉取完成（变基）")
-                } else {
-                    tr("拉取完成")
-                };
-                window.push_notification(Notification::success(summary(out)).title(title), cx);
-            },
-        );
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        let branch = self.status.as_ref().and_then(|s| s.branch.clone());
+        let read = channel.git(&self.entry.path, pull::config_args());
+        cx.spawn_in(window, async move |this, cx| {
+            // 什么都没配时 git config 以 1 退出：按空的算
+            let config = read.await.map(|out| out.stdout).unwrap_or_default();
+            let finish = pull::decide(&config, branch.as_deref().unwrap_or_default(), rebase);
+            this.update_in(cx, |this, window, cx| {
+                steps.push(Step::net(pull::fetch_args()));
+                let missing = tr("远程上找不到上游分支（可能已被删除），未合并。");
+                let merge = Step::local(pull::finish_args(finish, autostash, missing));
+                steps.push(merge.shown(pull::finish_shown(finish, autostash)));
+                let rebased = matches!(finish, pull::Finish::Rebase { .. });
+                this.run_seq(
+                    tr("拉取"),
+                    steps,
+                    window,
+                    cx,
+                    move |_, out, window, cx| {
+                        let title = if rebased {
+                            tr("拉取完成（变基）")
+                        } else {
+                            tr("拉取完成")
+                        };
+                        window.push_notification(
+                            Notification::success(summary(out)).title(title),
+                            cx,
+                        );
+                    },
+                );
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub(super) fn push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -569,12 +740,14 @@ impl RepoView {
             return;
         }
         let remote = self.default_remote();
+        // 完整引用名：本地有同名的标签时短名会认错
         let push = vec![
             "push".into(),
             "--progress".into(),
             "--set-upstream".into(),
+            "--".into(),
             remote.clone(),
-            branch.clone(),
+            format!("refs/heads/{branch}"),
         ];
         self.run_net_op(tr("推送"), push, window, cx, move |_, _, window, cx| {
             let text = tf!(
@@ -731,6 +904,8 @@ impl RepoView {
     }
 
     /// [`Self::run_stashed`] 的后一半：找到刚才自动贮藏的那一份，放回工作区，然后报告结果。
+    /// 按提交放回（`stash apply <提交>`），不按 `stash@{N}`：别处（终端里的 git、编辑器）同时存了
+    /// 贮藏、序号挪了也不会放错。放回了再从贮藏列表里删掉它，冲突时留着。
     fn restore_stash(
         &mut self,
         label: &'static str,
@@ -745,12 +920,12 @@ impl RepoView {
         };
         let list = channel.git(&self.entry.path, fr_core::refs::stash_args());
         cx.spawn_in(window, async move |this, cx| {
-            let selector = list
+            let commit = list
                 .await
                 .ok()
                 .and_then(|out| find_stash(&out.stdout, &marker));
             this.update_in(cx, |this, window, cx| {
-                let Some(selector) = selector else {
+                let Some(commit) = commit else {
                     // 刚才没有贮藏下来东西（比如只有子模块里的改动）：就当没贮藏过
                     match result {
                         Ok(out) => on_success(this, &out, window, cx),
@@ -758,43 +933,116 @@ impl RepoView {
                     }
                     return;
                 };
-                let pop = vec!["stash".into(), "pop".into(), selector];
+                // 带 --index：原来暂存的改动放回去还是暂存的
+                let apply = vec![
+                    "stash".into(),
+                    "apply".into(),
+                    "--index".into(),
+                    commit.clone(),
+                ];
                 this.run_op_with(
                     tr("恢复改动"),
-                    pop,
+                    apply,
                     window,
                     cx,
-                    move |this, popped, window, cx| match (result, popped) {
-                        (Ok(out), Ok(_)) => on_success(this, &out, window, cx),
-                        (Ok(_), Err(text)) => {
-                            this.show_changes(cx);
-                            let title = tf!("{label}已完成，但恢复改动时发生冲突", label);
-                            let note = Notification::warning(tr(
-                                "请在「本地修改」中解决冲突并暂存。自动贮藏仍在侧栏中，确认无遗漏后再删除。",
-                            ))
-                            .title(title.clone())
-                            .autohide(false);
-                            window.push_notification(with_detail(note, &title, &text), cx);
-                        }
-                        (Err(text), Ok(_)) => {
-                            let text =
-                                tf!("{text}\n\n改动已恢复到工作区。", text);
-                            failure(window, cx, label, text);
-                        }
-                        (Err(text), Err(pop)) => {
-                            let text = tf!(
-                                "{text}\n\n恢复改动也失败，改动仍在侧栏的「贮藏」中：\n{pop}",
-                                text,
-                                pop
+                    move |this, applied, window, cx| {
+                        // 暂存区放不回去（git 说 Conflicts in index. Try without --index.，这时它什么都
+                        // 没动）：改用不带 --index 的，改动都放回工作区，不再分暂存和未暂存，说一声
+                        if let Err(text) = &applied
+                            && text.contains("--index")
+                        {
+                            let apply = vec!["stash".into(), "apply".into(), commit.clone()];
+                            this.run_op_with(
+                                tr("恢复改动"),
+                                apply,
+                                window,
+                                cx,
+                                move |this, applied, window, cx| {
+                                    let restored = applied.is_ok();
+                                    if restored {
+                                        this.drop_autostash(commit, window, cx);
+                                    }
+                                    this.report_restore(
+                                        label, result, applied, on_success, window, cx,
+                                    );
+                                    if restored {
+                                        let text =
+                                            tr("原来暂存的改动未能保持暂存，已全部放回工作区。");
+                                        window.push_notification(Notification::warning(text), cx);
+                                    }
+                                },
                             );
-                            failure(window, cx, label, text);
+                            return;
                         }
+                        if applied.is_ok() {
+                            this.drop_autostash(commit, window, cx);
+                        }
+                        this.report_restore(label, result, applied, on_success, window, cx);
                     },
                 );
             })
             .ok();
         })
         .detach();
+    }
+
+    /// 改动放回以后，把自动贮藏的那一份从贮藏列表里删掉；没删成时说一声，它留在侧栏里。
+    fn drop_autostash(&mut self, commit: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        let path = self.entry.path.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            if !drop_stash_commit(&channel, &path, &commit).await {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                let text = tr(
+                    "改动已放回工作区，但自动贮藏未能从贮藏列表中删除，确认无误后可在侧栏中删除。",
+                );
+                window.push_notification(Notification::warning(text), cx);
+                this.refresh(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// [`Self::restore_stash`] 的结果：操作本身（`result`）和放回改动（`popped`）各自成没成。
+    fn report_restore(
+        &mut self,
+        label: &'static str,
+        result: Result<GitOutput, String>,
+        popped: Result<GitOutput, String>,
+        on_success: impl FnOnce(&mut Self, &GitOutput, &mut Window, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match (result, popped) {
+            (Ok(out), Ok(_)) => on_success(self, &out, window, cx),
+            (Ok(_), Err(text)) => {
+                self.show_changes(cx);
+                let title = tf!("{label}已完成，但恢复改动时发生冲突", label);
+                let note = Notification::warning(tr(
+                    "请在「本地修改」中解决冲突并暂存。自动贮藏仍在侧栏中，确认无遗漏后再删除。",
+                ))
+                .title(title.clone())
+                .autohide(false);
+                window.push_notification(with_detail(note, &title, &text), cx);
+            }
+            (Err(text), Ok(_)) => {
+                let text = tf!("{text}\n\n改动已恢复到工作区。", text);
+                failure(window, cx, label, text);
+            }
+            (Err(text), Err(pop)) => {
+                let text = tf!(
+                    "{text}\n\n恢复改动也失败，改动仍在侧栏的「贮藏」中：\n{pop}",
+                    text,
+                    pop
+                );
+                failure(window, cx, label, text);
+            }
+        }
     }
 
     /// 检出远程分支：有跟踪它的同名本地分支就切过去，没有就新建一个跟踪它的。
@@ -953,6 +1201,7 @@ impl RepoView {
             message = stash.message,
             selector = stash.selector
         );
+        let checks = self.stash_checks(&stash.selector);
         let selector = stash.selector.clone();
         self.confirm_plain(
             tr("弹出贮藏？"),
@@ -960,8 +1209,22 @@ impl RepoView {
             tr("弹出"),
             window,
             cx,
-            move |this, window, cx| this.stash_pop(selector.clone(), window, cx),
+            move |this, window, cx| {
+                this.stash_pop_checked(selector.clone(), checks.clone(), window, cx)
+            },
         );
+    }
+
+    /// 贮藏的编号（`stash@{n}`）是按位置排的，别处新建、删掉一条就指向别的了。记下它现在指向的那个
+    /// 提交，动手之前核对编号还是不是这一条（见 [`Self::verify_then`]）。
+    fn stash_checks(&self, selector: &str) -> Vec<Check> {
+        let target = self
+            .refs
+            .stashes
+            .iter()
+            .find(|stash| stash.selector == selector)
+            .map(|stash| stash.target.clone());
+        vec![(args(&["rev-parse", "-q", "--verify", selector]), target)]
     }
 
     /// 弹出贮藏：应用并从列表里删除。
@@ -971,19 +1234,32 @@ impl RepoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let checks = self.stash_checks(&selector);
+        self.stash_pop_checked(selector, checks, window, cx);
+    }
+
+    fn stash_pop_checked(
+        &mut self,
+        selector: String,
+        checks: Vec<Check>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let pop = vec!["stash".into(), "pop".into(), selector];
-        self.run_op(
-            tr("弹出贮藏"),
-            pop,
-            None,
-            window,
-            cx,
-            |this, _, window, cx| {
-                this.show_changes(cx);
-                window
-                    .push_notification(Notification::success(tr("改动已恢复，贮藏已删除")), cx);
-            },
-        );
+        self.verify_then(checks, window, cx, move |this, window, cx| {
+            this.run_op(
+                tr("弹出贮藏"),
+                pop,
+                None,
+                window,
+                cx,
+                |this, _, window, cx| {
+                    this.show_changes(cx);
+                    window
+                        .push_notification(Notification::success(tr("改动已恢复，贮藏已删除")), cx);
+                },
+            );
+        });
     }
 
     pub(super) fn stash_apply(
@@ -992,19 +1268,22 @@ impl RepoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let checks = self.stash_checks(&selector);
         let apply = vec!["stash".into(), "apply".into(), selector];
-        self.run_op(
-            tr("应用贮藏"),
-            apply,
-            None,
-            window,
-            cx,
-            |this, _, window, cx| {
-                this.show_changes(cx);
-                window
-                    .push_notification(Notification::success(tr("改动已恢复，贮藏已保留")), cx);
-            },
-        );
+        self.verify_then(checks, window, cx, move |this, window, cx| {
+            this.run_op(
+                tr("应用贮藏"),
+                apply,
+                None,
+                window,
+                cx,
+                |this, _, window, cx| {
+                    this.show_changes(cx);
+                    window
+                        .push_notification(Notification::success(tr("改动已恢复，贮藏已保留")), cx);
+                },
+            );
+        });
     }
 
     pub(super) fn stash_drop(
@@ -1019,6 +1298,8 @@ impl RepoView {
             selector,
             message
         );
+        // 确认框写的是这一条：确认时编号已经指向别的贮藏了就不删
+        let checks = self.stash_checks(&selector);
         self.confirm(
             tr("删除贮藏？"),
             description,
@@ -1027,16 +1308,19 @@ impl RepoView {
             cx,
             move |this, window, cx| {
                 let drop = vec!["stash".into(), "drop".into(), selector.clone()];
-                this.run_op(
-                    tr("删除贮藏"),
-                    drop,
-                    None,
-                    window,
-                    cx,
-                    |_, _, window, cx| {
-                        window.push_notification(Notification::success(tr("已删除此贮藏")), cx);
-                    },
-                );
+                this.verify_then(checks.clone(), window, cx, move |this, window, cx| {
+                    this.run_op(
+                        tr("删除贮藏"),
+                        drop,
+                        None,
+                        window,
+                        cx,
+                        |_, _, window, cx| {
+                            let text = tr("已删除此贮藏");
+                            window.push_notification(Notification::success(text), cx);
+                        },
+                    );
+                });
             },
         );
     }
@@ -1164,13 +1448,86 @@ pub(crate) fn explain(detail: &str) -> Option<&'static str> {
     }
 }
 
+/// git 自己的自动贮藏（`--autostash`）放回工作区时有冲突，就把它存进贮藏列表，说明是不翻译的
+/// 「autostash」。`list` 是 [`fr_core::refs::stash_args`] 的输出，`before` 是操作前就有的贮藏的提交：
+/// 多出了这样一份就是这次没放回去。
+fn kept_autostash(list: &[u8], before: &[String]) -> bool {
+    fr_core::refs::parse(&[], list)
+        .stashes
+        .iter()
+        .any(|stash| stash.message == "autostash" && !before.contains(&stash.target))
+}
+
 /// 在 `git stash list` 的输出里找说明里带 `marker` 的那一份，返回 `stash@{n}`。
 fn find_stash(list: &[u8], marker: &str) -> Option<String> {
     fr_core::refs::parse(&[], list)
         .stashes
         .into_iter()
         .find(|stash| stash.message.contains(marker))
-        .map(|stash| stash.selector)
+        .map(|stash| stash.target)
+}
+
+/// 删掉贮藏列表里提交是 `commit` 的那一份，返回它是不是还留在列表里。git 只认 `stash@{N}`：
+/// 删之前按提交找到它现在的序号，删完看 git 报的删掉的是不是它。正好别处同时存了贮藏、
+/// 删成了别的那一份，就把那一份存回去（`stash store`），这一份留着。
+async fn drop_stash_commit(channel: &Channel, path: &str, commit: &str) -> bool {
+    let Ok(list) = channel.git(path, fr_core::refs::stash_args()).await else {
+        return true;
+    };
+    let found = fr_core::refs::parse(&[], &list.stdout)
+        .stashes
+        .into_iter()
+        .find(|stash| stash.target == commit);
+    let Some(stash) = found else {
+        // 已经不在列表里了
+        return false;
+    };
+    let drop = vec!["stash".to_string(), "drop".into(), stash.selector];
+    let out = match channel.git(path, drop).await {
+        Ok(out) if out.success() => out,
+        _ => return true,
+    };
+    // git 说「Dropped stash@{N} (<提交>)」，各种语言的说法里都有完整的提交号
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    match object_ids(&said).next() {
+        Some(dropped) if dropped == commit => false,
+        Some(other) => {
+            let other = other.to_string();
+            let subject = vec![
+                "log".to_string(),
+                "-1".into(),
+                "--format=%s".into(),
+                other.clone(),
+            ];
+            let message = match channel.git(path, subject).await {
+                Ok(out) if out.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                _ => String::new(),
+            };
+            let store = vec![
+                "stash".to_string(),
+                "store".into(),
+                "-m".into(),
+                message,
+                other,
+            ];
+            channel.git(path, store).await.ok();
+            true
+        }
+        // 认不出 git 说了什么：再列一次看它还在不在
+        None => match channel.git(path, fr_core::refs::stash_args()).await {
+            Ok(list) => fr_core::refs::parse(&[], &list.stdout)
+                .stashes
+                .iter()
+                .any(|stash| stash.target == commit),
+            Err(_) => true,
+        },
+    }
+}
+
+/// 一段文字里的完整提交号（40 位，SHA-256 的仓库是 64 位）。
+fn object_ids(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !c.is_ascii_hexdigit())
+        .filter(|word| word.len() == 40 || word.len() == 64)
 }
 
 /// 最后 `n` 行；前面有省略时在开头注明省了多少行。
@@ -1187,12 +1544,68 @@ fn tail(text: &str, n: usize) -> String {
 }
 
 /// 给用户看的命令行：`git` 加参数，太长就截断。
+/// 给人看的命令行。前面的 `-c 名字=值` 不写：借 shell 别名的那几步，别名的整段脚本没法看。
 fn command_line(args: &[String]) -> String {
-    let mut text = format!("git {}", args.join(" "));
+    let mut rest = args;
+    while let [flag, _, tail @ ..] = rest
+        && flag == "-c"
+    {
+        rest = tail;
+    }
+    clip(format!("git {}", rest.join(" ")))
+}
+
+/// 给人看的命令行：带凭据的地址遮掉，太长就截断。
+fn clip(text: String) -> String {
+    let mut text = fr_core::git::redact_urls(&text).into_owned();
     if text.chars().count() > 80 {
         text = text.chars().take(80).collect::<String>() + "…";
     }
     text
+}
+
+/// 每个仓库正在做的写操作（键见 [`writing_key`]）。同一个仓库开在几个页面里时（子仓库页、「在新
+/// 标签页中打开」、子仓库总览的批量操作），各页的 `op` 互相看不见，写到一起会撞 index.lock、拉取和
+/// 合并交错，所以另记一份全局的。
+static WRITING: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, SharedString>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// 仓库在 [`WRITING`] 里的键：哪台电脑和路径。本机（Windows）不分大小写，两种斜杠都算。
+pub(super) fn writing_key(server: Option<&str>, path: &str) -> String {
+    match server {
+        None => {
+            let path = path.replace('/', "\\");
+            format!("\n{}", path.trim_end_matches('\\').to_lowercase())
+        }
+        Some(server) => format!("{server}\n{}", path.trim_end_matches('/')),
+    }
+}
+
+/// 占着一个仓库的「正在写」，放掉就让出来。
+pub(super) struct Writing(String);
+
+impl Writing {
+    /// 占上；这个仓库正在别处写时返回那个操作的名字。
+    pub(super) fn take(key: String, label: SharedString) -> Result<Writing, SharedString> {
+        let mut writing = WRITING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(running) = writing.get(&key) {
+            return Err(running.clone());
+        }
+        writing.insert(key.clone(), label);
+        Ok(Writing(key))
+    }
+}
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        WRITING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
 }
 
 /// 进度里最新的一行。git 用回车在同一行上刷新进度，所以回车和换行都算分隔。
@@ -1258,18 +1671,146 @@ fn summary(out: &GitOutput) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_line, explain, find_stash, last_progress_line, strip_progress, tail};
+    use super::{
+        Step, Writing, command_line, explain, find_stash, kept_autostash, last_progress_line,
+        strip_progress, tail, writing_key,
+    };
+
+    #[test]
+    fn 路径里有认不出的字符时不交给git() {
+        let step = |args: &[&str]| Step::local(args.iter().map(|arg| arg.to_string()).collect());
+        assert!(step(&["add", "--", "a\u{FFFD}.txt"]).lossy_path());
+        assert!(!step(&["add", "--", "a.txt"]).lossy_path());
+        // `--` 前面的（比如标签的说明）不算路径
+        assert!(!step(&["tag", "-a", "-m", "\u{FFFD}", "v1"]).lossy_path());
+    }
+
+    #[test]
+    fn 同一个仓库同时只能有一处在写() {
+        let key = writing_key(None, r"C:\Work\写互斥测试\");
+        assert_eq!(key, writing_key(None, "c:/work/写互斥测试"));
+        let first = Writing::take(key.clone(), "拉取".into()).unwrap();
+        let second = Writing::take(writing_key(None, "C:/WORK/写互斥测试"), "推送".into());
+        let Err(running) = second else {
+            panic!("同一个仓库应该被挡住");
+        };
+        assert_eq!(running.as_ref(), "拉取");
+        drop(first);
+        assert!(Writing::take(key, "推送".into()).is_ok());
+        // 服务器上的分大小写；不同电脑上的不算一个
+        assert_ne!(
+            writing_key(Some("a"), "/srv/x"),
+            writing_key(Some("a"), "/srv/X")
+        );
+        assert_ne!(
+            writing_key(Some("a"), "/srv/x"),
+            writing_key(Some("b"), "/srv/x")
+        );
+    }
 
     #[test]
     fn 按记号找自动贮藏的那一份() {
         let list = "stash@{0}\x1faaa\x1f1700000002\x1fOn main: 手工贮藏的\0\
                     stash@{1}\x1fbbb\x1f1700000001\x1fOn main: 切换分支之前自动贮藏的改动（kuai-123）\0";
+        // 认的是提交，不是会挪动的 stash@{N}
         assert_eq!(
             find_stash(list.as_bytes(), "kuai-123").as_deref(),
-            Some("stash@{1}")
+            Some("bbb")
         );
         assert_eq!(find_stash(list.as_bytes(), "kuai-999"), None);
         assert_eq!(find_stash(b"", "kuai-123"), None);
+    }
+
+    #[test]
+    fn 认出git放不回去时留下的自动贮藏() {
+        let dir = std::env::temp_dir().join(format!("fr-autostash-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (origin, work) = (dir.join("origin"), dir.join("work"));
+        std::fs::create_dir_all(&origin).unwrap();
+        let git = |at: &std::path::Path, args: &[&str]| fr_core::git::run(at, args).unwrap();
+        let ident = |at: &std::path::Path| {
+            git(at, &["config", "user.name", "t"]);
+            git(at, &["config", "user.email", "t@example.com"]);
+            git(at, &["config", "core.autocrlf", "false"]);
+        };
+        git(&origin, &["init", "-q", "-b", "main"]);
+        ident(&origin);
+        std::fs::write(origin.join("a.txt"), "a\n").unwrap();
+        git(&origin, &["add", "a.txt"]);
+        git(&origin, &["commit", "-q", "-m", "c1"]);
+        git(&dir, &["clone", "-q", "origin", "work"]);
+        ident(&work);
+        // 远程上改了这一行，本地也改了这一行（没提交）
+        std::fs::write(origin.join("a.txt"), "remote\n").unwrap();
+        git(&origin, &["commit", "-q", "-am", "c2"]);
+        std::fs::write(work.join("a.txt"), "local\n").unwrap();
+        let list_args = fr_core::refs::stash_args();
+        let list_args: Vec<&str> = list_args.iter().map(String::as_str).collect();
+        let targets = |list: &[u8]| -> Vec<String> {
+            fr_core::refs::parse(&[], list)
+                .stashes
+                .into_iter()
+                .map(|stash| stash.target)
+                .collect()
+        };
+        let before = targets(&git(&work, &list_args));
+        git(&work, &["fetch", "-q"]);
+        // 合并本身成了，放回改动时有冲突：git 照样以 0 退出，改动留在贮藏列表里
+        let finish = fr_core::pull::finish_args(fr_core::pull::Finish::Merge(None), true, "x");
+        let finish: Vec<&str> = finish.iter().map(String::as_str).collect();
+        git(&work, &finish);
+        let after = git(&work, &list_args);
+        assert!(kept_autostash(&after, &before));
+        // 操作前就有的不算
+        assert!(!kept_autostash(&after, &targets(&after)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 按提交删掉自动贮藏() {
+        let dir = std::env::temp_dir().join(format!("fr-drop-stash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = fr_core::git::run(&dir, args).unwrap();
+            String::from_utf8_lossy(&out).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "user.email", "t@example.com"]);
+        std::fs::write(dir.join("a.txt"), "1\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "first"]);
+        std::fs::write(dir.join("a.txt"), "2\n").unwrap();
+        git(&["stash", "push", "-q", "-m", "auto kuai-1"]);
+        let ours = git(&["rev-parse", "stash@{0}"]);
+        // 之后别处又存了一份：自动贮藏挪到了 stash@{1}
+        std::fs::write(dir.join("a.txt"), "3\n").unwrap();
+        git(&["stash", "push", "-q", "-m", "manual"]);
+        let theirs = git(&["rev-parse", "stash@{0}"]);
+        let repo = dir.to_string_lossy().to_string();
+        let drop = |commit: &str| {
+            futures::executor::block_on(super::drop_stash_commit(
+                &fr_channel::Channel::Local,
+                &repo,
+                commit,
+            ))
+        };
+        assert!(!drop(&ours));
+        assert_eq!(git(&["rev-parse", "stash@{0}"]), theirs);
+        assert_eq!(git(&["stash", "list"]).lines().count(), 1);
+        // 已经不在列表里的：什么都不做
+        assert!(!drop(&ours));
+        assert_eq!(git(&["stash", "list"]).lines().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 认出文字里的提交号() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let said = format!("Dropped stash@{{1}} ({id})");
+        assert_eq!(super::object_ids(&said).collect::<Vec<_>>(), [id]);
+        assert_eq!(super::object_ids("丢弃了 stash@{0}（abc）").count(), 0);
     }
 
     #[test]
@@ -1328,5 +1869,7 @@ mod tests {
         let args: Vec<String> = vec!["push".into(), "x".repeat(200)];
         assert!(command_line(&args).ends_with('…'));
         assert_eq!(command_line(&["status".to_string()]), "git status");
+        let fetch = ["-c", "fetch.writeFetchHEAD=true", "fetch", "--progress"].map(String::from);
+        assert_eq!(command_line(&fetch), "git fetch --progress");
     }
 }

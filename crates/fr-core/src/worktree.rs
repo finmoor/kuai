@@ -26,18 +26,60 @@ impl Worktree {
     }
 }
 
-pub fn list_args() -> Vec<String> {
-    ["worktree", "list", "--porcelain"]
-        .map(String::from)
-        .to_vec()
+/// git 这个版本的 `worktree list` 有没有 `-z`（2.36 起）。
+pub fn has_nul(git: Option<(u32, u32, u32)>) -> bool {
+    git.is_some_and(|version| version >= (2, 36, 0))
 }
 
-/// 解析 `git worktree list --porcelain`：一个工作树一段，段和段之间空一行。
-pub fn parse(out: &[u8]) -> Vec<Worktree> {
+/// 读清单的参数。`nul`（见 [`has_nul`]）：字段用 NUL 分开，目录名里有换行也读得对；
+/// 更老的 git（Ubuntu 22.04 自带的 2.34）没有，按行读（续行见 [`parse`]）。
+pub fn list_args(nul: bool) -> Vec<String> {
+    let mut args: Vec<String> = ["worktree", "list", "--porcelain"]
+        .map(String::from)
+        .to_vec();
+    if nul {
+        args.push("-z".into());
+    }
+    args
+}
+
+/// 解析 [`list_args`] 的输出：一个工作树一段，一个字段一行（`nul` 时以 NUL 结尾），
+/// 段和段之间空一个字段。
+///
+/// 按行读时，老的 git 把目录名、锁定和可清理的原因里的换行原样输出。那时的字段只有下面认的
+/// 这几种，认不出的一行就是上一个字段的续行：接回去，不然截断的路径可能正好是另一个工作树的，
+/// 删除、锁定就作用到那一个上了。
+pub fn parse(out: &[u8], nul: bool) -> Vec<Worktree> {
     let text = String::from_utf8_lossy(out);
+    let fields: Vec<&str> = match nul {
+        true => text.split('\0').collect(),
+        false => text.lines().collect(),
+    };
     let mut list: Vec<Worktree> = Vec::new();
-    for line in text.lines() {
+    // 上一个认得的字段（续行接在它后面）
+    let mut last = "";
+    for line in fields {
         let (key, value) = line.split_once(' ').unwrap_or((line, ""));
+        let known = matches!(
+            key,
+            "worktree" | "HEAD" | "branch" | "detached" | "bare" | "locked" | "prunable" | ""
+        );
+        if !nul && !known {
+            if let Some(tree) = list.last_mut() {
+                let field = match last {
+                    "worktree" => Some(&mut tree.path),
+                    "locked" => tree.locked.as_mut(),
+                    "prunable" => tree.prunable.as_mut(),
+                    _ => None,
+                };
+                if let Some(field) = field {
+                    field.push('\n');
+                    field.push_str(line);
+                }
+            }
+            continue;
+        }
+        last = key;
         if key == "worktree" {
             list.push(Worktree {
                 path: value.to_string(),
@@ -72,16 +114,17 @@ pub enum Checkout<'a> {
     Branch(&'a str),
 }
 
+/// 位置、基准都是用户在对话框里填的：放在 `--` 后面，以 `-` 开头也不会被当成选项。
 pub fn add_args(path: &str, checkout: Checkout) -> Vec<String> {
     let mut args = vec!["worktree".to_string(), "add".to_string()];
     match checkout {
         Checkout::NewBranch { name, base } => {
-            args.extend(["-b".to_string(), name.to_string(), path.to_string()]);
+            args.extend(["-b", name, "--", path].map(String::from));
             if !base.is_empty() {
                 args.push(base.to_string());
             }
         }
-        Checkout::Branch(name) => args.extend([path.to_string(), name.to_string()]),
+        Checkout::Branch(name) => args.extend(["--", path, name].map(String::from)),
     }
     args
 }
@@ -92,7 +135,7 @@ pub fn remove_args(path: &str, force: bool) -> Vec<String> {
     if force {
         args.push("--force".into());
     }
-    args.push(path.to_string());
+    args.extend(["--".to_string(), path.to_string()]);
     args
 }
 
@@ -103,7 +146,7 @@ pub fn prune_args() -> Vec<String> {
 
 pub fn lock_args(path: &str, lock: bool) -> Vec<String> {
     let verb = if lock { "lock" } else { "unlock" };
-    ["worktree", verb, path].map(String::from).to_vec()
+    ["worktree", verb, "--", path].map(String::from).to_vec()
 }
 
 /// 路径统一成正斜杠、去掉结尾的斜杠；Windows 的路径（带盘符）不分大小写，转成小写。
@@ -174,16 +217,16 @@ mod tests {
 
     #[test]
     fn 解析清单() {
-        let out = "worktree /data/ops-bridge\n\
+        let out = "worktree /data/app\n\
                    HEAD a41c9e0000000000000000000000000000000000\n\
                    branch refs/heads/main\n\
                    \n\
-                   worktree /data/ops-bridge.worktrees/feat-login\n\
+                   worktree /data/app.worktrees/feat-login\n\
                    HEAD 9c2e1a7000000000000000000000000000000000\n\
                    branch refs/heads/feat/login\n\
                    locked 正在评审\n\
                    \n\
-                   worktree /home/feng/.codex/worktrees/a41c/ops-bridge\n\
+                   worktree /home/me/.codex/worktrees/a41c/app\n\
                    HEAD 3e7e7e6000000000000000000000000000000000\n\
                    detached\n\
                    \n\
@@ -196,7 +239,7 @@ mod tests {
                    HEAD 77d0b15000000000000000000000000000000000\n\
                    detached\n\
                    locked\n";
-        let list = parse(out.as_bytes());
+        let list = parse(out.as_bytes(), false);
         assert_eq!(list.len(), 5);
         assert!(list[0].main && !list[1].main);
         assert_eq!(list[0].branch.as_deref(), Some("main"));
@@ -210,13 +253,49 @@ mod tests {
         );
         assert!(list[3].prunable.is_some() && list[3].locked.is_none());
         assert_eq!(list[4].locked.as_deref(), Some(""));
-        assert!(parse(b"").is_empty());
+        assert!(parse(b"", false).is_empty());
+        assert!(parse(b"", true).is_empty());
+    }
+
+    #[test]
+    fn 用nul分开时目录名里有换行也读得对() {
+        let out = b"worktree /srv/main\0HEAD abc\0branch refs/heads/main\0\0\
+                    worktree /srv/a\nb\0HEAD def\0detached\0locked\0\0";
+        let list = parse(out, true);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[1].path, "/srv/a\nb");
+        assert_eq!(list[1].locked.as_deref(), Some(""));
+        assert_eq!(list[0].branch.as_deref(), Some("main"));
+        assert_eq!(list_args(true).last().map(String::as_str), Some("-z"));
+        assert!(has_nul(Some((2, 36, 0))) && !has_nul(Some((2, 34, 1))) && !has_nul(None));
+    }
+
+    #[test]
+    fn 按行读时目录名和原因里的换行接回去() {
+        // git 2.34 的输出：目录名、锁定的原因里的换行原样输出
+        let out = "worktree /srv/main\nHEAD abc\nbranch refs/heads/main\n\n\
+                   worktree /srv/main\nfoo\nHEAD def\nbranch refs/heads/nl\nlocked 第一行\n第二行\n\n\
+                   worktree /srv/x\nHEAD 123\ndetached\nprunable gitdir file points to\nnowhere\n";
+        let list = parse(out.as_bytes(), false);
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].path, "/srv/main");
+        assert_eq!(list[1].path, "/srv/main\nfoo");
+        assert_eq!(list[1].branch.as_deref(), Some("nl"));
+        assert_eq!(list[1].locked.as_deref(), Some("第一行\n第二行"));
+        assert_eq!(
+            list[2].prunable.as_deref(),
+            Some("gitdir file points to\nnowhere")
+        );
+        // 用 NUL 分开时认不出的字段不管（新版本的 git 可能多出字段）
+        let list = parse(b"worktree /srv/a\0HEAD abc\0new-field x\0\0", true);
+        assert_eq!(list[0].path, "/srv/a");
     }
 
     #[test]
     fn 裸仓库() {
         let list = parse(
             b"worktree /srv/repo.git\nbare\n\nworktree /srv/wt\nHEAD abc\nbranch refs/heads/x\n",
+            false,
         );
         assert!(list[0].bare && list[0].main && list[0].head.is_none());
         assert_eq!(list[1].branch.as_deref(), Some("x"));
@@ -230,7 +309,7 @@ mod tests {
         };
         assert_eq!(
             add_args("/w/x", new),
-            ["worktree", "add", "-b", "feat/x", "/w/x", "main"]
+            ["worktree", "add", "-b", "feat/x", "--", "/w/x", "main"]
         );
         let from_head = Checkout::NewBranch {
             name: "feat/x",
@@ -238,19 +317,25 @@ mod tests {
         };
         assert_eq!(
             add_args("/w/x", from_head),
-            ["worktree", "add", "-b", "feat/x", "/w/x"]
+            ["worktree", "add", "-b", "feat/x", "--", "/w/x"]
         );
         assert_eq!(
             add_args("/w/x", Checkout::Branch("fix/y")),
-            ["worktree", "add", "/w/x", "fix/y"]
+            ["worktree", "add", "--", "/w/x", "fix/y"]
         );
-        assert_eq!(remove_args("/w/x", false), ["worktree", "remove", "/w/x"]);
+        assert_eq!(
+            remove_args("/w/x", false),
+            ["worktree", "remove", "--", "/w/x"]
+        );
         assert_eq!(
             remove_args("/w/x", true),
-            ["worktree", "remove", "--force", "/w/x"]
+            ["worktree", "remove", "--force", "--", "/w/x"]
         );
-        assert_eq!(lock_args("/w/x", true), ["worktree", "lock", "/w/x"]);
-        assert_eq!(lock_args("/w/x", false), ["worktree", "unlock", "/w/x"]);
+        assert_eq!(lock_args("/w/x", true), ["worktree", "lock", "--", "/w/x"]);
+        assert_eq!(
+            lock_args("/w/x", false),
+            ["worktree", "unlock", "--", "/w/x"]
+        );
     }
 
     #[test]
@@ -264,8 +349,8 @@ mod tests {
     #[test]
     fn 默认放在仓库旁边() {
         assert_eq!(
-            default_path("/data/ops-bridge/", "feat/login"),
-            "/data/ops-bridge.worktrees/feat-login"
+            default_path("/data/app/", "feat/login"),
+            "/data/app.worktrees/feat-login"
         );
         assert_eq!(
             default_path(r"C:\src\kuai", "fix/a/b"),
@@ -275,15 +360,15 @@ mod tests {
 
     #[test]
     fn 位置写短() {
-        let repo = "/data/platform/ops-bridge";
+        let repo = "/data/platform/app";
         assert_eq!(short_path(repo, repo), repo);
         assert_eq!(
-            short_path("/data/platform/ops-bridge/.claude/worktrees/fix", repo),
+            short_path("/data/platform/app/.claude/worktrees/fix", repo),
             ".claude/worktrees/fix"
         );
         assert_eq!(
-            short_path("/data/platform/ops-bridge.worktrees/feat-login", repo),
-            "../ops-bridge.worktrees/feat-login"
+            short_path("/data/platform/app.worktrees/feat-login", repo),
+            "../app.worktrees/feat-login"
         );
         assert_eq!(short_path("/tmp/review", repo), "/tmp/review");
         // Windows：斜杠方向、大小写不一样也认得出来，显示的保留原来的大小写

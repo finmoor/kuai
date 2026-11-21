@@ -7,8 +7,8 @@ use gpui_kit::*;
 
 /// 每条泳道的宽度
 pub const LANE_WIDTH: f32 = 14.;
-/// 提交图那一列最多画多少条泳道，再多的往右截掉
-pub const MAX_LANES: u16 = 40;
+/// 提交图那一列最多画多少条泳道，再多的往右截掉（截掉的线段 fr-core 不存，见那边的说明）
+pub const MAX_LANES: u16 = fr_core::graph::MAX_LANES;
 const LINE_WIDTH: f32 = 2.;
 const NODE_RADIUS: f32 = 4.5;
 
@@ -26,11 +26,18 @@ pub fn column_width(max_lanes: u16) -> Pixels {
     px(LANE_WIDTH * max_lanes.clamp(1, MAX_LANES) as f32 + 6.)
 }
 
-/// 一行提交图。`segments` 是这一行的线段，`lane`、`color` 是节点的位置和颜色。
-pub fn graph_cell(segments: Vec<Segment>, lane: u16, color: u8, width: Pixels) -> impl IntoElement {
+/// 一行提交图。`segments` 是这一行的线段，`lane`、`color` 是节点的位置和颜色，`clipped` 是这一行
+/// 有画不下的。
+pub fn graph_cell(
+    segments: Vec<Segment>,
+    lane: u16,
+    color: u8,
+    clipped: bool,
+    width: Pixels,
+) -> impl IntoElement {
     canvas(
         |_, _, _| {},
-        move |bounds, _, window, _| paint_row(bounds, &segments, lane, color, window),
+        move |bounds, _, window, _| paint_row(bounds, &segments, lane, color, clipped, window),
     )
     .w(width)
     .h_full()
@@ -41,6 +48,7 @@ fn paint_row(
     segments: &[Segment],
     lane: u16,
     color: u8,
+    clipped: bool,
     window: &mut Window,
 ) {
     let x = |l: u16| bounds.origin.x + px(LANE_WIDTH * (l as f32 + 0.5) + 3.);
@@ -49,7 +57,7 @@ fn paint_row(
     let bottom = top + bounds.size.height;
 
     // 泳道太多、右边画不下时，在这一行的右边点三个点，免得看着像历史断了
-    let mut clipped = lane >= MAX_LANES;
+    let mut clipped = clipped || lane >= MAX_LANES;
     for s in segments {
         if s.from >= MAX_LANES || s.to >= MAX_LANES {
             clipped = true;

@@ -24,6 +24,8 @@ use super::RepoView;
 /// 一个上游已删除的分支，和它的提交在不在远程分支里。
 struct Gone {
     name: String,
+    /// 读列表时它指向的提交：删之前核对还是不是它
+    tip: String,
     /// 它的提交都在某个远程分支里（删了不丢东西）
     merged: bool,
     /// 写在名字下面的一句：并入了哪个远程分支，或者有几个提交没并入
@@ -53,7 +55,12 @@ fn first_remote_branch<'a>(output: &'a str, current: Option<&str>) -> Option<&'a
         .or_else(|| branches().next())
 }
 
-async fn inspect(channel: &Channel, repo: &str, name: String, current: Option<&str>) -> Gone {
+async fn inspect(
+    channel: &Channel,
+    repo: &str,
+    (name, tip): (String, String),
+    current: Option<&str>,
+) -> Gone {
     let full = format!("refs/heads/{name}");
     let count = ["rev-list", "--count", &full, "--not", "--remotes"];
     let count = channel
@@ -92,6 +99,7 @@ async fn inspect(channel: &Channel, repo: &str, name: String, current: Option<&s
     };
     Gone {
         name,
+        tip,
         merged,
         detail,
     }
@@ -109,12 +117,12 @@ impl RepoView {
 
     /// 侧栏「分支」标题上的「清理 N」：先看每个分支的提交在不在远程分支里，再弹出对话框。
     pub(super) fn sweep_gone_branches(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let names: Vec<String> = self
+        let names: Vec<(String, String)> = self
             .refs
             .branches
             .iter()
             .filter(|branch| branch.gone && !branch.current)
-            .map(|branch| branch.name.to_string())
+            .map(|branch| (branch.name.to_string(), branch.target.clone()))
             .collect();
         if names.is_empty() {
             let text = tr("没有上游已删除的分支。");
@@ -206,11 +214,11 @@ impl RepoView {
                                 .label(tf!("删除 {n} 个分支", n = picked))
                                 .disabled(picked == 0)
                                 .on_click(move |_, window, cx| {
-                                    let names: Vec<String> = list
+                                    let names: Vec<(String, String)> = list
                                         .iter()
                                         .zip(states.iter())
                                         .filter(|(_, state)| state.get())
-                                        .map(|(gone, _)| gone.name.clone())
+                                        .map(|(gone, _)| (gone.name.clone(), gone.tip.clone()))
                                         .collect();
                                     window.close_dialog(cx);
                                     view.update(cx, |this, cx| this.run_sweep(names, window, cx))
@@ -221,24 +229,41 @@ impl RepoView {
         });
     }
 
-    fn run_sweep(&mut self, names: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+    /// 删掉勾选的分支（`names` 是名字和读列表时它指向的提交）。删之前核对每个分支还指着那个提交：
+    /// 对话框开着时又往上提交了，新的提交没有并入远程，`branch -D` 会连它们一起丢掉，这时一个都不删。
+    fn run_sweep(
+        &mut self,
+        names: Vec<(String, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if names.is_empty() {
             return;
         }
         let count = names.len();
+        let checks: Vec<super::ops::Check> = names
+            .iter()
+            .map(|(name, tip)| {
+                let full = format!("refs/heads/{name}");
+                let args = vec!["rev-parse".into(), "-q".into(), "--verify".into(), full];
+                (args, Some(tip.clone()))
+            })
+            .collect();
         let mut args: Vec<String> = vec!["branch".into(), "-D".into(), "--".into()];
-        args.extend(names);
-        self.run_op(
-            tr("清理分支"),
-            args,
-            None,
-            window,
-            cx,
-            move |_, _, window, cx| {
-                let text = tf!("已删除 {n} 个分支", n = count);
-                window.push_notification(Notification::success(text), cx);
-            },
-        );
+        args.extend(names.into_iter().map(|(name, _)| name));
+        self.verify_then(checks, window, cx, move |this, window, cx| {
+            this.run_op(
+                tr("清理分支"),
+                args,
+                None,
+                window,
+                cx,
+                move |_, _, window, cx| {
+                    let text = tf!("已删除 {n} 个分支", n = count);
+                    window.push_notification(Notification::success(text), cx);
+                },
+            );
+        });
     }
 }
 

@@ -1,12 +1,20 @@
 //! 交互式变基：列出要整理的提交，按界面上排好的顺序和做法生成 git 的待办清单。
 //!
 //! git 的交互式变基是先把待办清单写进一个文件，再启动「清单编辑器」让人改。这里没有终端，
-//! 所以把编辑器换成一条 shell 命令：它直接把我们排好的清单写进那个文件。命令用
-//! `-c sequence.editor=…` 给，不用环境变量，本机和服务器上的 git 都走得通（git 启动编辑器
-//! 用的是 sh，Git for Windows 自带）。
+//! 所以把编辑器换成一小段 shell（[`EDITOR`]）：git 在后面接上清单文件的路径，它把标准输入
+//! （我们排好的清单）写进那个文件。编辑器用 `-c sequence.editor=…` 给，不用环境变量，本机和
+//! 服务器上的 git 都走得通（git 启动编辑器用的是 sh，Git for Windows 自带）。
+//!
+//! 清单和说明都不放进命令里：Git for Windows 经 sh 执行的命令（编辑器、清单里的 `exec`）超过
+//! 8191 个字符就被截断（实测 git 2.53）。整理一百七十来个提交，旧的写法变基就失败；截在命令中间
+//! 还可能变成另一条能执行的命令（比如只剩 `git commit --amend`，说明没改却像是成功了）。
 //!
 //! 改说明不用清单里的 `reword`：它要开编辑器。改成先 `pick`，再用一行 `exec` 修改刚放上去的
-//! 那个提交，新的说明经 `printf '%b'` 从管道送进 `git commit --amend -F -`。
+//! 那个提交：`git commit --amend -F` 读编辑器事先写在清单旁边的说明文件（带 `--allow-empty`：
+//! 没有改动的提交变基时照样留着，改它的说明也得行）。
+//!
+//! 合并提交不能这样整理：清单里的 `pick` 重放不了合并提交，保留合并关系要用 `--rebase-merges`
+//! 的另一套清单。范围里有合并提交时界面不打开整理（见 [`Candidate::parents`]）。
 
 /// 对一个提交做什么。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,20 +122,22 @@ pub enum Problem {
     EmptyMessage,
 }
 
-/// 清单的每一行，旧的在前。丢掉的提交写成 `drop`，这样 git 报告里看得到。
+/// 清单的每一行，旧的在前。丢掉的提交写成 `drop`，这样 git 报告里看得到。改说明的第 k 个提交
+/// （从 1 数），新的说明从清单旁边的 `fr-msg-k` 里读（[`input`] 交给编辑器写下的）。
 pub fn todo(items: &[Item]) -> Vec<String> {
     let mut lines = Vec::new();
+    let mut reworded = 0;
     for item in items {
         match &item.action {
             Action::Pick => lines.push(format!("pick {}", item.id)),
             Action::Squash => lines.push(format!("squash {}", item.id)),
             Action::Fixup => lines.push(format!("fixup {}", item.id)),
             Action::Drop => lines.push(format!("drop {}", item.id)),
-            Action::Reword(message) => {
+            Action::Reword(_) => {
+                reworded += 1;
                 lines.push(format!("pick {}", item.id));
                 lines.push(format!(
-                    "exec printf '%b' {} | git commit --amend -q -F -",
-                    quote(&escape_for_printf(message.trim_end()))
+                    "exec git commit --amend --allow-empty -q -F \"$(git rev-parse --git-path rebase-merge/fr-msg-{reworded})\""
                 ));
             }
         }
@@ -135,35 +145,52 @@ pub fn todo(items: &[Item]) -> Vec<String> {
     lines
 }
 
-/// `git rebase -i` 的参数：把 `base` 之后的提交按 `items`（旧的在前）重做。
-pub fn args(base: &str, items: &[Item]) -> Vec<String> {
-    let lines: Vec<String> = todo(items).iter().map(|line| quote(line)).collect();
-    // git 会在后面接上清单文件的路径（`"$@"`），正好成为重定向的目标
-    let editor = format!("printf '%s\\n' {} >", lines.join(" "));
+/// 清单编辑器（git 在后面接上清单文件的路径）。标准输入的第一行是各条新说明的字节数，接着是
+/// 这几条说明，最后是清单：按字节数把说明一条条写到清单旁边的 `fr-msg-1`、`fr-msg-2`……（变基
+/// 结束、中止时 git 连同清单一起删掉），剩下的写进清单。`read` 和 `dd bs=1` 一次读一个字节，
+/// 不会多读走后面的。
+const EDITOR: &str = r#"f(){ d=$(dirname "$1"); read -r lens; i=0; for n in $lens; do i=$((i+1)); dd bs=1 count="$n" of="$d/fr-msg-$i" 2>/dev/null || return 1; done; cat > "$1"; }; f"#;
+
+/// `git rebase -i` 的参数：把 `base` 之后的提交重做，清单和新的说明（[`input`]）从标准输入给。
+/// 总是带 `--autostash`：工作区干净时它什么都不做，有改动时先贮藏、做完放回去。
+pub fn args(base: &str) -> Vec<String> {
     vec![
         "-c".into(),
-        format!("sequence.editor={editor}"),
+        format!("sequence.editor={EDITOR}"),
         "rebase".into(),
         "-i".into(),
+        "--autostash".into(),
         base.into(),
     ]
 }
 
-/// 给 sh 用的单引号字符串。
-fn quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', r"'\''"))
+/// [`args`] 给人看的写法（活动记录、失败的详情）：不露出清单编辑器那段脚本。
+pub fn shown(base: &str) -> String {
+    format!("git rebase -i --autostash {base}")
 }
 
-/// 转成 `printf '%b'` 的参数：反斜杠写两个，换行写成 `\n`，整段落在一行里。
-fn escape_for_printf(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 8);
-    for ch in text.chars() {
-        match ch {
-            '\\' => out.push_str(r"\\"),
-            '\n' => out.push_str(r"\n"),
-            '\r' => {}
-            ch => out.push(ch),
-        }
+/// 交给 [`args`] 的标准输入（格式见 [`EDITOR`]），`items` 是旧的在前。
+pub fn input(items: &[Item]) -> Vec<u8> {
+    let messages: Vec<Vec<u8>> = items
+        .iter()
+        .filter_map(|item| match &item.action {
+            Action::Reword(text) => {
+                let mut text = text.trim_end().replace('\r', "");
+                text.push('\n');
+                Some(text.into_bytes())
+            }
+            _ => None,
+        })
+        .collect();
+    let lens: Vec<String> = messages.iter().map(|text| text.len().to_string()).collect();
+    let mut out = lens.join(" ").into_bytes();
+    out.push(b'\n');
+    for text in &messages {
+        out.extend_from_slice(text);
+    }
+    for line in todo(items) {
+        out.extend_from_slice(line.as_bytes());
+        out.push(b'\n');
     }
     out
 }
@@ -199,9 +226,22 @@ mod tests {
                 "fixup c3",
                 "drop d4",
                 "pick e5",
-                r"exec printf '%b' '新的说明\n\n正文里有 '\''引号'\'' 和 \\ 反斜杠' | git commit --amend -q -F -",
+                r#"exec git commit --amend --allow-empty -q -F "$(git rev-parse --git-path rebase-merge/fr-msg-1)""#,
             ]
         );
+    }
+
+    #[test]
+    fn 标准输入先写说明的字节数和说明_再写清单() {
+        let input = input(&[
+            item("a1", Action::Reword("一\r\n二\n\n".into())),
+            item("b2", Action::Pick),
+            item("c3", Action::Reword("x".into())),
+        ]);
+        let text = String::from_utf8(input).unwrap();
+        // 「一\n二\n」是 8 个字节（汉字 3 个字节）；去掉了 \r 和末尾的空行，末尾补一个换行
+        assert!(text.starts_with("8 2\n一\n二\nx\npick a1\nexec "), "{text}");
+        assert!(text.ends_with("fr-msg-2)\"\n"), "{text}");
     }
 
     #[test]
@@ -231,6 +271,37 @@ mod tests {
         assert_eq!(list[0].subject(), "第三个");
         assert_eq!(list[0].message, "第三个\n\n有正文");
         assert_eq!(list[1].parents, 2);
+    }
+
+    /// 清单从标准输入给：三个提交各改成 12000 字的说明，合起来超过 Windows 一条命令的长度上限。
+    #[test]
+    fn 改的说明很长也不占命令行() {
+        let dir = std::env::temp_dir().join(format!("fr-rebase-long-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| crate::git::run(&dir, args).unwrap();
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "user.email", "t@example.com"]);
+        let mut ids = Vec::new();
+        for n in 0..4 {
+            git(&["commit", "-q", "--allow-empty", "-m", &format!("c{n}")]);
+            let id = String::from_utf8(git(&["rev-parse", "HEAD"])).unwrap();
+            ids.push(id.trim().to_string());
+        }
+        let base = ids.remove(0);
+        let long = |n: usize| format!("说明{n} {}", "长".repeat(12000));
+        let items: Vec<Item> = ids
+            .iter()
+            .enumerate()
+            .map(|(n, id)| item(id, Action::Reword(long(n))))
+            .collect();
+        let (running, _) = crate::exec::spawn(&dir, &args(&base), Some(input(&items))).unwrap();
+        let (_, finished) = running.collect().unwrap();
+        assert_eq!(finished.code, Some(0), "{}", finished.stderr);
+        let body = String::from_utf8(git(&["log", "-1", "--format=%B"])).unwrap();
+        assert_eq!(body.trim_end(), long(2));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 真的跑一遍：调顺序、并入、丢弃、改说明（说明里有引号、反斜杠、百分号和换行）。
@@ -272,9 +343,9 @@ mod tests {
             item(&d, Action::Pick),
         ];
         assert_eq!(check(&items), Ok(()));
-        let args = args(&base, &items);
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        git(&args);
+        let (running, _) = crate::exec::spawn(&dir, &args(&base), Some(input(&items))).unwrap();
+        let (_, finished) = running.collect().unwrap();
+        assert_eq!(finished.code, Some(0), "{}", finished.stderr);
 
         let log = String::from_utf8(git(&["log", "--format=%s", "main"])).unwrap();
         assert_eq!(

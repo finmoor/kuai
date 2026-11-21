@@ -3,6 +3,7 @@
 //!
 //! 菜单在点右键时才构建；构建函数里只带要用到的名字和哈希，点了菜单项再回到 [`RepoView`] 上执行。
 
+use fr_channel::GitOutput;
 use fr_core::i18n::{tr, tr_key};
 use fr_core::state::InProgress;
 use fr_core::status::{Entry, Kind};
@@ -14,7 +15,7 @@ use gpui_kit::*;
 
 use super::changes::Area;
 use super::compare::End;
-use super::dialogs::{Ask, ref_name_error};
+use super::dialogs::{Ask, Hint, ref_name_error};
 use super::history::Scope;
 use super::ops::{Step, args, failure};
 use super::sidebar::SideItem;
@@ -88,8 +89,24 @@ fn merge_args(name: &str, flag: Option<&str>, no_commit: bool) -> Vec<String> {
         }
         merge.push("--no-commit".into());
     }
-    merge.push(name.to_string());
+    // 名字以 `-` 开头（取来的标签可以这样）也不会被当成选项
+    merge.extend(["--".into(), name.to_string()]);
     merge
+}
+
+/// 合并时交给 git 的名字（`full` 是完整引用名）。一般用短名：合并说明里写的就是它（「Merge branch
+/// 'feat'」）。git 认短名时先看 `refs/<短名>`，再看标签、本地分支、远程分支；短名会被认成别的引用时
+/// 改用完整引用名，不然合并进来的可能是同名的标签。
+fn merge_rev(short: &str, full: &str, refs: &fr_core::refs::Refs) -> String {
+    let remote = full.starts_with("refs/remotes/");
+    let first = short.split('/').next().unwrap_or_default();
+    let shadowed = refs.tags.iter().any(|tag| tag.name == short)
+        || (remote && refs.branches.iter().any(|branch| branch.name == short))
+        // `refs/stash`、`refs/heads/…` 这些排在最前面：叫 stash、heads/x 的分支会被认成它们
+        || short == "stash"
+        || (short.contains('/') && ["heads", "tags", "remotes", "notes"].contains(&first))
+        || short.starts_with('-');
+    if shadowed { full } else { short }.to_string()
 }
 
 /// `git tag` 的参数：填了说明是带说明的标签（`-a -m`），没填是轻量标签。
@@ -383,6 +400,7 @@ impl RepoView {
                     let name = branch.name.clone();
                     if !branch.current {
                         let (a, b, c) = (name.clone(), name.clone(), name.clone());
+                        let (b_full, c_full) = (full.clone(), full.clone());
                         menu = menu.item(item(
                             &view,
                             tf!("切换到 {name}", name),
@@ -401,12 +419,14 @@ impl RepoView {
                             .item(item(
                                 &view,
                                 tf!("合并 {name} 到 {cur}…", name, cur),
-                                move |this, w, cx| this.merge(b.clone(), w, cx),
+                                move |this, w, cx| this.merge(b.clone(), b_full.clone(), w, cx),
                             ))
                             .item(item(
                                 &view,
                                 tf!("将 {cur} 变基到 {name}…", cur, name),
-                                move |this, w, cx| this.rebase_onto(c.clone(), c.clone(), w, cx),
+                                move |this, w, cx| {
+                                    this.rebase_onto(c_full.clone(), c.clone(), w, cx)
+                                },
                             ))
                             .separator();
                     }
@@ -486,15 +506,17 @@ impl RepoView {
                             move |this, w, cx| this.set_upstream(e.clone(), w, cx),
                         ))
                         .separator()
-                        .item(item(
-                            &view,
-                            tf!("合并 {name} 到 {cur}…", name, cur),
-                            move |this, w, cx| this.merge(b.clone(), w, cx),
-                        ))
+                        .item(item(&view, tf!("合并 {name} 到 {cur}…", name, cur), {
+                            let full = full.clone();
+                            move |this, w, cx| this.merge(b.clone(), full.clone(), w, cx)
+                        }))
                         .item(item(
                             &view,
                             tf!("将 {cur} 变基到 {name}…", cur, name),
-                            move |this, w, cx| this.rebase_onto(c.clone(), c.clone(), w, cx),
+                            {
+                                let full = full.clone();
+                                move |this, w, cx| this.rebase_onto(full.clone(), c.clone(), w, cx)
+                            },
                         ))
                         .separator()
                         .item(item(
@@ -631,10 +653,11 @@ impl RepoView {
                 let path = self.submodules.get(i)?.clone();
                 Some(Box::new(move |menu, _, _| {
                     let (a, b) = (path.clone(), path.clone());
+                    let c = path.clone();
                     menu.item(item(
                         &view,
                         tr("在新标签页中打开"),
-                        move |this, _, cx| this.open_submodule(i, cx),
+                        move |this, w, cx| this.open_submodule(c.clone(), w, cx),
                     ))
                     .item(item(
                         &view,
@@ -646,23 +669,34 @@ impl RepoView {
                 }))
             }
             SideItem::Stash(i) => {
-                let stash = self.refs.stashes.get(i)?.clone();
+                let target = self.refs.stashes.get(i)?.target.clone();
                 Some(Box::new(move |menu, _, _| {
-                    let (a, b) = (stash.selector.clone(), stash.selector.clone());
-                    let c = (stash.selector.clone(), stash.message.clone());
+                    // 按提交认，点的时候再换成 stash@{n}：菜单开着时又贮藏了一个（或者删了一个），
+                    // 原来的 stash@{n} 就对着别的了
+                    let (a, b, c) = (target.clone(), target.clone(), target.clone());
                     menu.item(item(
                         &view,
                         tr("应用（保留贮藏）"),
-                        move |this, w, cx| this.stash_apply(a.clone(), w, cx),
+                        move |this, w, cx| {
+                            if let Some(stash) = this.stash_now(&a) {
+                                this.stash_apply(stash.selector, w, cx)
+                            }
+                        },
                     ))
                     .item(item(
                         &view,
                         tr("弹出（应用并删除）"),
-                        move |this, w, cx| this.stash_pop(b.clone(), w, cx),
+                        move |this, w, cx| {
+                            if let Some(stash) = this.stash_now(&b) {
+                                this.stash_pop(stash.selector, w, cx)
+                            }
+                        },
                     ))
                     .separator()
                     .item(item(&view, tr("删除…"), move |this, w, cx| {
-                        this.stash_drop(c.0.clone(), c.1.clone(), w, cx)
+                        if let Some(stash) = this.stash_now(&c) {
+                            this.stash_drop(stash.selector, stash.message, w, cx)
+                        }
                     }))
                 }))
             }
@@ -763,7 +797,7 @@ impl RepoView {
                             ),
                         );
                     }
-                    // 经别的服务器连的（156>91）：本机连不到它，交不出去
+                    // 经别的服务器连的（A>B）：本机连不到它，交不出去
                     None if !local => {}
                     None => {
                         let file = format!("{full_path}/{}", entry.path);
@@ -914,7 +948,8 @@ impl RepoView {
                 tr("推送所有标签（--tags）"),
                 |this, w, cx| {
                     let remote = this.default_remote();
-                    let push = vec!["push".into(), "--progress".into(), remote, "--tags".into()];
+                    let mut push = args(&["push", "--progress", "--tags", "--"]);
+                    push.push(remote);
                     this.run_net_op(tr("推送"), push, w, cx, |_, _, w, cx| {
                         w.push_notification(Notification::success(tr("标签已推送")), cx);
                     });
@@ -1024,19 +1059,17 @@ impl RepoView {
             )
         };
         let reset = vec!["reset".into(), flag.into(), id.clone()];
+        // 确认框写的是现在这个分支：确认时 HEAD 已经换了（切了分支、别处提交了）就不重置，不然动的
+        // 是确认框里没写的那个分支，--hard 还丢掉它的改动
+        let checks = self.head_checks();
         let run = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
-            let (id, cur) = (id.clone(), cur.clone());
-            this.run_op(
-                tr("重置"),
-                reset.clone(),
-                None,
-                window,
-                cx,
-                move |_, _, w, cx| {
+            let (id, cur, reset) = (id.clone(), cur.clone(), reset.clone());
+            this.verify_then(checks.clone(), window, cx, move |this, window, cx| {
+                this.run_op(tr("重置"), reset, None, window, cx, move |_, _, w, cx| {
                     let text = tf!("{cur} 已重置到 {id}", cur, id = short(&id));
                     w.push_notification(Notification::success(text), cx);
-                },
-            );
+                });
+            });
         };
         match flag {
             "--hard" => {
@@ -1076,8 +1109,10 @@ impl RepoView {
     }
 
     /// 合并：先问怎么合（默认、总是生成合并提交、只快进、压缩成一份改动），要不要先不提交。
-    fn merge(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// 把 `name`（完整引用名是 `full`）合并到当前分支。
+    fn merge(&mut self, name: String, full: String, window: &mut Window, cx: &mut Context<Self>) {
         let cur = self.current_label();
+        let rev = merge_rev(&name, &full, &self.refs);
         let choose = super::dialogs::Choose {
             title: tf!("合并 {name} 到 {cur}", name = &name, cur).into(),
             description: SharedString::default(),
@@ -1086,7 +1121,7 @@ impl RepoView {
                 .map(|mode| (tr(mode.label).into(), tr(mode.detail).into()))
                 .collect(),
             selected: 0,
-            checks: vec![(tr("合并后暂不提交，以便检查（--no-commit）").into(), false)],
+            checks: vec![(tr("合并后暂不提交，以便检查（--no-commit）"), false)],
             ok: tr("合并"),
         };
         self.choose(
@@ -1096,7 +1131,7 @@ impl RepoView {
             move |this, picked, checks, window, cx| {
                 let mode = MERGE_MODES.get(picked).unwrap_or(&MERGE_MODES[0]);
                 let no_commit = checks.first().copied().unwrap_or(false);
-                let merge = merge_args(&name, mode.flag, no_commit);
+                let merge = merge_args(&rev, mode.flag, no_commit);
                 let (name, squash) = (name.clone(), mode.flag == Some("--squash"));
                 this.run_op(
                     tr("合并"),
@@ -1130,7 +1165,7 @@ impl RepoView {
         );
     }
 
-    /// 把当前分支变基到 `target`；`shown` 是给用户看的名字。
+    /// 把当前分支变基到 `target`（完整引用名或提交，短名可能认成同名的标签）；`shown` 是给用户看的名字。
     fn rebase_onto(
         &mut self,
         target: String,
@@ -1220,27 +1255,52 @@ impl RepoView {
         cx: &mut Context<Self>,
     ) {
         let name = branch.name.clone();
+        let upstream = branch.upstream.as_deref();
+        let (remote, remote_branch, set_upstream) =
+            match upstream.and_then(|upstream| upstream.split_once('/')) {
+                Some((remote, remote_branch)) => (remote.into(), remote_branch.into(), false),
+                None => (self.default_remote(), name.clone(), true),
+            };
+        let to = format!("{remote}/{remote_branch}");
+        // 强制推送时远程上的那个分支应当是什么：确认框打开时看到的远程跟踪分支，没有就是「远程上还
+        // 没有」。不写期望值时 git 拿推送那一刻的远程跟踪分支比，自动获取可能刚把它更新过，没看过的
+        // 新提交照样被盖掉
+        let tracking = upstream.unwrap_or(&to);
+        let expect = self
+            .refs
+            .remotes
+            .iter()
+            .find(|remote| remote.name == tracking)
+            .map(|remote| remote.target.clone());
         let mut push = args(&["push", "--progress"]);
         if force {
-            push.push("--force-with-lease".into());
+            let id = expect.as_deref().unwrap_or_default();
+            push.push(format!(
+                "--force-with-lease=refs/heads/{remote_branch}:{id}"
+            ));
         }
-        let to = match branch.upstream.as_deref().and_then(|u| u.split_once('/')) {
-            Some((remote, remote_branch)) => {
-                push.push(remote.into());
-                push.push(format!("{name}:{remote_branch}"));
-                format!("{remote}/{remote_branch}")
-            }
-            None => {
-                let remote = self.default_remote();
-                push.extend(["--set-upstream".into(), remote.clone(), name.clone()]);
-                format!("{remote}/{name}")
-            }
+        if set_upstream {
+            push.push("--set-upstream".into());
+        }
+        // 写完整引用名：本地有同名的标签时短名会认错；`--` 之后名字以 `-` 开头也不会被当成选项
+        push.extend([
+            "--".into(),
+            remote.clone(),
+            format!("refs/heads/{name}:refs/heads/{remote_branch}"),
+        ]);
+        let description = match &expect {
+            Some(id) => tf!(
+                "{to} 上的提交将被本地的 {name} 覆盖。若远程上的 {to} 已不是 {id}，则不推送（--force-with-lease）。",
+                to,
+                name,
+                id = short(id)
+            ),
+            None => tf!(
+                "将本地的 {name} 推送到 {to}。若远程上已有 {to}，则不推送（--force-with-lease）。",
+                to,
+                name
+            ),
         };
-        let description = tf!(
-            "{to} 上的提交将被本地的 {name} 覆盖。若 {to} 在上次获取后有新提交，则不推送（--force-with-lease）。",
-            to,
-            name
-        );
         let run = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
             let text = tf!("{name} 已推送到 {to}", name, to);
             this.run_net_op(
@@ -1311,9 +1371,10 @@ impl RepoView {
         let delete = vec![
             "push".into(),
             "--progress".into(),
-            remote.into(),
             "--delete".into(),
-            branch.into(),
+            "--".into(),
+            remote.into(),
+            format!("refs/heads/{branch}"),
         ];
         let description = tf!(
             "将删除 {remote} 上的分支 {branch}，其他协作者也将无法访问。本地分支不受影响。",
@@ -1377,6 +1438,7 @@ impl RepoView {
                 steps.push(Step::net(vec![
                     "push".into(),
                     "--progress".into(),
+                    "--".into(),
                     remote.clone(),
                     format!("refs/tags/{name}"),
                 ]));
@@ -1397,6 +1459,7 @@ impl RepoView {
         let push = vec![
             "push".into(),
             "--progress".into(),
+            "--".into(),
             remote.clone(),
             format!("refs/tags/{name}"),
         ];
@@ -1442,8 +1505,9 @@ impl RepoView {
                     let delete = vec![
                         "push".into(),
                         "--progress".into(),
-                        remote.clone(),
                         "--delete".into(),
+                        "--".into(),
+                        remote.clone(),
                         format!("refs/tags/{name}"),
                     ];
                     this.run_net_op(
@@ -1558,11 +1622,10 @@ impl RepoView {
     }
 
     fn ignore_path(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let ignore = fr_core::ignore::args(&path);
-        self.run_op(
+        let ignore = Step::local(fr_core::ignore::args(&path)).shown(fr_core::ignore::shown(&path));
+        self.run_seq(
             tr("忽略"),
-            ignore,
-            None,
+            vec![ignore],
             window,
             cx,
             move |_, _, w, cx| {
@@ -1608,37 +1671,102 @@ impl RepoView {
         });
     }
 
+    /// 修改远程的地址：先读出现在的地址填进去。推送单独配了地址（`pushurl`）时 `remote set-url`
+    /// 不动它，对话框里写明，并给一个勾选项把它删掉、推送也改用新地址。
     fn set_remote_url_dialog(
         &mut self,
         remote: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        let repo = self.entry.path.clone();
+        let read = |key: &str| {
+            let key = format!("remote.{remote}.{key}");
+            channel.git(&repo, args(&["config", "--get-all", &key]))
+        };
+        let (url, push) = (read("url"), read("pushurl"));
+        cx.spawn_in(window, async move |this, cx| {
+            let (url, push) = futures::join!(url, push);
+            let text = |out: anyhow::Result<GitOutput>| {
+                out.ok()
+                    .filter(GitOutput::success)
+                    .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                    .unwrap_or_default()
+            };
+            // 获取地址配了好几个时 git 用第一个
+            let url = text(url).lines().next().unwrap_or_default().to_string();
+            let push = text(push);
+            this.update_in(cx, |this, window, cx| {
+                this.set_remote_url_ask(remote, url, push, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn set_remote_url_ask(
+        &mut self,
+        remote: String,
+        url: String,
+        push: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 推送地址可以配好几个，一行一个
+        let push = push.lines().collect::<Vec<_>>().join(tr("、"));
+        let (hint, checks) = if push.is_empty() {
+            (tr("获取和推送均使用此地址。").into(), Vec::new())
+        } else {
+            // 勾上「推送也改用此地址」时说明跟着变
+            let hint = Hint::ByChecks(Box::new(move |checks| {
+                match checks.first().copied().unwrap_or(false) {
+                    true => tf!(
+                        "将删除另行配置的推送地址 {push}，获取和推送均使用此地址。",
+                        push
+                    ),
+                    false => tf!("推送另行配置了地址 {push}，不随此处修改。", push),
+                }
+                .into()
+            }));
+            (hint, vec![(tr("推送也改用此地址").into(), false)])
+        };
         let ask = Ask {
-            title: tf!("修改 {remote} 的地址", remote).into(),
+            title: tf!("修改 {remote} 的地址", remote = &remote).into(),
             placeholder: tr("新地址").into(),
-            value: String::new(),
-            hint: tr("获取和推送均使用此地址。").into(),
+            value: url,
+            hint,
             ok: tr("修改"),
+            checks,
+            validate: Some(Box::new(|_, answer| {
+                // 以 - 开头的地址会被 ssh 当成选项（git 也拒绝这样的地址）
+                answer
+                    .text
+                    .starts_with('-')
+                    .then(|| tr("地址不能以 - 开头。").to_string())
+            })),
             ..Default::default()
         };
         self.ask(ask, window, cx, move |this, answer, window, cx| {
-            let url = answer.text;
             let remote = remote.clone();
-            let set = vec!["remote".into(), "set-url".into(), remote.clone(), url];
-            this.run_op(
-                tr("修改远程"),
-                set,
-                None,
-                window,
-                cx,
-                move |_, _, w, cx| {
-                    w.push_notification(
-                        Notification::success(tf!("{remote} 的地址已修改", remote)),
-                        cx,
-                    );
-                },
-            );
+            let set = vec![
+                "remote".into(),
+                "set-url".into(),
+                "--".into(),
+                remote.clone(),
+                answer.text,
+            ];
+            let mut steps = vec![Step::local(set)];
+            if answer.checks.first().copied().unwrap_or(false) {
+                let key = format!("remote.{remote}.pushurl");
+                steps.push(Step::local(args(&["config", "--unset-all", &key])));
+            }
+            this.run_seq(tr("修改远程"), steps, window, cx, move |_, _, w, cx| {
+                let text = tf!("{remote} 的地址已修改", remote);
+                w.push_notification(Notification::success(text), cx);
+            });
         });
     }
 
@@ -1689,19 +1817,61 @@ impl RepoView {
         });
     }
 
-    /// 在新标签页里打开子模块：它就是仓库目录下的另一个仓库。
-    pub(super) fn open_submodule(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(path) = self.submodules.get(ix) else {
+    /// 在新标签页里打开子模块：它就是仓库目录下的另一个仓库。先核对它有自己的仓库：没初始化的
+    /// 子模块目录里没有，git 会往上找到这个仓库，打开的标签页叫子模块、动的却是这个仓库。没初始化
+    /// 就问要不要初始化。
+    /// 现在列表里提交是 `target` 的那个贮藏（菜单按提交认，见 `side_menu`）。没了是 None。
+    pub(super) fn stash_now(&self, target: &str) -> Option<fr_core::refs::Stash> {
+        self.refs
+            .stashes
+            .iter()
+            .find(|stash| stash.target == target)
+            .cloned()
+    }
+
+    /// 在新标签页中打开子模块 `path`（相对仓库根目录）。按路径不按下标：菜单开着时子模块列表可能
+    /// 重读了。
+    pub(super) fn open_submodule(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.submodules.contains(&path) {
+            return;
+        }
+        let Some(channel) = self.channel.clone() else {
             return;
         };
-        let full = match &self.entry.server {
-            Some(_) => format!("{}/{path}", self.entry.path),
-            None => format!("{}\\{}", self.entry.path, path.replace('/', "\\")),
-        };
-        cx.emit(RepoEvent::Open(RepoEntry {
-            server: self.entry.server.clone(),
-            path: full,
-        }));
+        let full = self.sub_path(&path);
+        let outer = channel.git(&self.entry.path, super::subs::toplevel_args());
+        cx.spawn_in(window, async move |this, cx| {
+            let outer = super::subs::toplevel(outer.await);
+            let ready = super::subs::own_repo(&channel, &full, outer.as_deref()).await;
+            this.update_in(cx, |this, window, cx| {
+                if ready {
+                    cx.emit(RepoEvent::Open(RepoEntry {
+                        server: this.entry.server.clone(),
+                        path: full,
+                    }));
+                    return;
+                }
+                let description = tf!(
+                    "子模块 {path} 尚未初始化。初始化将从远程获取其内容（git submodule update --init），完成后可再打开。",
+                    path = &path
+                );
+                this.confirm_plain(
+                    tr("初始化子模块？"),
+                    description,
+                    tr("初始化"),
+                    window,
+                    cx,
+                    move |this, window, cx| this.update_submodules(Some(path.clone()), window, cx),
+                );
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // ---------- 进行到一半的操作 ----------
@@ -1796,6 +1966,56 @@ impl RepoView {
                     },
                 );
             },
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{merge_args, merge_rev};
+    use fr_core::refs::{Branch, Refs, Tag};
+
+    fn branch(name: &str) -> Branch {
+        Branch {
+            name: name.into(),
+            target: String::new(),
+            current: false,
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            gone: false,
+        }
+    }
+
+    #[test]
+    fn 合并时短名会认错就用完整引用名() {
+        let refs = Refs {
+            branches: ["feat", "v1", "origin/main", "stash", "heads/x"]
+                .map(branch)
+                .to_vec(),
+            remotes: ["origin/main", "origin/dev"].map(branch).to_vec(),
+            tags: vec![Tag {
+                name: "v1".into(),
+                target: String::new(),
+            }],
+            stashes: Vec::new(),
+        };
+        let rev = |short: &str, full: &str| merge_rev(short, full, &refs);
+        assert_eq!(rev("feat", "refs/heads/feat"), "feat");
+        // 有同名的标签：git 先认标签
+        assert_eq!(rev("v1", "refs/heads/v1"), "refs/heads/v1");
+        // 远程分支和本地分支同名：git 先认本地分支
+        let remote = "refs/remotes/origin/main";
+        assert_eq!(rev("origin/main", remote), remote);
+        assert_eq!(rev("origin/main", "refs/heads/origin/main"), "origin/main");
+        assert_eq!(rev("origin/dev", "refs/remotes/origin/dev"), "origin/dev");
+        // 排在最前面的 refs/<名字>
+        assert_eq!(rev("stash", "refs/heads/stash"), "refs/heads/stash");
+        assert_eq!(rev("heads/x", "refs/heads/heads/x"), "refs/heads/heads/x");
+        // 名字放在 `--` 后面
+        assert_eq!(
+            merge_args("-x", None, false),
+            ["merge", "--no-edit", "--", "-x"]
         );
     }
 }

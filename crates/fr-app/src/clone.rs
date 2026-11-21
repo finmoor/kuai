@@ -6,7 +6,9 @@
 
 use fr_core::i18n::tr;
 use fr_core::tf;
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use fr_channel::StreamItem;
@@ -31,8 +33,14 @@ struct Running {
     target: String,
     /// 开始前这个目录不存在：中止后可以放心删掉
     created: bool,
+    /// 开始前这个目录在、是空的：中止后把里面的清掉，目录留着
+    was_empty: bool,
     _task: Task<()>,
 }
+
+/// 中止以后正在清理的本机目录（小写）：清完之前不能再往那里克隆，不然新克隆下来的会被一起删掉。
+/// 关了对话框再打开也算，所以是全局的。
+static CLEANING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
 
 pub struct CloneView {
     app: Entity<AppState>,
@@ -85,7 +93,7 @@ impl CloneView {
                 .find_map(|r| {
                     r.path
                         .rsplit_once(['\\', '/'])
-                        .map(|(dir, _)| dir.to_string())
+                        .map(|(dir, _)| drive_root(dir))
                 })
                 .or_else(|| std::env::var("USERPROFILE").ok()),
             Some(_) if start_dir.is_some() => start_dir,
@@ -94,7 +102,7 @@ impl CloneView {
                 _ => {
                     // 还没连上：这里就开始连，连上后把主目录填进去
                     let connecting = app.update(cx, |app, cx| app.connect(id, cx));
-                    status = Some((tr("正在连接服务器…").into(), false));
+                    status = Some((tr("正在连接主机…").into(), false));
                     connect = Some(cx.spawn_in(window, async move |this, cx| {
                         let result = connecting.await;
                         this.update_in(cx, |this: &mut Self, window, cx| {
@@ -110,7 +118,7 @@ impl CloneView {
                                 }
                                 Err(err) => {
                                     this.status =
-                                        Some((tf!("无法连接服务器：{err}", err).into(), true))
+                                        Some((tf!("无法连接主机：{err}", err).into(), true))
                                 }
                             }
                             cx.notify();
@@ -178,9 +186,23 @@ impl CloneView {
         (!name.is_empty()).then(|| name.to_string())
     }
 
+    /// 存放位置，换成 git -C 认得的写法：本机只写了盘符（`D:`）的补成盘的根目录，服务器上的 `~`
+    /// 换成主目录。预览和执行都用它，克隆到的就是预览里写的地方。
+    fn parent_dir(&self, cx: &App) -> String {
+        let parent = self.parent.read(cx).value().trim().to_string();
+        match &self.server {
+            None => drive_root(&parent),
+            Some(id) => match self.app.read(cx).status(id) {
+                ConnStatus::Ready(conn) => expand_home(&parent, &conn.hello.home),
+                // 还没连上：原样（git 进不去会报存放位置不存在）
+                _ => parent,
+            },
+        }
+    }
+
     /// 现在填的内容会克隆到哪里；还没填全时为空。
     fn target(&self, cx: &App) -> Option<String> {
-        let parent = self.parent.read(cx).value().trim().to_string();
+        let parent = self.parent_dir(cx);
         let name = self.name.read(cx).value().trim().to_string();
         (!parent.is_empty() && !name.is_empty())
             .then(|| join(&parent, &name, self.server.is_none()))
@@ -191,7 +213,7 @@ impl CloneView {
             return;
         }
         let url = self.url.read(cx).value().trim().to_string();
-        let parent = self.parent.read(cx).value().trim().to_string();
+        let parent = self.parent_dir(cx);
         let name = self.name.read(cx).value().trim().to_string();
         let problem = if url.is_empty() {
             Some(tr("请填写仓库地址").to_string())
@@ -202,8 +224,18 @@ impl CloneView {
         };
         let local = self.server.is_none();
         let target = join(&parent, &name, local);
+        // 上次中止的还在清：等清完（清的时候它不是空的，下面会说「已存在且不为空」，不对）
+        let cleaning = local && lock_cleaning().contains(&target.to_lowercase());
         // 本机可以先看一眼：目标已经有东西就不用等 git 报错了
         let problem = problem
+            .or_else(|| {
+                cleaning.then(|| {
+                    tf!(
+                        "正在清理上次未完成的 {target}，请稍后再试。",
+                        target = &target
+                    )
+                })
+            })
             .or_else(|| (local && dir_not_empty(Path::new(&target))).then(|| exists_text(&target)));
         if let Some(problem) = problem {
             self.status = Some((problem.into(), true));
@@ -211,6 +243,7 @@ impl CloneView {
             return;
         }
         let created = local && !Path::new(&target).exists();
+        let was_empty = local && Path::new(&target).is_dir() && !dir_not_empty(Path::new(&target));
         if local {
             // 本机的目录不存在就建出来；服务器上的要先有
             let _ = std::fs::create_dir_all(&parent);
@@ -223,7 +256,7 @@ impl CloneView {
         self.status = Some((tr("正在连接…").into(), false));
         self.confirm_abort = false;
         let task = cx.spawn_in(window, async move |this, cx| {
-            let result: Result<(), String> = async {
+            let result: Result<RepoEntry, String> = async {
                 let channel = channel.await.map_err(|err| err.to_string())?;
                 let clone = vec!["clone".into(), "--progress".into(), "--".into(), url, name];
                 let mut stream = channel.git_progress(&parent, clone);
@@ -240,22 +273,31 @@ impl CloneView {
                             })
                             .map_err(|_| tr("已取消").to_string())?;
                         }
-                        Some(Ok(StreamItem::Done(out))) if out.success() => return Ok(()),
+                        Some(Ok(StreamItem::Done(out))) if out.success() => break,
                         Some(Ok(StreamItem::Done(out))) => return Err(tail(&out.stderr)),
                         Some(Err(err)) => return Err(format!("{err:#}")),
                         None => return Err(tr("连接中断").into()),
                     }
                 }
+                // 按 git 认的仓库根目录登记：存放位置写的是相对路径、带 `..`、大小写不同时，
+                // 和自己拼出来的不一样，列表里会多出一个打不开的
+                let found = crate::open_dir::find(&channel, &done_target).await;
+                Ok(match found {
+                    Ok(crate::open_dir::Found::Repo(root)) => {
+                        crate::open_dir::entry(server.clone(), &root)
+                    }
+                    _ => RepoEntry {
+                        server: server.clone(),
+                        path: done_target.clone(),
+                    },
+                })
             }
             .await;
             this.update_in(cx, |this, _, cx| {
                 this.running = None;
                 this.confirm_abort = false;
                 match result {
-                    Ok(()) => cx.emit(CloneEvent::Done(RepoEntry {
-                        server,
-                        path: done_target.clone(),
-                    })),
+                    Ok(entry) => cx.emit(CloneEvent::Done(entry)),
                     Err(err) => this.status = Some((explain(&err, &done_target).into(), true)),
                 }
                 cx.notify();
@@ -265,6 +307,7 @@ impl CloneView {
         self.running = Some(Running {
             target,
             created,
+            was_empty,
             _task: task,
         });
         cx.notify();
@@ -279,44 +322,78 @@ impl CloneView {
         let Running {
             target,
             created,
+            was_empty,
             _task,
         } = running;
         // 丢掉任务：本机的 git 进程被杀掉，服务器上的请求发取消
         drop(_task);
         if self.server.is_some() {
             self.status = Some((
-                tf!("克隆已中止。服务器上的 {target} 可能有残留内容，请删除该目录或更换名称后重试。", target)
+                tf!(
+                    "克隆已中止。主机上的 {target} 可能有残留内容，请删除该目录或更换名称后重试。",
+                    target
+                )
                 .into(),
                 true,
             ));
-        } else if created {
-            self.status = Some((tr("克隆已中止，正在删除未完成的目录…").into(), false));
+        } else if created || was_empty {
+            let status = match created {
+                true => tr("克隆已中止，正在删除未完成的目录…"),
+                false => tr("克隆已中止，正在清理目录中未完成的内容…"),
+            };
+            self.status = Some((status.into(), false));
             let path = target.clone();
+            // 清完之前不让再往这里克隆（见 `CLEANING`）
+            lock_cleaning().insert(path.to_lowercase());
             let remove = cx.background_executor().spawn(async move {
                 // git 进程刚被杀掉，文件可能还占着，多试几次
                 let mut last = None;
                 for _ in 0..15 {
-                    match std::fs::remove_dir_all(&path) {
-                        Ok(()) => return Ok(()),
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    // 这次新建的目录整个删掉；本来就在的空目录只清里面的
+                    let removed = match created {
+                        true => std::fs::remove_dir_all(&path),
+                        false => empty_dir(Path::new(&path)),
+                    };
+                    match removed {
+                        Ok(()) => {
+                            last = None;
+                            break;
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                            last = None;
+                            break;
+                        }
                         Err(err) => last = Some(err),
                     }
                     std::thread::sleep(Duration::from_millis(200));
                 }
-                Err(last.map(|err| err.to_string()).unwrap_or_default())
+                lock_cleaning().remove(&path.to_lowercase());
+                match last {
+                    Some(err) => Err(err.to_string()),
+                    None => Ok(()),
+                }
             });
             cx.spawn(async move |this, cx| {
                 let result = remove.await;
                 this.update(cx, |this, cx| {
                     // 这期间又开始了新的克隆就不动它的进度
                     if this.running.is_none() {
-                        this.status = Some(match result {
-                            Ok(()) => (
+                        this.status = Some(match (result, created) {
+                            (Ok(()), true) => (
                                 tf!("克隆已中止，未完成的 {target} 已删除。", target).into(),
                                 false,
                             ),
-                            Err(err) => (
+                            (Ok(()), false) => (
+                                tf!("克隆已中止，{target} 中未完成的内容已清除。", target).into(),
+                                false,
+                            ),
+                            (Err(err), true) => (
                                 tf!("克隆已中止，但未能删除未完成的 {target}（{err}），请手动删除。", target, err)
+                                .into(),
+                                true,
+                            ),
+                            (Err(err), false) => (
+                                tf!("克隆已中止，但未能清除 {target} 中未完成的内容（{err}），请手动删除。", target, err)
                                 .into(),
                                 true,
                             ),
@@ -389,6 +466,46 @@ impl CloneView {
     }
 }
 
+fn lock_cleaning() -> std::sync::MutexGuard<'static, HashSet<String>> {
+    CLEANING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// 删掉目录里的东西，目录本身留着（克隆前它就在、是空的）。
+fn empty_dir(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        match entry.file_type()?.is_dir() {
+            true => std::fs::remove_dir_all(entry.path())?,
+            false => std::fs::remove_file(entry.path())?,
+        }
+    }
+    Ok(())
+}
+
+/// 本机只写了盘符（`D:`）时补成盘的根目录：`git -C D:` 进的是那个盘的「当前目录」，
+/// 和预览里拼出来的 `D:\名字` 不是一个地方。
+fn drive_root(path: &str) -> String {
+    let bytes = path.as_bytes();
+    match bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        true => format!("{path}\\"),
+        false => path.to_string(),
+    }
+}
+
+/// 服务器上的 `~`、`~/…` 换成主目录 `home`：git -C 不展开 `~`（目录浏览器里能用，这里也要能用）。
+fn expand_home(path: &str, home: &str) -> String {
+    let home = home.trim_end_matches(['/', '\\']);
+    if path == "~" {
+        return home.to_string();
+    }
+    match path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        Some(rest) => format!("{home}/{rest}"),
+        None => path.to_string(),
+    }
+}
+
 /// 目录和文件夹名拼成完整路径。本机用反斜杠，服务器上用斜杠。
 fn join(parent: &str, name: &str, local: bool) -> String {
     let separator = if local { '\\' } else { '/' };
@@ -434,7 +551,7 @@ fn explain(err: &str, target: &str) -> String {
         Some(tr("未找到仓库。请检查地址及账号的访问权限。").to_string())
     } else if lower.contains("no such file or directory") || lower.contains("cannot find the path")
     {
-        Some(tr("存放位置不存在。请先在服务器上创建该目录，或点击「浏览…」选择。").to_string())
+        Some(tr("存放位置不存在。请先在主机上创建该目录，或点击「浏览…」选择。").to_string())
     } else {
         crate::repo::explain(err).map(str::to_string)
     };
@@ -478,7 +595,7 @@ impl Render for CloneView {
         let label = move |text: &'static str| div().text_xs().text_color(muted).child(text);
         let hint = match &self.server {
             None => tr("克隆到本机。目录不存在时将自动创建。"),
-            Some(_) => tr("由服务器连接远程仓库，存放位置须已存在。"),
+            Some(_) => tr("由主机连接远程仓库，存放位置须已存在。"),
         };
         // 实际会克隆到哪里：克隆期间显示的是开始时定下来的
         let target = match &self.running {
@@ -593,7 +710,31 @@ impl Render for CloneView {
 
 #[cfg(test)]
 mod tests {
-    use super::{CloneView, explain, join, name_error};
+    use super::{CloneView, drive_root, empty_dir, expand_home, explain, join, name_error};
+
+    #[test]
+    fn 只写盘符的补成根目录_服务器上的波浪号换成主目录() {
+        assert_eq!(drive_root("D:"), r"D:\");
+        assert_eq!(drive_root(r"D:\work"), r"D:\work");
+        assert_eq!(drive_root("/home"), "/home");
+        assert_eq!(expand_home("~", "/home/me"), "/home/me");
+        assert_eq!(expand_home("~/src", "/home/me/"), "/home/me/src");
+        assert_eq!(expand_home("/opt/~x", "/home/me"), "/opt/~x");
+        assert_eq!(expand_home("~other/x", "/home/me"), "~other/x");
+    }
+
+    #[test]
+    fn 清空目录只删里面的() {
+        let dir = std::env::temp_dir().join(format!("kuai-clone-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git").join("objects")).unwrap();
+        std::fs::write(dir.join(".git").join("HEAD"), b"ref").unwrap();
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        empty_dir(&dir).unwrap();
+        assert!(dir.is_dir());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn 从地址里取仓库名() {

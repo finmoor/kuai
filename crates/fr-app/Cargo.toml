@@ -57,4 +57,6 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
     "Win32_System_Variant",
     "Win32_UI_Shell",
+    # ShellExecuteW 的显示方式（shell.rs 用默认程序打开文件）
+    "Win32_UI_WindowsAndMessaging",
 ] }

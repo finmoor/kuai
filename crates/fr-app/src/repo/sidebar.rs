@@ -14,6 +14,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
+use std::rc::Rc;
 
 use fr_core::i18n::{tr, trc};
 use fr_core::refs::Refs;
@@ -207,6 +208,9 @@ pub(super) struct Sidebar {
     pub(super) selected: SideItem,
     /// 侧栏的键盘焦点：上下键换选中的项，回车等于双击
     focus: FocusHandle,
+    /// 这一帧的行：画侧栏时算一遍，列表画行时接着用（原来行数、画行各算一遍整棵树，
+    /// 标签有几千个时每次重画都要建两遍）
+    rows: Rc<Vec<SideRow>>,
 }
 
 impl Sidebar {
@@ -225,6 +229,7 @@ impl Sidebar {
             scroll: UniformListScrollHandle::new(),
             selected: SideItem::History,
             focus: cx.focus_handle(),
+            rows: Rc::default(),
         };
         (sidebar, subscription)
     }
@@ -264,7 +269,7 @@ impl RepoView {
                 label: String::new(),
                 key: None,
                 open: false,
-                count: self.status.as_ref().map_or(0, |s| s.entries.len()),
+                count: self.change_count(),
             },
             SideRow {
                 item: SideItem::History,
@@ -679,7 +684,9 @@ impl RepoView {
             Page::Terminal => side.child(self.render_terminal_side(cx)),
             Page::Files => side.child(self.render_files_side(cx)),
             Page::Git => {
-                let count = self.sidebar_rows(cx).len();
+                let rows = Rc::new(self.sidebar_rows(cx));
+                let count = rows.len();
+                self.sidebar.rows = rows;
                 let actions = self.render_side_actions(cx);
                 side.child(
                     div().px(px(10.)).pt(px(8.)).pb(px(4.)).child(
@@ -815,7 +822,8 @@ impl RepoView {
         range: Range<usize>,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let rows = self.sidebar_rows(cx);
+        // 同一帧里画侧栏时刚算好的（见 [`Sidebar::rows`]）
+        let rows = self.sidebar.rows.clone();
         let hidden = self.hidden_refs(cx);
         let gone = self.gone_count();
         let theme = cx.theme();
@@ -849,6 +857,9 @@ impl RepoView {
                     .text_color(fg)
                     .when(selected, |d| d.bg(active))
                     .when(!selected && !is_header, |d| d.hover(|s| s.bg(hover)));
+                // 树里没有下一层的行（分支、标签……）在箭头那一列空着，名字才比上一层的名字靠右一格，
+                // 和同一层的文件夹对齐
+                let lead = || div().flex_none().w(px(12.));
                 let chevron = |open: bool| {
                     ui::icon_small(if open {
                         IconName::ChevronDown
@@ -986,7 +997,7 @@ impl RepoView {
                                 IconName::Folder
                             })
                             .flex_none()
-                            .text_color(muted),
+                            .text_color(ui::folder_color(cx)),
                         )
                         .child(name(row.label))
                         .when(!row.open, |r| r.child(count(row.count))),
@@ -1014,6 +1025,7 @@ impl RepoView {
                         });
                         // 当前分支：打勾、加粗，颜色用主色
                         inner
+                            .child(lead())
                             .child(if branch.current {
                                 ui::icon(IconName::Check).flex_none().text_color(accent)
                             } else {
@@ -1061,17 +1073,21 @@ impl RepoView {
                             .map(mark)
                     }
                     SideItem::Remote(_) => inner
+                        .child(lead())
                         .child(ui::icon(IconName::GitBranch).flex_none().text_color(muted))
                         .child(name(row.label))
                         .map(mark),
                     SideItem::Tag(_) => inner
+                        .child(lead())
                         .child(ui::icon(IconName::Tag).flex_none().text_color(muted))
                         .child(name(row.label))
                         .map(mark),
                     SideItem::Submodule(_) => inner
+                        .child(lead())
                         .child(ui::icon(IconName::Package).flex_none().text_color(muted))
                         .child(name(row.label)),
                     SideItem::Stash(_) => inner
+                        .child(lead())
                         .child(ui::icon(IconName::Archive).flex_none().text_color(muted))
                         .child(name(row.label)),
                 };
@@ -1114,8 +1130,9 @@ impl RepoView {
 
     /// 引用刷新后找回原来选中的那一项：分支、远程分支、标签按名字，贮藏按提交。
     /// 侧栏按下标选中，不找回的话，比如弹出一个贮藏后，选中的会变成下一个贮藏，
-    /// 那一行的「弹出」「删除」按钮就对着别的贮藏了。找不到就退回到当前视图对应的那一项。
-    pub(super) fn remap_sidebar_selection(&mut self, old: &Refs) {
+    /// 那一行的「弹出」「删除」按钮就对着别的贮藏了。找不到就退回到当前视图对应的那一项；
+    /// 选中的贮藏没了（弹出、删除了）时，提交详情里显示的它的改动也撤掉。
+    pub(super) fn remap_sidebar_selection(&mut self, old: &Refs, cx: &mut Context<Self>) {
         let new = &self.refs;
         let found = match self.sidebar.selected {
             SideItem::Branch(i) => old
@@ -1144,6 +1161,9 @@ impl RepoView {
             }
             other => Some(other),
         };
+        if found.is_none() && matches!(self.sidebar.selected, SideItem::Stash(_)) {
+            self.clear_commit_selection(cx);
+        }
         self.sidebar.selected = found.unwrap_or(match self.mode {
             Mode::Changes | Mode::Merge => SideItem::Changes,
             Mode::History | Mode::Blame => SideItem::History,
@@ -1353,8 +1373,10 @@ impl RepoView {
             SideItem::Submodule(i) => {
                 self.sidebar.selected = item;
                 // 双击：在新标签页里打开这个子模块
-                if clicks >= 2 {
-                    self.open_submodule(i, cx);
+                if clicks >= 2
+                    && let Some(path) = self.submodules.get(i).cloned()
+                {
+                    self.open_submodule(path, window, cx);
                 }
             }
             SideItem::Stash(i) => {

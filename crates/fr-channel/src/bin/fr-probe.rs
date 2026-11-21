@@ -93,7 +93,6 @@ fn main() -> Result<()> {
                 identity_file: value("--jump-key"),
                 password_auth: jump_password,
                 secret: value("--jump-secret-env").and_then(|name| std::env::var(name).ok()),
-                ..Default::default()
             })
             .collect(),
         on_stage: Some(Arc::new(|n| println!("已登录 {n} 台"))),
@@ -364,6 +363,9 @@ fn terminal(
             Ok(Ok(TermItem::Exited(code))) => {
                 println!("\n终端里的程序结束了，退出码 {code:?}");
                 return Ok(());
+            }
+            Ok(Ok(TermItem::Lagging)) => {
+                anyhow::bail!("输出积压过多，断开了（终端里的程序接着跑）")
             }
             Ok(Err(err)) => return Err(err),
             // 每 100 ms 醒一次看要不要送 `keys`；看够了由循环条件结束

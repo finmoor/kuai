@@ -37,7 +37,7 @@ impl Home {
     fn new() -> Home {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         // 放在 cargo 的 target/tmp 下，不放系统的临时目录：Defender 把复制到临时目录里再启动的
-        // 没签名的程序当成木马拦下来（2026-11-14 实测报 Trojan:Win32/Bearfoos.A!ml，Feng 同意挪到这里）
+        // 没签名的程序当成木马拦下来（实测报 Trojan:Win32/Bearfoos.A!ml）
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
             "kuaid-test-{}-{}",
             std::process::id(),
@@ -472,6 +472,10 @@ fn 结束终端会把里面的程序都带走() {
     client.hello();
     let (stream, opened) = client.open("repo", &home.dir);
     let shell_pid = pid_of_shell(&mut client, stream, &opened.term);
+    let programs = |client: &mut Client| {
+        client.call("term_programs", json!({ "term": opened.term }))["programs"].clone()
+    };
+    assert_eq!(programs(&mut client), json!([]), "shell 闲着时没有别的程序");
     // 前台跑着一个不会自己结束的程序，记下它的进程号
     client.line(
         &opened.term,
@@ -484,6 +488,10 @@ fn 结束终端会把里面的程序都带走() {
         .take_while(char::is_ascii_digit)
         .collect();
     assert!(process_exists(&child_pid));
+    assert_eq!(programs(&mut client), json!(["ping"]));
+    // 终端列表里也带着（协议 14）
+    let listed = client.terms();
+    assert_eq!(listed[0].programs, Some(vec!["ping".to_string()]));
     let closed = client.call("term_close", json!({ "term": opened.term }));
     assert_eq!(closed["closed"], true);
     client.exit_of(stream);

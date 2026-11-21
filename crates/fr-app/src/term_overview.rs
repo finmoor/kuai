@@ -1,35 +1,39 @@
 //! 终端页（标题栏上的「终端」，Ctrl+Shift+A）：所有工作区里各个仓库的终端合在一起管。
 //!
 //! 仓库标签页里的终端页是它只看一个仓库的样子：两边是同一批终端（都在各台电脑的 kuaid 里，数据
-//! 在 [`TermBoard`]）。设计见 `design/terminal-hub/`（方向 C，带固定）。
+//! 在 [`TermBoard`]）。设计见 `docs/design/terminal-hub/`（方向 C，带固定）。
 //!
-//! 左边是一棵树：工作区、里面的仓库、仓库的终端，工作区和仓库都可以收起（收着时行尾写里面有几个
-//! 终端停下了、在跑、空着）。右边顶上是选中的仓库的终端，排成标签，下面是选中那个的画面。新建、
+//! 左边按工作区分节：工作区是带颜色的分节标题（滚动时吸在顶上），下面是它的仓库和仓库的终端；
+//! 工作区和仓库都可以收起（收着时写里面有几个终端停下了、在跑、空着）。终端的图标看里面跑的程序、
+//! 颜色看状态。侧栏的设计见 `docs/design/terminal-sidebar/`（方向 C，2026-11-20）。
+//! 右边顶上是选中的仓库的终端，排成标签，下面是选中那个的画面。新建、
 //! 重启、结束都在这一页：行尾的按钮、标签栏上的 +、标签上的 ×、工具栏的「重启」、右键菜单。里面还在
 //! 输出的终端，结束、重启前先问一句。
 //!
 //! 固定（只记在这台电脑上）：
 //!
 //! - 终端：侧栏最上面「已固定」一组里一行；在它自己的仓库里排在最前面（侧栏和标签栏都是）。别的
-//!   仓库的标签栏里没有它（2026-11-19 Feng：「只有当前项目的固定终端才会展示在前面」）。它结束了
+//!   仓库的标签栏里没有它。它结束了
 //!   就不再固定；重启不算结束（按「哪个仓库的第几个」认，见 [`TermSlot`]）。
 //! - 仓库：排在「已固定」里固定的终端后面，原来的工作区里不再列它。
 //!
 //! 「已固定」下面有一个下拉，选只列哪台服务器上的工作区（全部、本机、各台服务器；没有配置服务器
-//! 时没有它）。固定的不受它影响，右边显示着的终端也不动。设计见 `design/machine-switch/`（方向 A）。
+//! 时没有它）。固定的不受它影响，右边显示着的终端也不动。设计见 `docs/design/machine-switch/`（方向 A）。
 //!
 //! 画面有两种接法。平常是「只看」（[`TerminalView::watch`]）：只看一眼不改终端的大小，敲的字照样
 //! 写得进去；焦点进到画面里（开始输入）以后，大小改成这一页放得下的（`TerminalView::claim`）。
 //! 这一页自己开的（新建、重启）是正经接着的（[`TerminalView::new`]），大小跟着这一页的画面，也就和
 //! 仓库的终端页一样大；选到别的终端再回来，就换成只看。
 //!
-//! 焦点：打开这一页时在侧栏上（↑↓ 选一行，Enter 把终端开成标签页，→ 进到终端里）；点画面、点
-//! 标签、新开一个终端时进到终端里，之后的键都归里面的程序，只留 Ctrl+Shift+↑、↓ 沿着侧栏换终端。
-//! 输入时画面带一圈主色的边框：Enter 在侧栏上是开标签页、在终端里是回车，得一眼看得出焦点在哪。
+//! 焦点：打开这一页时在侧栏上（↑↓ 选一行，Enter 打开它的仓库、显示 Git 页，→ 进到终端里）；点画面、
+//! 点标签、新开一个终端时进到终端里，之后的键都归里面的程序，只留 Ctrl+Shift+↑、↓ 沿着侧栏换终端。
+//! 输入时画面带一圈主色的边框：Enter 在侧栏上是打开仓库、在终端里是回车，得一眼看得出焦点在哪。
 //!
 //! 侧栏和仓库页的侧栏一样宽、一样的底色和字号，右边上面一条和终端页的工具栏一样高，下面全是画面：
-//! 这样画面和仓库的终端页一样大，终端是几行几列就正好放得下，字不用缩小。
+//! 这样画面和仓库的终端页一样大，终端是几行几列就正好放得下，字不用缩小。侧栏右边有分隔条，拖它改的
+//! 就是仓库页侧栏的那个宽度（见 [`crate::side_split`]）。
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use fr_core::i18n::{tr, trc};
@@ -48,7 +52,7 @@ use crate::app_state::AppState;
 use crate::machines::{LOCAL, WorkspaceKey, machine_of, split_relay};
 use crate::repo::tool_button;
 use crate::settings::{RepoEntry, TermSlot};
-use crate::term_board::{RepoGroup, Row, TermBoard, TermId, TermState, free_number};
+use crate::term_board::{Program, RepoGroup, Row, TermBoard, TermId, TermState, free_number};
 use crate::terminal::{self, TerminalView};
 use crate::ui;
 
@@ -56,6 +60,10 @@ use crate::ui;
 const HEAD_HEIGHT: f32 = 52.;
 /// 侧栏里一行的高度（和仓库终端页侧栏里的一行一样）
 const ROW_HEIGHT: f32 = 28.;
+/// 工作区分节标题的高度（下面 26 是能点的那一块）
+const GROUP_HEAD: f32 = 28.;
+/// 两个工作区之间空着的高度
+const GROUP_GAP: f32 = 8.;
 /// 固定的终端不在列表里了，等这么久还不在才取消固定：重启时列表里会空一下
 const UNPIN_AFTER: Duration = Duration::from_secs(3);
 
@@ -66,9 +74,9 @@ enum Filter {
     Running,
 }
 
-/// 要前往一个终端，或者一个仓库的终端页。
+/// 要离开终端页去的地方。
 pub enum Go {
-    Term(Row),
+    /// 打开这个仓库的标签页，显示 Git 页
     Repo(RepoEntry),
 }
 
@@ -111,6 +119,8 @@ struct SideRepo {
     /// 下面列出来的那些（筛过了）
     listed: Vec<Row>,
     collapsed: bool,
+    /// 它所在的工作区是第几种颜色（见 [`AppState::workspace_hues`]）；不在工作区里的是 None
+    hue: Option<usize>,
 }
 
 /// 侧栏里一个工作区的那一组。
@@ -118,6 +128,7 @@ struct SideGroup {
     workspace: Option<WorkspaceKey>,
     collapsed: bool,
     repos: Vec<SideRepo>,
+    hue: Option<usize>,
 }
 
 /// 侧栏里要画的东西（筛过了）。
@@ -125,6 +136,8 @@ struct Side {
     pinned_terms: Vec<Row>,
     pinned_repos: Vec<SideRepo>,
     groups: Vec<SideGroup>,
+    /// 各个仓库所在工作区的颜色（一个仓库在几个工作区里时按先列出的那个）
+    hues: HashMap<RepoEntry, usize>,
     /// 只列哪台电脑上的工作区（没有是全部）
     scope: Option<String>,
     /// 选的那台服务器这次还没连上
@@ -167,6 +180,10 @@ pub struct TermOverview {
     visible: bool,
     /// 等着确认固定的终端是不是真的没了
     unpin: Option<Task<()>>,
+    /// 侧栏里那棵树的滚动：吸顶的工作区标题按它算
+    rows_scroll: ScrollHandle,
+    /// 上一帧树的样子（见 [`Self::layout_sig`]）
+    layout_sig: u64,
     focus: FocusHandle,
     _observe: Subscription,
 }
@@ -208,7 +225,7 @@ fn row_in<'a>(hub: &'a [RepoGroup], slot: &TermSlot) -> Option<&'a Row> {
 }
 
 /// 一个仓库的终端分成两段：固定的（按固定的先后）、没固定的。标签栏和侧栏都是这个顺序。
-/// 仓库在不在 `scope` 那台电脑上。经别的电脑连的算那台电脑的：经 156 连的 91 上的仓库是 156 的。
+/// 仓库在不在 `scope` 那台电脑上。经别的电脑连的算那台电脑的：经 A 连的 B 上的仓库是 A 的。
 fn on_machine(scope: &str, entry: &RepoEntry) -> bool {
     let machine = machine_of(entry);
     split_relay(machine).map_or(machine, |(via, _)| via) == scope
@@ -243,8 +260,9 @@ fn term_menu(
             at(&view),
         );
         menu.item(
-            PopupMenuItem::new(tr("在标签页中打开")).on_click(move |_, _, cx| {
-                go.0.update(cx, |this, cx| this.go_term(&go.1, cx)).ok();
+            PopupMenuItem::new(tr("打开仓库")).on_click(move |_, _, cx| {
+                go.0.update(cx, |_, cx| cx.emit(Go::Repo(go.1.entry.clone())))
+                    .ok();
             }),
         )
         .item(
@@ -328,7 +346,7 @@ fn repo_menu(
             }),
         )
         .item(
-            PopupMenuItem::new(tr("前往仓库")).on_click(move |_, _, cx| {
+            PopupMenuItem::new(tr("打开仓库")).on_click(move |_, _, cx| {
                 go.0.update(cx, |_, cx| cx.emit(Go::Repo(go.1.clone())))
                     .ok();
             }),
@@ -359,6 +377,8 @@ impl TermOverview {
             ending: Vec::new(),
             visible: false,
             unpin: None,
+            rows_scroll: ScrollHandle::new(),
+            layout_sig: 0,
             focus: cx.focus_handle(),
             _observe: observe,
         }
@@ -387,10 +407,13 @@ impl TermOverview {
         row_in(&self.hub(cx), slot).cloned()
     }
 
-    /// 右边显示的是哪个终端（它算看着的）。
+    /// 右边显示的是哪个终端（它算看着的）。主窗口每次画都要：只看那个仓库的终端，不把全部工作区
+    /// 分一遍组。
     pub fn shown_id(&self, cx: &App) -> Option<TermId> {
         let slot = self.shown.as_ref()?;
-        Some(self.find(slot, cx)?.id)
+        let rows = self.board.read(cx).terms_of(&slot.entry)?;
+        let row = rows.into_iter().find(|row| row.number == slot.number)?;
+        (!self.ending.contains(&row.id)).then_some(row.id)
     }
 
     fn matches(&self, row: &Row) -> bool {
@@ -471,11 +494,31 @@ impl TermOverview {
     /// 侧栏里要画的：最上面固定的终端、固定的仓库，下面是选的那台电脑上各个工作区里的仓库，仓库
     /// 下面是它的终端。筛「已停下」「运行中」时只留那种终端和有那种终端的仓库。
     fn side(&self, hub: &[RepoGroup], cx: &App) -> Side {
-        let pins = &self.app.read(cx).settings.term_hub;
+        let app = self.app.read(cx);
+        let pins = &app.settings.term_hub;
         let scope = self.scope(cx);
         let here = scope.as_deref();
         let scoped = here.map(|machine| self.scoped(machine, hub, cx));
         let tree: &[RepoGroup] = scoped.as_deref().unwrap_or(hub);
+        let workspace_hues = app.workspace_hues();
+        let group_hue = |group: &RepoGroup| {
+            let key = group.workspace.as_ref()?;
+            Some(
+                workspace_hues
+                    .get(key)
+                    .copied()
+                    .unwrap_or_else(|| ui::name_slot(&app.workspace_name(key), ui::HUES)),
+            )
+        };
+        let mut hues: HashMap<RepoEntry, usize> = HashMap::new();
+        for group in tree.iter().chain(hub) {
+            let Some(hue) = group_hue(group) else {
+                continue;
+            };
+            for (entry, _) in &group.repos {
+                hues.entry(entry.clone()).or_insert(hue);
+            }
+        }
         let wanted =
             |rows: &[Row]| self.filter == Filter::All || rows.iter().any(|row| self.matches(row));
         let repo = |(entry, rows): &Repo| {
@@ -487,6 +530,7 @@ impl TermOverview {
                 listed: listed.cloned().collect(),
                 collapsed: pins.collapsed_repos.contains(entry),
                 all,
+                hue: hues.get(entry).copied(),
             }
         };
         let pinned_terms = pins
@@ -521,6 +565,7 @@ impl TermOverview {
                     workspace: group.workspace.clone(),
                     collapsed,
                     repos,
+                    hue: group_hue(group),
                 })
             })
             .collect();
@@ -531,6 +576,7 @@ impl TermOverview {
             pinned_terms,
             pinned_repos,
             groups,
+            hues,
             offline,
             total: seen.len(),
             stopped: count(TermState::Stopped),
@@ -688,10 +734,14 @@ impl TermOverview {
         let size = Some((row.cols.max(2), row.rows.max(1)));
         let same = self.peek.as_ref().is_some_and(|peek| peek.slot == slot);
         let current = self.peek.as_ref().is_some_and(|peek| {
+            let view = peek.view.read(cx);
             peek.slot == slot
                 && peek.id.as_ref() == Some(&row.id)
                 // 自己开的管着它的大小，不用跟
-                && (peek.owned || peek.view.read(cx).size() == size)
+                && (peek.owned || view.size() == size)
+                // 那台电脑换了连接（改了地址）：两边终端编号、大小一样也得重新接，不然输入还发给旧的
+                // 那台。自己开的还没接上时没有连接，不算
+                && view.conn().is_none_or(|old| std::sync::Arc::ptr_eq(&old, &conn))
         });
         if current {
             return;
@@ -743,8 +793,7 @@ impl TermOverview {
         self.focus.focus(window, cx);
     }
 
-    /// 别处要在这一页看一个终端（终端标签页的「在终端页中显示」、没开成标签页的终端停下了点
-    /// 「前往」）：右边显示它，焦点在侧栏上。
+    /// 别处要在这一页看一个终端（终端停下了点「前往」、点了系统通知）：右边显示它，焦点在侧栏上。
     pub fn reveal_term(&mut self, slot: &TermSlot, window: &mut Window, cx: &mut Context<Self>) {
         self.select_term(slot.clone(), window, cx);
         self.focus.focus(window, cx);
@@ -784,19 +833,20 @@ impl TermOverview {
         }
     }
 
+    /// 打开一个终端所在的仓库（双击那一行）。
     fn go_term(&mut self, slot: &TermSlot, cx: &mut Context<Self>) {
-        if let Some(row) = self.find(slot, cx) {
-            cx.emit(Go::Term(row));
-        }
+        cx.emit(Go::Repo(slot.entry.clone()));
     }
 
-    /// 把显示着的终端开成标签页（标题栏右边那一排）；没有显示着的就前往选中的仓库的终端页。
+    /// 打开显示着的终端所在的仓库；没有显示着的就打开选中的仓库（工具栏的「打开仓库」、Enter）。
+    /// 1.17 是把终端开成标签页，2026-11-20 去掉了终端标签页。
     fn go(&mut self, cx: &mut Context<Self>) {
-        match (self.shown.clone(), self.repo.clone()) {
-            (Some(slot), _) => self.go_term(&slot, cx),
-            (None, Some(entry)) => cx.emit(Go::Repo(entry)),
-            (None, None) => {}
-        }
+        let entry = match (&self.shown, &self.repo) {
+            (Some(slot), _) => slot.entry.clone(),
+            (None, Some(entry)) => entry.clone(),
+            (None, None) => return,
+        };
+        cx.emit(Go::Repo(entry));
     }
 
     fn set_filter(&mut self, filter: Filter, cx: &mut Context<Self>) {
@@ -861,7 +911,7 @@ impl TermOverview {
             .filter(|slot| self.opening.as_ref() != Some(*slot))
             .filter(|slot| {
                 board
-                    .terms_of(&slot.entry, cx)
+                    .terms_of(&slot.entry)
                     .is_some_and(|rows| rows.iter().all(|row| row.number != slot.number))
             })
             .cloned()
@@ -901,7 +951,7 @@ impl TermOverview {
             None => Some(app.connect_local(cx)),
         });
         let Some(connecting) = connecting else {
-            let text = tf!("终端启动失败：{err}", err = tr("未找到该服务器的设置"));
+            let text = tf!("终端启动失败：{err}", err = tr("未找到该主机的设置"));
             window.push_notification(Notification::error(text), cx);
             return;
         };
@@ -912,10 +962,17 @@ impl TermOverview {
             };
             this.update_in(cx, |this, window, cx| match listed {
                 Ok(terms) => {
-                    let used: Vec<u32> = terms
+                    let mut used: Vec<u32> = terms
                         .iter()
                         .filter_map(|term| terminal::session_number(&entry.path, &term.key))
                         .collect();
+                    // 连着点了两次：前一个刚开、kuaid 里还没有它，问到的列表里也就没有。同名的
+                    // term_open 只是接上，两次开的会是同一个终端
+                    let opening = this.opening.iter().filter(|slot| slot.entry == entry);
+                    used.extend(opening.map(|slot| slot.number));
+                    if let Some((_, rows)) = repo_in(&this.hub(cx), &entry) {
+                        used.extend(rows.iter().map(|row| row.number));
+                    }
                     let slot = TermSlot {
                         entry,
                         number: free_number(&used),
@@ -988,7 +1045,7 @@ impl TermOverview {
         }
     }
 
-    /// 里面还在输出的终端，结束、重启前先问一句（2026-11-18 Feng：「要二次确认」）。
+    /// 结束、重启前先问一句：里面还在输出、或者除了 shell 还有程序在跑的（见 [`crate::term_end`]）。
     fn ask_first(
         &mut self,
         slot: &TermSlot,
@@ -999,49 +1056,26 @@ impl TermOverview {
         let Some(row) = self.find(slot, cx) else {
             return;
         };
-        let run =
-            move |this: &mut Self, slot: &TermSlot, window: &mut Window, cx: &mut Context<Self>| {
-                match restart {
-                    true => this.restart_now(slot, window, cx),
-                    false => this.end_now(slot, window, cx),
-                }
-            };
-        if !(row.alive && row.state == TermState::Running) {
-            return run(self, slot, window, cx);
-        }
-        let repo = self.app.read(cx).repo_name(&row.entry);
-        let name = Self::term_name(&row);
-        let (title, text, ok) = match restart {
-            true => (
-                tr("重启终端？"),
-                tf!(
-                    "将终止 {repo} 中的终端「{name}」里正在运行的程序，并重新启动。此操作无法撤销。",
-                    repo,
-                    name
-                ),
-                tr("重启"),
-            ),
-            false => (
-                tr("结束终端？"),
-                tf!(
-                    "将结束 {repo} 中的终端「{name}」，其中正在运行的程序将终止。此操作无法撤销。",
-                    repo,
-                    name
-                ),
-                tr("结束"),
-            ),
+        // 问的就是这个会话：问的这一会儿这个位置上换成了别的，不能做到别的身上
+        let id = row.id.clone();
+        let ending = crate::term_end::Ending {
+            conn: self.board.read(cx).conn(&row.id.machine),
+            repo: self.app.read(cx).repo_name(&row.entry),
+            name: Self::term_name(&row),
+            row: Some(row),
+            term: None,
+            exited: false,
+            restart,
         };
-        let (this, slot) = (cx.entity().downgrade(), slot.clone());
-        crate::manager::confirm_in(
-            title.to_string(),
-            text,
-            ok,
-            true,
+        let slot = slot.clone();
+        crate::term_end::ask_first(
+            self,
+            ending,
             window,
             cx,
-            move |window, cx| {
-                this.update(cx, |this, cx| run(this, &slot, window, cx))
-                    .ok();
+            move |this, window, cx| match restart {
+                true => this.restart_now(&slot, &id, window, cx),
+                false => this.end_now(&slot, &id, window, cx),
             },
         );
     }
@@ -1056,23 +1090,49 @@ impl TermOverview {
         self.ask_first(slot, true, window, cx);
     }
 
-    /// 请 kuaid 结束这个终端。列表里还有它的那一小会儿当它不在了。
-    fn close(&mut self, row: &Row, cx: &mut Context<Self>) -> Option<Task<()>> {
+    /// 请 kuaid 结束这个终端。列表里还有它的那一小会儿当它不在了。没连着那台电脑是 None。
+    fn close(&mut self, row: &Row, cx: &mut Context<Self>) -> Option<terminal::Closing> {
         let conn = self.board.read(cx).conn(&row.id.machine)?;
         let closing = conn.term_close(&row.id.term);
         self.ending.push(row.id.clone());
-        Some(cx.background_executor().spawn(async move {
-            if let Err(err) = closing.await {
-                log::warn!("结束终端失败：{err:#}");
-            }
-        }))
+        Some(closing)
     }
 
-    fn end_now(&mut self, slot: &TermSlot, window: &mut Window, cx: &mut Context<Self>) {
+    /// 确认以后这个位置上已经换成了别的终端（原来那个结束了，别处又开了一个）：不做，说一声。
+    /// 返回换没换。
+    fn changed(row: Option<&Row>, id: &TermId, window: &mut Window, cx: &mut App) -> bool {
+        let changed = row.is_some_and(|row| row.id != *id);
+        if changed {
+            let text = tr("终端已发生变化，操作已取消。");
+            window.push_notification(Notification::warning(text), cx);
+        }
+        changed
+    }
+
+    /// 结束、重启失败了：说一声。
+    fn failed(restart: bool, err: &str, window: &mut Window, cx: &mut App) {
+        let text = match restart {
+            true => tf!("终端重启失败：{err}", err),
+            false => tf!("结束终端失败：{err}", err),
+        };
+        window.push_notification(Notification::error(text), cx);
+    }
+
+    fn end_now(
+        &mut self,
+        slot: &TermSlot,
+        id: &TermId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let hub = self.hub(cx);
+        // 问的这一会儿它自己没了：不用再结束
         let Some(row) = row_in(&hub, slot).cloned() else {
             return;
         };
+        if Self::changed(Some(&row), id, window, cx) {
+            return;
+        }
         // 显示的是它：换到同一个仓库里旁边那个（按标签栏的顺序）
         let next = (self.shown.as_ref() == Some(slot)).then(|| {
             let (_, rows) = repo_in(&hub, &slot.entry)?;
@@ -1086,9 +1146,8 @@ impl TermOverview {
             beside.map(Row::slot)
         });
         let Some(closing) = self.close(&row, cx) else {
-            return;
+            return Self::failed(false, tr("未连接"), window, cx);
         };
-        closing.detach();
         if let Some(next) = next {
             self.shown = next;
         }
@@ -1100,19 +1159,51 @@ impl TermOverview {
             self.focus.focus(window, cx);
         }
         // 固定着的：不用等列表推过来再取消
-        if self.pinned_term(slot, cx) {
+        let pinned = self.pinned_term(slot, cx);
+        if pinned {
             self.toggle_pin_term(slot, cx);
         }
+        // 没结束掉（连接断了）：不再藏着它，固定也还回去，说一声。原来只记日志，终端在主机上接着跑，
+        // 这一页却一直不列它
+        let (id, slot) = (row.id, slot.clone());
+        cx.spawn_in(window, async move |this, cx| {
+            let Err(err) = closing.await else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.ending.retain(|other| *other != id);
+                if pinned && !this.pinned_term(&slot, cx) {
+                    this.toggle_pin_term(&slot, cx);
+                }
+                Self::failed(false, &format!("{err:#}"), window, cx);
+                this.sync(window, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         self.sync(window, cx);
         cx.notify();
     }
 
-    fn restart_now(&mut self, slot: &TermSlot, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(row) = self.find(slot, cx) else {
+    fn restart_now(
+        &mut self,
+        slot: &TermSlot,
+        id: &TermId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let row = self.find(slot, cx);
+        if Self::changed(row.as_ref(), id, window, cx) {
             return;
-        };
-        let Some(closing) = self.close(&row, cx) else {
-            return;
+        }
+        // 问的这一会儿它自己没了（结束以后被清掉了）：不用关，直接在这个位置上开一个新的
+        let closing = match &row {
+            Some(row) => match self.close(row, cx) {
+                Some(closing) => Some(closing),
+                None => return Self::failed(true, tr("未连接"), window, cx),
+            },
+            None => None,
         };
         // 先不显示画面：原来那个正在结束，等它结束了再开，不然接上的还是它
         self.repo = Some(slot.entry.clone());
@@ -1121,12 +1212,29 @@ impl TermOverview {
         self.peek = None;
         self.focus.focus(window, cx);
         let slot = slot.clone();
+        let Some(closing) = closing else {
+            self.open(slot, window, cx);
+            return;
+        };
+        let id = id.clone();
         cx.spawn_in(window, async move |this, cx| {
-            closing.await;
+            let closed = closing.await;
             this.update_in(cx, |this, window, cx| {
                 // 等的这一会儿没换到别的终端上去
-                if this.opening.as_ref() == Some(&slot) {
-                    this.open(slot, window, cx);
+                let waiting = this.opening.as_ref() == Some(&slot);
+                match closed {
+                    Ok(()) if waiting => this.open(slot, window, cx),
+                    Ok(()) => {}
+                    // 没结束掉：它还在，不开新的（按名字开接上的还是它），说一声
+                    Err(err) => {
+                        this.ending.retain(|other| *other != id);
+                        if waiting {
+                            this.opening = None;
+                        }
+                        Self::failed(true, &format!("{err:#}"), window, cx);
+                        this.sync(window, cx);
+                        cx.notify();
+                    }
                 }
             })
             .ok();
@@ -1233,7 +1341,8 @@ impl TermOverview {
         }
     }
 
-    /// 鼠标停在一个终端上时的提示：叫什么、哪个仓库的、状态，停下了的写停了多久。
+    /// 鼠标停在一个终端上时的提示：叫什么、哪个仓库的、状态，停下了的写停了多久，里面除了 shell
+    /// 还在跑的程序（图标只分得出是哪一类）。
     fn term_tip(&self, row: &Row, cx: &App) -> String {
         let repo = self.app.read(cx).repo_name(&row.entry);
         let since = row
@@ -1241,16 +1350,28 @@ impl TermOverview {
             .filter(|_| row.alive && row.state != TermState::Running)
             .map(|at| format!(" · {}", ago(at)))
             .unwrap_or_default();
-        format!(
-            "{}（{}，{}{}）",
-            Self::term_name(row),
+        let programs = row
+            .programs
+            .as_ref()
+            .filter(|names| row.alive && !names.is_empty())
+            .map(|names| {
+                let names: Vec<&str> = names.iter().map(String::as_str).collect();
+                let running = tf!("正在运行：{names}", names = names.join(tr("、")));
+                format!("\n{running}")
+            })
+            .unwrap_or_default();
+        // 括号、逗号要翻译：英文界面里是半角的
+        let head = tf!(
+            "{name}（{repo}，{state}{since}）",
+            name = Self::term_name(row),
             repo,
-            Self::state_text(row),
+            state = Self::state_text(row),
             since
-        )
+        );
+        format!("{head}{programs}")
     }
 
-    /// 它在哪台电脑上：经别的电脑连的写成「91，经由 156」。
+    /// 它在哪台电脑上：经别的电脑连的写成「B，经由 A」。
     pub(crate) fn place(app: &AppState, entry: &RepoEntry) -> SharedString {
         let machine = machine_of(entry);
         match split_relay(machine) {
@@ -1320,7 +1441,12 @@ impl TermOverview {
             .child(ui::icon_small(icon))
     }
 
-    /// 侧栏里一行的壳：一样高、一样的圆角和选中、悬停的底色。
+    /// 侧栏里一行的壳：一样高、一样的圆角和选中、悬停的底色。里面的东西从左边 4 像素起，各列的位置
+    /// 由各行自己用定宽的空白排（见 [`Self::space`]）。
+    ///
+    /// 各列在侧栏里的横坐标（方向 C，`docs/design/terminal-sidebar/`）：工作区标题的色块 13、名字 29；仓库
+    /// 的箭头 10、图标 26、名字 46；终端的图标 46、名字 66，竖线在 33（仓库图标的中线）；「已固定」里
+    /// 的终端和仓库的图标、名字对齐。
     fn row_shell(id: impl Into<ElementId>, on: bool, cx: &App) -> (Stateful<Div>, Stateful<Div>) {
         let theme = cx.theme();
         let (selected_bg, hover) = (theme.sidebar_accent, theme.list_hover);
@@ -1338,9 +1464,8 @@ impl TermOverview {
             .min_w_0()
             .relative()
             .mx(px(6.))
-            .pl(px(16.))
+            .pl(px(4.))
             .pr(px(4.))
-            .gap(px(8.))
             .rounded(px(ui::RADIUS))
             .text_size(px(13.))
             .when(on, |el| el.bg(selected_bg))
@@ -1348,16 +1473,52 @@ impl TermOverview {
         (outer, inner)
     }
 
-    /// 「已固定」里一个终端的那一行：状态、名字、是哪个仓库的；鼠标移上去行尾是取消固定。
+    /// 定宽的一块空白：行里的各列靠它对齐。
+    fn space(width: f32) -> Div {
+        div().flex_none().w(px(width))
+    }
+
+    /// 工作区的颜色；不在工作区里的（「其他」）是 None，用次要文字的灰。
+    fn hue_color(hue: Option<usize>, cx: &App) -> Hsla {
+        match hue {
+            Some(slot) => ui::hue(slot, cx),
+            None => cx.theme().muted_foreground,
+        }
+    }
+
+    /// 终端前面的图标（占 14 像素宽）：形状看里面跑的程序（AI 助手是星芒，别的命令是三角，只有
+    /// shell 是提示符），颜色看状态（运行中主色、已停下警示色、空闲和已结束灰色）。旧版 kuaid 不报
+    /// 程序，退回状态圆点。
+    pub(crate) fn term_icon(row: &Row, cx: &App) -> Div {
+        let theme = cx.theme();
+        let color = match (row.alive, row.state) {
+            (false, _) | (true, TermState::Idle) => theme.muted_foreground,
+            (true, TermState::Running) => theme.primary,
+            (true, TermState::Stopped) => theme.warning,
+        };
+        let slot = h_flex().flex_none().size(px(14.)).justify_center();
+        let glyph = |name: IconName, size: f32| Icon::new(name).size(px(size)).text_color(color);
+        match row.program() {
+            Program::Unknown => slot.child(Self::dot(row.state, 8., cx)),
+            Program::Agent => slot.child(glyph(IconName::Sparkles, 14.)),
+            Program::Command => slot.child(glyph(IconName::Play, 11.)),
+            Program::Shell => slot.child(glyph(IconName::Terminal, 14.)),
+        }
+    }
+
+    /// 「已固定」里一个终端的那一行：程序和状态的图标、名字，行尾是工作区的色块和仓库名；鼠标移上去
+    /// 行尾是取消固定。图标、名字和仓库那一行的对齐。
     fn render_pinned_term(
         &self,
         index: usize,
         row: &Row,
         on: bool,
+        hue: Option<usize>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
         let (fg, muted) = (theme.sidebar_foreground, theme.muted_foreground);
+        let mark = Self::hue_color(hue, cx);
         let repo = self.app.read(cx).repo_name(&row.entry);
         let unseen = row.state == TermState::Stopped;
         let slot = row.slot();
@@ -1381,14 +1542,9 @@ impl TermOverview {
             .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
             .child(
                 inner
-                    // 圆点占的宽度和仓库那一行的图标一样，名字才对得齐
-                    .child(
-                        h_flex()
-                            .flex_none()
-                            .w(px(12.))
-                            .justify_center()
-                            .child(Self::dot(row.state, 8., cx)),
-                    )
+                    .pl(px(20.))
+                    .child(Self::term_icon(row, cx))
+                    .child(Self::space(6.))
                     .child(
                         div()
                             .flex_1()
@@ -1399,16 +1555,18 @@ impl TermOverview {
                             .child(Self::term_name(row)),
                     )
                     .child(
-                        div()
+                        h_flex()
                             .flex_none()
                             .min_w(px(22.))
-                            .max_w(px(84.))
+                            .max_w(px(96.))
+                            .ml(px(8.))
                             .pr(px(4.))
-                            .truncate()
+                            .gap(px(4.))
                             .text_size(px(11.))
                             .text_color(muted)
                             .group_hover("hub-row", |s| s.invisible())
-                            .child(repo),
+                            .child(ui::hue_mark(mark, 6.))
+                            .child(div().min_w_0().truncate().child(repo)),
                     )
                     .child(Self::row_actions().child(unpin)),
             )
@@ -1421,15 +1579,25 @@ impl TermOverview {
             .into_any_element()
     }
 
-    /// 仓库下面一个终端的那一行：状态、名字，行尾是停下、空闲了多久（固定着的是图钉）；鼠标移上去
-    /// 行尾换成固定和结束。比仓库那一行缩进一级，圆点对着仓库的名字。
-    fn render_term(&self, index: usize, row: &Row, on: bool, cx: &mut Context<Self>) -> AnyElement {
+    /// 仓库下面一个终端的那一行：程序和状态的图标、名字，行尾是停下、空闲了多久（固定着的是图钉）；
+    /// 鼠标移上去行尾换成固定和结束。图标对着仓库的名字，左边一条工作区颜色的竖线从仓库图标垂下来，
+    /// 选中的仓库的那几条深一些。
+    fn render_term(
+        &self,
+        index: usize,
+        row: &Row,
+        on: bool,
+        hue: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme();
         let (fg, muted, accent) = (
             theme.sidebar_foreground,
             theme.muted_foreground,
             theme.primary,
         );
+        let active = self.repo.as_ref() == Some(&row.entry);
+        let guide = Self::hue_color(hue, cx).opacity(if active { 0.75 } else { 0.4 });
         let unseen = row.state == TermState::Stopped;
         let slot = row.slot();
         let pinned = self.pinned_term(&slot, cx);
@@ -1465,6 +1633,7 @@ impl TermOverview {
         let tail = h_flex()
             .flex_none()
             .min_w(px(46.))
+            .ml(px(8.))
             .justify_end()
             .pr(px(4.))
             .text_size(px(11.))
@@ -1490,14 +1659,18 @@ impl TermOverview {
             .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
             .child(
                 inner
-                    .pl(px(36.))
+                    .pl(px(40.))
                     .child(
-                        h_flex()
-                            .flex_none()
-                            .w(px(12.))
-                            .justify_center()
-                            .child(Self::dot(row.state, 8., cx)),
+                        div()
+                            .absolute()
+                            .left(px(27.))
+                            .top(px(-1.))
+                            .bottom(px(-1.))
+                            .w(px(1.))
+                            .bg(guide),
                     )
+                    .child(Self::term_icon(row, cx))
+                    .child(Self::space(6.))
                     .child(
                         div()
                             .flex_1()
@@ -1519,8 +1692,9 @@ impl TermOverview {
             .into_any_element()
     }
 
-    /// 一个仓库的那一行：有终端的最前面是收起、展开的箭头，然后是名字；收着时行尾写几个停下了、
-    /// 在跑、空着；鼠标移上去行尾换成固定和新建。
+    /// 一个仓库的那一行：最前面一列是收起、展开的箭头（没有终端的空着，名字照样对齐），然后是工作区
+    /// 颜色的图标（没有终端的是灰的）和名字；收着时行尾写几个停下了、在跑、空着；鼠标移上去行尾换成
+    /// 固定和新建。
     fn render_repo(
         &self,
         index: usize,
@@ -1540,7 +1714,11 @@ impl TermOverview {
         let pinned = self.pinned_repo(entry, cx);
         let empty = rows.is_empty();
         let tip = match entry.server.is_some() {
-            true => format!("{}（{}）", entry.path, Self::place(app, entry)),
+            true => tf!(
+                "{path}（{place}）",
+                path = &entry.path,
+                place = Self::place(app, entry)
+            ),
             false => entry.path.clone(),
         };
         let (for_click, for_go, for_pin, for_new, for_fold) = (
@@ -1550,31 +1728,30 @@ impl TermOverview {
             entry.clone(),
             entry.clone(),
         );
-        // 箭头放在名字前面空着的那一块上，不占排版的位置：没有终端的仓库名字照样对得齐
-        let fold = (!repo.listed.is_empty()).then(|| {
-            let arrow = match repo.collapsed {
-                true => IconName::ChevronRight,
-                false => IconName::ChevronDown,
-            };
-            div()
-                .id(("hub-fold", index))
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left_0()
-                .w(px(16.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(muted)
-                .hover(|s| s.text_color(fg))
-                .child(Icon::new(arrow).size(px(12.)))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.focus.focus(window, cx);
-                    this.toggle_repo(&for_fold, cx);
-                }))
-        });
+        let twistie = h_flex()
+            .id(("hub-fold", index))
+            .flex_none()
+            .w(px(14.))
+            .h_full()
+            .justify_center()
+            .text_color(muted);
+        let twistie = match repo.listed.is_empty() {
+            true => twistie,
+            false => {
+                let arrow = match repo.collapsed {
+                    true => IconName::ChevronRight,
+                    false => IconName::ChevronDown,
+                };
+                twistie
+                    .hover(|s| s.text_color(fg))
+                    .child(Icon::new(arrow).size(px(12.)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.focus.focus(window, cx);
+                        this.toggle_repo(&for_fold, cx);
+                    }))
+            }
+        };
         // 展开着时终端就列在下面，行尾不用再写个数；位置留着，鼠标移上去按钮才不压着名字
         let counts = match repo.collapsed {
             true => Self::counts(rows, cx),
@@ -1611,6 +1788,10 @@ impl TermOverview {
             true => IconName::Server,
             false => IconName::FolderGit2,
         };
+        let icon_color = match empty {
+            true => muted,
+            false => Self::hue_color(repo.hue, cx),
+        };
         let (outer, inner) = Self::row_shell(("hub-repo", index), on, cx);
         outer
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
@@ -1622,7 +1803,10 @@ impl TermOverview {
             }))
             .child(
                 inner
-                    .child(ui::icon_small(icon).flex_none().text_color(muted))
+                    .child(twistie)
+                    .child(Self::space(2.))
+                    .child(ui::icon(icon).flex_none().text_color(icon_color))
+                    .child(Self::space(6.))
                     .child(
                         ui::clipped_with_tip(("hub-repo-name", index), name, tip)
                             .flex_1()
@@ -1632,34 +1816,42 @@ impl TermOverview {
                     .child(
                         counts
                             .min_w(px(46.))
+                            .ml(px(8.))
                             .justify_end()
                             .pr(px(4.))
                             .group_hover("hub-row", |s| s.invisible()),
                     )
-                    .children(fold)
                     .child(Self::row_actions().child(pin).child(new)),
             )
             .context_menu(repo_menu(cx.entity().downgrade(), entry.clone(), pinned))
             .into_any_element()
     }
 
-    /// 一组上面的那一行。工作区的可以点一下收起、展开，收着时行尾写里面几个停下、在跑、空着。
+    /// 一个工作区的分节标题：色块、名字（主机上的工作区在列着全部主机时带主机名）、一条细线、几个
+    /// 终端（收着时写几个停下、在跑、空着）、箭头。点一下收起、展开；「其他」那一组没有箭头，收不起。
+    /// `sticky` 是吸在树顶上的那一份（滚动时盖在树上面，见 [`Self::sticky_group`]）。
     fn render_group_head(
         &self,
         index: usize,
         group: &SideGroup,
         scoped: bool,
+        sticky: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let (muted, chip_bg, hover) = (theme.muted_foreground, theme.secondary, theme.list_hover);
+        let (fg, muted, border) = (
+            theme.sidebar_foreground,
+            theme.muted_foreground,
+            theme.sidebar_border,
+        );
+        let (chip_bg, hover, panel) = (theme.secondary, theme.list_hover, theme.sidebar);
         let app = self.app.read(cx);
         let workspace = group.workspace.as_ref();
         let name: SharedString = match workspace {
             Some(key) => app.workspace_name(key),
             None => tr("其他").into(),
         };
-        // 服务器上的工作区标出是哪台；只列着一台的时候不用标
+        // 主机上的工作区标出是哪台；只列着一台的时候不用标
         let machine = workspace
             .filter(|key| !key.is_local() && !scoped)
             .map(|key| app.machine_name(&key.machine));
@@ -1667,6 +1859,7 @@ impl TermOverview {
             div()
                 .flex_none()
                 .h(px(16.))
+                .ml(px(6.))
                 .px(px(6.))
                 .rounded_full()
                 .bg(chip_bg)
@@ -1681,41 +1874,119 @@ impl TermOverview {
             .iter()
             .flat_map(|repo| repo.all.iter().cloned())
             .collect();
+        // 收着时分状态写（几个停下、在跑、空着）；展开着、或者一个终端都没有时写总数（没有就是 0）
+        let count = match group.collapsed && !all.is_empty() {
+            true => Self::counts(&all, cx),
+            false => h_flex()
+                .flex_none()
+                .text_size(px(11.))
+                .font_weight(FontWeight::NORMAL)
+                .text_color(muted)
+                .child(all.len().to_string()),
+        };
         let arrow = match group.collapsed {
             true => IconName::ChevronRight,
             false => IconName::ChevronDown,
         };
+        let (id, name_id) = match sticky {
+            true => ("hub-group-sticky", "hub-group-sticky-name"),
+            false => ("hub-group", "hub-group-name"),
+        };
         let key = workspace.cloned();
-        h_flex()
-            .id(("hub-group", index))
+        let head = h_flex()
+            .id((id, index))
             .h(px(26.))
-            .mt(px(6.))
-            .mx(px(6.))
-            .px(px(4.))
-            .gap(px(6.))
+            .flex_1()
+            .min_w_0()
+            .pl(px(7.))
+            .pr(px(2.))
             .rounded(px(ui::RADIUS))
             .text_size(px(12.))
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(muted)
+            .text_color(fg)
+            .child(ui::hue_mark(Self::hue_color(group.hue, cx), 8.))
+            .child(Self::space(8.))
+            .child(ui::clipped((name_id, index), name).flex_shrink(1.))
+            .children(machine.map(chip))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(12.))
+                    .h(px(1.))
+                    .mx(px(8.))
+                    .bg(border),
+            )
+            .child(count)
             .when_some(key, |el, key| {
                 el.cursor_pointer()
                     .hover(|s| s.bg(hover))
-                    .child(ui::icon_small(arrow).flex_none())
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .w(px(16.))
+                            .ml(px(4.))
+                            .justify_center()
+                            .text_color(muted)
+                            .child(Icon::new(arrow).size(px(12.))),
+                    )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.focus.focus(window, cx);
                         this.toggle_group(key.clone(), cx);
                     }))
-            })
-            .child(ui::icon_small(IconName::Layers).flex_none())
-            .child(ui::clipped(("hub-group-name", index), name).flex_shrink(1.))
-            .children(machine.map(chip))
-            .child(div().flex_1())
-            .when(group.collapsed, |el| el.child(Self::counts(&all, cx)))
+            });
+        h_flex()
+            .h(px(GROUP_HEAD))
+            .px(px(6.))
+            .items_end()
+            .bg(panel)
+            .child(head)
             .into_any_element()
     }
 
+    /// 吸在树顶上的是哪个工作区的标题、往上推了多少（下一个工作区顶上来时跟着往上走）。按上一帧
+    /// 排好的位置算：树里每个工作区是滚动区域里的一个孩子，上面空着 [`GROUP_GAP`]（第一个除外）。
+    fn sticky_group(&self, side: &Side) -> Option<(usize, f32)> {
+        let handle = &self.rows_scroll;
+        // 树的可见部分的顶，在没滚动时的坐标里
+        let top = f32::from(handle.bounds().top() - handle.offset().y);
+        for at in 0..side.groups.len() {
+            let bounds = handle.bounds_for_item(at)?;
+            let (start, end) = (f32::from(bounds.top()), f32::from(bounds.bottom()));
+            if end <= top {
+                continue;
+            }
+            let gap = if at == 0 { 0. } else { GROUP_GAP };
+            if start + gap >= top {
+                return None;
+            }
+            return Some((at, (end - top - GROUP_HEAD).min(0.)));
+        }
+        None
+    }
+
+    /// 树的样子变了（工作区、仓库收起展开，多了少了几行）：滚动区域里各个孩子的位置要等这一帧排完
+    /// 才知道，吸顶的标题按的是上一帧的，所以变了就多画一帧。
+    fn layout_sig(side: &Side) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for group in &side.groups {
+            (&group.workspace, group.collapsed, group.repos.len()).hash(&mut hasher);
+            for repo in &group.repos {
+                (repo.collapsed, repo.listed.len()).hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
     /// 只看哪些：样子和仓库页侧栏顶上切页面的那一条一样，占满一行。
-    fn render_filter(&self, side: &Side, cx: &mut Context<Self>) -> impl IntoElement {
+    /// 全部、已停下、运行中三格，各带个数。侧栏窄了先不写个数，还放不下再省略字，鼠标停上去看全名。
+    fn render_filter(
+        &self,
+        side: &Side,
+        width: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme();
         let (track, fg, muted) = (theme.secondary, theme.foreground, theme.muted_foreground);
         let dark = theme.is_dark();
@@ -1742,6 +2013,15 @@ impl TermOverview {
                 tr("10 秒内有新输出"),
             ),
         ];
+        // 一格多宽：侧栏减去底板两边的外边距（10）、内边距（2）和格子之间的空（2）；字离格子两边各留 4
+        let room = (width - 2. * 10. - 2. * 2. - 2. * 2.) / 3. - 2. * 4.;
+        // 都按选中时的粗细量：换一格选中，个数不会忽有忽无
+        let label_width =
+            |label: &str| ui::text_width(window, label, 12., None, FontWeight::SEMIBOLD);
+        let counts = items.iter().all(|&(_, _, label, count, _)| {
+            let count = ui::text_width(window, &count.to_string(), 11., None, FontWeight::NORMAL);
+            label_width(label) + 5. + count <= room
+        });
         h_flex()
             .flex_none()
             .mx(px(10.))
@@ -1753,6 +2033,7 @@ impl TermOverview {
             .bg(track)
             .children(items.into_iter().map(|(filter, id, label, count, tip)| {
                 let on = self.filter == filter;
+                let cut = label_width(label) > room;
                 h_flex()
                     .id(id)
                     .flex_1()
@@ -1769,17 +2050,24 @@ impl TermOverview {
                             .when(!dark, |el| el.shadow_xs())
                     })
                     .when(!on, |el| el.cursor_pointer().hover(|s| s.text_color(fg)))
-                    .child(label)
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::NORMAL)
-                            .text_color(muted)
-                            .child(count.to_string()),
-                    )
-                    .when(!tip.is_empty(), |el| {
-                        el.tooltip(move |window, cx| ui::tip(tip, window, cx))
+                    .child(div().min_w_0().truncate().child(label))
+                    .when(counts, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::NORMAL)
+                                .text_color(muted)
+                                .child(count.to_string()),
+                        )
+                    })
+                    // 名字被省略了，提示里先写全名
+                    .when(cut || !tip.is_empty(), |el| {
+                        el.tooltip(move |window, cx| match (cut, tip.is_empty()) {
+                            (true, true) => ui::tip(label, window, cx),
+                            (true, false) => ui::two_line_tip(label.into(), tip.into(), window, cx),
+                            (false, _) => ui::tip(tip, window, cx),
+                        })
                     })
                     .on_click(cx.listener(move |this, _, _, cx| this.set_filter(filter, cx)))
             }))
@@ -1823,7 +2111,7 @@ impl TermOverview {
         let (icon, name) = choices
             .iter()
             .find(|choice| choice.0 == now)
-            .map(|choice| (choice.1.clone(), choice.2.clone()))?;
+            .map(|choice| (choice.1, choice.2.clone()))?;
         let this = cx.entity().downgrade();
         let button = Button::new("hub-scope")
             .outline()
@@ -1838,7 +2126,7 @@ impl TermOverview {
                     .child(ui::clipped("hub-scope-name", name).flex_shrink(1.)),
             )
             .dropdown_caret(true)
-            .tooltip(tr("只列出所选服务器上的工作区；已固定的不受影响"))
+            .tooltip(tr("只列出所选主机上的工作区；已固定的不受影响"))
             .dropdown_menu(move |mut menu, _, _| {
                 menu = menu.min_w(px(232.));
                 for (at, (scope, icon, name, note)) in choices.iter().enumerate() {
@@ -1847,13 +2135,13 @@ impl TermOverview {
                         menu = menu.separator();
                     }
                     let (this, to) = (this.clone(), scope.clone());
-                    let (icon, name, note) = (icon.clone(), name.clone(), note.clone());
+                    let (icon, name, note) = (*icon, name.clone(), note.clone());
                     menu = menu.item(
                         PopupMenuItem::element(move |_, _| {
                             h_flex()
                                 .w_full()
                                 .gap(px(8.))
-                                .child(ui::icon_small(icon.clone()).flex_none())
+                                .child(ui::icon_small(icon).flex_none())
                                 .child(div().flex_1().min_w_0().truncate().child(name.clone()))
                                 .child(
                                     div()
@@ -1903,7 +2191,7 @@ impl TermOverview {
             .items_center()
             .text_size(px(12.))
             .text_color(muted)
-            .child(tr("尚未连接此服务器，连接后显示其终端。"))
+            .child(tr("尚未连接此主机，连接后显示其终端。"))
             .children(failed.map(|err| {
                 v_flex()
                     .w_full()
@@ -1945,13 +2233,19 @@ impl TermOverview {
         }
         for row in &repo.listed {
             let lit = is_on(Pick::Term(row.slot()));
-            items.push(self.render_term(*index, row, lit, cx));
+            items.push(self.render_term(*index, row, lit, repo.hue, cx));
             *index += 1;
         }
     }
 
     /// 左边的侧栏。和仓库页的侧栏一样宽、一样的底色和字号：右边的画面才和仓库的终端页一样大。
-    fn render_side(&self, width: f32, side: &Side, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_side(
+        &self,
+        width: f32,
+        side: &Side,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme();
         let (panel, border, muted, accent) = (
             theme.sidebar,
@@ -1975,22 +2269,34 @@ impl TermOverview {
         let mut index = 0;
         let has_pinned = !side.pinned_terms.is_empty() || !side.pinned_repos.is_empty();
         if has_pinned {
+            // 和工作区的分节标题一个样子：图标、字、一条细线，字和工作区的名字对齐
             pinned.push(
                 h_flex()
                     .h(px(26.))
                     .mt(px(6.))
-                    .px(px(10.))
-                    .gap(px(6.))
+                    .mx(px(6.))
+                    .pl(px(5.))
+                    .pr(px(2.))
                     .text_size(px(12.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(muted)
                     .child(ui::icon_small(IconName::Pin).flex_none())
+                    .child(Self::space(6.))
                     .child(tr("已固定"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(12.))
+                            .h(px(1.))
+                            .mx(px(8.))
+                            .bg(border),
+                    )
                     .into_any_element(),
             );
             for row in &side.pinned_terms {
                 let on = is_on(Pick::Pinned(row.slot()));
-                pinned.push(self.render_pinned_term(index, row, on, cx));
+                let hue = side.hues.get(&row.entry).copied();
+                pinned.push(self.render_pinned_term(index, row, on, hue, cx));
                 index += 1;
             }
             for repo in &side.pinned_repos {
@@ -1998,15 +2304,30 @@ impl TermOverview {
             }
         }
         let scoped = side.scope.is_some();
+        // 一个工作区是滚动区域里的一个孩子（标题和它下面的行），吸顶的标题按孩子的位置算
         for (at, group) in side.groups.iter().enumerate() {
-            items.push(self.render_group_head(at, group, scoped, cx));
-            if group.collapsed {
-                continue;
+            let mut rows = vec![self.render_group_head(at, group, scoped, false, cx)];
+            if !group.collapsed {
+                for repo in &group.repos {
+                    self.push_repo(repo, &on, &mut index, &mut rows, cx);
+                }
             }
-            for repo in &group.repos {
-                self.push_repo(repo, &on, &mut index, &mut items, cx);
-            }
+            items.push(
+                v_flex()
+                    .flex_none()
+                    .when(at > 0, |el| el.pt(px(GROUP_GAP)))
+                    .children(rows)
+                    .into_any_element(),
+            );
         }
+        let sticky = self.sticky_group(side).map(|(at, push)| {
+            div()
+                .absolute()
+                .top(px(push))
+                .left_0()
+                .right_0()
+                .child(self.render_group_head(at, &side.groups[at], scoped, true, cx))
+        });
         // 树是空的：列着全部电脑、上面又有固定的时候不用说（没有的已经在上面了）
         let empty = side.groups.is_empty() && !side.offline && (scoped || !has_pinned);
         let switcher = self.render_scope(side, cx);
@@ -2022,7 +2343,7 @@ impl TermOverview {
         };
         let offline = (!offline.is_empty()).then(|| {
             tf!(
-                "未连接的服务器：{names}。连接后显示其终端。",
+                "未连接的主机：{names}。连接后显示其终端。",
                 names = offline.join(tr("、"))
             )
         });
@@ -2033,9 +2354,33 @@ impl TermOverview {
                 .child(div().font_weight(FontWeight::MEDIUM).child(keys))
                 .child(text)
         };
+        // 底下一行按键提示：哪一条放不下就整条不显示，不截成半截。左边留 14，右边不够时可以占掉
+        // 一些、至少离边 4：默认宽度下三条英文正好都放得下
+        let hints = {
+            let mut room = width - 1. - 14. - 4.;
+            let mut shown = Vec::new();
+            let all = [
+                ("↑ ↓", tr("选择")),
+                ("Enter", tr("打开仓库")),
+                ("→", tr("输入")),
+            ];
+            for (keys, text) in all {
+                let gap = if shown.is_empty() { 0. } else { 10. };
+                let need = gap
+                    + ui::text_width(window, keys, 11., None, FontWeight::MEDIUM)
+                    + 4.
+                    + ui::text_width(window, text, 11., None, FontWeight::NORMAL);
+                if need <= room {
+                    room -= need;
+                    shown.push(hint(keys, text));
+                }
+            }
+            shown
+        };
         v_flex()
             .w(px(width))
             .flex_none()
+            .relative()
             .h_full()
             .bg(panel)
             .border_r_1()
@@ -2065,10 +2410,9 @@ impl TermOverview {
                             .flex_1()
                             .min_w_0()
                             .child(
-                                div()
+                                ui::clipped("overview-title", trc("页面", "终端"))
                                     .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(trc("页面", "终端")),
+                                    .font_weight(FontWeight::SEMIBOLD),
                             )
                             .child(
                                 ui::clipped("overview-summary", summary)
@@ -2077,7 +2421,7 @@ impl TermOverview {
                             ),
                     ),
             )
-            .child(self.render_filter(side, cx))
+            .child(self.render_filter(side, width, window, cx))
             .when(has_pinned, |side| {
                 side.child(
                     v_flex()
@@ -2094,53 +2438,60 @@ impl TermOverview {
             })
             .children(switcher)
             .child(
-                v_flex()
-                    .id("overview-rows")
+                div()
+                    .relative()
                     .flex_1()
                     .min_h_0()
-                    .pb(px(10.))
-                    .overflow_y_scroll()
-                    .children(items)
-                    .children(connect)
-                    .when(empty, |list| {
-                        list.child(
-                            div()
-                                .px(px(14.))
-                                .py(px(24.))
-                                .text_size(px(12.))
-                                .text_color(muted)
-                                .text_center()
-                                .child(match self.filter {
-                                    Filter::All => tr("工作区中没有仓库"),
-                                    Filter::Stopped => tr("没有已停下的终端"),
-                                    Filter::Running => tr("没有运行中的终端"),
-                                }),
-                        )
-                    })
-                    .children(offline.map(|text| {
-                        div()
-                            .px(px(14.))
-                            .pt(px(12.))
-                            .text_size(px(11.))
-                            .text_color(muted)
-                            .child(text)
-                    })),
+                    .child(
+                        v_flex()
+                            .id("overview-rows")
+                            .size_full()
+                            .pb(px(10.))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.rows_scroll)
+                            .children(items)
+                            .children(connect)
+                            .when(empty, |list| {
+                                list.child(
+                                    div()
+                                        .px(px(14.))
+                                        .py(px(24.))
+                                        .text_size(px(12.))
+                                        .text_color(muted)
+                                        .text_center()
+                                        .child(match self.filter {
+                                            Filter::All => tr("工作区中没有仓库"),
+                                            Filter::Stopped => tr("没有已停下的终端"),
+                                            Filter::Running => tr("没有运行中的终端"),
+                                        }),
+                                )
+                            })
+                            .children(offline.map(|text| {
+                                div()
+                                    .px(px(14.))
+                                    .pt(px(12.))
+                                    .text_size(px(11.))
+                                    .text_color(muted)
+                                    .child(text)
+                            })),
+                    )
+                    .children(sticky),
             )
             .child(
                 h_flex()
                     .h(px(28.))
                     .flex_none()
-                    .px(px(14.))
-                    .gap(px(12.))
+                    .pl(px(14.))
+                    .pr(px(4.))
+                    .gap(px(10.))
                     .border_t_1()
                     .border_color(border)
                     .overflow_hidden()
                     .text_size(px(11.))
                     .text_color(muted)
-                    .child(hint("↑ ↓", tr("选择")))
-                    .child(hint("Enter", tr("打开标签页")))
-                    .child(hint("→", tr("输入"))),
+                    .children(hints),
             )
+            .child(crate::side_split::handle("hub-side-split", &self.app))
     }
 
     /// 标签栏上的一个终端：固定的前面有图钉；显示着的、鼠标移上去的有结束的 ×。
@@ -2208,7 +2559,7 @@ impl TermOverview {
                         .text_color(if on { accent } else { muted }),
                 )
             })
-            .child(Self::dot(row.state, 8., cx))
+            .child(Self::term_icon(row, cx))
             .child(
                 div()
                     .flex_1()
@@ -2373,8 +2724,8 @@ impl TermOverview {
                         .small()
                         .flex_none()
                         .ml(px(6.))
-                        .label(tr("在标签页中打开"))
-                        .tooltip(tr("在标题栏右侧打开此终端的标签页（Enter）"))
+                        .label(tr("打开仓库"))
+                        .tooltip(tr("打开此终端所在的仓库（Enter）"))
                         .on_click(cx.listener(|this, _, _, cx| this.go(cx))),
                 )
             })
@@ -2478,13 +2829,24 @@ impl Render for TermOverview {
         let width = crate::repo::sidebar_open(&self.app.read(cx).settings.layout, viewport);
         let hub = self.hub(cx);
         let side = self.side(&hub, cx);
+        let sig = Self::layout_sig(&side);
+        if std::mem::replace(&mut self.layout_sig, sig) != sig {
+            window.request_animation_frame();
+        }
         h_flex()
             .id("term-overview")
             .size_full()
             .track_focus(&self.focus)
             .capture_key_down(cx.listener(Self::on_key_first))
             .on_key_down(cx.listener(Self::on_key))
-            .child(self.render_side(width, &side, cx))
+            // 拖侧栏的分隔条：鼠标拖到画面上面也由这里按位置算宽度
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<crate::side_split::DragSide>, window, cx| {
+                    crate::side_split::drag(&this.app, event, window, cx);
+                    cx.notify();
+                },
+            ))
+            .child(self.render_side(width, &side, window, cx))
             .child(self.render_main(&hub, window, cx))
     }
 }
@@ -2513,6 +2875,7 @@ mod tests {
             alive: true,
             state: TermState::Idle,
             last_output: None,
+            programs: None,
         }
     }
 

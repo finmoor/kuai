@@ -4,7 +4,11 @@
 //! 终端的输出不能跟着卡住（不然里面的程序会停在写屏幕上）。两种放法：
 //!
 //! - [`Outbox::send`]：队列里积得多了就等。git 的输出用它，客户端收得慢 git 就慢下来。
-//! - [`Outbox::try_send`]：积得太多就不放、返回 false。终端的输出用它，由调用方决定怎么办。
+//! - [`Outbox::try_send`]：积得太多就不放、返回 false。终端的输出用它，由调用方决定怎么办
+//!   （先停发，积着的发掉了再接着，见 [`Outbox::queued`]）。
+//! - [`Outbox::push_latest`]：订阅推的整份（终端列表、主机状态、仓库有变化），同一个订阅只留
+//!   还没发出去的最新一份。
+//! - [`Outbox::push`]：不等也不丢，只有一个很高的总量上限，过了就当对方不收了，断开。
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -16,6 +20,9 @@ use fr_core::protocol::{self, Response};
 const HIGH_WATER: usize = 4 << 20;
 /// 队列里积了这么多字节，[`Outbox::try_send`] 就不再放
 const TERM_LIMIT: usize = 8 << 20;
+/// 队列里积了这么多字节还要 [`Outbox::push`]：对方很久没收了，断开（重连以后拿最新的）。比一次
+/// 连上时还原很多个终端屏幕的量大得多
+const PUSH_LIMIT: usize = 128 << 20;
 
 #[derive(Clone)]
 pub struct Outbox(Arc<Inner>);
@@ -30,7 +37,8 @@ struct Inner {
 
 #[derive(Default)]
 struct Queue {
-    frames: VecDeque<Vec<u8>>,
+    /// 要发的消息；带编号的是订阅推的整份（见 [`Outbox::push_latest`]）
+    frames: VecDeque<(Option<u64>, Vec<u8>)>,
     bytes: usize,
     closed: bool,
 }
@@ -60,7 +68,7 @@ impl Outbox {
         while queue.bytes > HIGH_WATER && !queue.closed {
             queue = self.0.room.wait(queue).unwrap();
         }
-        self.enqueue(queue, frame);
+        self.enqueue(queue, None, frame);
     }
 
     /// 放一条消息，不等；队列里积得太多时不放，返回 false。已经关了也返回 false。
@@ -69,22 +77,58 @@ impl Outbox {
         if queue.closed || queue.bytes > TERM_LIMIT {
             return false;
         }
-        self.enqueue(queue, encode(response, payload));
+        self.enqueue(queue, None, encode(response, payload));
         true
     }
 
-    /// 放一条消息，不等也不看积了多少。只用来发不能丢的、不大的消息（流的开头和结尾、还原屏幕）。
+    /// 放一条消息，不等。只用来发不能丢的、不大的消息（流的开头和结尾、还原屏幕）。积到
+    /// [`PUSH_LIMIT`] 还没发出去就断开：原来不看积了多少，对方一直不收时只增不减。
     pub fn push(&self, response: &Response, payload: &[u8]) {
         let queue = self.0.queue.lock().unwrap();
-        self.enqueue(queue, encode(response, payload));
+        self.enqueue_capped(queue, None, encode(response, payload));
     }
 
-    fn enqueue(&self, mut queue: std::sync::MutexGuard<'_, Queue>, frame: Vec<u8>) {
+    /// 订阅推的整份（`key` 是订阅的请求编号）：队列里还有这个订阅没发出去的那份就换成这份，不再
+    /// 多排一份。原来每秒一份终端列表、每次改动一份主机状态都排进去，对方收得慢时越积越多。
+    pub fn push_latest(&self, key: u64, response: &Response, payload: &[u8]) {
+        let frame = encode(response, payload);
+        let mut queue = self.0.queue.lock().unwrap();
+        let queued = queue.frames.iter().position(|(k, _)| *k == Some(key));
+        if let Some(at) = queued {
+            let old = std::mem::replace(&mut queue.frames[at].1, frame);
+            let new = queue.frames[at].1.len();
+            queue.bytes = queue.bytes - old.len() + new;
+            return;
+        }
+        self.enqueue_capped(queue, Some(key), frame);
+    }
+
+    fn enqueue_capped(
+        &self,
+        queue: std::sync::MutexGuard<'_, Queue>,
+        key: Option<u64>,
+        frame: Vec<u8>,
+    ) {
+        if queue.bytes > PUSH_LIMIT && !queue.closed {
+            drop(queue);
+            eprintln!("kuaid: 客户端很久没收消息了，断开");
+            close(&self.0);
+            return;
+        }
+        self.enqueue(queue, key, frame);
+    }
+
+    fn enqueue(
+        &self,
+        mut queue: std::sync::MutexGuard<'_, Queue>,
+        key: Option<u64>,
+        frame: Vec<u8>,
+    ) {
         if queue.closed {
             return;
         }
         queue.bytes += frame.len();
-        queue.frames.push_back(frame);
+        queue.frames.push_back((key, frame));
         drop(queue);
         self.0.more.notify_one();
     }
@@ -95,9 +139,13 @@ impl Outbox {
     }
 
     /// 对方已经断开（或者自己关了）。
-    #[cfg(test)]
     pub fn is_closed(&self) -> bool {
         self.0.queue.lock().unwrap().closed
+    }
+
+    /// 队列里还有多少字节没写到对方那里。
+    pub fn queued(&self) -> usize {
+        self.0.queue.lock().unwrap().bytes
     }
 
     /// 等队列里的都写出去（最多等 `timeout`）。退出前用。
@@ -142,10 +190,10 @@ fn write_loop(inner: &Inner, mut writer: impl Write) {
             }
             std::mem::take(&mut queue.frames)
         };
-        let size: usize = batch.iter().map(Vec::len).sum();
+        let size: usize = batch.iter().map(|(_, frame)| frame.len()).sum();
         let written = batch
             .iter()
-            .try_for_each(|frame| writer.write_all(frame))
+            .try_for_each(|(_, frame)| writer.write_all(frame))
             .and_then(|()| writer.flush());
         if written.is_err() {
             close(inner);
@@ -218,6 +266,46 @@ mod tests {
         out.drain(Duration::from_secs(10));
         assert!(out.try_send(&response, &payload));
         out.close();
+    }
+
+    #[test]
+    fn 订阅推的整份只留最新的一份() {
+        // 管道没人读：写线程拿走第一批以后卡在写上，后面的都积在队列里
+        let (reader, writer) = std::io::pipe().unwrap();
+        let out = Outbox::new(writer);
+        let (big, payload) = chunk(9, 1 << 20);
+        while out.try_send(&big, &payload) {}
+        let before = out.0.queue.lock().unwrap().bytes;
+        for round in 0..100u64 {
+            let (snapshot, payload) = chunk(5, 1000 + round as usize);
+            out.push_latest(5, &snapshot, &payload);
+        }
+        let queue = out.0.queue.lock().unwrap();
+        let snapshots: Vec<_> = queue.frames.iter().filter(|(k, _)| *k == Some(5)).collect();
+        assert_eq!(snapshots.len(), 1);
+        // 写线程可能正拿着一份在写（还没算发掉），队列里只排着一份：一百份只多出一两份的量
+        assert!(
+            queue.bytes < before + 3 * 1200,
+            "{} {}",
+            queue.bytes,
+            before
+        );
+        drop(queue);
+        // 最后收到的是最新的那份
+        let reading = std::thread::spawn(move || {
+            let mut reader = BufReader::new(reader);
+            let mut last = 0;
+            while let Ok(Some((got, payload))) = protocol::read_message::<_, Response>(&mut reader)
+            {
+                if got.id == 5 {
+                    last = payload.len();
+                }
+            }
+            last
+        });
+        out.drain(Duration::from_secs(10));
+        out.close();
+        assert_eq!(reading.join().unwrap(), 1099);
     }
 
     #[test]

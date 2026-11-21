@@ -11,12 +11,22 @@ use fr_core::{patch, tf};
 use futures::future::BoxFuture;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::diff::DiffFile;
 use gpui_kit::component::{ActiveTheme as _, Selectable as _, Sizable as _, h_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::RepoView;
 use crate::ui;
+
+/// 解码、解析一份补丁。在后台调：整个文件、超长的行解析要好一会儿，不能占着界面线程。返回全文
+/// 和解析出来的文件，解析失败的是给用户看的原因。
+pub(super) fn parse_patch(bytes: &[u8]) -> (String, Result<Vec<DiffFile>, SharedString>) {
+    let text = crate::text::decode(bytes).into_owned();
+    let files = DiffFile::parse(&text)
+        .map_err(|err| tf!("diff 解析失败：{message}", message = err.message()).into());
+    (text, files)
+}
 
 /// 不忽略空白时的那份补丁的请求；没开「忽略空白」时没有。
 pub(super) type Plain = Option<BoxFuture<'static, anyhow::Result<GitOutput>>>;

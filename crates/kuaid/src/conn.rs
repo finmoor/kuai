@@ -8,7 +8,7 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
@@ -291,6 +291,21 @@ pub fn serve(shared: &Arc<Shared>, reader: impl Read, writer: impl Write + Send 
     }
     // 客户端断开了：它的 git 杀掉、监听停掉、等着的密码请求当作取消；终端会话留着
     conn.kill_git();
+    // 它转发过 ssh-agent：固定地址可能正指着它，改指到别的还连着、也转发了的连接上
+    if conn.auth_sock.lock().unwrap().is_some()
+        && let Some(control) = &shared.control
+    {
+        let other = shared
+            .conns
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|other| other.id != conn.id)
+            .find_map(|other| other.auth_sock.lock().unwrap().clone());
+        if let Some(sock) = other {
+            control.auth_sock(&sock);
+        }
+    }
     drop(watchers);
     shared.workspaces.unwatch(conn.id, None);
     shared.terms.unwatch(conn.id, None);
@@ -314,12 +329,9 @@ fn handle(
         "git" => start_git(conn, request, payload),
         "cancel" => {
             if let Some(target) = param("id").and_then(Value::as_u64) {
+                // 不会卡住读下一个请求：Windows 上要启动 taskkill，kill 放在别的线程里做
                 if let Some(killer) = conn.running.lock().unwrap().get(&target).cloned() {
-                    // Windows 上杀进程树要启动 taskkill，近一秒：不能卡住读下一个请求
-                    match cfg!(windows) {
-                        true => drop(std::thread::spawn(move || killer.kill())),
-                        false => killer.kill(),
-                    }
+                    killer.kill();
                 }
                 watchers.remove(&target);
                 shared.workspaces.unwatch(conn.id, Some(target));
@@ -363,16 +375,31 @@ fn handle(
             conn.reply(id, applied);
         }
         "watch" => {
+            // 自己结束了的（仓库目录没了、换了）不再留着
+            watchers.retain(|_, watcher| watcher.is_running());
             let repo = param("repo").and_then(Value::as_str).unwrap_or_default();
-            let out = conn.out.clone();
-            let started = fr_core::watch::watch(Path::new(repo), move || {
-                let changed = Response {
-                    id,
-                    chunk: true,
-                    ..Default::default()
-                };
-                out.push(&changed, &[]);
-            });
+            let (out, end) = (conn.out.clone(), conn.out.clone());
+            let started = fr_core::watch::watch(
+                Path::new(repo),
+                move || {
+                    let changed = Response {
+                        id,
+                        chunk: true,
+                        ..Default::default()
+                    };
+                    // 「有变化」都一样：还没发出去的有一条就够了
+                    out.push_latest(id, &changed, &[]);
+                },
+                // 告诉客户端监听结束了：它过一会儿重新装，装在原处新建的那个目录上
+                move |reason| {
+                    let ended = Response {
+                        id,
+                        error: Some(reason),
+                        ..Default::default()
+                    };
+                    end.push(&ended, &[]);
+                },
+            );
             match started {
                 Ok(watcher) => {
                     watchers.insert(id, watcher);
@@ -391,6 +418,11 @@ fn handle(
         }
         "bridge" => {
             let reported = param("auth_sock").and_then(Value::as_str).map(str::to_string);
+            // 固定地址马上改指到这条连接转发来的：按编号接回的旧终端（term_attach 不经 term_env）
+            // 里的 shell 用的也是固定地址，原来要等下次新开终端才改指，期间指着断掉的连接
+            if let (Some(control), Some(sock)) = (&shared.control, &reported) {
+                control.auth_sock(sock);
+            }
             *conn.auth_sock.lock().unwrap() = reported;
         }
         "term_open" => {
@@ -494,7 +526,7 @@ fn simple(shared: &Shared, request: &Request) -> Result<Value> {
             version: VERSION.into(),
             os: std::env::consts::OS.into(),
             arch: std::env::consts::ARCH.into(),
-            git: git_version().into(),
+            git: git_version(),
             home: crate::dirs::home(),
             build: shared.build.clone(),
             daemon: shared.control.is_some(),
@@ -506,6 +538,9 @@ fn simple(shared: &Shared, request: &Request) -> Result<Value> {
             param("path").unwrap_or(""),
         )?)?),
         "term_list" => Ok(json!({ "terms": shared.terms.list() })),
+        "term_programs" => Ok(json!({
+            "programs": shared.terms.programs(param("term").unwrap_or_default())
+        })),
         "term_close" => {
             let closed = shared.terms.close(param("term").unwrap_or_default());
             Ok(json!({ "closed": closed }))
@@ -534,7 +569,8 @@ fn fs_request(request: Request, payload: &[u8]) -> Result<(Value, Vec<u8>)> {
         "fs_stat" => done(serde_json::to_value(files::stat(repo, path)?)?),
         "fs_read" => {
             let (offset, len) = (number("offset").unwrap_or(0), number("len"));
-            let (stat, bytes) = files::read(repo, path, offset, len.unwrap_or(files::READ_MAX))?;
+            let len = len.unwrap_or(files::READ_MAX);
+            let (stat, bytes) = files::read(repo, path, offset, len, number("whole"))?;
             Ok((serde_json::to_value(stat)?, bytes))
         }
         "fs_write" => {
@@ -543,6 +579,7 @@ fn fs_request(request: Request, payload: &[u8]) -> Result<(Value, Vec<u8>)> {
             done(serde_json::to_value(files::write(&params, payload)?)?)
         }
         "fs_mkdir" => files::make_dir(repo, path).and_then(|()| done(json!({}))),
+        "fs_sync" => done(serde_json::to_value(files::sync(repo, path)?)?),
         "fs_remove" => match flag("shallow") {
             true => files::remove_shallow(repo, path),
             false => files::remove(repo, path),
@@ -667,18 +704,17 @@ fn start_git(conn: &Arc<Conn>, request: Request, payload: Vec<u8>) {
     });
 }
 
-/// git 版本只查一次。
-fn git_version() -> &'static str {
-    static GIT: OnceLock<String> = OnceLock::new();
-    GIT.get_or_init(|| {
-        Command::new("git")
-            .arg("--version")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|| "未找到 git".into())
-    })
+/// 这台电脑上 git 的版本（`git --version` 的输出）。每次握手都重新问：常驻进程一直在，主机上
+/// 升级了 git，新连上的客户端要看到新的版本（Git 页按它核对最低版本，见
+/// `fr_core::git::MIN_VERSION`）。
+fn git_version() -> String {
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "未找到 git".into())
 }
 
 #[cfg(test)]
@@ -742,6 +778,51 @@ mod tests {
             assert!(Instant::now() < deadline, "等不到：{what}");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// 仓库目录删掉了：监听以出错结束，客户端过一会儿重新装。原来一直挂在原来那个目录上，之后在
+    /// 原处恢复的仓库再怎么改也不通知，客户端也不知道。
+    #[test]
+    fn 仓库目录没了_监听以出错结束() {
+        let dir = files::tests::TempDir::new();
+        let repo = dir.0.join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        fr_core::git::run(&repo, &["init", "-q"]).unwrap();
+        let (terms, _) = fake_registry();
+        let shared = Shared::with_dirs(
+            terms,
+            None,
+            "1.0.0-abc".into(),
+            dir.0.clone(),
+            Workspaces::new(dir.0.join("workspaces.json")),
+        );
+        let mut client = connect(&shared);
+        let id = client.send("watch", json!({ "repo": repo.to_string_lossy() }), &[]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || while tx.send(client.next().0).is_ok() {});
+        // 等监听装好
+        std::thread::sleep(Duration::from_millis(800));
+        std::fs::write(repo.join("src/a.txt"), "1").unwrap();
+        let changed = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!((changed.id, changed.chunk), (id, true));
+
+        // Windows 上刚退出的 git、杀毒可能还开着里面的文件，多试几次
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while let Err(err) = std::fs::remove_dir_all(&repo) {
+            assert!(Instant::now() < deadline, "删不掉仓库目录：{err}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let ended = loop {
+            let response = rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("仓库目录删掉以后监听没有结束");
+            if !response.chunk {
+                break response;
+            }
+        };
+        assert_eq!(ended.id, id);
+        let error = ended.error.unwrap_or_default();
+        assert!(error.contains("repo"), "{error}");
     }
 
     #[test]
@@ -1120,5 +1201,31 @@ mod tests {
         let result: GitResult = serde_json::from_value(response.result.unwrap()).unwrap();
         assert_eq!(result.code, Some(0));
         assert!(String::from_utf8_lossy(&payload).starts_with("git version"));
+    }
+
+    /// 客户端取消 git 时不丢下请求，等这边回话（[`fr_channel`] 的 `git_cancellable` 靠它知道 git
+    /// 真的退出了）：杀掉以后照常回一个结果，退出码是空的。
+    #[test]
+    fn 取消的_git_退出以后照常回话() {
+        let (terms, _) = fake_registry();
+        let shared = Shared::new(terms, None, String::new());
+        let mut client = connect(&shared);
+        let args = json!(["-c", "alias.slow=!sleep 60", "slow"]);
+        let id = client.send("git", json!({ "repo": ".", "args": args }), &[]);
+        let started = Instant::now();
+        wait_until("git 开始跑", || {
+            shared
+                .conns
+                .lock()
+                .unwrap()
+                .values()
+                .any(|conn| conn.running.lock().unwrap().contains_key(&id))
+        });
+        client.send("cancel", json!({ "id": id }), &[]);
+        let (response, _) = client.next();
+        assert_eq!(response.id, id);
+        let result: GitResult = serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_ne!(result.code, Some(0));
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 }

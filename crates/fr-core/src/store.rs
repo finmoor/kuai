@@ -339,17 +339,17 @@ impl Store {
     pub fn route(&self, id: &str) -> Result<(&Server, Vec<&Server>)> {
         let target = self
             .server(id)
-            .with_context(|| tf!("未找到服务器 {id}", id))?;
+            .with_context(|| tf!("未找到主机 {id}", id))?;
         let mut route: Vec<&Server> = Vec::new();
         let mut at = target;
         while let Some(jump) = at.jump.as_deref() {
             let next = self
                 .server(jump)
-                .with_context(|| tf!("未找到服务器 {id}", id = jump))?;
+                .with_context(|| tf!("未找到主机 {id}", id = jump))?;
             if next.id == target.id || route.iter().any(|seen| seen.id == next.id) {
                 bail!(
                     "{}",
-                    tf!("服务器 {name} 的跳板机设置有循环", name = target.name)
+                    tf!("主机 {name} 的跳板机设置有循环", name = target.name)
                 );
             }
             route.push(next);
@@ -455,6 +455,35 @@ fn read(path: &Path) -> Result<Option<Store>> {
         .with_context(|| tf!("{path} 格式错误", path = path.display()))
 }
 
+/// 在跨进程的锁里改状态文件：读最新的、执行改动、有变化就存回去，返回改完的和有没有变化。
+/// kuaid 和连不上 kuaid 时直接写文件的 Kuai 都走这里：原来 kuaid 拿第一次读到、一直留在内存
+/// 里的那份当底子，Kuai 直接写进去的改动会被它下一次保存盖掉。
+pub fn update(path: &Path, ops: &[Op], windows: bool) -> Result<(Store, bool)> {
+    let _lock = lock(path)?;
+    let mut store = load(path);
+    let changed = store.apply(ops, windows)?;
+    if changed {
+        save(path, &store)?;
+    }
+    Ok((store, changed))
+}
+
+/// 状态文件旁边的锁文件，拿到独占锁才返回；返回的文件关掉时锁就放了。
+fn lock(path: &Path) -> Result<std::fs::File> {
+    let dir = path.parent().context(tr("状态文件的路径无效"))?;
+    std::fs::create_dir_all(dir).with_context(|| tf!("无法创建 {path}", path = dir.display()))?;
+    let lock = path.with_extension("json.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock)
+        .with_context(|| tf!("无法写入 {path}", path = lock.display()))?;
+    file.lock()
+        .with_context(|| tf!("无法写入 {path}", path = lock.display()))?;
+    Ok(file)
+}
+
 /// 写状态文件：先写临时文件再改名，原来那份留作上一份。
 pub fn save(path: &Path, store: &Store) -> Result<()> {
     let dir = path.parent().context(tr("状态文件的路径无效"))?;
@@ -541,6 +570,41 @@ fn is_machine_id(text: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn 改状态文件时以文件里最新的为底() {
+        let dir = std::env::temp_dir().join(format!("fr-store-update-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join(FILE);
+        let add = |path: &str| Op::AddRepo { path: path.into() };
+        let (first, changed) = update(&path, &[add("/a")], false).unwrap();
+        assert!(changed);
+        assert_eq!(first.repos, ["/a"]);
+        // 别的进程（连不上 kuaid 的 Kuai）直接改了文件
+        let mut other = load(&path);
+        other.repos.push("/x".into());
+        save(&path, &other).unwrap();
+        // 接着改的这一边以文件里的为底，不拿自己记着的旧的盖掉
+        let (next, _) = update(&path, &[add("/y")], false).unwrap();
+        assert_eq!(next.repos, ["/a", "/x", "/y"]);
+        assert_eq!(load(&path), next);
+        // 没有变化：不写
+        let (same, changed) = update(&path, &[add("/a")], false).unwrap();
+        assert!(!changed);
+        assert_eq!(same, next);
+        // 几个线程同时改：一个都不丢
+        let threads: Vec<_> = (0..8)
+            .map(|n| {
+                let path = path.clone();
+                std::thread::spawn(move || update(&path, &[add(&format!("/t{n}"))], false).unwrap())
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(load(&path).repos.len(), 3 + 8);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn add_workspace(id: &str, name: &str) -> Op {
         Op::AddWorkspace {
             id: id.into(),
@@ -599,19 +663,19 @@ mod tests {
             .apply(
                 &[
                     add_workspace("w", "a"),
-                    put("w", RepoRef::local(r"C:\Users\Feng\Repo")),
-                    put("w", RepoRef::local("c:/users/feng/repo/")),
+                    put("w", RepoRef::local(r"C:\Users\me\Repo")),
+                    put("w", RepoRef::local("c:/users/me/repo/")),
                     Op::RenameRepo {
-                        path: "C:/Users/Feng/Repo".into(),
+                        path: "C:/Users/me/Repo".into(),
                         name: Some("仓库".into()),
                     },
                 ],
                 true,
             )
             .unwrap();
-        assert_eq!(store.repos, [r"C:\Users\Feng\Repo"]);
+        assert_eq!(store.repos, [r"C:\Users\me\Repo"]);
         assert_eq!(store.workspaces[0].repos.len(), 1);
-        assert_eq!(store.name_of(r"C:\users\feng\repo", true), Some("仓库"));
+        assert_eq!(store.name_of(r"C:\users\me\repo", true), Some("仓库"));
         // 别的电脑经 kuaid 加的是正斜杠：存成反斜杠，和这台自己加的一样
         let ops = [put("w", RepoRef::local("D:/work/x"))];
         store.apply(&ops, true).unwrap();
@@ -823,8 +887,8 @@ mod tests {
     fn 服务器是哪台电脑_知道了才写() {
         let mut server = Server {
             id: "s1".into(),
-            name: "91".into(),
-            destination: "root@91".into(),
+            name: "B".into(),
+            destination: "root@host-b".into(),
             ..Server::default()
         };
         assert!(!serde_json::to_string(&server).unwrap().contains("machine"));

@@ -1,6 +1,6 @@
 # 更新记录
 
-各版本发布在 [GitHub Releases](https://github.com/finmoor/kuai/releases)，发布说明取自本文件中对应版本的一节（`tools/release-notes.ps1`）。Kuai 的更新提示会列出该节中以 `- ` 开头的条目，因此每条应简短，并面向用户描述变化，写法见 [docs/界面文案规范.md](docs/界面文案规范.md)。1.7 及更早的版本见 README 的「里程碑」。
+各版本发布在 [GitHub Releases](https://github.com/finmoor/kuai/releases)，发布说明取自本文件中对应版本的一节（`tools/release-notes.ps1`）。Kuai 的更新提示会列出该节中以 `- ` 开头的条目，因此每条应简短，并面向用户描述变化。
 
 ## 1.17.0
 

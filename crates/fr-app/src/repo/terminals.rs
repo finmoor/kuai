@@ -17,20 +17,23 @@
 //!   运行的交给 [`Parked`] 保管，再打开这个仓库、到终端页时接回来；退出 Kuai（包括重启以完成
 //!   更新）时才结束。
 
-use fr_channel::Channel;
+use std::sync::Arc;
+
+use fr_channel::{Channel, Connection};
 use fr_core::i18n::tr;
 use fr_core::tf;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::{Page, RepoView, TOOLBAR_HEIGHT, tool_button};
 use crate::settings::RepoEntry;
-use crate::term_board::{BoardHandle, Row as TermRow, TermBoard, TermState, free_number};
-use crate::terminal::{self, TerminalView};
+use crate::term_board::{BoardHandle, Row as TermRow, TermBoard, free_number};
+use crate::terminal::{self, Closing, TerminalView};
 use crate::ui;
 
 /// 侧栏里一个终端一行的高度。
@@ -50,6 +53,17 @@ struct TermTab {
     _observe: Subscription,
 }
 
+/// kuaid 里留着、这次还没接上的一个终端。
+#[derive(Clone, PartialEq)]
+struct Waiting {
+    /// 这个仓库的第几个终端
+    number: u32,
+    /// 里面的程序还在跑
+    alive: bool,
+    /// kuaid 给它的编号：接上时按编号接（见 [`TerminalView::attach_to`]）
+    term: String,
+}
+
 /// 一个仓库的终端们。
 #[derive(Default)]
 pub(super) struct Terminals {
@@ -57,14 +71,19 @@ pub(super) struct Terminals {
     tabs: Vec<TermTab>,
     /// 终端页上显示的是哪一个
     active: usize,
-    /// kuaid 里留着、这次还没接上的终端：序号，里面的程序还在不在跑
-    waiting: Vec<(u32, bool)>,
+    /// kuaid 里留着、这次还没接上的终端
+    waiting: Vec<Waiting>,
+    /// 这次连上以后问到过 kuaid 里留着哪几个（`waiting` 是问到的）；连上新的连接时重新问
+    listed: bool,
     /// 主窗口的那份实时终端列表（没有主窗口的地方是 None，只在打开时问一次 kuaid）
     board: Option<Entity<TermBoard>>,
     /// 这边说了要结束的终端的序号：列表里还有它的那一小会儿不当它是留着的
     ending: Vec<u32>,
     /// 显示着的终端在别处结束了，焦点可能跟着没了：下次画之前放到现在显示的那个上
     refocus: bool,
+    /// 点了「新终端」、正在问 kuaid 留着哪几个的次数（见 [`RepoView::new_terminal_in`]）：
+    /// 一个终端都没有时终端页写「正在连接…」
+    asking: usize,
 }
 
 /// 关掉的本机仓库标签页留下的、开在 Kuai 进程里的终端，里面的程序接着运行。再打开这个仓库、到终端页时接回去
@@ -119,8 +138,9 @@ pub fn end_parked_terminals(entry: &RepoEntry, cx: &mut App) {
         *parked = rest;
         ended
     };
+    // 都是开在 Kuai 进程里的：丢掉会话就结束了，没有要等的请求
     for terminal in ended {
-        terminal.view.update(cx, |view, cx| view.kill(cx));
+        terminal.view.update(cx, |view, _| drop(view.kill()));
     }
 }
 
@@ -181,7 +201,7 @@ impl RepoView {
             .iter()
             .filter(|tab| tab.view.read(cx).is_running())
             .count();
-        let waiting = self.terminals.waiting.iter().filter(|(_, alive)| *alive);
+        let waiting = self.terminals.waiting.iter().filter(|term| term.alive);
         opened + waiting.count() + parked_running(Some(&self.entry), cx)
     }
 
@@ -201,16 +221,22 @@ impl RepoView {
     /// 这台电脑的 kuaid 在跑的话，问一下它里面留着这个仓库的哪几个终端。它没在跑就不问：
     /// 没有留着的终端，用不着为了问这一句把它拉起来。
     fn check_local_terminals(&mut self, cx: &mut Context<Self>) {
-        if !fr_channel::Connection::local_daemon_running() {
+        if !Connection::local_daemon_running() {
             return;
         }
+        self.terminals.listed = false;
         let connecting = self.app.update(cx, |app, cx| app.connect_local(cx));
         cx.spawn(async move |this, cx| {
             let Ok(conn) = connecting.await else {
                 return;
             };
-            this.update(cx, |this, cx| this.list_terminals(&conn, cx))
-                .ok();
+            let Ok(listing) = this.update(cx, |this, _| this.waiting_list(&conn)) else {
+                return;
+            };
+            let Some(found) = listing.await else {
+                return;
+            };
+            this.update(cx, |this, cx| this.set_waiting(found, cx)).ok();
         })
         .detach();
     }
@@ -232,7 +258,7 @@ impl RepoView {
     /// 这个仓库的终端现在有哪些（实时列表里的）。那台电脑的列表还没读到、没连着是 None。
     fn board_rows(&self, cx: &App) -> Option<Vec<TermRow>> {
         let board = self.terminals.board.as_ref()?;
-        board.read(cx).terms_of(&self.entry, cx)
+        board.read(cx).terms_of(&self.entry)
     }
 
     /// 终端列表有变化：别处开的记到 `waiting` 里（到终端页时接上），别处结束了的把这边的那一行
@@ -248,7 +274,7 @@ impl RepoView {
             .retain(|number| listed(*number).is_some());
         let mut changed = self.terminals.ending.len() != before;
         let mut gone: Vec<usize> = Vec::new();
-        let mut restarted: Vec<Entity<TerminalView>> = Vec::new();
+        let mut restarted: Vec<(Entity<TerminalView>, String)> = Vec::new();
         for (index, tab) in self.terminals.tabs.iter_mut().enumerate() {
             let view = tab.view.read(cx);
             if view.in_process() {
@@ -257,17 +283,17 @@ impl RepoView {
             let mine = view.term_id();
             match (listed(tab.number), &mine) {
                 (Some(row), Some(id)) if *id == row.id.term => tab.listed_as = mine,
-                // 位置上换了别的编号，手上这个已经结束：别处把它重启了
-                (Some(_), Some(_)) if tab.listed_as == mine && !view.is_alive() => {
-                    restarted.push(tab.view.clone());
+                // 位置上换了别的编号，手上这个已经结束：别处把它重启了，按新的编号接上
+                (Some(row), Some(_)) if tab.listed_as == mine && !view.is_alive() => {
+                    restarted.push((tab.view.clone(), row.id.term.clone()));
                 }
                 (None, Some(_)) if tab.listed_as == mine => gone.push(index),
                 (None, None) if tab.adopted => gone.push(index),
                 _ => {}
             }
         }
-        for view in restarted {
-            view.update(cx, |view, cx| view.reattach(cx));
+        for (view, term) in restarted {
+            view.update(cx, |view, cx| view.reattach(term, cx));
             changed = true;
         }
         for index in gone.into_iter().rev() {
@@ -283,11 +309,15 @@ impl RepoView {
         self.terminals.active = self.terminals.active.min(last);
         // 列表里有、这边还没开的：留着等接上
         let opened: Vec<u32> = self.terminals.tabs.iter().map(|tab| tab.number).collect();
-        let waiting: Vec<(u32, bool)> = rows
+        let waiting: Vec<Waiting> = rows
             .iter()
             .filter(|row| !opened.contains(&row.number))
             .filter(|row| !self.terminals.ending.contains(&row.number))
-            .map(|row| (row.number, row.alive))
+            .map(|row| Waiting {
+                number: row.number,
+                alive: row.alive,
+                term: row.id.term.clone(),
+            })
             .collect();
         if waiting != self.terminals.waiting {
             self.terminals.waiting = waiting;
@@ -360,37 +390,54 @@ impl RepoView {
         let Channel::Remote(conn) = channel else {
             return;
         };
-        self.list_terminals(conn, cx);
-    }
-
-    /// 问 kuaid 里留着这个仓库的哪几个终端，记到 `waiting` 里。
-    fn list_terminals(&mut self, conn: &fr_channel::Connection, cx: &mut Context<Self>) {
-        let listing = conn.term_list();
-        let repo = self.entry.path.clone();
+        self.terminals.listed = false;
+        let listing = self.waiting_list(conn);
         cx.spawn(async move |this, cx| {
-            let Ok(terms) = listing.await else {
+            let Some(found) = listing.await else {
                 return;
             };
-            let mut found: Vec<(u32, bool)> = terms
-                .iter()
-                .filter_map(|term| Some((terminal::session_number(&repo, &term.key)?, term.alive)))
-                .collect();
-            found.sort();
-            found.dedup_by_key(|(number, _)| *number);
-            this.update(cx, |this, cx| {
-                // 实时列表读到了就以它为准（它一直跟着变，这里问到的只是这一刻的）
-                if this.board_rows(cx).is_some() {
-                    return;
-                }
-                // 已经开着的不用再接
-                let opened: Vec<u32> = this.terminals.tabs.iter().map(|tab| tab.number).collect();
-                found.retain(|(number, _)| !opened.contains(number));
-                this.terminals.waiting = found;
-                cx.notify();
-            })
-            .ok();
+            this.update(cx, |this, cx| this.set_waiting(found, cx)).ok();
         })
         .detach();
+    }
+
+    /// 问 kuaid 里留着这个仓库的哪几个终端；问不到是 None。
+    fn waiting_list(
+        &self,
+        conn: &Connection,
+    ) -> impl Future<Output = Option<Vec<Waiting>>> + use<> {
+        let listing = conn.term_list();
+        let repo = self.entry.path.clone();
+        async move {
+            let terms = listing.await.ok()?;
+            let mut found: Vec<Waiting> = terms
+                .iter()
+                .filter_map(|term| {
+                    Some(Waiting {
+                        number: terminal::session_number(&repo, &term.key)?,
+                        alive: term.alive,
+                        term: term.term.clone(),
+                    })
+                })
+                .collect();
+            found.sort_by_key(|term| term.number);
+            found.dedup_by_key(|term| term.number);
+            Some(found)
+        }
+    }
+
+    /// 记下问到的留着的终端（[`Self::waiting_list`]），到终端页时接上。
+    fn set_waiting(&mut self, mut found: Vec<Waiting>, cx: &mut Context<Self>) {
+        self.terminals.listed = true;
+        // 实时列表读到了就以它为准（它一直跟着变，这里问到的只是这一刻的）
+        if self.board_rows(cx).is_some() {
+            return;
+        }
+        // 已经开着的不用再接
+        let opened: Vec<u32> = self.terminals.tabs.iter().map(|tab| tab.number).collect();
+        found.retain(|term| !opened.contains(&term.number));
+        self.terminals.waiting = found;
+        cx.notify();
     }
 
     /// 加一个终端，返回它在第几个。`restored`：它是 kuaid 里留着的、里面的程序还在跑。
@@ -463,9 +510,13 @@ impl RepoView {
             .map(|tab| tab.number);
         let before = self.terminals.tabs.len();
         self.adopt_parked(cx);
-        for (number, alive) in std::mem::take(&mut self.terminals.waiting) {
-            let at = self.add_terminal(number, alive, window, cx);
-            self.terminals.tabs[at].adopted = true;
+        for waiting in std::mem::take(&mut self.terminals.waiting) {
+            let at = self.add_terminal(waiting.number, waiting.alive, window, cx);
+            let tab = &mut self.terminals.tabs[at];
+            tab.adopted = true;
+            // 列表里它是这个编号：列表里没有它了就是结束了（接上以前也算）
+            tab.listed_as = Some(waiting.term.clone());
+            tab.view.update(cx, |view, _| view.attach_to(waiting.term));
         }
         if self.terminals.tabs.len() == before {
             return;
@@ -492,9 +543,9 @@ impl RepoView {
         }
     }
 
-    /// 到终端页（终端总览页的「前往仓库」）。
-    pub fn show_terminal_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_page(Page::Terminal, window, cx);
+    /// 到 Git 页（终端页的「打开仓库」）。
+    pub fn show_git_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_page(Page::Git, window, cx);
     }
 
     /// 切到 Git、终端或文件页。到终端页时留着的都接回来，焦点放进终端；一个都没有就显示空的
@@ -554,12 +605,67 @@ impl RepoView {
     }
 
     /// 再开一个终端，开在仓库里的 `dir` 目录（文件页的「终端」），切到终端页显示它。
+    /// 同 [`Self::new_terminal`]，开在仓库里的 `dir` 目录（相对仓库根）。
+    ///
+    /// 终端按名字（第几个）开，kuaid 里正好留着同名的就是接上它。还不知道留着哪几个时（还在连、
+    /// 刚连上，实时列表和问的那一次都还没回来）先问一遍：留着的先接回来，新的用空着的序号。
     pub(super) fn new_terminal_in(
         &mut self,
         dir: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.terminals.listed || self.board_rows(cx).is_some() {
+            return self.open_new_terminal(dir, window, cx);
+        }
+        // 去哪问：开终端时连的那一台（见 [`crate::shell::terminal_launch`]），还在连就等连上。
+        // 本机的问这台电脑在跑的 kuaid，没在跑就没有留着的
+        let server = self.entry.server.clone();
+        let connecting = self.app.update(cx, |app, cx| match &server {
+            Some(server) if app.knows_server(server) => Some(app.connect(server, cx)),
+            Some(_) => None,
+            None if Connection::local_daemon_running() => Some(app.connect_local(cx)),
+            None => None,
+        });
+        let Some(connecting) = connecting else {
+            return self.open_new_terminal(dir, window, cx);
+        };
+        // 连得慢时点了也看得出在开：先到终端页
+        self.terminals.asking += 1;
+        self.show_page(Page::Terminal, window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let found = match connecting.await {
+                Ok(conn) => match this.update(cx, |this, _| this.waiting_list(&conn)) {
+                    Ok(listing) => Ok(listing.await),
+                    Err(_) => return,
+                },
+                Err(err) => Err(err),
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.terminals.asking -= 1;
+                match found {
+                    Ok(found) => {
+                        if let Some(found) = found {
+                            this.set_waiting(found, cx);
+                        }
+                        this.open_new_terminal(dir, window, cx);
+                    }
+                    // 本机的 kuaid 连不上：开终端时退回到 Kuai 进程里
+                    Err(_) if server.is_none() => this.open_new_terminal(dir, window, cx),
+                    Err(err) => {
+                        let text = tf!("终端启动失败：{err}", err);
+                        window.push_notification(Notification::error(text), cx);
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_new_terminal(&mut self, dir: String, window: &mut Window, cx: &mut Context<Self>) {
+        // 留着的先接回来，新的排在它们后面
         self.adopt_waiting(window, cx);
         let used: Vec<u32> = self.terminals.tabs.iter().map(|tab| tab.number).collect();
         let number = free_number(&used);
@@ -569,16 +675,8 @@ impl RepoView {
 
     /// 再开一个终端（侧栏的「新终端」、Ctrl+Shift+`），切到终端页显示它。
     pub fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // 留着的先接回来，新的排在它们后面
-        self.adopt_waiting(window, cx);
-        let used: Vec<u32> = self.terminals.tabs.iter().map(|tab| tab.number).collect();
-        let number = free_number(&used);
-        self.terminals.active = self.add_terminal(number, false, window, cx);
-        self.show_page(Page::Terminal, window, cx);
+        self.new_terminal_in(String::new(), window, cx);
     }
-
-    // 1.16 以前终端总览页的「前往」经 show_terminal_number 到仓库的终端页显示那个终端；第二版改成
-    // 「在标签页中打开」（终端标签页，见 `term_tab`），不再用它
 
     /// 终端页上正显示着的是第几个终端；不在终端页、这一页没显示出来时是 None。
     pub fn shown_terminal(&self) -> Option<(RepoEntry, u32)> {
@@ -629,8 +727,31 @@ impl RepoView {
         rows.into_iter().find(|row| row.number == number)
     }
 
-    /// 结束、重启第 `index` 个终端。里面还在输出的先问一句（2026-11-18 Feng：「要二次确认」），
-    /// 和终端总览页一样。
+    /// 实时列表订阅这个仓库所在那台电脑用的连接：没连着是 None。
+    fn board_conn(&self, cx: &App) -> Option<Arc<Connection>> {
+        let board = self.terminals.board.as_ref()?;
+        board
+            .read(cx)
+            .conn(crate::machines::machine_of(&self.entry))
+    }
+
+    /// 第 `index` 个终端还没接上（没选中过，或者还在连）时，[`TerminalView::kill`] 关不了 kuaid 里的
+    /// 那个会话：照它等着接的编号（没有就照实时列表里这个位置上的那一行）经实时列表的连接去关。
+    /// 返回发出去的请求；没有要关的、关不了的是 None。
+    fn close_unattached(&self, index: usize, cx: &App) -> Option<Closing> {
+        let view = self.terminals.tabs.get(index)?.view.read(cx);
+        if view.in_process() || view.term_id().is_some() {
+            return None;
+        }
+        let term = match view.pending() {
+            Some(term) => term,
+            None => self.board_row(index, cx)?.id.term,
+        };
+        Some(self.board_conn(cx)?.term_close(&term))
+    }
+
+    /// 结束、重启第 `index` 个终端。里面还在输出、或者除了 shell 还有程序在跑的先问一句，
+    /// 和终端页一样（见 [`crate::term_end`]）。
     fn ask_first(
         &mut self,
         index: usize,
@@ -641,58 +762,39 @@ impl RepoView {
         let Some(tab) = self.terminals.tabs.get(index) else {
             return;
         };
-        let number = tab.number;
-        // 问的这一会儿列表可能变了：按序号再找一遍
+        let (number, view) = (tab.number, tab.view.clone());
+        let terminal = view.read(cx);
+        let name: SharedString = terminal
+            .title()
+            .unwrap_or_else(|| tf!("终端 {n}", n = number.to_string()).into());
+        // 它接着的、等着接的那个会话。实时列表里这个位置上是别的会话（列表还没跟上）时，那一行不算它的
+        let target = terminal.term_id().or_else(|| terminal.pending());
+        let row = self
+            .board_row(index, cx)
+            .filter(|row| target.as_ref().is_none_or(|term| *term == row.id.term));
+        let ending = crate::term_end::Ending {
+            term: target,
+            exited: !terminal.is_running(),
+            conn: terminal.conn().or_else(|| self.board_conn(cx)),
+            repo: self.app.read(cx).repo_name(&self.entry),
+            name,
+            row,
+            restart,
+        };
+        // 问的这一会儿列表可能变了：按序号再找一遍，还得是同一个终端（不是结束以后新开在这个位置上的）
         let run = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
             let at = this
                 .terminals
                 .tabs
                 .iter()
-                .position(|tab| tab.number == number);
+                .position(|tab| tab.number == number && tab.view == view);
             match (at, restart) {
                 (Some(at), true) => this.restart_terminal_now(at, window, cx),
                 (Some(at), false) => this.end_terminal_now(at, window, cx),
                 (None, _) => {}
             }
         };
-        let busy = self
-            .board_row(index, cx)
-            .is_some_and(|row| row.alive && row.state == TermState::Running);
-        if !busy {
-            return run(self, window, cx);
-        }
-        let repo = self.app.read(cx).repo_name(&self.entry);
-        let name: SharedString = tab
-            .view
-            .read(cx)
-            .title()
-            .unwrap_or_else(|| tf!("终端 {n}", n = number.to_string()).into());
-        match restart {
-            true => self.confirm(
-                tr("重启终端？"),
-                tf!(
-                    "将终止 {repo} 中的终端「{name}」里正在运行的程序，并重新启动。此操作无法撤销。",
-                    repo,
-                    name
-                ),
-                tr("重启"),
-                window,
-                cx,
-                run,
-            ),
-            false => self.confirm(
-                tr("结束终端？"),
-                tf!(
-                    "将结束 {repo} 中的终端「{name}」，其中正在运行的程序将终止。此操作无法撤销。",
-                    repo,
-                    name
-                ),
-                tr("结束"),
-                window,
-                cx,
-                run,
-            ),
-        }
+        crate::term_end::ask_first(self, ending, window, cx, run);
     }
 
     /// 结束第 `index` 个终端。里面还在输出的先问。
@@ -705,32 +807,18 @@ impl RepoView {
         if index >= self.terminals.tabs.len() {
             return;
         }
-        // 留着、还没接上的（没选中过）不知道编号，`kill` 说不了：照实时列表里的编号去结束
-        let unattached = {
-            let view = self.terminals.tabs[index].view.read(cx);
-            (!view.in_process() && view.term_id().is_none())
-                .then(|| self.board_row(index, cx))
-                .flatten()
-        };
+        let number = self.terminals.tabs[index].number;
         if self.board_row(index, cx).is_some() {
-            self.terminals
-                .ending
-                .push(self.terminals.tabs[index].number);
+            self.terminals.ending.push(number);
         }
-        if let Some(row) = unattached
-            && let Some(board) = &self.terminals.board
-            && let Some(conn) = board.read(cx).conn(&row.id.machine)
-        {
-            let closing = conn.term_close(&row.id.term);
-            cx.background_executor()
-                .spawn(async move {
-                    let _ = closing.await;
-                })
-                .detach();
-        }
+        // 留着、还没接上的（没选中过）`kill` 说不了：照编号去结束
+        let unattached = self.close_unattached(index, cx);
         let tab = self.terminals.tabs.remove(index);
         // 服务器上的终端不说一声的话会接着跑
-        tab.view.update(cx, |view, cx| view.kill(cx));
+        let closing = tab.view.update(cx, |view, _| view.kill()).or(unattached);
+        if let Some(closing) = closing {
+            self.watch_closing(number, closing, window, cx);
+        }
         if index < self.terminals.active {
             self.terminals.active -= 1;
         }
@@ -750,7 +838,35 @@ impl RepoView {
         self.ask_first(index, true, window, cx);
     }
 
+    /// 等结束终端的请求的回答。没结束掉（连接断了）：不再当它是要结束的，列表里它还在就回到「留着」
+    /// 里（到终端页时接回来），说一声。原来只记日志，终端在主机上接着跑，这边却一直藏着它。
+    fn watch_closing(
+        &mut self,
+        number: u32,
+        closing: Closing,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let Err(err) = closing.await else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.terminals.ending.retain(|other| *other != number);
+                let text = tf!("结束终端失败：{err}", err = format!("{err:#}"));
+                window.push_notification(Notification::error(text), cx);
+                this.board_changed(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn restart_terminal_now(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // 还没接上的：先照编号关掉 kuaid 里的那个会话，关掉了再开（`restart` 自己关不了，原来重启
+        // 只是接回了原来那个）
+        let closing = self.close_unattached(index, cx);
         let Some(tab) = self.terminals.tabs.get_mut(index) else {
             return;
         };
@@ -758,7 +874,7 @@ impl RepoView {
         tab.adopted = false;
         let view = tab.view.clone();
         self.select_terminal(index, window, cx);
-        view.update(cx, |view, cx| view.restart(cx));
+        view.update(cx, |view, cx| view.restart(closing, cx));
     }
 
     /// 给第 `index` 个终端选图片、文件发进去，并显示它。
@@ -853,6 +969,11 @@ impl RepoView {
         let title: SharedString = terminal.title().unwrap_or_else(|| tr("终端").into());
         // 里面的程序已经结束了：名字变淡
         let running = terminal.is_running();
+        // 程序和状态的图标，和终端页的一样；还不在实时列表里的空着
+        let icon = match self.board_row(index, cx) {
+            Some(row) => crate::term_overview::TermOverview::term_icon(&row, cx),
+            None => div().flex_none().w(px(14.)),
+        };
         let close = div()
             .id(("terminal-end", index))
             .flex_none()
@@ -914,6 +1035,7 @@ impl RepoView {
                             .text_color(muted)
                             .child(tab.number.to_string()),
                     )
+                    .child(icon)
                     .child(ui::clipped(("terminal-title", index), title).flex_1())
                     .child(close),
             )
@@ -1108,10 +1230,26 @@ impl RepoView {
     }
 
     /// 终端页上一个终端都没有（还没开过，或者最后一个结束了）：不自己开，也不跳回 Git 页，
-    /// 留在这里等用户开。
+    /// 留在这里等用户开。点了「新终端」、还在连时写「正在连接…」。
     fn render_no_terminal(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let (muted, bg) = (theme.muted_foreground, theme.background);
+        if self.terminals.asking > 0 {
+            return v_flex()
+                .flex_1()
+                .min_h_0()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .bg(bg)
+                .child(
+                    Icon::new(IconName::SquareTerminal)
+                        .size(px(28.))
+                        .text_color(muted),
+                )
+                .child(div().text_color(muted).child(tr("正在连接…")))
+                .into_any_element();
+        }
         v_flex()
             .flex_1()
             .min_h_0()

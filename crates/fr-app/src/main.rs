@@ -22,10 +22,11 @@ mod secrets;
 mod settings;
 mod settings_page;
 mod shell;
+mod side_split;
 mod tab_fit;
 mod term_board;
+mod term_end;
 mod term_overview;
-mod term_tab;
 mod terminal;
 mod text;
 mod toast;
@@ -162,6 +163,34 @@ fn workspace_action<A: Action>(
     });
 }
 
+/// 设置文件的问题在主窗口上说：启动时读它出了问题（见 [`settings::LoadIssue`]），之后存不了。
+/// 这两种通知都不自己消失，用户得看到。
+fn tell_settings_problems(
+    load_issue: Option<settings::LoadIssue>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::component::notification::Notification;
+    if let Some(issue) = load_issue {
+        window.push_notification(Notification::error(issue.text()).autohide(false), cx);
+    }
+    let mut failures = app_state::save_failures();
+    window
+        .spawn(cx, async move |cx| {
+            while let Some(err) = failures.next().await {
+                let text = fr_core::tf!("设置未能保存：{err}", err);
+                let told = cx.update(|window, cx| {
+                    window.push_notification(Notification::error(text).autohide(false), cx)
+                });
+                if told.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+}
+
 /// 设置 FR_LOG=1 时把日志打到标准错误，比如 GPUI 选用了哪块显卡。
 struct StderrLogger;
 
@@ -220,9 +249,28 @@ fn uninstall_command() -> Option<i32> {
     Some(0)
 }
 
+/// 测试实例（设了 `FR_SETTINGS`）没另设 `FR_KUAID_HOME` 时，给它在设置文件旁边单独一套本机
+/// kuaid 的状态（`kuaid-home`）。不然本机的 kuaid、工作区、主机列表和日常在用的是同一份：测试设置
+/// 里的主机列表一交过去，日常的就被换掉，失去主机的仓库也从工作区里删掉。要和日常的共用，把
+/// `FR_KUAID_HOME` 明确设成那一套。
+fn isolate_test_instance() {
+    let Some(settings) = std::env::var_os("FR_SETTINGS").filter(|path| !path.is_empty()) else {
+        return;
+    };
+    if std::env::var_os("FR_KUAID_HOME").is_some_and(|dir| !dir.is_empty()) {
+        return;
+    }
+    let home = PathBuf::from(settings)
+        .parent()
+        .map_or_else(|| PathBuf::from("kuaid-home"), |dir| dir.join("kuaid-home"));
+    // SAFETY: 启动的第一件事，这时还没有别的线程在读环境变量
+    unsafe { std::env::set_var("FR_KUAID_HOME", &home) };
+}
+
 fn main() {
     // 甩掉 Redirection Guard 后重新启动的：先把带过来的 FR_* 环境变量设上，后面的都照它们来
     redirect_guard::restore_env();
+    isolate_test_instance();
     // 被 git 或 ssh 当作 askpass 启动时：去问已经开着的主程序，打出回答就退出
     if let Some(code) = fr_core::askpass::run_helper() {
         std::process::exit(code);
@@ -271,7 +319,10 @@ fn main() {
         return;
     }
 
-    let settings = settings::load();
+    // 本机 git 的版本号先在后台问好（读工作树清单时要看），界面线程上不等 git 启动
+    std::thread::spawn(fr_core::git::local_version);
+
+    let (settings, load_issue) = settings::load();
     // 语言在画任何界面之前就定下来
     fr_core::i18n::set_lang(settings.language.resolve());
 
@@ -359,7 +410,7 @@ fn main() {
 
             let saved_window = settings.window;
             terminal::set_prefs(&settings.terminal, cx);
-            let app = cx.new(|cx| AppState::new(settings, cx));
+            let app = cx.new(|cx| AppState::new(settings, load_issue.clone(), cx));
             // 在终端里按 Ctrl+加号、减号调了字号：存进设置
             terminal::set_prefs_writer(cx, {
                 let app = app.clone();
@@ -393,6 +444,7 @@ fn main() {
                 if let Some(dir) = open_arg {
                     workspace.update(cx, |ws, cx| ws.open_local_dir(dir, window, cx));
                 }
+                tell_settings_problems(load_issue, window, cx);
                 workspace
             })
             .expect("打开窗口失败");

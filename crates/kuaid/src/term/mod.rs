@@ -11,13 +11,14 @@ pub mod conpty;
 pub mod host;
 #[cfg(windows)]
 pub mod hosted;
+mod programs;
 #[cfg(unix)]
 pub mod pty;
 pub mod screen;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
@@ -32,8 +33,8 @@ use screen::Screen;
 const KEEP_ENDED: Duration = Duration::from_secs(24 * 3600);
 /// 还原屏幕的那一段按这么大一块块发
 const DUMP_CHUNK: usize = 64 * 1024;
-/// 客户端收得太慢、输出积压太多时，断开它的时候说的话
-const LAGGING: &str = "终端输出积压过多，连接已断开；重新连接后可继续使用";
+/// 收得太慢、停发了输出的客户端（见 [`Client::lagging`]），队列里积着的少到这么多就接着发
+const RESUME_AT: usize = 1 << 20;
 /// 订阅了终端列表（`term_watch`）时，隔这么久看一次有没有变化
 const WATCH_EVERY: Duration = Duration::from_secs(1);
 /// 最近这么久以内有过输出的算「正在输出」
@@ -51,14 +52,22 @@ pub trait Backend: Send + Sync {
     fn resize(&self, size: Size);
     /// 结束里面的程序。
     fn kill(&self);
+    /// 除了 shell 还有哪些程序在跑（见 [`programs`]）。`procs` 是这一轮共用的进程表。
+    fn programs(&self, procs: &programs::Procs) -> Vec<String> {
+        let _ = procs;
+        Vec::new()
+    }
     /// 升级换程序时带过去的两个数。Linux：伪终端的文件描述符和 shell 的进程号；
     /// Windows：托管进程听的端口和 shell 的进程号。
     fn handle(&self) -> Option<(i32, i32)> {
         None
     }
-    /// 升级换程序前：不再收程序的输出，返回时已经收到的都交给了 [`Session::output`]。
-    /// Linux 上用不着（整个进程一把锁，见 `pty::freeze`）。
-    fn pause(&self) {}
+    /// 升级换程序前：不再收程序的输出，返回时已经收到的都交给了 [`Session::output`]。返回
+    /// false：没确认停下（发不过去、等不到回话），不能交接。Linux 上用不着（整个进程一把锁，
+    /// 见 `pty::freeze`）。
+    fn pause(&self) -> bool {
+        true
+    }
     /// 升级没换成：接着收。
     fn resume(&self) {}
 }
@@ -86,6 +95,9 @@ struct Client {
     /// 只看的（`term_attach` 带 `watch`）：不改大小、不回答程序的话，不算「有人接着」。用户在那一头
     /// 敲的字照样经 `term_input` 写进来
     watch: bool,
+    /// 收得太慢，队列里积满了，程序的输出停发给它了（不能让程序等它）。积着的发得差不多了，先把它的
+    /// 终端重置、发一份现在的屏幕，再接着发（见 [`catch_up`]）
+    lagging: bool,
 }
 
 pub struct Session {
@@ -125,25 +137,18 @@ impl Session {
         state.last_output = Some(Instant::now());
         // 没人接着（只看的不算）：程序问终端的话由我们回答，不然它会一直等
         let answer = !reply.is_empty() && !state.attended();
-        state.clients.retain(|client| {
+        // 连接已经断了的不再发（断开的连接随后会整个摘掉）
+        state.clients.retain(|client| !client.out.is_closed());
+        for client in state.clients.iter_mut().filter(|client| !client.lagging) {
             let header = Response {
                 id: client.request,
                 chunk: true,
                 bytes: bytes.len() as u64,
                 ..Default::default()
             };
-            if client.out.try_send(&header, bytes) {
-                return true;
-            }
-            // 这个客户端收得太慢（或者已经断了）：断开它，不能让程序等它
-            let lagging = Response {
-                id: client.request,
-                error: Some(LAGGING.into()),
-                ..Default::default()
-            };
-            client.out.push(&lagging, &[]);
-            false
-        });
+            client.lagging = !client.out.try_send(&header, bytes);
+        }
+        catch_up(&mut state);
         drop(state);
         if answer {
             self.backend.write(reply);
@@ -152,7 +157,10 @@ impl Session {
 
     /// 隔一会儿调用一次（没有输出的时候也要）。
     pub fn tick(&self) {
-        self.state.lock().unwrap().screen.flush_sync();
+        let mut state = self.state.lock().unwrap();
+        state.screen.flush_sync();
+        state.clients.retain(|client| !client.out.is_closed());
+        catch_up(&mut state);
     }
 
     /// 程序结束了。接着的客户端收到退出码；有人看到了就不用再留着这个会话。
@@ -165,7 +173,16 @@ impl Session {
         state.ended = Some(Instant::now());
         // 只看的客户端看到了不算：正经接上来的人还没见过最后的画面和退出码
         let seen = state.attended();
+        // 停发了输出的客户端先补上最后的画面
+        let dump = state
+            .clients
+            .iter()
+            .any(|client| client.lagging)
+            .then(|| state.screen.redump());
         for client in state.clients.drain(..) {
+            if let (true, Some(dump)) = (client.lagging, &dump) {
+                push_dump(&client.out, client.request, dump);
+            }
             client.out.push(&exit_message(client.request, code), &[]);
         }
         drop(state);
@@ -218,16 +235,7 @@ impl Session {
             self.backend.resize(size);
         }
         if !created {
-            let dump = state.screen.dump();
-            for part in dump.chunks(DUMP_CHUNK) {
-                let header = Response {
-                    id: request,
-                    chunk: true,
-                    bytes: part.len() as u64,
-                    ..Default::default()
-                };
-                out.push(&header, part);
-            }
+            push_dump(out, request, &state.screen.dump());
         }
         match state.exit {
             Some(code) => {
@@ -247,6 +255,7 @@ impl Session {
                     request,
                     out: out.clone(),
                     watch,
+                    lagging: false,
                 });
             }
         }
@@ -275,7 +284,12 @@ impl Session {
         }
     }
 
-    fn info(&self) -> TermInfo {
+    fn info(&self, procs: &programs::Procs) -> TermInfo {
+        // 先问在跑的程序，再拿锁：问的时候要读进程表，别让输出等着
+        let programs = match self.is_alive() {
+            true => self.backend.programs(procs),
+            false => Vec::new(),
+        };
         let state = self.state.lock().unwrap();
         let size = state.screen.size();
         TermInfo {
@@ -290,6 +304,7 @@ impl Session {
             age: now_secs().saturating_sub(self.created),
             idle_ms: state.last_output.map(|at| at.elapsed().as_millis() as u64),
             last: state.screen.last_text(),
+            programs: Some(programs),
         }
     }
 
@@ -304,6 +319,36 @@ fn session_key(key: &str) -> String {
     match cfg!(windows) {
         true => fr_core::dir::windows_key(key),
         false => key.to_string(),
+    }
+}
+
+/// 停发了输出的客户端（见 [`Client::lagging`]），队列里积着的发得差不多了：先发一份现在的屏幕（把它的
+/// 终端重置了再画，见 [`Screen::redump`]），之后照常发输出。
+fn catch_up(state: &mut State) {
+    let ready: Vec<usize> = (0..state.clients.len())
+        .filter(|&at| state.clients[at].lagging && state.clients[at].out.queued() <= RESUME_AT)
+        .collect();
+    if ready.is_empty() {
+        return;
+    }
+    let dump = state.screen.redump();
+    for at in ready {
+        let client = &mut state.clients[at];
+        push_dump(&client.out, client.request, &dump);
+        client.lagging = false;
+    }
+}
+
+/// 把还原屏幕的那一段按 [`DUMP_CHUNK`] 一块块放进 `out`，挂在 `request` 号上。
+fn push_dump(out: &Outbox, request: u64, dump: &[u8]) {
+    for part in dump.chunks(DUMP_CHUNK) {
+        let header = Response {
+            id: request,
+            chunk: true,
+            bytes: part.len() as u64,
+            ..Default::default()
+        };
+        out.push(&header, part);
     }
 }
 
@@ -342,9 +387,39 @@ pub struct Registry(Arc<Inner>);
 
 struct Inner {
     sessions: Mutex<BTreeMap<String, Arc<Session>>>,
+    /// 正在开的会话（见 [`Registry::open`]）；开完了叫醒 `opened` 上等着的
+    opening: Mutex<Opening>,
+    opened: Condvar,
     next: AtomicU64,
     spawner: Spawner,
     watchers: Mutex<Watchers>,
+}
+
+/// 正在开的会话，和升级时的「先别开了」。
+#[derive(Default)]
+struct Opening {
+    /// 正在开的会话的名字
+    keys: HashSet<String>,
+    /// 正在开的有几个（没名字的也算）
+    in_flight: usize,
+    /// 升级要交接了，不再开新的（见 [`Registry::hold_opens`]）
+    held: bool,
+}
+
+/// 开完（成没成都算）时把它从「正在开」里拿掉，叫醒等着的。
+struct OpenGuard<'a> {
+    inner: &'a Inner,
+    key: String,
+}
+
+impl Drop for OpenGuard<'_> {
+    fn drop(&mut self) {
+        let mut opening = self.inner.opening.lock().unwrap();
+        opening.keys.remove(&self.key);
+        opening.in_flight -= 1;
+        drop(opening);
+        self.inner.opened.notify_all();
+    }
 }
 
 /// 订阅了终端列表的客户端（`term_watch`）。
@@ -372,6 +447,7 @@ struct Brief {
     last: String,
     known: bool,
     busy: Option<u64>,
+    programs: Option<Vec<String>>,
 }
 
 fn briefs(list: &[TermInfo], beat: u64) -> Vec<Brief> {
@@ -388,6 +464,7 @@ fn briefs(list: &[TermInfo], beat: u64) -> Vec<Brief> {
                 .idle_ms
                 .filter(|idle| *idle < BUSY.as_millis() as u64)
                 .map(|_| beat / BUSY_BEAT),
+            programs: info.programs.clone(),
         })
         .collect()
 }
@@ -402,15 +479,24 @@ fn listing(id: u64, list: &[TermInfo]) -> Response {
     }
 }
 
-/// 盯着列表的线程：隔一会儿看一次，变了就推给所有订阅的。
-fn watch_loop(inner: Weak<Inner>) {
-    let (mut sent, mut beat) = (None, 0u64);
+/// 盯着列表的线程：隔一会儿看一次，变了就推给所有订阅的。`sent` 是开始时刚推过的那份（订阅时
+/// 先推了一份，一秒后不用再推一遍一样的）。
+fn watch_loop(inner: Weak<Inner>, mut sent: Option<Vec<Brief>>) {
+    let mut beat = 0u64;
     loop {
         std::thread::sleep(WATCH_EVERY);
         let Some(inner) = inner.upgrade() else {
             return;
         };
         let registry = Registry(inner);
+        // 先看还有没有人订阅：列表要扫一遍进程，没人看就不扫了
+        {
+            let mut watchers = registry.0.watchers.lock().unwrap();
+            if watchers.list.is_empty() {
+                watchers.running = false;
+                return;
+            }
+        }
         let list = registry.list();
         beat += 1;
         let now = briefs(&list, beat);
@@ -421,7 +507,9 @@ fn watch_loop(inner: Weak<Inner>) {
         }
         if sent.as_ref() != Some(&now) {
             for watcher in &watchers.list {
-                watcher.out.push(&listing(watcher.id, &list), &[]);
+                watcher
+                    .out
+                    .push_latest(watcher.id, &listing(watcher.id, &list), &[]);
             }
             sent = Some(now);
         }
@@ -432,6 +520,8 @@ impl Registry {
     pub fn new(spawner: Spawner) -> Registry {
         Registry(Arc::new(Inner {
             sessions: Mutex::default(),
+            opening: Mutex::default(),
+            opened: Condvar::new(),
             next: AtomicU64::new(1),
             spawner,
             watchers: Mutex::default(),
@@ -455,17 +545,37 @@ impl Registry {
     ) -> Result<()> {
         let size = Size::new(params.cols, params.rows);
         let key = session_key(&params.key);
-        // 整个过程拿着登记表的锁：两个客户端同时开同一个名字，只会开出一个
-        let mut sessions = self.0.sessions.lock().unwrap();
-        let existing = sessions
-            .values()
-            .find(|session| !key.is_empty() && session.key == key)
-            .cloned();
-        if let Some(session) = existing {
-            drop(sessions);
-            session.attach(conn, request, out, size, false, false);
-            return Ok(());
-        }
+        // 两个客户端同时开同一个名字只开出一个：同名的正在开就等它开完再看。起伪终端不拿着
+        // 登记表的锁（Windows 上要等托管进程起来，最长 15 秒），期间列表、接上、结束别的终端照常
+        let mut opening = self.0.opening.lock().unwrap();
+        let _opening = loop {
+            // 升级正在交接：现在开的不会被交接过去，开了也会丢
+            if opening.held {
+                anyhow::bail!("kuaid 正在升级，请稍后再打开终端");
+            }
+            let existing = self
+                .0
+                .sessions
+                .lock()
+                .unwrap()
+                .values()
+                .find(|session| !key.is_empty() && session.key == key)
+                .cloned();
+            if let Some(session) = existing {
+                drop(opening);
+                session.attach(conn, request, out, size, false, false);
+                return Ok(());
+            }
+            if key.is_empty() || opening.keys.insert(key.clone()) {
+                opening.in_flight += 1;
+                drop(opening);
+                break OpenGuard {
+                    inner: &self.0,
+                    key: key.clone(),
+                };
+            }
+            opening = self.0.opened.wait(opening).unwrap();
+        };
         let id = format!("t{}", self.0.next.fetch_add(1, Ordering::Relaxed));
         let backend = (self.0.spawner)(&Spawn {
             term: id.clone(),
@@ -490,8 +600,7 @@ impl Registry {
             }),
             registry: Arc::downgrade(&self.0),
         });
-        sessions.insert(id, session.clone());
-        drop(sessions);
+        self.0.sessions.lock().unwrap().insert(id, session.clone());
         // 先接上再开始读输出：第一个字也不会漏
         session.attach(conn, request, out, size, true, false);
         session.backend.start(session.clone());
@@ -521,11 +630,13 @@ impl Registry {
             id,
             out: out.clone(),
         });
-        out.push(&listing(id, &self.list()), &[]);
+        let list = self.list();
+        out.push(&listing(id, &list), &[]);
         if !watchers.running {
             watchers.running = true;
             let inner = Arc::downgrade(&self.0);
-            std::thread::spawn(move || watch_loop(inner));
+            let sent = briefs(&list, 0);
+            std::thread::spawn(move || watch_loop(inner, Some(sent)));
         }
     }
 
@@ -548,7 +659,11 @@ impl Registry {
     }
 
     pub fn list(&self) -> Vec<TermInfo> {
-        self.all().iter().map(|session| session.info()).collect()
+        let procs = programs::Procs::take();
+        self.all()
+            .iter()
+            .map(|session| session.info(&procs))
+            .collect()
     }
 
     /// 现在有几个会话（含程序已经结束、还没人看过的）。
@@ -556,9 +671,14 @@ impl Registry {
         self.0.sessions.lock().unwrap().len()
     }
 
-    /// 里面的程序还在跑的有几个。
-    pub fn alive(&self) -> usize {
-        self.all().iter().filter(|s| s.is_alive()).count()
+    /// `term_programs`：会话里除了 shell 还有哪些程序在跑。程序已经结束、没有这个会话时是空的。
+    pub fn programs(&self, term: &str) -> Vec<String> {
+        match self.get(term) {
+            Some(session) if session.is_alive() => {
+                session.backend.programs(&programs::Procs::take())
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// `term_close`：结束里面的程序，忘掉这个会话。还接着的客户端会收到退出码。
@@ -570,10 +690,17 @@ impl Registry {
         true
     }
 
-    pub fn close_all(&self) {
+    /// 结束所有会话，等里面的程序退出，最多等 `wait`（比强杀前的宽限长一点，不理挂断的也等到
+    /// 被强杀）。等的是拿出来的这些会话：原来叫停的地方先清空表、再按表里还剩几个活着的等，
+    /// 表已经空了，根本没等；Linux 上过一会儿强杀靠读线程，进程先退了就没杀成。
+    pub fn close_all(&self, wait: Duration) {
         let sessions = std::mem::take(&mut *self.0.sessions.lock().unwrap());
         for session in sessions.values() {
             session.backend.kill();
+        }
+        let deadline = Instant::now() + wait;
+        while sessions.values().any(|session| session.is_alive()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -594,12 +721,24 @@ impl Registry {
 
     /// 升级换程序前：让每个还在跑的会话停止收输出（见 [`Backend::pause`]）。
     #[cfg_attr(not(windows), allow(dead_code))]
-    pub fn pause_all(&self) {
+    /// 有一个没确认停下就把停了的都恢复，返回 false：原来不管确认没确认都接着交接，已经从
+    /// 伪终端读出来、还没进旧进程屏幕的输出可能就丢了。
+    pub fn pause_all(&self) -> bool {
+        let mut paused: Vec<Arc<Session>> = Vec::new();
         for session in self.all() {
-            if session.is_alive() {
-                session.backend.pause();
+            if !session.is_alive() {
+                continue;
             }
+            if !session.backend.pause() {
+                session.backend.resume();
+                for session in &paused {
+                    session.backend.resume();
+                }
+                return false;
+            }
+            paused.push(session);
         }
+        true
     }
 
     /// 升级没换成：接着收。
@@ -610,6 +749,22 @@ impl Registry {
                 session.backend.resume();
             }
         }
+    }
+
+    /// 升级交接前：不再开新的终端，等正在开的开完再返回。之后开的会被拒绝，不会有开好了却没
+    /// 交接过去的（原来升级只挡住再升级，冻结之后照样开得出新终端，客户端收到「开好了」，
+    /// 换了程序以后它就没了）。
+    pub fn hold_opens(&self) {
+        let mut opening = self.0.opening.lock().unwrap();
+        opening.held = true;
+        while opening.in_flight > 0 {
+            opening = self.0.opened.wait(opening).unwrap();
+        }
+    }
+
+    /// 升级没成：又可以开终端了。
+    pub fn release_opens(&self) {
+        self.0.opening.lock().unwrap().held = false;
     }
 
     /// 升级换程序前：把每个会话拍下来。调用前要先让伪终端那一层停止读输出。
@@ -697,6 +852,8 @@ pub(crate) mod tests {
         pub size: Mutex<Option<Size>>,
         pub killed: Mutex<bool>,
         pub session: Mutex<Option<Arc<Session>>>,
+        /// 假装在跑的程序
+        pub programs: Mutex<Vec<String>>,
     }
 
     impl Backend for Arc<Fake> {
@@ -714,6 +871,10 @@ pub(crate) mod tests {
 
         fn kill(&self) {
             *self.killed.lock().unwrap() = true;
+        }
+
+        fn programs(&self, _: &programs::Procs) -> Vec<String> {
+            self.programs.lock().unwrap().clone()
         }
 
         fn handle(&self) -> Option<(i32, i32)> {
@@ -774,6 +935,25 @@ pub(crate) mod tests {
         let mut screen = Screen::new(Size::new(20, 4));
         screen.advance(bytes);
         screen.line_text(0)
+    }
+
+    #[test]
+    fn 里面在跑的程序_结束以后和没有的会话都是空的() {
+        let (registry, fakes) = fake_registry();
+        let (out, mut inbox) = mailbox();
+        open(&registry, "/repo", 1, 10, &out);
+        let term = inbox.opened().term;
+        let fake = fakes.lock().unwrap()[0].clone();
+        assert!(registry.programs(&term).is_empty(), "shell 闲着");
+        *fake.programs.lock().unwrap() = vec!["claude".into()];
+        assert_eq!(registry.programs(&term), ["claude"]);
+        // 程序结束了：会话还在（等人来看），但没有在跑的了
+        registry.detach(1, None);
+        let session = fake.session.lock().unwrap().clone().unwrap();
+        session.finish(Some(0));
+        assert_eq!(registry.list().len(), 1);
+        assert!(registry.programs(&term).is_empty());
+        assert!(registry.programs("no-such-term").is_empty());
     }
 
     #[test]
@@ -900,20 +1080,95 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn 客户端收得太慢就断开它() {
+    fn 客户端收得太慢就停发_积着的收完以后从现在的屏幕接着() {
         let (registry, fakes) = fake_registry();
-        // 这个客户端的管道没人读
-        let (reader, writer) = std::io::pipe().unwrap();
-        let out = Outbox::new(writer);
+        // 这个客户端的管道先没人读
+        let (out, mut inbox) = mailbox();
         open(&registry, "/repo", 1, 1, &out);
-        let session = fakes.lock().unwrap()[0].session.lock().unwrap().clone().unwrap();
+        let session = fakes.lock().unwrap()[0]
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
         let block = vec![b'x'; 1 << 20];
         for _ in 0..64 {
             session.output(&block);
         }
-        // 程序没被卡住（上面的循环跑完了），那个客户端被断开了
-        assert_eq!(registry.list()[0].attached, 0);
-        drop(reader);
+        // 程序没被卡住（上面的循环跑完了），那个客户端还接着，只是停发了
+        assert_eq!(registry.list()[0].attached, 1);
+        assert!(out.queued() < 16 << 20, "停发以后还在往里放");
+        session.output(b"\x1b[2J\x1b[Hfirst\r\nsecond");
+        // 客户端开始收：先是积着的，然后是重置加现在的屏幕，之后的输出照常
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            inbox.opened();
+            let (mut screen, mut skipped) = (Screen::new(Size::new(20, 4)), 0);
+            loop {
+                let (response, payload) = inbox.next();
+                assert!(response.chunk && response.error.is_none());
+                // 停发前积着的那些不用画：后面先重置
+                if payload.iter().all(|&byte| byte == b'x') {
+                    skipped += payload.len();
+                    continue;
+                }
+                screen.advance(&payload);
+                if payload.ends_with(b"!") {
+                    let _ = done.send((screen.line_text(0), screen.line_text(1), skipped));
+                    return;
+                }
+            }
+        });
+        let started = Instant::now();
+        while out.queued() > RESUME_AT {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "积着的一直发不出去"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        session.tick();
+        session.output(b"!");
+        let (first, second, skipped) = result
+            .recv_timeout(Duration::from_secs(60))
+            .expect("没收到重置以后的输出");
+        assert_eq!((first.as_str(), second.as_str()), ("first", "second!"));
+        // 停发以后的没发：收到的只有停发前积着的那些
+        assert!(skipped < 16 << 20, "{skipped}");
+        assert_eq!(registry.list()[0].attached, 1);
+    }
+
+    #[test]
+    fn 停发了的客户端在程序结束时先补上最后的画面() {
+        let (registry, fakes) = fake_registry();
+        let (out, mut inbox) = mailbox();
+        open(&registry, "/repo", 1, 1, &out);
+        let session = fakes.lock().unwrap()[0]
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let block = vec![b'x'; 1 << 20];
+        for _ in 0..64 {
+            session.output(&block);
+        }
+        session.output(b"\x1b[2J\x1b[Hbye");
+        session.finish(Some(0));
+        inbox.opened();
+        let mut screen = Screen::new(Size::new(20, 4));
+        loop {
+            let (response, payload) = inbox.next();
+            if !response.chunk {
+                let exit: TermExit = serde_json::from_value(response.result.unwrap()).unwrap();
+                assert_eq!(exit.exit, Some(0));
+                break;
+            }
+            if !payload.iter().all(|&byte| byte == b'x') {
+                screen.advance(&payload);
+            }
+        }
+        assert_eq!(screen.line_text(0), "bye");
     }
 
     #[test]
@@ -942,6 +1197,26 @@ pub(crate) mod tests {
         // 新开的会话编号接着往下排，不和带过来的重
         open(&fresh, "/other", 9, 2, &out2);
         assert_eq!(inbox2.opened().term, format!("t{next}"));
+    }
+
+    #[test]
+    fn 升级交接时不开新终端_没成接着开() {
+        let (registry, _) = fake_registry();
+        let (out, mut inbox) = mailbox();
+        registry.hold_opens();
+        let params = TermOpen {
+            key: "/repo".into(),
+            cwd: "/repo".into(),
+            cols: 20,
+            rows: 4,
+            shell: Vec::new(),
+        };
+        let refused = registry.open(&params, Vec::new(), 1, 1, &out);
+        assert!(refused.is_err());
+        assert!(registry.list().is_empty());
+        registry.release_opens();
+        open(&registry, "/repo", 1, 2, &out);
+        assert!(inbox.opened().created);
     }
 
     #[test]
@@ -1014,6 +1289,7 @@ pub(crate) mod tests {
             (list[0].term.as_str(), list[0].idle_ms),
             (term.as_str(), None)
         );
+        assert_eq!(list[0].programs, Some(Vec::new()), "shell 闲着");
 
         // 有了输出：推来最后一行和「多久以前」
         let session = fakes.lock().unwrap()[0]
@@ -1037,6 +1313,11 @@ pub(crate) mod tests {
                 break;
             }
         }
+
+        // 屏幕不动，里面起了程序：也推
+        *fakes.lock().unwrap()[0].programs.lock().unwrap() = vec!["claude".into()];
+        let list = listed(&mut watcher);
+        assert_eq!(list[0].programs, Some(vec!["claude".to_string()]));
 
         // 结束这个终端：推来空的列表
         registry.close(&term);

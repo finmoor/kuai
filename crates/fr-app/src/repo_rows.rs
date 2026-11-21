@@ -172,14 +172,23 @@ pub(crate) fn render_block<T: 'static>(
         Some(_) => IconName::Server,
         None => IconName::FolderGit2,
     };
+    // 没找全（子仓库太多）：写「至少」，不当成全部
+    let truncated = block
+        .scanned
+        .as_ref()
+        .is_some_and(|scanned| scanned.truncated);
     let folded_note = (has_subs && !unfolded).then(|| {
+        let n = subs.len();
         div()
             .flex_shrink(2.)
             .min_w_0()
             .truncate()
             .text_xs()
             .text_color(muted)
-            .child(tf!("{n} 个子仓库", n = subs.len()))
+            .child(match truncated {
+                true => tf!("至少 {n} 个子仓库", n),
+                false => tf!("{n} 个子仓库", n),
+            })
     });
     let terms = block.terms.map(|(count, state)| {
         let chip = h_flex()

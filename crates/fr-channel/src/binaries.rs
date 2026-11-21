@@ -119,11 +119,7 @@ impl Binaries {
             };
             bail!(
                 "{}",
-                tf!(
-                    "服务器为 {system}（{arch}），暂无对应的 kuaid",
-                    system,
-                    arch
-                )
+                tf!("主机为 {system}（{arch}），暂无对应的 kuaid", system, arch)
             );
         };
         Ok(found)
@@ -295,6 +291,8 @@ mod tests {
             .unwrap()
     }
 
+    /// 开发时才去仓库里找（见 [`dev_conpty_dir`]），按发布版编的测试里不找。
+    #[cfg(debug_assertions)]
     #[test]
     fn windows_版带上_conpty_开发时取仓库里的() {
         let nowhere = Path::new("no-such-dir").join("kuaid.exe");
@@ -302,6 +300,11 @@ mod tests {
         let names: Vec<&str> = extras.iter().map(|(name, _)| *name).collect();
         assert_eq!(names, CONPTY_FILES);
         assert!(extras.iter().all(|(_, path)| path.is_file()), "{extras:?}");
+    }
+
+    #[test]
+    fn linux_版不带别的文件() {
+        let nowhere = Path::new("no-such-dir").join("kuaid");
         assert!(extras_for(target(Os::Linux, "x86_64"), &nowhere).is_empty());
     }
 
@@ -313,6 +316,10 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let kuaid = base.join("kuaid.exe");
         std::fs::write(&kuaid, b"not really kuaid").unwrap();
+        // 打包后 ConPTY 就在 kuaid 旁边
+        for name in CONPTY_FILES {
+            std::fs::write(base.join(name), name).unwrap();
+        }
         let windows = target(Os::Windows, "AMD64");
         let binaries = Binaries {
             found: vec![Found {

@@ -43,9 +43,11 @@ pub fn no_window(cmd: &mut Command) {
 
 /// 登录一台服务器的 ssh 选项：转发 ssh-agent、私钥、密码登录、要密码时怎么问。
 /// `askpass`：要密码、口令时有人可以问（设了 askpass 程序），只问一次；没有就只用密钥，要密码直接失败。
+/// `key_only`：只用公钥认证，服务器不能在键盘交互认证里问话（自动回答存着的私钥口令的那一次用）。
 pub fn login_args(
     identity_file: Option<&str>,
     password_auth: bool,
+    key_only: bool,
     forward_agent: bool,
     askpass: bool,
 ) -> Vec<String> {
@@ -63,6 +65,8 @@ pub fn login_args(
             "-o",
             "PreferredAuthentications=keyboard-interactive,password",
         ]);
+    } else if key_only {
+        add(&["-o", "PreferredAuthentications=publickey"]);
     }
     match askpass {
         // 密码只问一次：ssh 默认问三次，用户点了取消它还会接着再问两次。输错了点「重试」重连
@@ -79,13 +83,16 @@ mod tests {
     #[test]
     fn 私钥和密码登录变成_ssh_的选项() {
         let has = |args: &[String], what: &str| args.iter().any(|arg| arg == what);
-        let plain = login_args(None, false, false, true);
+        let plain = login_args(None, false, false, false, true);
         assert_eq!(plain, ["-o", "NumberOfPasswordPrompts=1"]);
-        let key = login_args(Some("C:/keys/id"), false, true, true);
+        let key = login_args(Some("C:/keys/id"), false, false, true, true);
         assert!(has(&key, "-A") && has(&key, "IdentitiesOnly=yes"));
         let at = key.iter().position(|arg| arg == "-i").unwrap();
         assert_eq!(key[at + 1], "C:/keys/id");
-        let password = login_args(None, true, false, false);
+        // 自动回答存着的私钥口令的那一次：只用公钥
+        let key_only = login_args(Some("C:/keys/id"), false, true, false, true);
+        assert!(has(&key_only, "PreferredAuthentications=publickey"));
+        let password = login_args(None, true, false, false, false);
         assert!(has(
             &password,
             "PreferredAuthentications=keyboard-interactive,password"

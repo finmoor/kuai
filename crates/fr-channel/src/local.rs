@@ -5,17 +5,72 @@ use fr_core::tf;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use fr_core::exec::{self, Killer, OnStderr};
 use futures::FutureExt as _;
 use futures::channel::{mpsc, oneshot};
-use futures::future::{self, BoxFuture};
+use futures::future::BoxFuture;
 
-use crate::{ChangeStream, DirListing, GitOutput, GitStream, StreamItem, UploadItem};
+use crate::{ChangeStream, DirListing, GitCancel, GitOutput, GitStream, StreamItem, UploadItem};
 
-/// 丢弃时杀掉 git 进程；正常拿到结果后解除。
-struct KillOnDrop(Option<Killer>);
+/// 一个本机 git 进程起了没有、要不要杀。进程在后台线程里起：Windows 上起一个要十几毫秒，一次刷新
+/// 同时起七八个，调用的线程多半是界面线程（原来在调用的线程里起，刷新时界面卡一下）。所以取消可能
+/// 在它起好之前。
+#[derive(Default)]
+struct Control(Mutex<ControlState>);
+
+#[derive(Default)]
+struct ControlState {
+    cancelled: bool,
+    /// 起好了、还没结束
+    killer: Option<Killer>,
+}
+
+impl Control {
+    fn state(&self) -> MutexGuard<'_, ControlState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 起之前问一声：取消了就不起了。
+    fn cancelled(&self) -> bool {
+        self.state().cancelled
+    }
+
+    /// 起好了：记下怎么杀。这期间取消了的马上杀掉。
+    fn started(&self, killer: Killer) {
+        let mut state = self.state();
+        match state.cancelled {
+            true => {
+                drop(state);
+                killer.kill();
+            }
+            false => state.killer = Some(killer),
+        }
+    }
+
+    /// 结束了，不用再杀。
+    fn finished(&self) {
+        self.state().killer = None;
+    }
+
+    /// 取消：还没起的不起了，起了的杀掉。
+    fn cancel(&self) {
+        let killer = {
+            let mut state = self.state();
+            state.cancelled = true;
+            state.killer.take()
+        };
+        // 不占调用的线程：Windows 上要启动 taskkill，kill 放在别的线程里做
+        if let Some(killer) = killer {
+            killer.kill();
+        }
+    }
+}
+
+/// 丢弃时取消（见 [`Control::cancel`]）；正常拿到结果后解除。
+struct KillOnDrop(Option<Arc<Control>>);
 
 impl KillOnDrop {
     fn disarm(&mut self) {
@@ -25,29 +80,37 @@ impl KillOnDrop {
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        if let Some(killer) = self.0.take() {
-            killer.kill();
+        if let Some(control) = self.0.take() {
+            control.cancel();
         }
     }
 }
 
-pub(crate) fn git(
+/// 在后台线程里起 git、收齐它的输出。返回结果和管着它的 [`Control`]。
+fn run(
     repo: &str,
     args: Vec<String>,
     stdin: Option<Vec<u8>>,
-) -> BoxFuture<'static, Result<GitOutput>> {
-    let (running, killer) = match exec::spawn(Path::new(repo), &args, stdin) {
-        Ok(started) => started,
-        Err(err) => return future::ready(Err(err)).boxed(),
-    };
+) -> (BoxFuture<'static, Result<GitOutput>>, Arc<Control>) {
+    let control = Arc::new(Control::default());
     let (tx, rx) = oneshot::channel();
+    let (repo, worker) = (repo.to_string(), control.clone());
     std::thread::spawn(move || {
-        let _ = tx.send(running.collect());
+        // 起之前就取消了：不起，当作刚起就被杀掉
+        if worker.cancelled() {
+            let _ = tx.send(Ok((Vec::new(), exec::Finished::default())));
+            return;
+        }
+        let collected =
+            exec::spawn(Path::new(&repo), &args, stdin).and_then(|(running, killer)| {
+                worker.started(killer);
+                running.collect()
+            });
+        worker.finished();
+        let _ = tx.send(collected);
     });
-    let mut guard = KillOnDrop(Some(killer));
-    async move {
+    let output = async move {
         let result = rx.await.map_err(|_| anyhow!(tr("git 线程意外退出")));
-        guard.disarm();
         let (stdout, finished) = result??;
         Ok(GitOutput {
             code: finished.code,
@@ -55,8 +118,42 @@ pub(crate) fn git(
             stderr: finished.stderr,
             elapsed: finished.elapsed,
         })
+    };
+    (output.boxed(), control)
+}
+
+pub(crate) fn git(
+    repo: &str,
+    args: Vec<String>,
+    stdin: Option<Vec<u8>>,
+) -> BoxFuture<'static, Result<GitOutput>> {
+    let (output, control) = run(repo, args, stdin);
+    let mut guard = KillOnDrop(Some(control));
+    async move {
+        let output = output.await;
+        guard.disarm();
+        output
     }
     .boxed()
+}
+
+/// 同 [`git`]，另给一个取消的办法（见 [`GitCancel`]）。
+pub(crate) fn git_cancellable(
+    repo: &str,
+    args: Vec<String>,
+) -> (BoxFuture<'static, Result<GitOutput>>, GitCancel) {
+    let (output, control) = run(repo, args, None);
+    let cancel = {
+        let control = control.clone();
+        GitCancel(Arc::new(move || control.cancel()))
+    };
+    let mut guard = KillOnDrop(Some(control));
+    let output = async move {
+        let output = output.await;
+        guard.disarm();
+        output
+    };
+    (output.boxed(), cancel)
 }
 
 pub(crate) fn git_stream(repo: &str, args: Vec<String>, progress: bool) -> GitStream {
@@ -67,20 +164,25 @@ pub(crate) fn git_stream(repo: &str, args: Vec<String>, progress: bool) -> GitSt
             let _ = tx.unbounded_send(Ok(StreamItem::Progress(chunk.to_vec())));
         }) as OnStderr
     });
-    let (running, killer) = match exec::spawn_with(Path::new(repo), &args, None, on_stderr) {
-        Ok(started) => started,
-        Err(err) => {
-            let _ = tx.unbounded_send(Err(err));
-            return GitStream {
-                rx,
-                _cancel: Box::new(()),
-            };
-        }
-    };
+    let control = Arc::new(Control::default());
+    let (repo, worker) = (repo.to_string(), control.clone());
+    // 起进程也在这个线程里，见 [`Control`]
     std::thread::spawn(move || {
+        if worker.cancelled() {
+            return;
+        }
+        let (running, killer) = match exec::spawn_with(Path::new(&repo), &args, None, on_stderr) {
+            Ok(started) => started,
+            Err(err) => {
+                let _ = tx.unbounded_send(Err(err));
+                return;
+            }
+        };
+        worker.started(killer);
         let result = running.finish(|chunk| {
             let _ = tx.unbounded_send(Ok(StreamItem::Chunk(chunk.to_vec())));
         });
+        worker.finished();
         let _ = tx.unbounded_send(result.map(|finished| {
             StreamItem::Done(GitOutput {
                 code: finished.code,
@@ -92,15 +194,20 @@ pub(crate) fn git_stream(repo: &str, args: Vec<String>, progress: bool) -> GitSt
     });
     GitStream {
         rx,
-        _cancel: Box::new(KillOnDrop(Some(killer))),
+        _cancel: Box::new(KillOnDrop(Some(control))),
     }
 }
 
 pub(crate) fn watch(repo: &str) -> ChangeStream {
     let (tx, rx) = mpsc::unbounded();
-    let watcher = fr_core::watch::watch(Path::new(repo), move || {
-        let _ = tx.unbounded_send(());
-    });
+    // 仓库目录没了、换了，监听自己结束时也丢弃 tx，流跟着结束；原因不用转告，仓库页刷新时自己看得到
+    let watcher = fr_core::watch::watch(
+        Path::new(repo),
+        move || {
+            let _ = tx.unbounded_send(());
+        },
+        |_| {},
+    );
     // 装不上监听时 tx 已经丢弃，流马上结束
     ChangeStream {
         rx,
@@ -281,4 +388,33 @@ fn recycle(path: &Path) -> Result<()> {
         bail!("{}", tf!("系统返回错误 {code}", code));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn 取消以后等到_git_真的退出才完成() {
+        let dir = std::env::temp_dir().join(format!("fr-cancel-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 一个要跑很久的 git：别名里 sleep，git 底下还有子进程
+        let args = ["-c", "alias.slow=!sleep 60", "slow"]
+            .map(String::from)
+            .to_vec();
+        let (output, cancel) = git_cancellable(dir.to_str().unwrap(), args);
+        let started = Instant::now();
+        std::thread::sleep(Duration::from_millis(500));
+        cancel.cancel();
+        let out = futures::executor::block_on(output).unwrap();
+        assert!(!out.success());
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

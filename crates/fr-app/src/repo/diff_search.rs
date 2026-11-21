@@ -30,6 +30,8 @@ use crate::ui;
 
 /// 最多记这么多处匹配：再多也看不过来，省得一个字母搜出几十万处。
 const MAX_HITS: usize = 5000;
+/// 补丁比这大时，字停下一会儿再找：一个字一个字敲时不用每个字都在后台解析一遍。
+const SETTLE_SIZE: usize = 256 << 10;
 
 /// 哪一处的改动。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +64,8 @@ pub(super) struct DiffSearch {
     hits: Vec<Hit>,
     /// 现在停在第几处
     pos: Option<usize>,
+    /// 在后台找的那一次（提交详情、比较）：字又变了就换一个，旧的丢掉
+    searching: Option<Task<()>>,
 }
 
 impl DiffSearch {
@@ -83,6 +87,7 @@ impl DiffSearch {
             case: false,
             hits: Vec::new(),
             pos: None,
+            searching: None,
         };
         (search, events)
     }
@@ -132,8 +137,8 @@ impl DiffSearches {
     }
 }
 
-/// 一行里所有的匹配（字节范围，不重叠）。不区分大小写时两边都按小写比。
-fn occurrences(hay: &str, needle: &str, case: bool) -> Vec<Range<usize>> {
+/// 一行里的匹配（字节范围，不重叠），最多 `limit` 个。不区分大小写时两边都按小写比。
+fn occurrences(hay: &str, needle: &str, case: bool, limit: usize) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     if needle.is_empty() || hay.len() < needle.len() {
         return out;
@@ -141,7 +146,8 @@ fn occurrences(hay: &str, needle: &str, case: bool) -> Vec<Range<usize>> {
     if case {
         out.extend(
             hay.match_indices(needle)
-                .map(|(at, found)| at..at + found.len()),
+                .map(|(at, found)| at..at + found.len())
+                .take(limit),
         );
         return out;
     }
@@ -154,14 +160,15 @@ fn occurrences(hay: &str, needle: &str, case: bool) -> Vec<Range<usize>> {
                 .filter(|(at, found)| {
                     hay.is_char_boundary(*at) && hay.is_char_boundary(at + found.len())
                 })
-                .map(|(at, found)| at..at + found.len()),
+                .map(|(at, found)| at..at + found.len())
+                .take(limit),
         );
         return out;
     }
     // 少数字母转小写后字节数会变：退一步，只把英文字母不分大小写
     let (hay_bytes, needle_bytes) = (hay.as_bytes(), needle.as_bytes());
     let mut at = 0;
-    while at + needle_bytes.len() <= hay_bytes.len() {
+    while at + needle_bytes.len() <= hay_bytes.len() && out.len() < limit {
         let end = at + needle_bytes.len();
         if hay.is_char_boundary(at)
             && hay.is_char_boundary(end)
@@ -187,7 +194,7 @@ fn patch_hits(text: &str, needle: &str, case: bool) -> (Vec<Hit>, usize) {
                 continue;
             };
             let content = String::from_utf8_lossy(&line.content);
-            for range in occurrences(&content, needle, case) {
+            for range in occurrences(&content, needle, case, MAX_HITS - hits.len()) {
                 hits.push(Hit {
                     file,
                     old,
@@ -222,7 +229,7 @@ fn stage_hits(diff: &StageDiff, needle: &str, case: bool) -> Vec<Hit> {
         };
         let old = line.kind == LineKind::Removed;
         let number = if old { line.old_no } else { line.new_no }.unwrap_or(0);
-        for range in occurrences(text, needle, case) {
+        for range in occurrences(text, needle, case, MAX_HITS - hits.len()) {
             hits.push(Hit {
                 file: 0,
                 old,
@@ -277,6 +284,7 @@ impl RepoView {
         search.open = false;
         search.hits.clear();
         search.pos = None;
+        search.searching = None;
         self.focus_diff(at, window, cx);
         cx.notify();
     }
@@ -296,26 +304,50 @@ impl RepoView {
 
     /// 按搜索框里的字重新找一遍（字变了、换了大小写、改动重读了）。`jump` 为真时跳到第一处。
     pub(super) fn update_diff_search(&mut self, at: Where, jump: bool, cx: &mut Context<Self>) {
-        let search = self.diff_search.at(at);
+        let search = self.diff_search.at_mut(at);
         if !search.open {
             return;
         }
+        search.searching = None;
         let (needle, case) = (search.input.read(cx).value().to_string(), search.case);
-        let hits = match (needle.is_empty(), at) {
-            (true, _) => Vec::new(),
-            (false, Where::Changes) => match self.changes_diff() {
-                Some(diff) => stage_hits(diff, &needle, case),
-                None => Vec::new(),
-            },
-            (false, Where::History | Where::Compare) => {
-                let (hits, files) = patch_hits(self.diff_text(at), &needle, case);
-                // 我们解析出来的文件数要和改动视图里的对得上，行才定位得到
-                match files == self.diff_state(at).read(cx).files().len() {
-                    true => hits,
-                    false => Vec::new(),
-                }
+        match (needle.is_empty(), at) {
+            (true, _) => self.set_diff_hits(at, Vec::new(), jump, cx),
+            (false, Where::Changes) => {
+                let hits = match self.changes_diff() {
+                    Some(diff) => stage_hits(diff, &needle, case),
+                    None => Vec::new(),
+                };
+                self.set_diff_hits(at, hits, jump, cx);
             }
-        };
+            // 补丁要解析一遍才找得了，大的要好一会儿：放到后台，找好了再放上来（原来每敲一个字
+            // 都在界面线程上把整份补丁解析一遍）
+            (false, Where::History | Where::Compare) => {
+                let text = self.diff_text(at);
+                let files = self.diff_state(at).read(cx).files().len();
+                let task = cx.spawn(async move |this, cx| {
+                    if text.len() > SETTLE_SIZE {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(150))
+                            .await;
+                    }
+                    let (hits, found) = cx
+                        .background_spawn(async move { patch_hits(&text, &needle, case) })
+                        .await;
+                    // 我们解析出来的文件数要和改动视图里的对得上，行才定位得到
+                    let hits = match found == files {
+                        true => hits,
+                        false => Vec::new(),
+                    };
+                    this.update(cx, |this, cx| this.set_diff_hits(at, hits, jump, cx))
+                        .ok();
+                });
+                self.diff_search.at_mut(at).searching = Some(task);
+            }
+        }
+    }
+
+    /// 找好了：换上新的匹配，停在哪一处跟着调。
+    fn set_diff_hits(&mut self, at: Where, hits: Vec<Hit>, jump: bool, cx: &mut Context<Self>) {
         let search = self.diff_search.at_mut(at);
         search.hits = hits;
         search.pos = match (jump, search.pos) {
@@ -417,9 +449,9 @@ impl RepoView {
     }
 
     /// 那一处现在显示的补丁（本地修改的不走这里）。
-    fn diff_text(&self, at: Where) -> &str {
+    fn diff_text(&self, at: Where) -> SharedString {
         match at {
-            Where::Changes => "",
+            Where::Changes => SharedString::default(),
             Where::History => self.history_diff_text(),
             Where::Compare => self.compare_diff_text(),
         }
@@ -590,29 +622,38 @@ fn hit_position(hit: &Hit, path: Option<&SharedString>) -> Option<DiffLinePositi
 #[cfg(test)]
 mod tests {
     use super::{occurrences, patch_hits};
+    use std::ops::Range;
+
+    fn all(hay: &str, needle: &str, case: bool) -> Vec<Range<usize>> {
+        occurrences(hay, needle, case, usize::MAX)
+    }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn 一行里的匹配够数就不再找() {
+        assert_eq!(occurrences("aaaa", "a", true, 2), [0..1, 1..2]);
+        assert_eq!(occurrences("A a A a", "a", false, 3), [0..1, 2..3, 4..5]);
+        assert_eq!(occurrences("İ old OLD old", "old", false, 1), [3..6]);
+        assert!(occurrences("aaaa", "a", true, 0).is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
     fn 一行里找出所有匹配() {
+        assert_eq!(all("let old = Old::new(old);", "old", true), [4..7, 19..22]);
         assert_eq!(
-            occurrences("let old = Old::new(old);", "old", true),
-            [4..7, 19..22]
-        );
-        assert_eq!(
-            occurrences("let old = Old::new(old);", "old", false),
+            all("let old = Old::new(old);", "old", false),
             [4..7, 10..13, 19..22]
         );
         // 中文、和字节数不变的大小写
-        assert_eq!(occurrences("忽略空白 Ignore", "空白", false), [6..12]);
-        assert_eq!(occurrences("ÀB àb", "àb", false), [0..3, 4..7]);
+        assert_eq!(all("忽略空白 Ignore", "空白", false), [6..12]);
+        assert_eq!(all("ÀB àb", "àb", false), [0..3, 4..7]);
         // 不重叠
-        assert_eq!(occurrences("aaaa", "aa", true), [0..2, 2..4]);
-        assert!(occurrences("abc", "", true).is_empty());
-        assert!(occurrences("ab", "abc", false).is_empty());
+        assert_eq!(all("aaaa", "aa", true), [0..2, 2..4]);
+        assert!(all("abc", "", true).is_empty());
+        assert!(all("ab", "abc", false).is_empty());
         // 转小写后字节数会变的字（İ）在这一行里：英文照样不分大小写，位置不乱
-        assert_eq!(
-            occurrences("İstanbul OLD old", "old", false),
-            [10..13, 14..17]
-        );
+        assert_eq!(all("İstanbul OLD old", "old", false), [10..13, 14..17]);
     }
 
     #[test]

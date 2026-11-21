@@ -120,11 +120,11 @@ fn section_menu(
         return menu.item(PopupMenuItem::new(empty_text(section)).disabled(true));
     }
     let total = entries.len();
-    for (item, label, checked) in entries.into_iter().take(MENU_MAX) {
+    for (item, label, key, checked) in entries.into_iter().take(MENU_MAX) {
         let view = view.clone();
         menu = menu.item(PopupMenuItem::new(label).checked(checked).on_click(
             move |_, window, cx| {
-                view.update(cx, |this, cx| this.click_rail_entry(item, window, cx))
+                view.update(cx, |this, cx| this.click_rail_entry(item, &key, window, cx))
                     .ok();
             },
         ));
@@ -322,7 +322,7 @@ impl RepoView {
     /// Git 页的那几项：本地修改、所有提交，和分支、远程、标签、贮藏、子模块的弹出列表。
     fn render_git_rail(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let selected = self.sidebar.selected;
-        let changes = self.status.as_ref().map_or(0, |s| s.entries.len());
+        let changes = self.change_count();
         let changes_button = rail_button(
             "rail-changes",
             IconName::FileDiff,
@@ -419,8 +419,9 @@ impl RepoView {
         items
     }
 
-    /// 弹出列表里的各项：在侧栏里对应的那一项、显示的名字、打不打勾（当前分支）。
-    fn rail_entries(&self, section: SideSection) -> Vec<(SideItem, String, bool)> {
+    /// 弹出列表里的各项：在侧栏里对应的那一项、显示的名字、认它用的名字（贮藏是提交，见
+    /// [`Self::rail_item_now`]）、打不打勾（当前分支）。
+    fn rail_entries(&self, section: SideSection) -> Vec<(SideItem, String, String, bool)> {
         let refs = &self.refs;
         match section {
             SideSection::Branches => refs
@@ -435,38 +436,97 @@ impl RepoView {
                     if branch.behind > 0 {
                         label.push_str(&format!("  ↓{}", branch.behind));
                     }
-                    (SideItem::Branch(i), label, branch.current)
+                    (
+                        SideItem::Branch(i),
+                        label,
+                        branch.name.clone(),
+                        branch.current,
+                    )
                 })
                 .collect(),
             SideSection::Remotes => refs
                 .remotes
                 .iter()
                 .enumerate()
-                .map(|(i, branch)| (SideItem::Remote(i), branch.name.to_string(), false))
+                .map(|(i, branch)| {
+                    let name = branch.name.to_string();
+                    (SideItem::Remote(i), name.clone(), name, false)
+                })
                 .collect(),
             SideSection::Tags => refs
                 .tags
                 .iter()
                 .enumerate()
-                .map(|(i, tag)| (SideItem::Tag(i), tag.name.to_string(), false))
+                .map(|(i, tag)| {
+                    let name = tag.name.to_string();
+                    (SideItem::Tag(i), name.clone(), name, false)
+                })
                 .collect(),
             SideSection::Stashes => refs
                 .stashes
                 .iter()
                 .enumerate()
-                .map(|(i, stash)| (SideItem::Stash(i), stash_label(&stash.message), false))
+                .map(|(i, stash)| {
+                    let label = stash_label(&stash.message);
+                    (SideItem::Stash(i), label, stash.target.clone(), false)
+                })
                 .collect(),
             SideSection::Submodules => self
                 .submodules
                 .iter()
                 .enumerate()
-                .map(|(i, path)| (SideItem::Submodule(i), path.clone(), false))
+                .map(|(i, path)| (SideItem::Submodule(i), path.clone(), path.clone(), false))
                 .collect(),
         }
     }
 
+    /// 弹出列表里那一项现在在第几个：按名字（贮藏按提交、子模块按路径）在现在的列表里找，没了是
+    /// None。菜单开着时引用可能已经重读了（自动获取、文件监听），列表多一个少一个，按原来的下标取
+    /// 就成了别的那个。
+    fn rail_item_now(&self, item: SideItem, key: &str) -> Option<SideItem> {
+        let refs = &self.refs;
+        match item {
+            SideItem::Branch(_) => refs
+                .branches
+                .iter()
+                .position(|b| b.name == key)
+                .map(SideItem::Branch),
+            SideItem::Remote(_) => refs
+                .remotes
+                .iter()
+                .position(|b| b.name == key)
+                .map(SideItem::Remote),
+            SideItem::Tag(_) => refs
+                .tags
+                .iter()
+                .position(|t| t.name == key)
+                .map(SideItem::Tag),
+            SideItem::Stash(_) => refs
+                .stashes
+                .iter()
+                .position(|s| s.target == key)
+                .map(SideItem::Stash),
+            SideItem::Submodule(_) => self
+                .submodules
+                .iter()
+                .position(|path| path == key)
+                .map(SideItem::Submodule),
+            other => Some(other),
+        }
+    }
+
     /// 点了弹出列表里的一项：和在侧栏里单击那一行一样；子模块单击就打开（侧栏里要双击）。
-    fn click_rail_entry(&mut self, item: SideItem, window: &mut Window, cx: &mut Context<Self>) {
+    fn click_rail_entry(
+        &mut self,
+        item: SideItem,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 已经没了（删掉了、被别处改了名）就不做
+        let Some(item) = self.rail_item_now(item, key) else {
+            return;
+        };
         let clicks = match item {
             SideItem::Submodule(_) => 2,
             _ => 1,

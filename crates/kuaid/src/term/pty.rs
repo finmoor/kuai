@@ -10,7 +10,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
 use std::time::{Duration, Instant};
@@ -41,6 +41,8 @@ pub struct Pty {
     /// 写线程要用的那一头，`start` 时取走
     input_rx: Mutex<Option<Receiver<Option<Vec<u8>>>>>,
     closing: Arc<AtomicBool>,
+    /// 挂断时的前台进程组（见 [`Reader::finish_group`]）
+    hung_group: Arc<AtomicI32>,
 }
 
 impl Pty {
@@ -126,6 +128,7 @@ impl Pty {
             input,
             input_rx: Mutex::new(Some(input_rx)),
             closing: Arc::default(),
+            hung_group: Arc::default(),
         }
     }
 
@@ -150,6 +153,7 @@ impl Backend for Pty {
             slot: self.master.clone(),
             pid: self.pid,
             closing: self.closing.clone(),
+            hung_group: self.hung_group.clone(),
             input: self.input.clone(),
         };
         let spawned = std::thread::Builder::new()
@@ -173,9 +177,19 @@ impl Backend for Pty {
     fn kill(&self) {
         // 先挂断；读线程看到这个标记，过一会儿程序还没退就强杀
         if let Some(master) = self.master() {
+            // 记下这时的前台进程组：shell 一收到挂断就退了的话，之后就问不到了
+            if let Some(group) = foreground_group(master.as_raw_fd()) {
+                self.hung_group.store(group, Ordering::Release);
+            }
             signal(master.as_raw_fd(), self.pid, libc::SIGHUP);
         }
         self.closing.store(true, Ordering::Release);
+    }
+
+    fn programs(&self, _: &super::programs::Procs) -> Vec<String> {
+        self.master()
+            .map(|master| super::programs::foreground(master.as_raw_fd(), self.pid))
+            .unwrap_or_default()
     }
 
     fn handle(&self) -> Option<(i32, i32)> {
@@ -189,6 +203,7 @@ struct Reader {
     slot: Arc<Mutex<Option<Arc<File>>>>,
     pid: i32,
     closing: Arc<AtomicBool>,
+    hung_group: Arc<AtomicI32>,
     input: Sender<Option<Vec<u8>>>,
 }
 
@@ -203,6 +218,7 @@ impl Reader {
                 let since = *closing_since.get_or_insert_with(Instant::now);
                 if since.elapsed() > KILL_GRACE {
                     signal(fd, self.pid, libc::SIGKILL);
+                    kill_group(self.hung_group.load(Ordering::Acquire), libc::SIGKILL);
                     break;
                 }
             }
@@ -227,12 +243,29 @@ impl Reader {
                 Ready::Closed => break,
             }
         }
+        if self.closing.load(Ordering::Acquire) {
+            self.finish_group(closing_since.unwrap_or_else(Instant::now));
+        }
         let code = exit.unwrap_or_else(|| wait_exit(self.pid));
         // 放掉主端：写线程退出后它就关了
         *self.slot.lock().unwrap() = None;
         let _ = self.input.send(None);
         drop(self.master);
         self.session.finish(code);
+    }
+
+    /// 叫停时 shell 先退了：挂断时的前台程序还在（不理挂断的）就等它，过了宽限强杀；等完才算会话
+    /// 结束，叫停的地方（`close_all`）也就等到它没了。原来 shell 一退读线程就结束，没人强杀它，
+    /// 常驻进程退出以后它一直留着。
+    fn finish_group(&self, since: Instant) {
+        let group = self.hung_group.load(Ordering::Acquire);
+        while group_alive(group) {
+            if since.elapsed() > KILL_GRACE {
+                kill_group(group, libc::SIGKILL);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// 读一块输出交给会话。返回 false：对面都关了，没有可读的了。
@@ -327,14 +360,34 @@ fn wait_exit(pid: i32) -> Option<i32> {
     None
 }
 
+/// 伪终端现在的前台进程组。
+fn foreground_group(fd: RawFd) -> Option<libc::pid_t> {
+    let mut group: libc::pid_t = 0;
+    // SAFETY: TIOCGPGRP 往 group 里写一个进程组号
+    let got = unsafe { libc::ioctl(fd, libc::TIOCGPGRP as _, &mut group) } == 0;
+    (got && group > 1).then_some(group)
+}
+
+/// 进程组里还有进程。
+fn group_alive(group: libc::pid_t) -> bool {
+    // SAFETY: 信号 0 不发信号，只检查
+    group > 1 && unsafe { libc::kill(-group, 0) } == 0
+}
+
+fn kill_group(group: libc::pid_t, signal: libc::c_int) {
+    if group > 1 {
+        // SAFETY: 这个进程组是这个伪终端挂断时的前台那一组
+        unsafe { libc::kill(-group, signal) };
+    }
+}
+
 /// 给终端里的程序发信号：前台的那一组、shell 自己那一组、shell 本身。
 fn signal(fd: RawFd, pid: i32, signal: libc::c_int) {
+    if let Some(group) = foreground_group(fd) {
+        kill_group(group, signal);
+    }
     // SAFETY: 进程号都是这个伪终端里的；发信号没有内存上的事
     unsafe {
-        let mut foreground: libc::pid_t = 0;
-        if libc::ioctl(fd, libc::TIOCGPGRP as _, &mut foreground) == 0 && foreground > 1 {
-            libc::kill(-foreground, signal);
-        }
         libc::kill(-pid, signal);
         libc::kill(pid, signal);
         if signal == libc::SIGHUP {

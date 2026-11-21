@@ -55,7 +55,8 @@ pub(super) struct Log {
 
 impl Log {
     /// 开始一条命令，返回它的编号。
-    pub(super) fn begin(&mut self, label: SharedString, args: &[String]) -> u64 {
+    /// 开始执行一条命令；`command` 是给人看的命令行（`git …`）。
+    pub(super) fn begin(&mut self, label: SharedString, command: String) -> u64 {
         self.next_id += 1;
         if self.entries.len() >= MAX_ENTRIES {
             self.entries.pop_back();
@@ -64,7 +65,8 @@ impl Log {
             id: self.next_id,
             at: chrono::Local::now(),
             label,
-            command: format!("git {}", args.join(" ")).into(),
+            // 带凭据的远程地址（添加、修改远程时）不留在记录里，复制出去的也没有
+            command: fr_core::git::redact_urls(&command).into_owned().into(),
             outcome: Outcome::Running,
             elapsed: None,
             output: SharedString::default(),
@@ -87,11 +89,15 @@ impl Log {
                 } else {
                     Outcome::Failed
                 };
-                entry.output = output_text(out).into();
+                entry.output = fr_core::git::redact_urls(&output_text(out))
+                    .into_owned()
+                    .into();
             }
             Err(err) => {
                 entry.outcome = Outcome::Failed;
-                entry.output = format!("{err:#}").into();
+                entry.output = fr_core::git::redact_urls(&format!("{err:#}"))
+                    .into_owned()
+                    .into();
             }
         }
     }
@@ -367,7 +373,7 @@ mod tests {
     #[test]
     fn 记录的开始和结束() {
         let mut log = Log::default();
-        let a = log.begin("提交".into(), &["commit".into(), "-F".into(), "-".into()]);
+        let a = log.begin("提交".into(), "git commit -F -".into());
         assert_eq!(log.running(), 1);
         assert_eq!(&*log.entries[0].command, "git commit -F -");
         log.end(
@@ -386,7 +392,7 @@ mod tests {
             &*log.entries[0].output,
             "Writing: 100%\nerror: x\nnothing to commit"
         );
-        let b = log.begin("获取".into(), &["fetch".into()]);
+        let b = log.begin("获取".into(), "git fetch".into());
         log.end(b, &Err(anyhow::anyhow!("已取消")), true);
         // 新的在前
         assert_eq!(log.entries[0].outcome, Outcome::Cancelled);
@@ -397,7 +403,7 @@ mod tests {
     fn 记录多了去掉最旧的() {
         let mut log = Log::default();
         for n in 0..MAX_ENTRIES + 5 {
-            log.begin("x".into(), &[n.to_string()]);
+            log.begin("x".into(), format!("git {n}"));
         }
         assert_eq!(log.entries.len(), MAX_ENTRIES);
         assert_eq!(&*log.entries[0].command, format!("git {}", MAX_ENTRIES + 4));

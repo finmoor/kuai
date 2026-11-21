@@ -78,10 +78,9 @@ pub fn preview(cx: &App) -> impl IntoElement + use<> {
         .bg(background)
         .overflow_hidden()
         .child(
-            canvas(
-                |bounds, window, cx| frame(bounds, window, cx),
-                |bounds, frame, window, cx| paint_frame(&frame, bounds, window, cx),
-            )
+            canvas(frame, |bounds, frame, window, cx| {
+                paint_frame(&frame, bounds, window, cx)
+            })
             .size_full(),
         )
 }
