@@ -1,52 +1,184 @@
-# Kuai（筷子）
+<div align="center">
 
-Windows 上的远程开发工具：本机和远程主机上的仓库，在同一个界面里管理 Git、终端和文件。Git 部分的界面和操作方式接近 Fork，目标是完全替代 Fork。
+<img src="crates/fr-app/assets/icon.png" width="104" height="104" alt="Kuai">
 
-与 Fork 相比有两点不同。一是可以打开远程主机上的仓库：添加主机时，会在主机上安装类似 VS Code Server 的常驻程序 `kuaid`，通过 SSH 的 stdin/stdout 通信；不需要 root 权限，不开放网络端口，主机也无需联网。主机上仓库的 git 命令都在主机上执行，Windows 端只接收结果。二是可以在同一个程序中用终端编程（1.5 起）：每个仓库分为 Git 和终端两页（1.7 起），在终端页中运行 Claude Code、Codex 等工具，再切换到 Git 页查看改动、按行暂存；远程主机上的终端运行在 `kuaid` 中，关闭 Kuai 或断线后仍会继续运行；本机的终端也是（1.11 起，运行在本机的 `kuaid` 中）。主机可以是 Linux，也可以是开启了 OpenSSH 服务的 Windows 电脑（1.11 起）。主机上的目录还可以映射成本机的盘符或文件夹，用本机的程序直接打开（1.13 起，需要安装 WinFsp）。
+<h1>Kuai 筷子</h1>
 
-> 名字取自筷子：不用叉子（Fork）改用筷子，「筷」也谐音「快」。起名之前叫 fork-remote，crate 前缀 `fr-`、环境变量 `FR_*` 沿用这个内部代号。
+<p><b>远程仓库，本机体验。</b></p>
+
+<p>
+Windows 上的远程开发客户端：在一个窗口中管理本机和远程主机上的 Git、终端与文件。<br>
+Git 界面向 Fork 看齐 · 终端在断线后继续运行 · 使用 Rust 和 GPUI 编写
+</p>
+
+<p>
+<a href="https://github.com/finmoor/kuai/releases/latest"><img src="https://img.shields.io/github/v/release/finmoor/kuai?style=flat-square&label=release&color=3b82f6" alt="最新版本"></a>
+<a href="https://github.com/finmoor/kuai/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/finmoor/kuai/ci.yml?branch=main&style=flat-square&label=CI" alt="CI"></a>
+<img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square" alt="Windows 10 | 11">
+<img src="https://img.shields.io/badge/Rust-GPUI-DEA584?style=flat-square&logo=rust&logoColor=white" alt="Rust + GPUI">
+<a href="#许可证"><img src="https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-22c55e?style=flat-square" alt="MIT 或 Apache-2.0"></a>
+</p>
+
+<p>
+<a href="https://github.com/finmoor/kuai/releases/latest"><b>下载</b></a> ·
+<a href="#功能">功能</a> ·
+<a href="#快速上手">快速上手</a> ·
+<a href="#工作原理">工作原理</a> ·
+<a href="CHANGELOG.md">更新记录</a> ·
+<a href="README.en.md">English</a>
+</p>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/zh-CN/git-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/screenshots/zh-CN/git-light.png">
+  <img src="assets/screenshots/zh-CN/git-dark.png" alt="Kuai 的 Git 页：远程主机上仓库的提交图、提交详情和改动">
+</picture>
+
+<sub>远程主机 dev-server 上的仓库：提交图、提交详情和改动。截图中的项目与人名均为演示数据。</sub>
+
+</div>
+
+## 为什么做 Kuai
+
+在 Windows 上开发，代码常常放在另一台 Linux 主机上。这时：
+
+- 图形化的 Git 客户端大多只能打开本机的仓库；
+- 经 SSH 登录主机，只能使用命令行的 git；
+- 在主机上运行 Claude Code、Codex 等 AI 编程助手，连接一断任务随之中断，它改动的内容也不便逐行审查。
+
+Kuai 在主机上安装一个常驻的小程序 `kuaid`，经 SSH 与它通信：git 命令在主机上执行，终端在主机上运行，Windows 端只负责显示。远程仓库的提交图、按行暂存、冲突解决、终端和文件，用法与本机仓库相同。
+
+> 名字取自筷子：不用叉子（Fork）改用筷子，「筷」也谐音「快」。
+
+## 功能
+
+### Git：向 Fork 看齐
+
+提交图、按行暂存、交互式变基、冲突解决，日常的 Git 操作都在界面中完成。
+
+![本地修改：选中若干行后暂存，下方填写提交说明](assets/screenshots/zh-CN/changes.png)
+
+- **按文件、按块、按行**暂存和丢弃；并排对比、行内差异高亮、忽略空白、图片对比
+- **提交图**，以及按名称分组的分支、远程、标签和贮藏；可按说明、作者、哈希、文件路径或改动内容搜索提交
+- **合并、变基、交互式变基**（调整顺序、修改说明、并入、丢弃）、挑拣、还原、重置
+- **冲突解决**：逐处选择当前分支的版本、传入的版本或保留双方，也可手动编辑
+- **比较**任意两个分支、标签、提交或本地修改；文件历史、逐行追溯
+- **工作树、子仓库总览、子模块**；后台自动获取；「活动」列出执行过的每条 git 命令及其输出
+
+### 终端：关闭 Kuai 后继续运行
+
+每个仓库都有自己的终端，运行在仓库所在的主机上。关闭标签页、退出 Kuai 或网络断开，其中的程序照常运行；再次打开即可接回，屏幕内容保持不变。
+
+![「终端」页：左侧按工作区列出各仓库的终端，右侧是 Claude Code 的画面](assets/screenshots/zh-CN/terminals.png)
+
+- 适合长时间运行 **Claude Code、Codex** 等 AI 编程助手：在终端页下达任务，切换到 Git 页逐行审查它的改动
+- **「终端」页**汇总所有工作区中各仓库的终端，图标区分 AI 助手、其他命令和空闲的 shell；终端停止输出时提醒，Kuai 不在前台时发送 Windows 通知
+- **发送图片和文件**：拖放到终端，或复制截图后粘贴；文件先上传到主机，终端中得到的是它在主机上的路径
+- 一个仓库可以打开多个终端；本机仓库的终端同样在退出 Kuai 后继续运行
+- 字体、字号、行高、光标、回滚行数均可设置
+
+### 文件：无需另配 SFTP
+
+![文件页：左侧为远程仓库的目录树，右侧为编辑器](assets/screenshots/zh-CN/files.png)
+
+- **目录树和编辑器**：查看、修改、新建、重命名、删除、上传、下载，图片直接显示
+- 读写经由已建立的 SSH 连接，**无需另行配置 SFTP**，使用跳板机时同样可用
+- **目录映射**：将主机上的目录映射为本机的盘符或文件夹，用资源管理器、VS Code 等本机程序直接打开（需安装 [WinFsp](https://winfsp.dev/)，Kuai 可代为安装）
+
+### 主机：无需 root，不开放端口
+
+- 主机可以是 **Linux（x86_64）**，也可以是开启了 OpenSSH 服务的 **Windows**
+- 首次连接时自动将 `kuaid` 安装到用户目录 `~/.kuai`：**不需要 root 权限，不开放网络端口**，主机也无需联网
+- 使用 Windows 自带的 OpenSSH，沿用 `~/.ssh/config`、密钥和 ssh-agent；密码和私钥口令保存在 Windows 凭据管理器中
+- 支持多级**跳板机**，跳板机上不安装任何程序
+- **工作区**将常一起使用的仓库归为一组，保存在仓库所在的主机上：换一台电脑连接，看到的是同一份
+- 新版 Kuai 连接时自动更新主机上的 kuaid，正在运行的终端不受影响
+
+### 更多画面
+
+<table>
+  <tr>
+    <td width="50%" valign="top"><img src="assets/screenshots/zh-CN/compare.png" alt="比较两个分支"><br><sub><b>比较</b> · 任意两个分支、标签、提交或本地修改</sub></td>
+    <td width="50%" valign="top"><img src="assets/screenshots/zh-CN/workspaces.png" alt="工作区页"><br><sub><b>工作区</b> · 一组仓库的分支、改动数和终端状态</sub></td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top"><img src="assets/screenshots/zh-CN/themes.png" alt="设置中的全部配色"><br><sub><b>配色</b> · 13 套，深色和浅色各选一套</sub></td>
+    <td width="50%" valign="top"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/zh-CN/git-light.png"><source media="(prefers-color-scheme: light)" srcset="assets/screenshots/zh-CN/git-dark.png"><img src="assets/screenshots/zh-CN/git-light.png" alt="另一种主题下的 Git 页"></picture><br><sub><b>深色与浅色</b> · 可跟随系统</sub></td>
+  </tr>
+</table>
+
+此外还有：中文和英文界面、托盘和开机自启、可固定和恢复的标签页、快速打开仓库（Ctrl+P），以及带 SHA-256 校验的一键更新。
+
+## 与 Fork 相比
+
+Kuai 的 Git 界面和操作方式向 [Fork](https://fork.dev/) 看齐，目标是在日常使用中替代它。
+
+- **多出来的**：打开远程主机上的仓库；内置的、退出后继续运行的终端；文件页和目录映射；中文界面；开源。
+- **还没有的**：reflog、bisect、Git LFS 的专用界面、git-flow、自定义命令、多选提交批量操作，以及 GitHub、GitLab 等平台的账号集成和拉取请求。
 
 ## 下载
 
-从 [GitHub Releases](https://github.com/finmoor/kuai/releases) 下载，以下两种任选其一：
+从 [GitHub Releases](https://github.com/finmoor/kuai/releases/latest) 下载，以下两种任选其一：
 
 - **安装版** `kuai-<版本>-windows-x64-setup.exe`（推荐）：安装在用户目录下（`%LOCALAPPDATA%\Programs\Kuai`），无需管理员权限；可从开始菜单启动，可在「设置 → 应用」中卸载。
 - **解压版** `kuai-<版本>-windows-x64.zip`：解压得到的 Kuai 文件夹可放在任意位置，双击 `kuai.exe` 运行。
 
-运行要求：64 位 Windows 10 或 11，PATH 中有 git（2.31 或更新的版本），使用 Windows 自带的 OpenSSH；远程主机为 Linux（x86_64）或开启了 OpenSSH 服务的 Windows，并已安装 git（同样需要 2.31 或更新的版本），无需 root 权限。将主机上的目录映射到本机时还需安装 [WinFsp](https://winfsp.dev/)，未安装时 Kuai 可经 winget 代为安装。程序未进行代码签名，首次运行时 Windows 可能提示「Windows 已保护你的电脑」，请点击「更多信息」，再点击「仍要运行」。
+运行要求：
 
-有新版本时，标题栏齿轮左侧会显示更新提示，点击可查看更新内容并一键更新（安装版在后台运行新的安装程序，解压版直接替换文件）；也可在「设置 → 关于」中检查更新。主机上的 kuaid 无需单独更新，新版 Kuai 连接时会自动替换。
-
-## 技术栈
-
-- 客户端：Rust + GPUI，经 [gpui-kit](https://github.com/longbridge/gpui-kit) 0.9 引入（gpui-pre 快照、gpui-base、gpui-component）。
-- 主机上的 `kuaid`：Rust；Linux 版用 musl 静态编译，从 Windows 交叉编译；Windows 版（1.11 起）和客户端一起编。1.5 以前叫 fr-agent，那时不常驻。
-- 本机仓库在进程内直接调用核心代码；远程主机上的仓库经 SSH 交给 kuaid。两边用同一套 `fr-core`。本机仓库的终端（1.11 起）开在这台电脑自己的 kuaid 里。
-- git 操作调用命令行，密码输入走 askpass 助手，和 Fork 的做法一样；高频只读操作以后可以换成 gitoxide。
-- 选这套栈是为了性能。GPUI 还没到 1.0，动手前先做了技术验证（大提交图滚动、大 diff 高亮、中文输入法、kuaid 经 SSH 往返），都通过了。
-
-## 目录
-
-| 路径 | 内容 |
+| 位置 | 要求 |
 |---|---|
-| `crates/fr-core` | 调用 git、解析输出、计算提交图布局、通信协议、界面语言（`i18n.rs`，英文译文在 `locales/en.json`）；不依赖界面，客户端和 kuaid 共用 |
-| `crates/fr-channel` | 仓库通道：本机仓库在进程内执行 git，远程主机上的仓库经 ssh 交给 kuaid（连接复用、自动安装 kuaid、终端接口）；测试工具 `fr-probe` |
-| `crates/fr-app` | GPUI 客户端 |
-| `crates/kuaid` | 常驻程序 `kuaid`（Linux、Windows）：执行 git、托管终端会话；装在主机上，Windows 电脑自己也用它开终端 |
-| `crates/fr-mount` | 把主机上的目录映射成本机的盘符或文件夹：WinFsp 的薄绑定（运行时加载它的 DLL）和文件系统，读写变成 kuaid 的 `fs_*` 请求 |
-| `tools/gen-test-repo.py` | 生成性能测试用的大仓库 |
-| `tools/ui-test/` | 界面测试脚本：建测试仓库、截窗口、往测试窗口投递点击和输入（不动真实鼠标） |
-| `tools/package.ps1` | 打发布包：客户端加 Linux 版、Windows 版 kuaid，出安装程序和解压版的 zip，输出到 `dist/` |
-| `tools/installer/` | 安装程序的脚本（Inno Setup 6，`kuai.iss`）和简体中文的界面文字 |
-| `tools/release-notes.ps1`、`CHANGELOG.md` | 发版时的发布说明：取 `CHANGELOG.md` 里这个版本的那一节 |
-| `.github/workflows/` | 推代码时跑测试（`ci.yml`，kuaid 常驻那一套在 Windows、Linux 上各跑各的）；推 `v*` 标签时打包发版（`release.yml`） |
-| `tools/make-icon.py` | 画应用图标，输出 `crates/fr-app/assets/icon.ico` |
+| 本机 | 64 位 Windows 10 或 11；PATH 中有 git 2.31 或更新的版本；使用 Windows 自带的 OpenSSH |
+| 远程主机 | Linux（x86_64），或开启了 OpenSSH 服务的 Windows；已安装 git 2.31 或更新的版本；无需 root 权限 |
+| 目录映射 | 需安装 [WinFsp](https://winfsp.dev/)，未安装时 Kuai 可经 winget 代为安装 |
 
-## 版本
+程序未进行代码签名，首次运行时 Windows 可能提示「Windows 已保护你的电脑」，请点击「更多信息」，再点击「仍要运行」。
 
-各版本的更新内容见 [CHANGELOG.md](CHANGELOG.md) 和 [GitHub Releases](https://github.com/finmoor/kuai/releases)。
+有新版本时，标题栏齿轮左侧会显示更新提示，点击可查看更新内容并一键更新（安装版在后台运行新的安装程序，解压版直接替换文件）；也可在「设置 → 关于」中检查更新。主机上的 kuaid 无需单独更新，新版 Kuai 连接时会自动替换。各版本的更新内容见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 快速上手
+
+1. 安装并打开 Kuai。
+2. 在「主机」页点击「添加主机…」，填写地址和用户名（也可以填 `~/.ssh/config` 中的主机别名），选择用密钥或密码登录。
+3. 首次连接时，Kuai 自动将 kuaid 安装到主机的 `~/.kuai` 下并启动。
+4. 点击「打开仓库…」，在主机上选择仓库所在的目录。
+5. 每个仓库分为 Git、终端、文件三页：在终端页运行 `claude`，按 <kbd>Ctrl</kbd>+<kbd>&#96;</kbd> 回到 Git 页查看改动、按行暂存、提交。
+
+打开本机的仓库：在「主机」页选中「本机」，点击「添加本机仓库…」；或在命令行中运行 `kuai.exe <仓库路径>`。
+
+## 工作原理
+
+```mermaid
+flowchart LR
+    subgraph pc["Windows 电脑"]
+        app["Kuai<br/>GPUI 客户端"]
+    end
+    subgraph host["远程主机 · Linux 或 Windows"]
+        kd["kuaid<br/>常驻，无需 root"]
+        git["git"]
+        term["终端会话"]
+        files["文件"]
+    end
+    app ==>|"SSH 的标准输入输出<br/>不开放网络端口"| kd
+    kd --> git
+    kd --> term
+    kd --> files
+```
+
+- **git 在主机上执行。** Windows 端只接收结果并负责显示；解析输出、计算提交图布局的代码（`fr-core`）由客户端和 kuaid 共用。
+- **kuaid 是一个静态链接的单文件程序**（Linux 版约 3 MB），经 SSH 上传到 `~/.kuai` 下。所有客户端断开且终端全部结束 10 分钟后，它自动退出。
+- **通信只经过 SSH 的标准输入输出**，沿用系统已有的密钥和配置，不新开端口，也不需要额外的账号。
+- **原生界面。** 客户端使用 Rust 和 [GPUI](https://www.gpui.rs/)（经 [gpui-kit](https://github.com/longbridge/gpui-kit) 引入）编写，由显卡绘制。技术验证时，在 20 万个提交、13 条并行泳道的测试仓库上，解析历史用时 79 ms，计算泳道布局用时 14 ms，滚动时每帧绘制平均 2.7 ms。
+
+## 反馈
+
+发现问题或有建议，请在 [Issues](https://github.com/finmoor/kuai/issues) 中提出。
 
 ## 快捷键
+
+常用的几个：<kbd>Ctrl</kbd>+<kbd>P</kbd> 快速打开仓库，<kbd>Ctrl</kbd>+<kbd>&#96;</kbd> 在终端页和之前的页面之间切换，<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> 打开「终端」页，<kbd>Ctrl</kbd>+<kbd>Enter</kbd> 提交，在改动行上按空格键暂存。
+
+<details>
+<summary><b>全部快捷键</b></summary>
 
 | 按键 | 作用 |
 |---|---|
@@ -64,6 +196,7 @@ Windows 上的远程开发工具：本机和远程主机上的仓库，在同一
 | Ctrl+Shift+B | 收起或展开左侧栏（收起后显示为一列图标，所有标签页共用此状态） |
 | Ctrl+Shift+E | 切换到当前仓库的文件页 |
 | Ctrl+Shift+A | 切换到「终端」页（所有工作区中各仓库的终端） |
+| Ctrl+Shift+↑、Ctrl+Shift+↓ | 在「终端」页往终端中输入时，切换到侧栏中的上一个、下一个终端（输入时终端画面顶上有一条细线） |
 | Alt+← | 在子仓库或工作树中时，返回根仓库的子仓库总览或工作树总览（焦点在终端、输入框中时不生效） |
 | Ctrl+S | 保存文件页中当前打开的文件 |
 
@@ -78,9 +211,43 @@ Windows 上的远程开发工具：本机和远程主机上的仓库，在同一
 | 逐行追溯 | 上下方向键、PageUp、PageDown、Home、End 选择行，Enter 跳转到修改该行的提交，Esc 关闭 |
 | 文件页的目录树 | 上下方向键切换，左右方向键折叠、展开目录，Enter 打开文件并保留，空格键预览；F2 重命名，Delete 删除（会先确认） |
 
-焦点位于终端中时，只有以下快捷键仍由 Kuai 处理：Ctrl+Tab、Ctrl+Shift+Tab、Ctrl+Shift+T、Ctrl+1、Ctrl+2、Ctrl+Shift+E、Ctrl+\`、Ctrl+Shift+\`、Ctrl+,、Ctrl+Shift+B、Ctrl+Shift+A。其余按键（Tab、Shift+Tab、Esc、F5、Ctrl+W、Ctrl+F、Ctrl+P、Ctrl+S、功能键、Alt 组合键等）全部交给终端中的程序。终端中：Ctrl+C 中断（选中文字时为复制），Ctrl+Shift+C 复制，Ctrl+V、Shift+Insert 粘贴（剪贴板中为图片或文件时，粘贴的是其路径）；右键在有选中文字时复制，否则粘贴；Shift+PageUp、Shift+PageDown 和鼠标滚轮可查看之前的输出；终端中的程序使用鼠标时（例如 Claude Code），滚轮交给程序，按住 Shift 滚动则查看终端的记录。
+焦点位于终端中时，只有以下快捷键仍由 Kuai 处理：Ctrl+Tab、Ctrl+Shift+Tab、Ctrl+Shift+T、Ctrl+1、Ctrl+2、Ctrl+Shift+E、Ctrl+\`、Ctrl+Shift+\`、Ctrl+,、Ctrl+Shift+B、Ctrl+Shift+A，以及「终端」页中的 Ctrl+Shift+↑、Ctrl+Shift+↓。其余按键（Tab、Shift+Tab、Esc、F5、Ctrl+W、Ctrl+F、Ctrl+P、Ctrl+S、功能键、Alt 组合键等）交给终端中的程序（Alt+V 见下文）。终端中：Ctrl+C 中断（选中文字时为复制），Ctrl+Shift+C 复制，Ctrl+V、Shift+Insert 粘贴（剪贴板中为图片或文件时，粘贴的是其路径）；远程主机上的终端中，剪贴板中有图片或文件时 Alt+V（Claude Code 在 Windows 上粘贴图片的按键）也由 Kuai 发送，与 Ctrl+V 相同，否则交给程序；右键在有选中文字时复制，否则粘贴；Shift+PageUp、Shift+PageDown、鼠标滚轮和右侧的滚动条可查看之前的输出，往回翻时输入区固定在底部，打字时画面不动，按 Enter 回到底部；左侧的刻度是发出过的消息，鼠标停留可预览，单击跳转。终端中的程序使用鼠标时（例如 opencode、全屏模式的 Claude Code），点击、拖动、右键和滚轮都交给程序；按住 Shift 时仍由 Kuai 处理：拖动选中文字，右键复制或粘贴，滚动查看终端的记录。
 
-## 构建与运行
+</details>
+
+## 开发
+
+需要 Rust（stable，MSVC 工具链）和 Visual Studio 生成工具；`cargo run --release -p fr-app` 即可运行客户端。
+
+<details>
+<summary><b>技术栈、目录结构、构建与发版</b></summary>
+
+### 技术栈
+
+- 客户端：Rust + GPUI，经 [gpui-kit](https://github.com/longbridge/gpui-kit) 0.9 引入（gpui-pre 快照、gpui-base、gpui-component）。
+- 主机上的 `kuaid`：Rust；Linux 版用 musl 静态编译，从 Windows 交叉编译；Windows 版（1.11 起）和客户端一起编。1.5 以前叫 fr-agent，那时不常驻。
+- 本机仓库在进程内直接调用核心代码；远程主机上的仓库经 SSH 交给 kuaid。两边用同一套 `fr-core`。本机仓库的终端（1.11 起）开在这台电脑自己的 kuaid 里。
+- git 操作调用命令行，密码输入走 askpass 助手，和 Fork 的做法一样；高频只读操作以后可以换成 gitoxide。
+- 选这套栈是为了性能。GPUI 还没到 1.0，动手前先做了技术验证（大提交图滚动、大 diff 高亮、中文输入法、kuaid 经 SSH 往返），都通过了。
+
+### 目录
+
+| 路径 | 内容 |
+|---|---|
+| `crates/fr-core` | 调用 git、解析输出、计算提交图布局、通信协议、界面语言（`i18n.rs`，英文译文在 `locales/en.json`）；不依赖界面，客户端和 kuaid 共用 |
+| `crates/fr-channel` | 仓库通道：本机仓库在进程内执行 git，远程主机上的仓库经 ssh 交给 kuaid（连接复用、自动安装 kuaid、终端接口）；测试工具 `fr-probe` |
+| `crates/fr-app` | GPUI 客户端 |
+| `crates/kuaid` | 常驻程序 `kuaid`（Linux、Windows）：执行 git、托管终端会话；装在主机上，Windows 电脑自己也用它开终端 |
+| `crates/fr-mount` | 把主机上的目录映射成本机的盘符或文件夹：WinFsp 的薄绑定（运行时加载它的 DLL）和文件系统，读写变成 kuaid 的 `fs_*` 请求 |
+| `tools/gen-test-repo.py` | 生成性能测试用的大仓库 |
+| `tools/ui-test/` | 界面测试脚本：建测试仓库、截窗口、往测试窗口投递点击和输入（不动真实鼠标） |
+| `tools/package.ps1` | 打发布包：客户端加 Linux 版、Windows 版 kuaid，出安装程序和解压版的 zip，输出到 `dist/` |
+| `tools/installer/` | 安装程序的脚本（Inno Setup 6，`kuai.iss`）和简体中文的界面文字 |
+| `tools/release-notes.ps1`、`CHANGELOG.md` | 发版时的发布说明：取 `CHANGELOG.md` 里这个版本的那一节 |
+| `.github/workflows/` | 推代码时跑测试（`ci.yml`，kuaid 常驻那一套在 Windows、Linux 上各跑各的）；推 `v*` 标签时打包发版（`release.yml`） |
+| `tools/make-icon.py` | 画应用图标，输出 `crates/fr-app/assets/icon.ico` |
+
+### 构建与运行
 
 需要 Rust（stable，MSVC 工具链）和 Visual Studio 生成工具（「使用 C++ 的桌面开发」：MSVC 和 Windows SDK）。第一次编译约 5 分钟。
 
@@ -124,6 +291,8 @@ pwsh tools/package.ps1
 设置存在 `%APPDATA%\kuai\settings.json`；环境变量 `FR_SETTINGS` 可以换成别的文件，测试时不碰自己的设置（开机自启写的是注册表，测试时用 `FR_AUTOSTART_KEY` 换一个键，任务管理器里的「禁用」记在它后面加 `-approved` 的键里）。
 
 界面上新加一句话：源码里直接写中文、包上 `tr("…")`（带变量用 `tf!`），再到 `crates/fr-core/locales/en.json` 里补英文；没补的话 `cargo test -p fr-core` 会把缺的列出来。在 Git Bash 里给 Windows 程序传 `/data/...` 这类路径会被改写，所以上面测主机那条要加 `MSYS_NO_PATHCONV=1`。
+
+</details>
 
 ## 许可证
 
