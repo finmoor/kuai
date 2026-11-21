@@ -211,7 +211,7 @@ flowchart LR
 | 逐行追溯 | 上下方向键、PageUp、PageDown、Home、End 选择行，Enter 跳转到修改该行的提交，Esc 关闭 |
 | 文件页的目录树 | 上下方向键切换，左右方向键折叠、展开目录，Enter 打开文件并保留，空格键预览；F2 重命名，Delete 删除（会先确认） |
 
-焦点位于终端中时，只有以下快捷键仍由 Kuai 处理：Ctrl+Tab、Ctrl+Shift+Tab、Ctrl+Shift+T、Ctrl+1、Ctrl+2、Ctrl+Shift+E、Ctrl+\`、Ctrl+Shift+\`、Ctrl+,、Ctrl+Shift+B、Ctrl+Shift+A，以及「终端」页中的 Ctrl+Shift+↑、Ctrl+Shift+↓。其余按键（Tab、Shift+Tab、Esc、F5、Ctrl+W、Ctrl+F、Ctrl+P、Ctrl+S、功能键、Alt 组合键等）交给终端中的程序（Alt+V 见下文）。终端中：Ctrl+C 中断（选中文字时为复制），Ctrl+Shift+C 复制，Ctrl+V、Shift+Insert 粘贴（剪贴板中为图片或文件时，粘贴的是其路径）；远程主机上的终端中，剪贴板中有图片或文件时 Alt+V（Claude Code 在 Windows 上粘贴图片的按键）也由 Kuai 发送，与 Ctrl+V 相同，否则交给程序；右键在有选中文字时复制，否则粘贴；Shift+PageUp、Shift+PageDown、鼠标滚轮和右侧的滚动条可查看之前的输出，往回翻时输入区固定在底部，打字时画面不动，按 Enter 回到底部；左侧的刻度是发出过的消息，鼠标停留可预览，单击跳转。终端中的程序使用鼠标时（例如 opencode、全屏模式的 Claude Code），点击、拖动、右键和滚轮都交给程序；按住 Shift 时仍由 Kuai 处理：拖动选中文字，右键复制或粘贴，滚动查看终端的记录。
+焦点位于终端中时，只有以下快捷键仍由 Kuai 处理：Ctrl+Tab、Ctrl+Shift+Tab、Ctrl+Shift+T、Ctrl+1、Ctrl+2、Ctrl+Shift+E、Ctrl+\`、Ctrl+Shift+\`、Ctrl+,、Ctrl+Shift+B、Ctrl+Shift+A，以及「终端」页中的 Ctrl+Shift+↑、Ctrl+Shift+↓。其余按键（Tab、Shift+Tab、Esc、F5、Ctrl+W、Ctrl+F、Ctrl+P、Ctrl+S、功能键、Alt 组合键等）交给终端中的程序（Alt+V 见下文）。终端中：Ctrl+C 中断（选中文字时为复制），Ctrl+Shift+C 复制，Ctrl+V、Shift+Insert 粘贴（剪贴板中为图片或文件时，粘贴的是其路径）；远程主机上的终端中，剪贴板中有图片或文件时 Alt+V（Claude Code 在 Windows 上粘贴图片的按键）也由 Kuai 发送，与 Ctrl+V 相同，否则交给程序；右键在有选中文字时复制，否则粘贴；Shift+PageUp、Shift+PageDown、鼠标滚轮和右侧的滚动条可查看之前的输出，往回翻时输入区固定在底部，打字时画面不动，按 Enter 回到底部；左侧的刻度是发出过的消息，鼠标停留可预览，单击跳转；按住 Ctrl 单击网址、文件路径即可打开：网址在浏览器中打开，仓库中的文件在文件页中打开并跳到对应的行，本机上仓库外的文件用默认程序打开。终端中的程序使用鼠标时（例如 opencode、全屏模式的 Claude Code），点击、拖动、右键和滚轮都交给程序；按住 Shift 时仍由 Kuai 处理：拖动选中文字，右键复制或粘贴，滚动查看终端的记录。
 
 </details>
 

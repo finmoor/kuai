@@ -140,9 +140,12 @@ Ctrl+Shift+A 「终端」页；Alt+← 从子仓库或工作树返回总览。
 终端中：仅 Ctrl+Tab、Ctrl+Shift+Tab、Ctrl+Shift+T、Ctrl+1、Ctrl+2、Ctrl+Shift+E、Ctrl+`、Ctrl+Shift+`、
 Ctrl+,、Ctrl+Shift+B、Ctrl+Shift+A 仍由 Kuai 处理，其余按键（Tab、Esc、F5、Ctrl+W、Ctrl+F、Ctrl+P、Ctrl+S 等）均交给终端中的程序；
 Ctrl+C 中断（选中文字时为复制）；Ctrl+Shift+C 复制；Ctrl+V、Shift+Insert 粘贴（粘贴图片或文件时为文件路径）；
+远程主机上的终端中，剪贴板里有图片或文件时 Alt+V 与 Ctrl+V 相同；
 右键默认在有选中文字时复制，否则粘贴（可在设置中修改）；Ctrl+加号、Ctrl+减号调整字号，Ctrl+0 恢复默认；
-鼠标滚轮、触摸板或 Shift+PageUp、Shift+PageDown 查看之前的输出；终端中的程序使用鼠标时（例如 Claude Code），
-滚轮交给程序，按住 Shift 滚动则查看终端的记录。
+鼠标滚轮、触摸板、右侧的滚动条或 Shift+PageUp、Shift+PageDown 查看之前的输出，往回查看时输入区固定在底部，
+按 Enter 回到底部；左侧的刻度是发送过的消息，鼠标停留可预览，单击跳转；
+按住 Ctrl 单击网址、文件路径即可打开（仓库中的文件在文件页中打开）；
+终端中的程序使用鼠标时（例如 opencode），点击、拖动和滚轮交给程序，按住 Shift 则由 Kuai 处理（选中文字、查看记录）。
 列表中：上下方向键切换选中项；在文件和改动行上按空格键暂存、按 Delete 丢弃；
 文件列表中按住 Ctrl 或 Shift 点击可多选。
 文件页的目录树中：方向键移动、折叠和展开，Enter 打开，空格键预览，F2 重命名，Delete 删除。
