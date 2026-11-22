@@ -6,7 +6,9 @@ mod appearance;
 mod autostart;
 mod browser;
 mod clone;
+mod desktop;
 mod diagnose;
+mod fonts;
 mod graph_paint;
 mod instance;
 mod machines;
@@ -394,6 +396,8 @@ fn main() {
     if update::apply_staged_at_startup() {
         return;
     }
+    // Linux：应用菜单里的 Kuai 和图标（解压即用，没有安装程序）
+    desktop::integrate();
 
     // 本机 git 的版本号先在后台问好（读工作树清单时要看），界面线程上不等 git 启动
     std::thread::spawn(fr_core::git::local_version);
@@ -410,6 +414,8 @@ fn main() {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            // Linux 上挑等宽字体（没有 Consolas）
+            fonts::init(cx);
             // 组件库自带的文字（输入框的右键菜单、对话框的关闭按钮等）跟着界面语言
             gpui_kit::component::set_locale(fr_core::i18n::lang().code());
             // Ctrl+Shift+F：切换 GPUI 的帧耗时浮层（隐藏 → 简要 → 详细）
@@ -505,6 +511,12 @@ fn main() {
                     title: Some("Kuai".into()),
                     ..gpui_kit::component::TitleBar::title_bar_options()
                 }),
+                // Linux 上也自己画标题栏和最小化、最大化、关闭（阴影、拖边改大小由组件库的窗口边框
+                // 来做）；不要的话窗口管理器在上面再加一条自己的标题栏。桌面不支持时（没有合成器的
+                // X11）窗口管理器照样加，组件库那时不画按钮。
+                window_decorations: cfg!(target_os = "linux").then_some(WindowDecorations::Client),
+                // Linux 上窗口的 WM_CLASS / app_id：桌面靠它对上 kuai.desktop，任务栏才显示 Kuai 的图标
+                app_id: cfg!(target_os = "linux").then(|| "kuai".to_string()),
                 ..gpui_kit::component::TitleBar::window_options()
             };
             gpui_kit::open_window(options, cx, |window, cx| {

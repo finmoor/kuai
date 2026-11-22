@@ -247,7 +247,7 @@ pub(super) fn rows_box(rows: &[Row], cx: &App) -> Div {
                 .child(
                     div()
                         .flex_none()
-                        .font_family("Consolas")
+                        .font_family(crate::fonts::mono())
                         .text_color(muted)
                         .child(commit.id.chars().take(8).collect::<String>()),
                 )

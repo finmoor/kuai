@@ -922,7 +922,7 @@ impl RepoView {
             }
             if local {
                 let file = format!("{full_path}/{}", entry.path);
-                menu = menu.item(PopupMenuItem::new(tr("在资源管理器中显示")).on_click(
+                menu = menu.item(PopupMenuItem::new(crate::shell::reveal_label()).on_click(
                     move |_, window, cx| {
                         crate::shell::report(crate::shell::reveal_in_explorer(&file), window, cx)
                     },

@@ -46,7 +46,6 @@ const FILE_ROW_HEIGHT: f32 = 24.;
 /// diff 里每一行（包括块标题）的高度。uniform_list 按量出来的一行给所有行排版，
 /// 行高必须一样；块标题里的 xsmall 按钮高 20px，正好放得下
 const DIFF_ROW_HEIGHT: f32 = 22.;
-const MONO: &str = "Consolas";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Area {
@@ -2452,7 +2451,7 @@ impl RepoView {
                         .h(px(DIFF_ROW_HEIGHT))
                         .w_full()
                         .px_3()
-                        .font_family(MONO)
+                        .font_family(crate::fonts::mono())
                         .text_size(px(12.))
                         .text_color(c.muted)
                         .child(text)
@@ -2461,7 +2460,7 @@ impl RepoView {
                         // 按钮在前、标题在后：窗口窄、标题长的时候按钮不会被挤到右边看不见的地方
                         let title = div()
                             .flex_none()
-                            .font_family(MONO)
+                            .font_family(crate::fonts::mono())
                             .text_size(px(12.))
                             .text_color(c.muted)
                             .child(text);
@@ -2541,7 +2540,7 @@ impl RepoView {
                             .id(ix)
                             .h(px(DIFF_ROW_HEIGHT))
                             .w_full()
-                            .font_family(MONO)
+                            .font_family(crate::fonts::mono())
                             .text_size(px(13.))
                             .when_some(bg, |d, bg| d.bg(bg))
                             .on_mouse_down(

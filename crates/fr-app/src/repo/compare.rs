@@ -48,7 +48,6 @@ use super::{Mode, RepoView};
 use crate::ui;
 
 const ROW_HEIGHT: f32 = 24.;
-const MONO: &str = "Consolas";
 /// 「提交」一栏里每边最多列这么多个
 const COMMITS_MAX: usize = 300;
 /// 下拉里分支、标签各最多列这么多个，再多的填名字
@@ -1192,7 +1191,7 @@ impl RepoView {
                         div()
                             .flex_none()
                             .text_xs()
-                            .font_family(MONO)
+                            .font_family(crate::fonts::mono())
                             .text_color(muted)
                             .child(short(&sha).to_string())
                     })),
@@ -1714,7 +1713,7 @@ impl RepoView {
                                 div()
                                     .flex_none()
                                     .text_xs()
-                                    .font_family(MONO)
+                                    .font_family(crate::fonts::mono())
                                     .text_color(muted)
                                     .child(short(&id).to_string()),
                             )

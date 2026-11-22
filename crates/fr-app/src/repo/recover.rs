@@ -1146,7 +1146,7 @@ impl RepoView {
                             .w(px(SHA_WIDTH))
                             .flex_none()
                             .text_xs()
-                            .font_family("Consolas")
+                            .font_family(crate::fonts::mono())
                             .text_color(muted)
                             .child(short(&step.id).to_string()),
                     );

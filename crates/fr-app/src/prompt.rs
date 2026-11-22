@@ -213,7 +213,7 @@ fn open_host_key(
                         .child(
                             div()
                                 .text_sm()
-                                .font_family("Consolas")
+                                .font_family(crate::fonts::mono())
                                 .child(key.fingerprint.clone()),
                         ),
                 )

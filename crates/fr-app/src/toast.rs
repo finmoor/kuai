@@ -1,5 +1,5 @@
-//! Windows 的系统通知：屏幕右下角弹出来、之后留在通知中心里的那种。Kuai 不在前台时用它说
-//! 「某个终端停下了」，点一下回到 Kuai、前往那个终端。
+//! 系统通知：Windows 上是屏幕右下角弹出来、之后留在通知中心里的那种，Linux 上是桌面的通知（见
+//! Linux 的 `imp`）。Kuai 不在前台时用它说「某个终端停下了」，点一下回到 Kuai、前往那个终端。
 //!
 //! 不用界面库带的那一套（`Notification::in_app_and_system`）：它要先给整个进程设 AppUserModelID，
 //! 任务栏按这个标识把窗口和固定的图标对上号，1.14 以前固定到任务栏上的 Kuai 图标没有这个标识，
@@ -49,6 +49,7 @@ fn escape(text: &str) -> String {
 }
 
 /// 通知的内容：标题一行、正文一行（空着就只有标题），不出声。
+#[cfg_attr(not(windows), allow(dead_code))]
 fn document(title: &str, body: &str) -> String {
     let (title, body) = (clean(title), clean(body));
     let mut xml = String::from(r#"<toast><visual><binding template="ToastGeneric">"#);
@@ -221,7 +222,162 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+/// Linux：freedesktop 的通知接口（`org.freedesktop.Notifications`，经 D-Bus）。GPUI 自带的那一套
+/// 同一个标记不会换掉上一条、也收不回，这里自己来：一个后台线程连着会话总线，记下每个标记的通知号，
+/// 再发时带上它（换掉上一条），收回时按号关掉；用户点了通知（`ActionInvoked` 的 `default`）就把
+/// 标记交出去。
+#[cfg(target_os = "linux")]
+mod imp {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use futures::StreamExt as _;
+    use futures::channel::mpsc;
+
+    enum Job {
+        Show {
+            tag: String,
+            title: String,
+            body: String,
+        },
+        Remove(String),
+        /// 做完了往里回个话（退出前收回时要等它做完）
+        Clear(std::sync::mpsc::SyncSender<()>),
+    }
+
+    pub struct Toasts {
+        jobs: mpsc::UnboundedSender<Job>,
+    }
+
+    impl Toasts {
+        pub fn new(clicks: mpsc::UnboundedSender<String>) -> Self {
+            let (jobs, rx) = mpsc::unbounded();
+            let spawned = std::thread::Builder::new()
+                .name("kuai-notify".into())
+                .spawn(move || {
+                    if let Err(err) = futures::executor::block_on(serve(rx, clicks)) {
+                        log::warn!("系统通知用不了：{err}");
+                    }
+                });
+            if let Err(err) = spawned {
+                log::warn!("无法启动发系统通知的线程：{err}");
+            }
+            Self { jobs }
+        }
+
+        pub fn show(&mut self, tag: &str, title: &str, body: &str) {
+            let _ = self.jobs.unbounded_send(Job::Show {
+                tag: tag.to_string(),
+                title: title.to_string(),
+                body: body.to_string(),
+            });
+        }
+
+        pub fn remove(&mut self, tag: &str) {
+            let _ = self.jobs.unbounded_send(Job::Remove(tag.to_string()));
+        }
+
+        /// 等它做完（最多半秒）：退出时调的，不等的话进程先退了，通知还留在那里点不动。
+        pub fn clear(&mut self) {
+            let (done, wait) = std::sync::mpsc::sync_channel(1);
+            if self.jobs.unbounded_send(Job::Clear(done)).is_ok() {
+                let _ = wait.recv_timeout(Duration::from_millis(500));
+            }
+        }
+    }
+
+    async fn serve(
+        mut jobs: mpsc::UnboundedReceiver<Job>,
+        clicks: mpsc::UnboundedSender<String>,
+    ) -> zbus::Result<()> {
+        let connection = zbus::Connection::session().await?;
+        let proxy = zbus::Proxy::new(
+            &connection,
+            "org.freedesktop.Notifications",
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications",
+        )
+        .await?;
+        let mut actions = proxy.receive_signal("ActionInvoked").await?.fuse();
+        // 标记 → 通知号
+        let mut shown: HashMap<String, u32> = HashMap::new();
+        loop {
+            futures::select! {
+                job = jobs.next() => {
+                    let Some(job) = job else { break };
+                    if let Err(err) = run(&proxy, &mut shown, job).await {
+                        log::warn!("系统通知没发出去：{err}");
+                    }
+                }
+                signal = actions.next() => {
+                    let Some(signal) = signal else { break };
+                    let Ok((id, action)) = signal.body().deserialize::<(u32, String)>() else {
+                        continue;
+                    };
+                    let tag = shown.iter().find(|(_, shown)| **shown == id).map(|(tag, _)| tag);
+                    if let Some(tag) = tag
+                        && action == "default"
+                    {
+                        clicks.unbounded_send(tag.clone()).ok();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn run(
+        proxy: &zbus::Proxy<'_>,
+        shown: &mut HashMap<String, u32>,
+        job: Job,
+    ) -> zbus::Result<()> {
+        match job {
+            Job::Show { tag, title, body } => {
+                let replaces = shown.get(&tag).copied().unwrap_or(0);
+                // 桌面靠 desktop-entry 对上 kuai.desktop，显示 Kuai 的名字和图标
+                let hints = HashMap::from([("desktop-entry", zbus::Variant::Str("kuai".into()))]);
+                let id: u32 = proxy
+                    .call(
+                        "Notify",
+                        &(
+                            "Kuai",
+                            replaces,
+                            "kuai",
+                            super::clean(&title),
+                            // 正文可能按标记语言解析：尖括号、& 换掉
+                            super::escape(&super::clean(&body)),
+                            vec!["default", "Kuai"],
+                            hints,
+                            -1i32,
+                        ),
+                    )
+                    .await?;
+                shown.insert(tag, id);
+            }
+            Job::Remove(tag) => {
+                if let Some(id) = shown.remove(&tag) {
+                    close(proxy, id).await;
+                }
+            }
+            Job::Clear(done) => {
+                for (_, id) in shown.drain() {
+                    close(proxy, id).await;
+                }
+                let _ = done.try_send(());
+            }
+        }
+        Ok(())
+    }
+
+    /// 关掉一条；已经被用户关掉、过期了的不算错。
+    async fn close(proxy: &zbus::Proxy<'_>, id: u32) {
+        let _: zbus::Result<()> = proxy.call("CloseNotification", &(id,)).await;
+    }
+
+    pub fn unregister() {}
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 mod imp {
     use futures::channel::mpsc;
 

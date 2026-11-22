@@ -219,7 +219,7 @@ pub(super) fn tree_menu(
             ));
         if !remote {
             menu = menu.item(item(
-                tr("在资源管理器中显示"),
+                crate::shell::reveal_label(),
                 Box::new(move |this, window, cx| {
                     let path = this.full_path(&reveal);
                     crate::shell::report(crate::shell::reveal_in_explorer(&path), window, cx);
@@ -694,10 +694,7 @@ impl RepoView {
         cx: &mut Context<Self>,
     ) {
         let name = split(&path).1.to_string();
-        let downloads = std::env::var_os("USERPROFILE")
-            .map(|home| PathBuf::from(home).join("Downloads"))
-            .filter(|dir| dir.is_dir())
-            .unwrap_or_else(std::env::temp_dir);
+        let downloads = downloads_dir().unwrap_or_else(std::env::temp_dir);
         let picked = cx.prompt_for_new_path(&downloads, Some(&name));
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(dest))) = picked.await else {
@@ -763,7 +760,7 @@ impl RepoView {
                             let shown = shown.clone();
                             Button::new("download-reveal")
                                 .small()
-                                .label(tr("在资源管理器中显示"))
+                                .label(crate::shell::reveal_label())
                                 .on_click(move |_, window, cx| {
                                     let result = crate::shell::reveal_in_explorer(&shown);
                                     crate::shell::report(result, window, cx);
@@ -1084,6 +1081,25 @@ impl RepoView {
             cx.notify();
         }
     }
+}
+
+/// 「下载」文件夹：Windows 是 `<用户目录>\Downloads`；Linux 问 `xdg-user-dir`（中文桌面上叫「下载」），
+/// 问不到用 `~/Downloads`。不存在时是 None。
+fn downloads_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let dir = std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join("Downloads"));
+    #[cfg(not(windows))]
+    let dir = std::process::Command::new("xdg-user-dir")
+        .arg("DOWNLOAD")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|dir| PathBuf::from(dir.trim()))
+        .filter(|dir| dir.is_absolute() && dir.is_dir())
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Downloads")));
+    dir.filter(|dir| dir.is_dir())
 }
 
 /// 下载副本的子目录编号：整个进程一个计数。不用标签的编号，那是每个仓库页各自从头数的，两个

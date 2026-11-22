@@ -95,7 +95,7 @@ impl CloneView {
                         .rsplit_once(['\\', '/'])
                         .map(|(dir, _)| drive_root(dir))
                 })
-                .or_else(|| std::env::var("USERPROFILE").ok()),
+                .or_else(|| std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok()),
             Some(_) if start_dir.is_some() => start_dir,
             Some(id) => match app.read(cx).status(id) {
                 ConnStatus::Ready(conn) => Some(conn.hello.home.clone()),
@@ -508,7 +508,8 @@ fn expand_home(path: &str, home: &str) -> String {
 
 /// 目录和文件夹名拼成完整路径。本机用反斜杠，服务器上用斜杠。
 fn join(parent: &str, name: &str, local: bool) -> String {
-    let separator = if local { '\\' } else { '/' };
+    // Windows 本机用反斜杠，别的（服务器上的、Linux 本机）用正斜杠
+    let separator = if local && cfg!(windows) { '\\' } else { '/' };
     let trimmed = parent.trim_end_matches(['/', '\\']);
     // 根目录（`/`、`C:\`）去掉尾巴后会变空或只剩盘符，补回分隔符
     format!("{trimmed}{separator}{name}")
@@ -751,7 +752,10 @@ mod tests {
 
     #[test]
     fn 拼出克隆到的路径() {
+        #[cfg(windows)]
         assert_eq!(join(r"C:\work\", "app", true), r"C:\work\app");
+        #[cfg(not(windows))]
+        assert_eq!(join("/home/me/", "app", true), "/home/me/app");
         assert_eq!(join("/home/me", "app", false), "/home/me/app");
         assert_eq!(join("/", "app", false), "/app");
     }

@@ -40,6 +40,14 @@ self-replace = "1.5.1"
 semver = "1.0.28"
 sha2 = "0.10"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# 密码、口令存进钥匙圈（Secret Service，secrets.rs）。版本、特性和 GPUI 用的一致，不多编一份
+oo7 = { version = "0.6", default-features = false, features = ["async-std", "native_crypto"] }
+# 系统通知（toast.rs）：经 D-Bus 发 freedesktop 通知。版本、特性和 GPUI 带的 notify-rust 用的一致
+zbus = { version = "6", default-features = false, features = ["proxy", "default-rt"] }
+# X11 上把窗口叫到前面（win.rs 的 raise）。版本和 GPUI 用的一致
+x11rb = "0.13.1"
+
 [target.'cfg(windows)'.dependencies]
 # 托盘图标和它的右键菜单（最小化到托盘、关闭到托盘）
 tray-icon = { version = "0.26", default-features = false }

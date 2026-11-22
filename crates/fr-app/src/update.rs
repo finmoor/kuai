@@ -704,9 +704,17 @@ fn update_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("FR_UPDATE_DIR") {
         return dir.into();
     }
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+    // Windows 是 %LOCALAPPDATA%，Linux 是 $XDG_CACHE_HOME（没设就是 ~/.cache）
+    let env = |name: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    let base = match cfg!(windows) {
+        true => env("LOCALAPPDATA"),
+        false => env("XDG_CACHE_HOME").or_else(|| env("HOME").map(|home| home.join(".cache"))),
+    };
+    base.unwrap_or_else(std::env::temp_dir)
         .join("kuai")
         .join("update")
 }

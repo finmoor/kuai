@@ -875,7 +875,7 @@ impl RepoView {
                             Box::new(move |this, window, cx| this.open_externally(id, window, cx)),
                         ))
                         .item(item(
-                            tr("在资源管理器中显示"),
+                            crate::shell::reveal_label(),
                             Box::new(move |this, window, cx| {
                                 let path = this.full_path(&reveal);
                                 let result = crate::shell::reveal_in_explorer(&path);
@@ -1220,7 +1220,7 @@ impl RepoView {
                     false => row.child(
                         Button::new("opaque-reveal")
                             .small()
-                            .label(tr("在资源管理器中显示"))
+                            .label(crate::shell::reveal_label())
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 let full = this.full_path(&path);
                                 let result = crate::shell::reveal_in_explorer(&full);

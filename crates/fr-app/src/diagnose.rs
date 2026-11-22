@@ -475,11 +475,17 @@ struct Redact {
 impl Redact {
     fn new() -> Self {
         let mut redact = Redact { pairs: Vec::new() };
-        if let Some(home) = std::env::var_os("USERPROFILE") {
-            let home = home.to_string_lossy().to_string();
-            if let Some((base, _)) = home.rsplit_once('\\') {
-                let hidden = format!("{base}\\<{}>", tr("用户"));
-                redact.add(&home.replace('\\', "/"), &hidden.replace('\\', "/"));
+        let (var, sep) = match cfg!(windows) {
+            true => ("USERPROFILE", '\\'),
+            false => ("HOME", '/'),
+        };
+        if let Some(home) = std::env::var_os(var) {
+            let home = home.to_string_lossy().trim_end_matches(sep).to_string();
+            if let Some((base, _)) = home.rsplit_once(sep) {
+                let hidden = format!("{base}{sep}<{}>", tr("用户"));
+                if cfg!(windows) {
+                    redact.add(&home.replace('\\', "/"), &hidden.replace('\\', "/"));
+                }
                 redact.add(&home, &hidden);
             }
         }
@@ -621,6 +627,16 @@ fn os_text() -> String {
             };
             return format!("{name} {display}（{build}）{}", std::env::consts::ARCH);
         }
+    }
+    // Linux：发行版的名字（Ubuntu 24.04.5 LTS）
+    #[cfg(not(windows))]
+    if let Ok(text) = std::fs::read_to_string("/etc/os-release")
+        && let Some(name) = text
+            .lines()
+            .find_map(|line| line.strip_prefix("PRETTY_NAME="))
+    {
+        let name = name.trim().trim_matches('"');
+        return format!("{name} {}", std::env::consts::ARCH);
     }
     format!("{} {}", std::env::consts::OS, std::env::consts::ARCH)
 }
@@ -1126,7 +1142,7 @@ fn steps_box(steps: &[Step], cx: &App) -> Div {
                                     .rounded(px(4.))
                                     .bg(secondary)
                                     .text_xs()
-                                    .font_family("Consolas")
+                                    .font_family(crate::fonts::mono())
                                     .whitespace_normal()
                                     .child(step.raw.clone()),
                             )
@@ -1148,7 +1164,7 @@ fn report_box(text: String, cx: &App) -> AnyElement {
         .border_color(theme.border)
         .bg(theme.secondary)
         .text_xs()
-        .font_family("Consolas")
+        .font_family(crate::fonts::mono())
         .whitespace_normal()
         .children(
             text.lines()

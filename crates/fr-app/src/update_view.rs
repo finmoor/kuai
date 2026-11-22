@@ -503,7 +503,7 @@ fn problem_hint(problem: &Problem, muted: Hsla) -> Option<Div> {
             .text_color(muted)
             .child(
                 div()
-                    .font_family("Consolas")
+                    .font_family(crate::fonts::mono())
                     .child(dir.to_string_lossy().to_string()),
             )
             .child(div().whitespace_normal().child(tr(

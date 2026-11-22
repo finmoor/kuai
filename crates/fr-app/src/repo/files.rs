@@ -848,7 +848,8 @@ impl RepoView {
     /// 仓库根在磁盘上的完整路径加上相对路径（状态栏、复制路径用）。服务器上的用 `/`，本机用 `\`。
     pub(super) fn full_path(&self, path: &str) -> String {
         let root = self.entry.path.trim_end_matches(['/', '\\']);
-        if self.entry.server.is_some() {
+        // 服务器上的、Windows 以外的本机：正斜杠
+        if self.entry.server.is_some() || !cfg!(windows) {
             return match path.is_empty() {
                 true => root.to_string(),
                 false => format!("{root}/{path}"),

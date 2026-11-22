@@ -285,7 +285,7 @@ impl RepoView {
                                 .w(px(150.))
                                 .flex_none()
                                 .px_2()
-                                .font_family("Consolas")
+                                .font_family(crate::fonts::mono())
                                 .text_color(muted)
                                 .child(who),
                         )
@@ -312,7 +312,7 @@ impl RepoView {
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .font_family("Consolas")
+                                .font_family(crate::fonts::mono())
                                 .text_sm()
                                 .whitespace_nowrap()
                                 .overflow_hidden()

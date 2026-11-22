@@ -253,7 +253,7 @@ pub(crate) fn render_block<T: 'static>(
                 .child(
                     ui::clipped(("block-path", key), block.entry.path.clone())
                         .text_xs()
-                        .font_family("Consolas")
+                        .font_family(crate::fonts::mono())
                         .text_color(muted),
                 ),
         )
@@ -324,7 +324,7 @@ pub(crate) fn render_block<T: 'static>(
                                 .child(
                                     ui::clipped(("sub-path", id), relative.clone())
                                         .text_xs()
-                                        .font_family("Consolas")
+                                        .font_family(crate::fonts::mono())
                                         .text_color(muted),
                                 ),
                         )
@@ -503,7 +503,7 @@ fn state_cells(
                         div()
                             .min_w_0()
                             .truncate()
-                            .font_family("Consolas")
+                            .font_family(crate::fonts::mono())
                             .text_color(if state.is_some() { strong } else { muted })
                             .child(branch),
                     )

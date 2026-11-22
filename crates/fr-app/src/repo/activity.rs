@@ -320,7 +320,7 @@ impl Render for ActivityPanel {
                     .child(
                         ui::clipped("command", entry.command.clone())
                             .flex_1()
-                            .font_family("Consolas")
+                            .font_family(crate::fonts::mono())
                             .text_xs()
                             .text_color(muted),
                     )
@@ -343,7 +343,7 @@ impl Render for ActivityPanel {
                         .gap_2()
                         .rounded(px(ui::RADIUS))
                         .bg(panel)
-                        .font_family("Consolas")
+                        .font_family(crate::fonts::mono())
                         .text_xs()
                         .child(div().whitespace_normal().child(entry.command.clone()))
                         .child(

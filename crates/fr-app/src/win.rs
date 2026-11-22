@@ -177,6 +177,48 @@ pub fn hwnd(window: &Window) -> Option<Hwnd> {
     imp::hwnd(window)
 }
 
+/// Linux（X11）上把窗口叫到最前，最小化的也还原：以任务栏、窗口切换器的身份（source=2）发
+/// `_NET_ACTIVE_WINDOW`。GPUI 的 `activate_window` 发的标的是应用自己（source=1）、时间戳为 0，
+/// mutter 防抢焦点，只让 Dock 上的图标标出来。Wayland 上交给 GPUI；Windows 上用 [`show`]。
+#[cfg(target_os = "linux")]
+pub fn raise(window: &Window) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{ClientMessageEvent, ConnectionExt as _, EventMask};
+    // GPUI 的 Window 自己也有 window_handle()，要写明是 raw-window-handle 的那个
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let id = match handle.as_raw() {
+        RawWindowHandle::Xcb(handle) => handle.window.get(),
+        RawWindowHandle::Xlib(handle) => handle.window as u32,
+        _ => return,
+    };
+    let sent = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let (conn, screen) = x11rb::connect(None)?;
+        let root = conn.setup().roots[screen].root;
+        let atom = conn
+            .intern_atom(false, b"_NET_ACTIVE_WINDOW")?
+            .reply()?
+            .atom;
+        let event = ClientMessageEvent::new(32, id, atom, [2u32, 0, 0, 0, 0]);
+        conn.send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            event,
+        )?;
+        conn.flush()?;
+        Ok(())
+    })();
+    if let Err(err) = sent {
+        log::warn!("没能把窗口叫到前面：{err}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn raise(_: &Window) {}
+
 /// 把窗口藏起来（任务栏上的按钮也没了），只能从托盘叫回来。
 pub fn hide(hwnd: Hwnd) {
     imp::hide(hwnd)

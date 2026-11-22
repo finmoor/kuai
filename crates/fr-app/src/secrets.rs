@@ -1,5 +1,6 @@
 //! 服务器的登录密码、私钥口令：存在 Windows 凭据管理器里（「控制面板 › 凭据管理器 › Windows 凭据」
-//! 的「普通凭据」），由系统按登录用户加密，`settings.json` 里不存。
+//! 的「普通凭据」），Linux 上存在钥匙圈（Secret Service）里，由系统按登录用户加密，`settings.json`
+//! 里不存。
 //!
 //! 每台服务器一条，名字是 `kuai:server:<服务器 id>`。环境变量 FR_SECRETS_PREFIX 可以换掉
 //! 前面那段（测试用，免得测试留下的和真的混在一起）。
@@ -205,7 +206,137 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+/// Linux：存进 Secret Service（GNOME 钥匙圈、KWallet，经 D-Bus），和 GPUI 用的是同一个库。每条带
+/// 两个属性：`application=kuai`、`kuai-target=<凭据名>`，「用户名」那一栏记在 `account` 属性里。
+///
+/// 只有存（用户在主机设置里点了保存）时才会弹系统的框：还没有钥匙圈时要设密码新建一个，锁着时
+/// （自动登录的桌面不会自动解锁）要密码解锁；用户不给就是没存上。读、删、列出都不弹框：每次连接
+/// 都要读，在界面线程上，钥匙圈没有、锁着都当作没存，连接时照常问密码。
+#[cfg(target_os = "linux")]
+mod imp {
+    use std::collections::HashMap;
+
+    use oo7::dbus::{Collection, Item};
+
+    const APPLICATION: &str = "kuai";
+
+    type DbusResult<T> = Result<T, oo7::dbus::Error>;
+
+    fn run<T, E>(work: impl std::future::Future<Output = Result<T, E>>) -> Result<T, E> {
+        futures::executor::block_on(work)
+    }
+
+    /// 默认的钥匙圈，已经解锁的才要：不新建、不弹框解锁。
+    async fn unlocked() -> DbusResult<Option<Collection>> {
+        let service = oo7::dbus::Service::new().await?;
+        let Some(collection) = service.with_alias("default").await? else {
+            return Ok(None);
+        };
+        Ok((!collection.is_locked().await?).then_some(collection))
+    }
+
+    async fn find(target: Option<&str>) -> DbusResult<Vec<Item>> {
+        let Some(collection) = unlocked().await? else {
+            return Ok(Vec::new());
+        };
+        match target {
+            Some(target) => {
+                collection
+                    .search_items(&[("application", APPLICATION), ("kuai-target", target)])
+                    .await
+            }
+            None => {
+                collection
+                    .search_items(&[("application", APPLICATION)])
+                    .await
+            }
+        }
+    }
+
+    pub fn write(target: &str, account: &str, secret: &str) -> Result<(), String> {
+        let attributes = HashMap::from([
+            ("application", APPLICATION),
+            ("kuai-target", target),
+            ("account", account),
+        ]);
+        run(async {
+            let keyring = oo7::Keyring::new().await?;
+            keyring.unlock().await?;
+            // 同一条（application、kuai-target 一样）先删掉：account 变了的话 replace 换不掉它
+            keyring
+                .delete(&[("application", APPLICATION), ("kuai-target", target)])
+                .await?;
+            keyring
+                .create_item(&format!("Kuai: {account}"), &attributes, secret, true)
+                .await
+        })
+        .map_err(|err| err.to_string())
+    }
+
+    pub fn read(target: &str) -> Option<(String, String)> {
+        let found = run(async {
+            let Some(item) = find(Some(target)).await?.into_iter().next() else {
+                return Ok(None);
+            };
+            if item.is_locked().await? {
+                return Ok(None);
+            }
+            let secret = item.secret().await?;
+            let account = item
+                .attributes()
+                .await?
+                .remove("account")
+                .unwrap_or_default();
+            DbusResult::Ok(Some((secret, account)))
+        });
+        match found {
+            Ok(Some((secret, account))) => {
+                Some((String::from_utf8(secret.to_vec()).ok()?, account))
+            }
+            Ok(None) => None,
+            Err(err) => {
+                log::warn!("读不了钥匙圈：{err}");
+                None
+            }
+        }
+    }
+
+    pub fn delete(target: &str) {
+        let done = run(async {
+            for item in find(Some(target)).await? {
+                item.delete(None).await?;
+            }
+            DbusResult::Ok(())
+        });
+        if let Err(err) = done {
+            log::warn!("没删掉钥匙圈里的 {target}：{err}");
+        }
+    }
+
+    /// 名字匹配 `pattern` 的（只认末尾一个 `*` 当通配，和 Windows 的写法一样）。
+    pub fn list(pattern: &str) -> Vec<String> {
+        let prefix = pattern.strip_suffix('*');
+        let found = run(async {
+            let mut names = Vec::new();
+            for item in find(None).await? {
+                if let Some(name) = item.attributes().await?.remove("kuai-target") {
+                    names.push(name);
+                }
+            }
+            DbusResult::Ok(names)
+        });
+        found
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|name| match prefix {
+                Some(prefix) => name.starts_with(prefix),
+                None => name == pattern,
+            })
+            .collect()
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 mod imp {
     pub fn write(_: &str, _: &str, _: &str) -> Result<(), String> {
         Err(fr_core::i18n::tr("当前系统不支持保存密码").into())
@@ -283,5 +414,53 @@ mod tests {
         let name = format!("kuai-test:long-{}", std::process::id());
         assert!(imp::write(&name, "tester", &"x".repeat(2000)).is_err());
         assert_eq!(imp::read(&name), None);
+    }
+}
+
+/// 真的读写钥匙圈：要有桌面会话和 Secret Service（钥匙圈锁着时会弹框要密码），平时不跑。
+/// `cargo test -p fr-app secrets -- --ignored`，在桌面的终端里运行。
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::imp;
+
+    #[test]
+    #[ignore = "要有桌面会话和钥匙圈"]
+    fn 钥匙圈存取删() {
+        let name = format!("kuai-test:{}", std::process::id());
+        imp::write(&name, "me@10.0.0.1", "第一个 密码").unwrap();
+        assert_eq!(
+            imp::read(&name),
+            Some(("第一个 密码".into(), "me@10.0.0.1".into()))
+        );
+        // 换掉：地址也跟着换，不留两条
+        imp::write(&name, "me@10.0.0.2", "second").unwrap();
+        assert_eq!(
+            imp::read(&name),
+            Some(("second".into(), "me@10.0.0.2".into()))
+        );
+        assert_eq!(
+            imp::list("kuai-test:*")
+                .iter()
+                .filter(|n| **n == name)
+                .count(),
+            1
+        );
+        imp::delete(&name);
+        assert_eq!(imp::read(&name), None);
+        assert!(!imp::list("kuai-test:*").contains(&name));
+        // 钥匙圈锁着时读、删都不弹框，当作没存。测完钥匙圈是锁着的（下次存时会要密码），这一条
+        // 删不掉，用固定的名字，重复跑也只留这一条
+        let locked = "kuai-test:locked";
+        imp::write(locked, "me@10.0.0.1", "x").unwrap();
+        futures::executor::block_on(async {
+            let service = oo7::dbus::Service::new().await.unwrap();
+            let collection = service.with_alias("default").await.unwrap().unwrap();
+            collection.lock(None).await.unwrap();
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(imp::read(locked), None);
+        assert!(imp::list("kuai-test:*").is_empty());
+        imp::delete(locked);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 }

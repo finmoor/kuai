@@ -262,12 +262,12 @@ async fn init(channel: &Channel, dir: &str) -> Result<String, String> {
     }
 }
 
-/// 仓库列表里的一项。本机的路径换成 Windows 的写法，和以前加进来的一致。
-/// git 给的仓库根目录（`rev-parse --show-toplevel`）在列表里的写法：本机换成反斜杠。
+/// 仓库列表里的一项。本机是 Windows 时路径换成 Windows 的写法，和以前加进来的一致。
+/// git 给的仓库根目录（`rev-parse --show-toplevel`）在列表里的写法：Windows 本机换成反斜杠。
 pub(crate) fn entry(server: Option<String>, root: &str) -> RepoEntry {
     let path = match server {
-        None => root.replace('/', "\\"),
-        Some(_) => root.to_string(),
+        None if cfg!(windows) => root.replace('/', "\\"),
+        _ => root.to_string(),
     };
     RepoEntry { server, path }
 }

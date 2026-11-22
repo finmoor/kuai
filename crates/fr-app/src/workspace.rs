@@ -533,6 +533,24 @@ impl Workspace {
             .update(cx, |updater, cx| updater.window_shown(cx));
     }
 
+    /// 把窗口叫到前面（点了系统通知、又启动了一次 Kuai）。Windows 上 [`Self::show_window`] 会从托盘、
+    /// 最小化里还原；别的系统上请窗口管理器激活它（最小化的也还原）。
+    fn bring_to_front(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_window(cx);
+        if !cfg!(windows) {
+            window.activate_window();
+            win::raise(window);
+            // 在 GNOME 的通知面板里点的：面板还开着时窗口管理器不理激活请求，等它关了再请求一次
+            cx.spawn_in(window, async move |_, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(400))
+                    .await;
+                cx.update(|window, _| win::raise(window)).ok();
+            })
+            .detach();
+        }
+    }
+
     /// 把窗口藏到托盘。和 [`Self::show_window`] 一样放到这一轮更新之后再做。
     fn hide_window(&self, cx: &mut Context<Self>) {
         if let Some(hwnd) = self.hwnd {
@@ -688,7 +706,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if request.show {
-            self.show_window(cx);
+            self.bring_to_front(window, cx);
         }
         if let Some(dir) = request.open {
             self.open_local_dir(dir, window, cx);
@@ -1310,7 +1328,7 @@ impl Workspace {
     /// 点了系统通知：把窗口叫到前面，前往那个终端（它已经不在了就只叫窗口）。
     fn toast_clicked(&mut self, tag: &str, window: &mut Window, cx: &mut Context<Self>) {
         log::info!("点了系统通知：{tag}");
-        self.show_window(cx);
+        self.bring_to_front(window, cx);
         let row = tag.rsplit_once('/').and_then(|(machine, term)| {
             let id = TermId {
                 machine: machine.to_string(),
@@ -1376,7 +1394,13 @@ impl Workspace {
         if let Some(hwnd) = self.hwnd {
             cx.spawn(async move |_, _| win::flash(hwnd)).detach();
         }
-        if self.app.read(cx).settings.notify_terminal_system {
+        let system = self.app.read(cx).settings.notify_terminal_system;
+        // Linux：不发系统通知时请窗口管理器提醒（Dock、任务栏上的图标标出来）。发的话不用：GNOME 对
+        // 「请求注意」的窗口另发一条「Kuai 已就绪」，和我们的通知重了
+        if !cfg!(windows) && !system {
+            window.request_attention();
+        }
+        if system {
             self.toast_job(ToastJob::Show {
                 key: toast_key.to_string(),
                 title: toast_title.to_string(),
@@ -2485,7 +2509,7 @@ fn path_row(path: SharedString, cx: &App) -> impl IntoElement {
                 .flex_1()
                 .text_ellipsis_start()
                 .text_xs()
-                .font_family("Consolas")
+                .font_family(crate::fonts::mono())
                 .text_color(muted),
         )
         .child(

@@ -1661,7 +1661,7 @@ impl RepoView {
                             .w(px(SHA_WIDTH))
                             .flex_none()
                             .text_xs()
-                            .font_family("Consolas")
+                            .font_family(crate::fonts::mono())
                             .text_color(colors.muted)
                             .child(SharedString::from(
                                 commit.id[..8.min(commit.id.len())].to_string(),

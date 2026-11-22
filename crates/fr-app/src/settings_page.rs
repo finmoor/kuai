@@ -86,7 +86,10 @@ impl SettingsPage {
                 },
             ),
         )
-        .description(tr("登录 Windows 后自动启动；开启托盘选项时直接进入托盘。"));
+        .description(match cfg!(windows) {
+            true => tr("登录 Windows 后自动启动；开启托盘选项时直接进入托盘。"),
+            false => tr("登录桌面后自动启动。"),
+        });
         let minimize = {
             let (get, set) = (app.clone(), app.clone());
             SettingItem::new(
@@ -176,13 +179,14 @@ impl SettingsPage {
             .default_open(true)
             .group(SettingGroup::new().title(tr("语言")).item(language))
             .group(SettingGroup::new().title(tr("标签页")).item(tab_close))
-            .group(
-                SettingGroup::new()
-                    .title(tr("启动和关闭"))
-                    .item(autostart)
-                    .item(minimize)
-                    .item(close),
-            )
+            .group({
+                let group = SettingGroup::new().title(tr("启动和关闭")).item(autostart);
+                // Linux 上还没有托盘：两个托盘选项不显示
+                match crate::tray::AVAILABLE {
+                    true => group.item(minimize).item(close),
+                    false => group,
+                }
+            })
             .group(
                 SettingGroup::new()
                     .title("Git")
@@ -521,7 +525,10 @@ impl SettingsPage {
         let notify_system = {
             let (get, set) = (app.clone(), app.clone());
             SettingItem::new(
-                tr("发送 Windows 通知"),
+                match cfg!(windows) {
+                    true => tr("发送 Windows 通知"),
+                    false => tr("发送系统通知"),
+                },
                 SettingField::switch(
                     move |cx| get.read(cx).settings.notify_terminal_system,
                     move |on, cx| {
@@ -531,9 +538,14 @@ impl SettingsPage {
                     },
                 ),
             )
-            .description(tr(
-                "Kuai 不在前台时，终端停下同时发送 Windows 通知；点击通知前往该终端。需开启上一项。",
-            ))
+            .description(match cfg!(windows) {
+                true => tr(
+                    "Kuai 不在前台时，终端停下同时发送 Windows 通知；点击通知前往该终端。需开启上一项。",
+                ),
+                false => tr(
+                    "Kuai 不在前台时，终端停下同时发送系统通知；点击通知前往该终端。需开启上一项。",
+                ),
+            })
         };
         SettingPage::new(tr("终端"))
             .icon(Icon::new(IconName::SquareTerminal))
@@ -590,7 +602,10 @@ impl SettingsPage {
                     },
                 ),
             )
-            .description(tr("「跟随系统」使用 Windows 的深色或浅色设置。"))
+            .description(match cfg!(windows) {
+                true => tr("「跟随系统」使用 Windows 的深色或浅色设置。"),
+                false => tr("「跟随系统」使用系统的深色或浅色设置。"),
+            })
         };
         let palette_item = |dark: bool| {
             let (get, set) = (app.clone(), app.clone());

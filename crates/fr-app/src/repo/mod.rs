@@ -933,12 +933,14 @@ impl RepoView {
                     match app.read(cx).local_path(&server_id, &c) {
                         Some(local) => {
                             let code = local.clone();
-                            menu.item(PopupMenuItem::new(tr("在资源管理器中打开")).on_click(
-                                move |_, window, cx| {
-                                    let result = crate::shell::open_folder(&local);
-                                    crate::shell::report(result, window, cx)
-                                },
-                            ))
+                            menu.item(
+                                PopupMenuItem::new(crate::shell::open_folder_label()).on_click(
+                                    move |_, window, cx| {
+                                        let result = crate::shell::open_folder(&local);
+                                        crate::shell::report(result, window, cx)
+                                    },
+                                ),
+                            )
                             .item(
                                 PopupMenuItem::new(tr("在本机的 VS Code 中打开")).on_click(
                                     move |_, window, cx| {
@@ -964,11 +966,13 @@ impl RepoView {
                             crate::shell::report(crate::shell::open_vscode(&b), window, cx)
                         },
                     ))
-                    .item(PopupMenuItem::new(tr("在资源管理器中打开")).on_click(
-                        move |_, window, cx| {
-                            crate::shell::report(crate::shell::open_folder(&c), window, cx)
-                        },
-                    )),
+                    .item(
+                        PopupMenuItem::new(crate::shell::open_folder_label()).on_click(
+                            move |_, window, cx| {
+                                crate::shell::report(crate::shell::open_folder(&c), window, cx)
+                            },
+                        ),
+                    ),
             }
         })
     }

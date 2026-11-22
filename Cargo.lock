@@ -1800,6 +1800,7 @@ dependencies = [
  "gpui-pre",
  "image",
  "log",
+ "oo7",
  "raw-window-handle",
  "self-replace",
  "semver",
@@ -1812,6 +1813,8 @@ dependencies = [
  "windows 0.62.2",
  "winreg",
  "winresource",
+ "x11rb",
+ "zbus 6.2.1",
  "zip",
 ]
 

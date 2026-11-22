@@ -572,7 +572,12 @@ impl RightClick {
 }
 
 impl TerminalSettings {
-    pub const DEFAULT_FONT: &str = "Consolas";
+    /// Linux 上这台电脑没装时，画的时候换成系统的等宽字体（`fonts::usable`）
+    pub const DEFAULT_FONT: &str = if cfg!(windows) {
+        "Consolas"
+    } else {
+        "DejaVu Sans Mono"
+    };
     pub const DEFAULT_SIZE: f32 = 13.;
     pub const MIN_SIZE: f32 = 9.;
     pub const MAX_SIZE: f32 = 24.;
@@ -1276,10 +1281,18 @@ const DIR: &str = "kuai";
 const LEGACY_DIR: &str = "fork-remote";
 const FILE: &str = "settings.json";
 
+/// 设置文件夹的上一级：Windows 是 `%APPDATA%`；Linux 是 `$XDG_CONFIG_HOME`，没设就是 `~/.config`
+/// （和 fr-core 的状态文件同一个文件夹，见 `fr_core::store::path`）。
 fn appdata() -> PathBuf {
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+    let env = |name: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    if cfg!(windows) {
+        return env("APPDATA").unwrap_or_else(|| PathBuf::from("."));
+    }
+    env("XDG_CONFIG_HOME").unwrap_or_else(|| PathBuf::from(fr_core::dir::home()).join(".config"))
 }
 
 pub fn file() -> PathBuf {
@@ -2026,7 +2039,7 @@ mod tests {
         use super::{RightClick, TerminalCursor, TerminalSettings};
         let settings = Settings::default();
         let terminal = &settings.terminal;
-        assert_eq!(terminal.font, "Consolas");
+        assert_eq!(terminal.font, TerminalSettings::DEFAULT_FONT);
         assert_eq!(terminal.font_size, 13.);
         // 1.9 以前行高写死 16 像素
         assert_eq!(terminal.cell_height(), 16.);
@@ -2057,7 +2070,7 @@ mod tests {
                 .contains("\"terminal\":")
         );
         let empty = super::parse(r#"{"terminal":{"font":" ","font_size":2}}"#).unwrap();
-        assert_eq!(empty.terminal.font, "Consolas");
+        assert_eq!(empty.terminal.font, TerminalSettings::DEFAULT_FONT);
         assert_eq!(empty.terminal.font_size, 9.);
     }
 

@@ -72,7 +72,9 @@ pub(super) fn config(prefs: &TerminalSettings) -> Config {
 
 /// 画字用的字体：选的等宽字体，里面没有的字（中文）先找选的中文字体，再由系统挑。
 pub(super) fn base_font(prefs: &TerminalSettings) -> Font {
-    let mut font = font(SharedString::from(prefs.font.clone()));
+    let mut font = font(SharedString::from(
+        crate::fonts::usable(&prefs.font).to_string(),
+    ));
     if !prefs.cjk_font.is_empty() {
         font.fallbacks = Some(FontFallbacks::from_fonts(vec![prefs.cjk_font.clone()]));
     }

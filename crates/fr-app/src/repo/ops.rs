@@ -1688,9 +1688,10 @@ static WRITING: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, SharedString>>,
 > = std::sync::LazyLock::new(Default::default);
 
-/// 仓库在 [`WRITING`] 里的键：哪台电脑和路径。本机（Windows）不分大小写，两种斜杠都算。
+/// 仓库在 [`WRITING`] 里的键：哪台电脑和路径。Windows 本机不分大小写，两种斜杠都算。
 pub(super) fn writing_key(server: Option<&str>, path: &str) -> String {
     match server {
+        None if !cfg!(windows) => format!("\n{}", path.trim_end_matches('/')),
         None => {
             let path = path.replace('/', "\\");
             format!("\n{}", path.trim_end_matches('\\').to_lowercase())
@@ -1804,10 +1805,17 @@ mod tests {
 
     #[test]
     fn 同一个仓库同时只能有一处在写() {
-        let key = writing_key(None, r"C:\Work\写互斥测试\");
-        assert_eq!(key, writing_key(None, "c:/work/写互斥测试"));
+        // Windows 本机不分大小写、两种斜杠都算；Linux 本机分大小写
+        let (path, same) = match cfg!(windows) {
+            true => (r"C:\Work\写互斥测试\", "C:/WORK/写互斥测试"),
+            false => ("/work/写互斥测试/", "/work/写互斥测试"),
+        };
+        let key = writing_key(None, path);
+        assert_eq!(key, writing_key(None, same));
+        #[cfg(not(windows))]
+        assert_ne!(key, writing_key(None, "/WORK/写互斥测试"));
         let first = Writing::take(key.clone(), "拉取".into()).unwrap();
-        let second = Writing::take(writing_key(None, "C:/WORK/写互斥测试"), "推送".into());
+        let second = Writing::take(writing_key(None, same), "推送".into());
         let Err(running) = second else {
             panic!("同一个仓库应该被挡住");
         };

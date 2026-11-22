@@ -270,7 +270,7 @@ impl Render for RebaseEditor {
                         div()
                             .w(px(64.))
                             .flex_none()
-                            .font_family("Consolas")
+                            .font_family(crate::fonts::mono())
                             .text_xs()
                             .text_color(muted)
                             .child(row.commit.id.chars().take(8).collect::<String>()),

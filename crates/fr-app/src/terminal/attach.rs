@@ -312,7 +312,7 @@ mod tests {
         let png = || ClipboardEntry::Image(Image::from_bytes(ImageFormat::Png, b"png".to_vec()));
         let file = || {
             ClipboardEntry::ExternalPaths(gpui_kit::ExternalPaths(
-                [PathBuf::from(r"C:\a\b.png")].into_iter().collect(),
+                [local_dir().join("b.png")].into_iter().collect(),
             ))
         };
         let item = |entries: Vec<ClipboardEntry>| ClipboardItem { entries };
@@ -382,9 +382,17 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// 这个系统上的一个本机目录（`C:\a`、`/a`）：路径按系统的分隔符拆
+    fn local_dir() -> PathBuf {
+        PathBuf::from(if cfg!(windows) { r"C:\a" } else { "/a" })
+    }
+
     #[test]
     fn 名字() {
-        assert_eq!(Attachment::File(r"C:\a\图 1.png".into()).name(), "图 1.png");
+        assert_eq!(
+            Attachment::File(local_dir().join("图 1.png")).name(),
+            "图 1.png"
+        );
         let image = Attachment::Image {
             name: "paste-1.png".into(),
             image: Image::from_bytes(ImageFormat::Png, Vec::new()),

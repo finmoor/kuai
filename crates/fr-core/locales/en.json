@@ -1799,5 +1799,17 @@
   "找不到 git。请安装 Git for Windows {min} 或更高版本（git-scm.com），然后重新打开 Kuai。": "git was not found. Install Git for Windows {min} or later (git-scm.com), then reopen Kuai.",
   "找不到 git。请安装 git {min} 或更高版本。": "git was not found. Install git {min} or later.",
   "找不到 ssh。请在 Windows 设置的「可选功能」中添加「OpenSSH 客户端」，然后重试。": "ssh was not found. Add \"OpenSSH Client\" under Optional features in Windows Settings, then try again.",
-  "找不到 ssh。请安装 OpenSSH 客户端，然后重试。": "ssh was not found. Install the OpenSSH client, then try again."
+  "找不到 ssh。请安装 OpenSSH 客户端，然后重试。": "ssh was not found. Install the OpenSSH client, then try again.",
+  "PATH 中未找到 ssh。请安装 OpenSSH 客户端（如 openssh-client 软件包）后重试。": "ssh is not in PATH. Install the OpenSSH client (such as the openssh-client package), then try again.",
+  "文件管理器": "the file manager",
+  "未找到 VS Code 命令行工具（code）。请安装 VS Code 后重启 Kuai。": "VS Code command-line tool (code) not found. Install VS Code, then restart Kuai.",
+  "未找到可用的 shell（bash、zsh、fish）。": "No usable shell found (bash, zsh, fish).",
+  "未找到终端程序（如 gnome-terminal、konsole、xterm）。": "No terminal app found (such as gnome-terminal, konsole or xterm).",
+  "登录 shell": "Login shell",
+  "在文件管理器中显示": "Show in File Manager",
+  "在文件管理器中打开": "Open in File Manager",
+  "登录桌面后自动启动。": "Starts when you sign in to the desktop.",
+  "发送系统通知": "Send system notifications",
+  "Kuai 不在前台时，终端停下同时发送系统通知；点击通知前往该终端。需开启上一项。": "When Kuai is in the background, also send a system notification when a terminal stops; click it to go to that terminal. Requires the option above.",
+  "「跟随系统」使用系统的深色或浅色设置。": "“Follow system” uses the system dark or light setting."
 }

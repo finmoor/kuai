@@ -1253,7 +1253,7 @@ impl Render for AddRepos {
                                 .child(
                                     ui::clipped(("add-path", ix), entry.path.clone())
                                         .text_xs()
-                                        .font_family("Consolas")
+                                        .font_family(crate::fonts::mono())
                                         .text_color(muted),
                                 ),
                         )

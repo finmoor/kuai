@@ -10,6 +10,7 @@
 //!   连接，默认的权限只允许本人和管理员写入。
 //! - 键取设置文件路径的哈希：测试时用 FR_SETTINGS 指向别的文件，和平时用的 Kuai 互不影响。
 //! - 更新时旧的 Kuai 先启动新的再退出，新的带着 `--wait-pid=<旧进程号>`，先等旧的退出（`update.rs`）。
+//! - Linux 等 Unix 系统上互斥量换成文件锁、管道换成 Unix 套接字，做法一样（见 Unix 的 `imp`）。
 //!
 //! 这根管道还替这台电脑上的 kuaid 办一件事：把它的常驻进程拉起来（[`start_daemon`]）。从别的电脑
 //! 经 ssh 连上来时，kuaid 的转接程序在会话 0（没有桌面），它自己拉起的常驻进程也在那里，里面的终端
@@ -89,6 +90,7 @@ fn announce(name: String) -> Option<(PathBuf, String)> {
 ///
 /// 跑的是 `kuaid.exe --spawn-daemon`：它用「什么句柄都不继承」的办法起常驻进程，自己马上退出。
 /// 直接从这里起的话，我们手里正开着的管道（和 ssh、git 之间的）可能被常驻进程带走，那些连接就断不开了。
+#[cfg_attr(not(windows), allow(dead_code))]
 fn start_daemon(exe: &str, resume: Option<&str>) -> bool {
     let root = fr_channel::local_kuai_root();
     let exe = Path::new(exe);
@@ -137,6 +139,7 @@ fn start_daemon(exe: &str, resume: Option<&str>) -> bool {
 
 /// 两个路径是不是同一个：Windows 上不分大小写、两种斜杠都行。只比写法，不去解析 `..`
 /// （带 `..` 的一律算不同）。
+#[cfg_attr(not(windows), allow(dead_code))]
 fn same_path(a: &Path, b: &Path) -> bool {
     let plain = |path: &Path| {
         let text = path.to_string_lossy().replace('/', "\\").to_lowercase();
@@ -477,7 +480,211 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+/// Linux 等 Unix 系统：有没有已经运行的看文件锁 `kuai-<键>.lock`（进程退出、崩溃时系统自动放开）；
+/// 请求经 Unix 套接字 `kuai-<键>.sock` 交过去，一样是一行 JSON、处理完回一个字节。两个文件放在
+/// `$XDG_RUNTIME_DIR`（只有本人能进的目录），没有这个变量时放在 `~/.kuai/run/`。
+///
+/// kuaid 在 Unix 上自己拉起常驻进程，不来找 Kuai（Windows 上那样做是为了离开会话 0），所以不写
+/// `kuai.pipe`。
+#[cfg(unix)]
+mod imp {
+    use std::fs::File;
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::PathBuf;
+    use std::sync::mpsc::sync_channel;
+    use std::time::{Duration, Instant};
+
+    use futures::channel::mpsc::UnboundedSender;
+
+    use super::{Incoming, Request};
+
+    /// 一条请求最长这么多字节（一个路径用不了这么多）
+    const MAX_REQUEST: u64 = 64 * 1024;
+    /// 连上来以后最多等这么久把请求说完：连上来不说话的占不住线程
+    const READ_LIMIT: Duration = Duration::from_secs(3);
+    const REPLY_LIMIT: Duration = Duration::from_secs(3);
+
+    /// 放锁和套接字的目录。
+    fn dir() -> PathBuf {
+        match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+            Some(dir) if dir.is_absolute() && dir.is_dir() => dir,
+            _ => {
+                let dir = fr_channel::local_kuai_root().join("run");
+                let _ = std::fs::create_dir_all(&dir);
+                dir
+            }
+        }
+    }
+
+    fn socket_path(key: &str) -> PathBuf {
+        dir().join(format!("kuai-{key}.sock"))
+    }
+
+    pub fn pipe_name(_: &str) -> Option<String> {
+        None
+    }
+
+    /// 拿着锁文件；`None` 是锁文件建不出来，这时不管有没有别的 Kuai，照常运行。
+    pub struct Guard(#[allow(dead_code)] Option<File>);
+
+    /// 锁上锁文件；锁不上（另一个 Kuai 在运行）返回 None。
+    pub fn take(key: &str) -> Option<Guard> {
+        let path = dir().join(format!("kuai-{key}.lock"));
+        let file = match File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(err) => {
+                log::warn!("无法创建 {}：{err}", path.display());
+                return Some(Guard(None));
+            }
+        };
+        match file.try_lock() {
+            Ok(()) => Some(Guard(Some(file))),
+            Err(std::fs::TryLockError::WouldBlock) => None,
+            Err(std::fs::TryLockError::Error(err)) => {
+                log::warn!("无法锁定 {}：{err}", path.display());
+                Some(Guard(None))
+            }
+        }
+    }
+
+    /// 后台线程守着套接字，收到的请求送进 `tx`。一个连接一个线程：哪个连上来不说话也挡不住别的。
+    pub fn listen(key: &str, tx: UnboundedSender<Incoming>) {
+        let path = socket_path(key);
+        // 上一个 Kuai 没收拾掉的（崩溃了）：锁在我们手里，这个文件肯定没人守了
+        let _ = std::fs::remove_file(&path);
+        let listener = match UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(err) => {
+                log::warn!("无法创建 {}：{err}", path.display());
+                return;
+            }
+        };
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        let spawned = std::thread::Builder::new()
+            .name("kuai-instance".into())
+            .spawn(move || {
+                for stream in listener.incoming() {
+                    if tx.is_closed() {
+                        break;
+                    }
+                    match stream {
+                        Ok(stream) => {
+                            let tx = tx.clone();
+                            std::thread::spawn(move || serve(stream, tx));
+                        }
+                        Err(err) => {
+                            log::warn!("套接字接受连接失败：{err}");
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
+                    }
+                }
+            });
+        if let Err(err) = spawned {
+            log::warn!("无法启动守着套接字的线程：{err}");
+        }
+    }
+
+    /// 读一条请求，交给界面线程，等它处理完再回一个字节。
+    fn serve(stream: UnixStream, tx: UnboundedSender<Incoming>) {
+        let _ = stream.set_read_timeout(Some(READ_LIMIT));
+        let _ = stream.set_write_timeout(Some(REPLY_LIMIT));
+        let mut buf = Vec::new();
+        let deadline = Instant::now() + READ_LIMIT;
+        let mut reader = (&stream).take(MAX_REQUEST);
+        let mut chunk = [0u8; 1024];
+        while !buf.contains(&b'\n') && Instant::now() < deadline {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => buf.extend_from_slice(&chunk[..read]),
+            }
+        }
+        let line = buf.split(|byte| *byte == b'\n').next().unwrap_or_default();
+        let Ok(request) = serde_json::from_slice::<Request>(line) else {
+            return;
+        };
+        // 拉起 kuaid 常驻进程只在 Windows 上替它办
+        if request.daemon.is_some() {
+            return;
+        }
+        let (done, handled) = sync_channel(1);
+        if tx.unbounded_send(Incoming { request, done }).is_err() {
+            return;
+        }
+        // 界面线程卡住或者正在退出时不回：那边会再试，等这个进程退出以后自己接手
+        if handled.recv_timeout(Duration::from_secs(3)).is_ok() {
+            let _ = (&stream).write_all(b"1");
+        }
+    }
+
+    /// 把请求交给正在运行的 Kuai，它处理完返回 true。
+    pub fn forward(key: &str, request: &Request) -> bool {
+        let Ok(line) = serde_json::to_string(request) else {
+            return false;
+        };
+        let Ok(mut stream) = UnixStream::connect(socket_path(key)) else {
+            return false;
+        };
+        // 那边最多等界面线程 3 秒
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        if stream.write_all(format!("{line}\n").as_bytes()).is_err() {
+            return false;
+        }
+        let mut reply = [0u8; 1];
+        stream.read_exact(&mut reply).is_ok() && reply[0] == b'1'
+    }
+
+    /// 等进程 `pid` 退出，最多等 `timeout`。看 `/proc/<pid>/stat`：没有了或者成了僵尸（退出了、
+    /// 还没被收尸）都算退出了。
+    pub fn wait_for_exit(pid: u32, timeout: Duration) {
+        let stat = PathBuf::from(format!("/proc/{pid}/stat"));
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let running = std::fs::read_to_string(&stat).is_ok_and(|text| {
+                // 第三项是状态；第二项（程序名）带括号，可能有空格，从最后一个右括号往后数
+                text.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    .is_some_and(|state| state != "Z" && state != "X")
+            });
+            if !running {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// 还没有窗口时报错用的对话框：GNOME 有 zenity、KDE 有 kdialog，都没有就只打到标准错误。
+    pub fn alert(text: &str) {
+        eprintln!("{text}");
+        let shown = std::process::Command::new("zenity")
+            .args([
+                "--warning",
+                "--no-markup",
+                "--title",
+                "Kuai",
+                "--text",
+                text,
+            ])
+            .status()
+            .is_ok();
+        if !shown {
+            let _ = std::process::Command::new("kdialog")
+                .args(["--title", "Kuai", "--sorry", text])
+                .status();
+        }
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 mod imp {
     use futures::channel::mpsc::UnboundedSender;
     use std::time::Duration;
@@ -545,6 +752,79 @@ mod tests {
         });
         assert!(forwarded);
         drop(silent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 套接字一来一回_连上不说话的挡不住别人_锁住了别人拿不到() {
+        use futures::StreamExt as _;
+        let key = format!("test-{}", std::process::id());
+        let guard = imp::take(&key).expect("第一个拿得到");
+        assert!(imp::take(&key).is_none(), "锁着的时候第二个也拿到了");
+        let (tx, mut rx) = mpsc::unbounded();
+        imp::listen(&key, tx);
+        // 界面那头：收到就算处理完，把请求转回来核对
+        let (seen_tx, seen) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Some(incoming) = futures::executor::block_on(rx.next()) {
+                let _ = seen_tx.send(incoming.request);
+                let _ = incoming.done.send(());
+            }
+        });
+        let dir = match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+            Some(dir) if dir.is_absolute() && dir.is_dir() => dir,
+            _ => fr_channel::local_kuai_root().join("run"),
+        };
+        let socket = dir.join(format!("kuai-{key}.sock"));
+        // 一个连上来不说话的
+        let silent = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        let request = Request {
+            open: Some("/home/me/有 空格".into()),
+            show: true,
+            ..Default::default()
+        };
+        assert!(imp::forward(&key, &request));
+        assert_eq!(seen.recv_timeout(Duration::from_secs(5)).unwrap(), request);
+        drop(silent);
+        drop(guard);
+        // 放开以后下一个拿得到。别的测试这时可能正在起子进程：fork 出来、还没 exec 的那一下，子进程
+        // 也拿着锁文件（exec 时才关），多试几次
+        let again = (0..100)
+            .find_map(|_| {
+                let taken = imp::take(&key);
+                if taken.is_none() {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                taken
+            })
+            .expect("放开以后拿不到");
+        drop(again);
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_file(dir.join(format!("kuai-{key}.lock")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 等退出_已经退出的和僵尸都不等() {
+        let started = Instant::now();
+        // 不存在的进程
+        imp::wait_for_exit(u32::MAX - 1, Duration::from_secs(5));
+        // 退出了、还没被收尸的子进程
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        imp::wait_for_exit(child.id(), Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let _ = child.wait();
+        // 还在跑的要等满
+        let mut running = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        imp::wait_for_exit(running.id(), Duration::from_millis(300));
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        let _ = running.kill();
+        let _ = running.wait();
     }
 
     #[test]

@@ -642,22 +642,24 @@ enum Winget {
 /// 启动 winget 安装 WinFsp，不等它做完（见 `wait_winget`）。`FR_WINGET` 是测试用的：换成
 /// 别的程序（假的 winget）。
 fn start_winget() -> Result<std::process::Child, Winget> {
-    use std::os::windows::process::CommandExt as _;
-    const NO_WINDOW: u32 = 0x0800_0000;
     let winget = std::env::var_os("FR_WINGET").unwrap_or_else(|| "winget".into());
-    let child = std::process::Command::new(winget)
-        .args([
-            "install",
-            "--id",
-            WINFSP_PACKAGE,
-            "--exact",
-            "--accept-package-agreements",
-            "--accept-source-agreements",
-            "--disable-interactivity",
-        ])
-        .creation_flags(NO_WINDOW)
-        .spawn();
-    match child {
+    let mut cmd = std::process::Command::new(winget);
+    cmd.args([
+        "install",
+        "--id",
+        WINFSP_PACKAGE,
+        "--exact",
+        "--accept-package-agreements",
+        "--accept-source-agreements",
+        "--disable-interactivity",
+    ]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(NO_WINDOW);
+    }
+    match cmd.spawn() {
         Ok(child) => Ok(child),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(Winget::Missing),
         Err(err) => {
@@ -1017,7 +1019,7 @@ pub fn map_dialog(
                 .child(
                     ui::clipped("preview-remote", remote_now.clone())
                         .text_ellipsis_start()
-                        .font_family("Consolas")
+                        .font_family(crate::fonts::mono())
                         .text_xs(),
                 )
                 .child(
@@ -1033,7 +1035,7 @@ pub fn map_dialog(
                             ui::clipped("preview-local", preview.local_root())
                                 .flex_1()
                                 .text_ellipsis_start()
-                                .font_family("Consolas")
+                                .font_family(crate::fonts::mono())
                                 .text_xs()
                                 .text_color(accent),
                         ),
@@ -1111,7 +1113,7 @@ pub fn map_dialog(
                                             .disabled(!as_drive)
                                             .child(
                                                 div()
-                                                    .font_family("Consolas")
+                                                    .font_family(crate::fonts::mono())
                                                     .child(drive.borrow().clone()),
                                             )
                                             .dropdown_caret(true)
@@ -1458,7 +1460,7 @@ pub fn section(app: &Entity<AppState>, server: &Server, cx: &App) -> AnyElement 
                         .child(
                             ui::clipped("remote", mapping.remote.clone())
                                 .text_ellipsis_start()
-                                .font_family("Consolas")
+                                .font_family(crate::fonts::mono())
                                 .text_xs(),
                         )
                         .child(
@@ -1474,7 +1476,7 @@ pub fn section(app: &Entity<AppState>, server: &Server, cx: &App) -> AnyElement 
                                     ui::clipped("local", mapping.local_root())
                                         .flex_1()
                                         .text_ellipsis_start()
-                                        .font_family("Consolas")
+                                        .font_family(crate::fonts::mono())
                                         .text_xs()
                                         .text_color(if live { accent } else { muted }),
                                 ),
@@ -1611,7 +1613,7 @@ pub fn chip(app: &Entity<AppState>, server: &Server, mapping: &Mapping, cx: &App
                     let line = |text: String| {
                         div()
                             .max_w(px(360.))
-                            .font_family("Consolas")
+                            .font_family(crate::fonts::mono())
                             .text_xs()
                             .whitespace_normal()
                             .child(text)

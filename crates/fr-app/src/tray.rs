@@ -4,9 +4,13 @@
 //! 图标用 exe 里嵌的 1 号图标，和任务栏上的是同一个。
 
 use fr_core::i18n::tr;
+#[cfg(windows)]
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui_kit::*;
+
+/// 这个系统上有没有托盘图标（Linux 上还没做：设置里不显示托盘的选项）。
+pub const AVAILABLE: bool = cfg!(windows);
 
 /// 用户在托盘上做了什么。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

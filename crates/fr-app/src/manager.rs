@@ -497,7 +497,7 @@ impl ManagerView {
                             div()
                                 .min_w_0()
                                 .truncate()
-                                .font_family("Consolas")
+                                .font_family(crate::fonts::mono())
                                 .text_xs()
                                 .text_color(muted)
                                 .child(choice.destination.clone()),
@@ -535,7 +535,7 @@ impl ManagerView {
                                             .child(name.clone())
                                             .child(
                                                 div()
-                                                    .font_family("Consolas")
+                                                    .font_family(crate::fonts::mono())
                                                     .text_xs()
                                                     .text_color(muted)
                                                     .child(destination.clone()),
@@ -876,7 +876,7 @@ fn local_badge(local: String, colors: Colors) -> Div {
         .child(Icon::new(IconName::HardDrive).size_3().flex_none())
         .child(
             ui::clipped("local", local)
-                .font_family("Consolas")
+                .font_family(crate::fonts::mono())
                 .text_ellipsis_start(),
         )
 }
