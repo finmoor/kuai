@@ -306,6 +306,11 @@ impl RepoView {
         self.subs.paths.len()
     }
 
+    /// 子仓库的目录（相对仓库根）。
+    pub(super) fn sub_paths(&self) -> &[String] {
+        &self.subs.paths
+    }
+
     /// 子仓库在磁盘上的路径。本机的 Windows 路径用反斜杠，和单独打开它时的写法一样
     /// （终端、记住的东西按路径认）。
     pub(super) fn sub_path(&self, relative: &str) -> String {

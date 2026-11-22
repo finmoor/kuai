@@ -529,9 +529,14 @@ pub(super) struct Files {
     rows: Arc<Vec<TreeRow>>,
     pub filter: Entity<InputState>,
     needle: String,
-    /// 仓库里所有的文件（跟踪的，和没跟踪又没被忽略的），过滤时用；第一次过滤时才读
+    /// 仓库里所有的文件（跟踪的，和没跟踪又没被忽略的），连同子仓库里的（前面加上子仓库的目录），
+    /// 排好序；过滤时用，第一次过滤时才读
     all_files: Option<Arc<Vec<String>>>,
     all_task: Option<Task<()>>,
+    /// 正在读 `all_files`
+    all_loading: bool,
+    /// 读 `all_files` 时的子仓库：子仓库找完以后变了的，过滤时重读
+    all_subs: Vec<String>,
     pub show_ignored: bool,
     /// 被忽略的路径（`git ls-files -o -i --directory` 给的，目录不带末尾的斜杠）
     ignored: HashSet<String>,
@@ -571,7 +576,8 @@ struct Shown {
 
 impl Files {
     pub(super) fn new(window: &mut Window, cx: &mut Context<RepoView>) -> (Self, Subscription) {
-        let filter = cx.new(|cx| InputState::new(window, cx).placeholder(tr("按名称过滤文件…")));
+        let filter =
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr("按名称或路径过滤文件…")));
         let subscription = cx.subscribe(&filter, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.files_filter_changed(cx);
@@ -587,6 +593,8 @@ impl Files {
             needle: String::new(),
             all_files: None,
             all_task: None,
+            all_loading: false,
+            all_subs: Vec::new(),
             show_ignored: true,
             ignored: HashSet::new(),
             ignored_task: None,
@@ -689,38 +697,11 @@ impl Files {
     fn rebuild(&mut self) {
         let mut rows = Vec::new();
         if self.filtering() {
-            let needle = self.needle.to_lowercase();
             let files = self.all_files.clone().unwrap_or_default();
-            // 名字里有的排前面，只是路径里有的排后面
-            let (mut by_name, mut by_path) = (Vec::new(), Vec::new());
-            for path in files.iter() {
-                let lower = path.to_lowercase();
-                if !lower.contains(&needle) {
-                    continue;
-                }
-                let (parent, name) = split(path);
-                let row = TreeRow {
-                    path: path.clone(),
-                    name: name.to_string().into(),
-                    depth: 0,
-                    dir: false,
-                    link: false,
-                    open: false,
-                    ignored: false,
-                    repo: false,
-                    parent: (!parent.is_empty()).then(|| parent.to_string().into()),
-                };
-                match name.to_lowercase().contains(&needle) {
-                    true => by_name.push(row),
-                    false => by_path.push(row),
-                }
-                if by_name.len() >= MATCH_MAX {
-                    break;
-                }
-            }
-            rows = by_name;
-            rows.extend(by_path);
-            rows.truncate(MATCH_MAX);
+            // 树里列着的也搜（展开过的被忽略的目录里的）：树上看得到的都搜得到
+            let mut shown = Vec::new();
+            self.walk("", 0, false, &mut shown);
+            rows = filter_rows(&files, shown, &self.needle);
         } else {
             self.walk("", 0, false, &mut rows);
         }
@@ -777,6 +758,71 @@ impl Files {
 
 /// 树里一行是不是子仓库、算不算被忽略：`repo` 是子仓库的目录，`inherited` 是上面的目录被忽略了，
 /// `listed` 是它自己在被忽略的清单里。子仓库自己不算被忽略，下面的行也就不跟着变淡。
+/// 过滤框里的字对得上这个路径（小写）时是第几档：0 名字里有整段字，1 路径里有整段字，2 按斜杠、
+/// 空格拆开的几段依次出现在路径里（`docs/design/reliab` 对得上
+/// `docs/design/reliability/design-demos/reliability.html`，中间的目录可以不写）。对不上是 None。
+fn match_rank(path: &str, needle: &str, parts: &[&str]) -> Option<u8> {
+    let name = split(path).1;
+    if name.contains(needle) {
+        return Some(0);
+    }
+    if path.contains(needle) {
+        return Some(1);
+    }
+    let mut from = 0;
+    for part in parts {
+        let at = path[from..].find(part)?;
+        from += at + part.len();
+    }
+    (!parts.is_empty()).then_some(2)
+}
+
+/// 过滤框里的字筛出来的行。`files` 是排好序的仓库文件（`ls-files` 给的，连同子仓库里的），
+/// `shown` 是树里现在列着的行：里面 `files` 没有的文件也算（被忽略的，显示被忽略的文件时）。按
+/// [`match_rank`] 的档排，最多 [`MATCH_MAX`] 行。反斜杠当斜杠（Windows 上的写法）。
+fn filter_rows(files: &[String], shown: Vec<TreeRow>, needle: &str) -> Vec<TreeRow> {
+    let needle = needle.replace('\\', "/").to_lowercase();
+    let parts: Vec<&str> = needle
+        .split(|c: char| c == '/' || c.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .collect();
+    let extra: Vec<(String, bool)> = shown
+        .into_iter()
+        .filter(|row| !row.dir && files.binary_search(&row.path).is_err())
+        .map(|row| (row.path, row.ignored))
+        .collect();
+    let candidates = files.iter().map(|path| (path.as_str(), false)).chain(
+        extra
+            .iter()
+            .map(|(path, ignored)| (path.as_str(), *ignored)),
+    );
+    let mut ranked: [Vec<TreeRow>; 3] = Default::default();
+    for (path, ignored) in candidates {
+        let Some(rank) = match_rank(&path.to_lowercase(), &needle, &parts) else {
+            continue;
+        };
+        let (parent, name) = split(path);
+        let row = TreeRow {
+            path: path.to_string(),
+            name: name.to_string().into(),
+            depth: 0,
+            dir: false,
+            link: false,
+            open: false,
+            ignored,
+            repo: false,
+            parent: (!parent.is_empty()).then(|| parent.to_string().into()),
+        };
+        ranked[rank as usize].push(row);
+        if ranked[0].len() >= MATCH_MAX {
+            break;
+        }
+    }
+    let mut rows: Vec<TreeRow> = ranked.into_iter().flatten().collect();
+    rows.truncate(MATCH_MAX);
+    rows
+}
+
 fn tree_flags(repo: bool, inherited: bool, listed: bool) -> (bool, bool) {
     (repo, !repo && (inherited || listed))
 }
@@ -941,7 +987,8 @@ impl RepoView {
         }));
     }
 
-    /// 读一遍仓库里所有的文件（过滤用）。
+    /// 读一遍仓库里所有的文件（过滤用），子仓库里的也读：子仓库常被根仓库忽略，根仓库的
+    /// `ls-files` 里没有它们，树上看得到却搜不到。
     fn load_all_files(&mut self, cx: &mut Context<Self>) {
         let Some(channel) = self.channel.clone() else {
             return;
@@ -952,21 +999,60 @@ impl RepoView {
             "--cached",
             "--others",
             "--exclude-standard",
-        ];
-        let request = channel.git(&self.entry.path, args.map(String::from).to_vec());
+        ]
+        .map(String::from)
+        .to_vec();
+        let subs = self.sub_paths().to_vec();
+        let request = channel.git(&self.entry.path, args.clone());
+        let sub_requests: Vec<_> = subs
+            .iter()
+            .map(|sub| channel.git(&self.sub_path(sub), args.clone()))
+            .collect();
+        self.files.all_subs = subs.clone();
+        self.files.all_loading = true;
         self.files.all_task = Some(cx.spawn(async move |this, cx| {
-            let Ok(out) = request.await.and_then(|out| out.ok()) else {
-                return;
+            let out = match request.await.and_then(|out| out.ok()) {
+                Ok(out) => out,
+                Err(err) => {
+                    log::warn!("无法列出仓库里的文件：{err:#}");
+                    // 下次改过滤框里的字时再读
+                    this.update(cx, |this, _| this.files.all_loading = false)
+                        .ok();
+                    return;
+                }
             };
-            let mut files: Vec<String> = String::from_utf8_lossy(&out)
-                .split('\0')
-                .filter(|path| !path.is_empty())
-                .map(str::to_string)
-                .collect();
+            let mut outs: Vec<(Option<&String>, Vec<u8>)> = vec![(None, out)];
+            for (sub, out) in subs
+                .iter()
+                .zip(futures::future::join_all(sub_requests).await)
+            {
+                match out.and_then(|out| out.ok()) {
+                    Ok(out) => outs.push((Some(sub), out)),
+                    Err(err) => log::warn!("无法列出子仓库 {sub} 的文件：{err:#}"),
+                }
+            }
+            let mut files: Vec<String> = Vec::new();
+            for (prefix, out) in outs {
+                files.extend(
+                    String::from_utf8_lossy(&out)
+                        .split('\0')
+                        // 没跟踪的子仓库列成「目录/」，注册过的子模块列成一项：里面的文件另外读
+                        .filter(|path| {
+                            !path.is_empty()
+                                && !path.ends_with('/')
+                                && !(prefix.is_none() && subs.iter().any(|sub| sub == path))
+                        })
+                        .map(|path| match prefix {
+                            Some(sub) => format!("{sub}/{path}"),
+                            None => path.to_string(),
+                        }),
+                );
+            }
             files.sort_unstable();
             files.dedup();
             this.update(cx, |this, cx| {
                 this.files.all_files = Some(Arc::new(files));
+                this.files.all_loading = false;
                 this.files.rebuild();
                 cx.notify();
             })
@@ -980,8 +1066,9 @@ impl RepoView {
             return;
         }
         self.files.needle = needle;
-        if self.files.filtering() && self.files.all_files.is_none() && self.files.all_task.is_none()
-        {
+        // 没读过的读；读的时候子仓库还没找完（或者后来变了）的重读
+        let stale = self.files.all_files.is_none() || self.files.all_subs != self.sub_paths();
+        if self.files.filtering() && stale && !self.files.all_loading {
             self.load_all_files(cx);
         }
         self.files.scroll.scroll_to_item(0, ScrollStrategy::Top);
@@ -1804,11 +1891,88 @@ impl RepoView {
 mod tests {
     // 不能 `use super::*`：界面库也有一个叫 test 的宏，会盖掉标准的 #[test]
     use super::{
-        Class, Encoding, classify, decode, encode, extension, indent_of, language, local_file_name,
-        tree_flags,
+        Class, Encoding, TreeRow, classify, decode, encode, extension, filter_rows, indent_of,
+        language, local_file_name, tree_flags,
     };
     use fr_core::i18n::tr;
     use gpui_kit::ImageFormat;
+
+    #[test]
+    fn 过滤时子仓库里的_树里列着的被忽略的文件都搜得到_不重复() {
+        let tree_row = |path: &str, dir: bool, ignored: bool| TreeRow {
+            path: path.into(),
+            name: path.rsplit('/').next().unwrap().to_string().into(),
+            depth: 0,
+            dir,
+            link: false,
+            open: false,
+            ignored,
+            repo: false,
+            parent: None,
+        };
+        // ls-files 给的（连同子仓库 docs 里的），排好序
+        let files: Vec<String> = [
+            "README.md",
+            "docs/design/reliability/design-demos/reliability.html",
+            "src/main.rs",
+        ]
+        .map(String::from)
+        .to_vec();
+        // 树里展开着被忽略的 target/debug
+        let shown = || {
+            vec![
+                tree_row("src", true, false),
+                tree_row("src/main.rs", false, false),
+                tree_row("target", true, true),
+                tree_row("target/debug/app.exe", false, true),
+            ]
+        };
+        let found = |needle: &str| -> Vec<(String, bool)> {
+            filter_rows(&files, shown(), needle)
+                .into_iter()
+                .map(|row| (row.path, row.ignored))
+                .collect()
+        };
+        let html = "docs/design/reliability/design-demos/reliability.html".to_string();
+        // 中间的目录（design-demos）可以不写
+        assert_eq!(
+            found("docs/design/reliability/reliab"),
+            [(html.clone(), false)]
+        );
+        assert_eq!(
+            found("docs/design/reliability/design-demos/reliab"),
+            [(html.clone(), false)]
+        );
+        assert_eq!(found("Reliability.HTML"), [(html.clone(), false)]);
+        // 几段要按顺序出现
+        assert_eq!(found("html demos"), []);
+        assert_eq!(found("demos html"), [(html.clone(), false)]);
+        // 反斜杠当斜杠
+        assert_eq!(found(r"design\reliability"), [(html, false)]);
+        // 树里列着的被忽略的文件，照样变淡
+        assert_eq!(found("app.exe"), [("target/debug/app.exe".into(), true)]);
+        // 两边都有的只出一次，目录不算
+        assert_eq!(found("main"), [("src/main.rs".into(), false)]);
+        assert_eq!(found("target"), [("target/debug/app.exe".into(), true)]);
+    }
+
+    #[test]
+    fn 过滤的排序_名字里有的_路径里有整段的_依次对上几段的() {
+        // 和 ls-files 读回来的一样排好序
+        let files: Vec<String> = ["a/m/ain.rs", "a/main/x.rs", "src/main.rs"]
+            .map(String::from)
+            .to_vec();
+        let paths: Vec<String> = filter_rows(&files, Vec::new(), "main")
+            .into_iter()
+            .map(|row| row.path)
+            .collect();
+        assert_eq!(paths, ["src/main.rs", "a/main/x.rs"]);
+        let paths: Vec<String> = filter_rows(&files, Vec::new(), "a/ain")
+            .into_iter()
+            .map(|row| row.path)
+            .collect();
+        assert_eq!(paths, ["a/m/ain.rs", "a/main/x.rs"]);
+    }
 
     #[test]
     fn 子仓库的目录不按忽略变淡_里面的也不() {

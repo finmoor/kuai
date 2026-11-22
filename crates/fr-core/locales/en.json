@@ -972,7 +972,7 @@
   "音频": "Audio",
   "大文件": "Large file",
   "保存失败：{err}": "Save failed: {err}",
-  "按名称过滤文件…": "Filter files by name…",
+  "按名称或路径过滤文件…": "Filter files by name or path…",
   "放弃修改": "Discard changes",
   "放弃对 {name} 的修改？": "Discard changes to {name}?",
   "文件不存在。": "The file does not exist.",
