@@ -9,11 +9,15 @@ use std::process::Command;
 /// 主机密钥怎么核对不在这里设，照 ssh 自己的规矩和用户的 `~/.ssh/config`：没见过的主机 ssh 会问
 /// 一句要不要信任，这句话经 askpass 交给界面，显示指纹让用户确认（见 `askpass::host_key_prompt`）；
 /// 记录过的密钥对不上，ssh 直接拒绝。没有人可以问的（`BatchMode=yes`、不许弹窗的连接）这一次连不上。
+///
+/// 线路卡死（不通也不断，比如无线网掉了）时，连着 30 秒没有回音才算断开、去重连：原来是 15 秒
+/// 问一次、4 次没回音，模拟线路上实测 76 秒才发现，这期间终端像冻住了。不能再短：慢线路上
+/// 刷屏、传文件时 ssh 通道里可能积着 2 MB，300 KB/s 要 7 秒才轮到回音，太短会误断
 pub const KEEP_OPTIONS: &[&str] = &[
     "-o",
-    "ServerAliveInterval=15",
+    "ServerAliveInterval=10",
     "-o",
-    "ServerAliveCountMax=4",
+    "ServerAliveCountMax=3",
 ];
 
 /// 没见过的主机不问，直接记进 known_hosts。只给测试工具用，界面不用

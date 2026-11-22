@@ -35,8 +35,6 @@ pub use screen::Size;
 const KEEP_ENDED: Duration = Duration::from_secs(24 * 3600);
 /// 还原屏幕的那一段按这么大一块块发
 const DUMP_CHUNK: usize = 64 * 1024;
-/// 收得太慢、停发了输出的客户端（见 [`Client::lagging`]），队列里积着的少到这么多就接着发
-const RESUME_AT: usize = 1 << 20;
 /// 订阅了终端列表（`term_watch`）时，隔这么久看一次有没有变化
 const WATCH_EVERY: Duration = Duration::from_secs(1);
 /// 最近这么久以内有过输出的算「正在输出」
@@ -410,10 +408,7 @@ impl Session {
 
     fn info(&self, procs: &programs::Procs) -> TermInfo {
         // 先问在跑的程序，再拿锁：问的时候要读进程表，别让输出等着
-        let programs = match self.is_alive() {
-            true => self.backend.programs(procs),
-            false => Vec::new(),
-        };
+        let programs = self.running(procs);
         let state = self.state.lock().unwrap();
         let size = state.screen.size();
         TermInfo {
@@ -438,6 +433,23 @@ impl Session {
     fn is_alive(&self) -> bool {
         self.state.lock().unwrap().exit.is_none()
     }
+
+    /// 除了 shell 还有哪些程序在跑；程序已经结束的是空的。Windows 上只看得到 shell 起的子进程，
+    /// PowerShell 自己执行的命令（`Start-Sleep`、不出声的 `Copy-Item`）不起子进程：敲过命令、光标停在
+    /// 空行的行首（新的提示符还没出来）时算有程序在跑、不知道名字（一个空串），结束前照样先问。
+    fn running(&self, procs: &programs::Procs) -> Vec<String> {
+        if !self.is_alive() {
+            return Vec::new();
+        }
+        let mut names = self.backend.programs(procs);
+        if cfg!(windows) && names.is_empty() {
+            let state = self.state.lock().unwrap();
+            if !state.marks.is_empty() && state.screen.at_blank_line() {
+                names.push(String::new());
+            }
+        }
+        names
+    }
 }
 
 /// 会话的名字记成什么：Windows 上同一个目录有几种写法，统一成一种（见
@@ -453,7 +465,10 @@ fn session_key(key: &str) -> String {
 /// 终端重置了再画，见 [`Screen::redump`]），之后照常发输出。
 fn catch_up(state: &mut State) {
     let ready: Vec<usize> = (0..state.clients.len())
-        .filter(|&at| state.clients[at].lagging && state.clients[at].out.queued() <= RESUME_AT)
+        .filter(|&at| {
+            let out = &state.clients[at].out;
+            state.clients[at].lagging && out.queued() <= out.resume_at()
+        })
         .collect();
     if ready.is_empty() {
         return;
@@ -815,10 +830,8 @@ impl Registry {
     /// `term_programs`：会话里除了 shell 还有哪些程序在跑。程序已经结束、没有这个会话时是空的。
     pub fn programs(&self, term: &str) -> Vec<String> {
         match self.get(term) {
-            Some(session) if session.is_alive() => {
-                session.backend.programs(&programs::Procs::take())
-            }
-            _ => Vec::new(),
+            Some(session) => session.running(&programs::Procs::take()),
+            None => Vec::new(),
         }
     }
 
@@ -1109,6 +1122,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn 没有子进程_敲过命令还没出提示符_windows_上算在跑() {
+        let (registry, _fakes) = fake_registry();
+        let (out, mut inbox) = mailbox();
+        open(&registry, "/repo", 1, 10, &out);
+        let term = inbox.opened().term;
+        let session = registry.get(&term).unwrap();
+        // 刚开、提示符还没出来：没敲过命令，不算
+        assert!(registry.programs(&term).is_empty());
+        session.output(br"PS C:\> Start-Sleep 15");
+        session.input(b"\r".to_vec());
+        session.output(b"\r\n");
+        // PowerShell 自己执行的命令不起子进程，只有 Windows 上这样看
+        let busy: &[&str] = match cfg!(windows) {
+            true => &[""],
+            false => &[],
+        };
+        assert_eq!(registry.programs(&term), busy);
+        assert_eq!(registry.list()[0].programs.as_deref().unwrap(), busy);
+        session.output(br"PS C:\> ");
+        assert!(registry.programs(&term).is_empty(), "提示符出来了");
+    }
+
+    #[test]
     fn 输出转给接着的客户端_断开以后程序接着跑_再接上能还原() {
         let (registry, fakes) = fake_registry();
         let (out, mut inbox) = mailbox();
@@ -1362,6 +1398,45 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn 程序一直刷屏时客户端一直收得到_停发了也会接着发() {
+        let (registry, fakes) = fake_registry();
+        let (out, mut inbox) = mailbox();
+        open(&registry, "/repo", 1, 1, &out);
+        let session = fakes.lock().unwrap()[0]
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        // 客户端一直在收，记下每一刻收到了多少
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = received.clone();
+        std::thread::spawn(move || {
+            inbox.opened();
+            loop {
+                let (_, payload) = inbox.next();
+                counting.fetch_add(payload.len(), std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        // 程序刷 3 秒屏，比管道收得快
+        let block = b"flood line flood line flood line\r\n".repeat(2000);
+        let started = Instant::now();
+        let mut halfway = 0;
+        while started.elapsed() < Duration::from_secs(3) {
+            session.output(&block);
+            session.tick();
+            if halfway == 0 && started.elapsed() > Duration::from_millis(1500) {
+                halfway = received.load(std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let late = received.load(std::sync::atomic::Ordering::Relaxed) - halfway;
+        assert!(
+            late > 1 << 20,
+            "后一半时间只收到 {late} 字节，停发以后没接着发"
+        );
+    }
+
+    #[test]
     fn 客户端收得太慢就停发_积着的收完以后从现在的屏幕接着() {
         let (registry, fakes) = fake_registry();
         // 这个客户端的管道先没人读
@@ -1402,7 +1477,7 @@ pub(crate) mod tests {
             }
         });
         let started = Instant::now();
-        while out.queued() > RESUME_AT {
+        while out.queued() > out.resume_at() {
             assert!(
                 started.elapsed() < Duration::from_secs(60),
                 "积着的一直发不出去"

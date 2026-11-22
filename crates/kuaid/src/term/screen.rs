@@ -155,6 +155,18 @@ impl Screen {
         reply
     }
 
+    /// 光标停在主屏一个空行的行首：shell 收了命令、新的提示符还没出来（命令在跑，没在输出）。shell
+    /// 等输入时光标在提示符后面，提示符不是空的（两行的提示符第二行也有 `❯`、`>`）。
+    pub fn at_blank_line(&self) -> bool {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return false;
+        }
+        let grid = self.term.grid();
+        let at = grid.cursor.point;
+        let row = &grid[at.line];
+        at.column.0 == 0 && (0..grid.columns()).all(|col| row[Column(col)].c == ' ')
+    }
+
     /// 屏幕上最后一行有字的内容，终端列表里给人看一眼用：从下往上找，跳过空行和只有框线的行，
     /// 去掉两头的空白和框线（全屏程序爱画框），最多 [`LAST_TEXT`] 个字。
     pub fn last_text(&self) -> String {
@@ -797,6 +809,26 @@ mod tests {
         assert_eq!(screen.last_text(), "需要提交吗？");
         screen.advance(b"  ? for shortcuts  ");
         assert_eq!(screen.last_text(), "? for shortcuts");
+    }
+
+    #[test]
+    fn 光标停在空行行首_是命令在跑_提示符后面不是() {
+        let mut screen = Screen::new(Size::new(40, 6));
+        screen.advance(br"PS C:\> ");
+        assert!(!screen.at_blank_line());
+        // 按了回车，命令在跑、没在输出
+        screen.advance(br"Start-Sleep 15");
+        screen.advance(b"\r\n");
+        assert!(screen.at_blank_line());
+        // 输出了一半（进度没换行）：不算停在空行
+        screen.advance(b"copying 45%");
+        assert!(!screen.at_blank_line());
+        // 跑完，新的提示符出来了：两行的提示符第二行也不是空的
+        screen.advance("\r\n\r\n~/repo on main\r\n\u{276f} ".as_bytes());
+        assert!(!screen.at_blank_line());
+        // 全屏程序里不认
+        screen.advance(b"\x1b[?1049h\x1b[H\x1b[2J");
+        assert!(!screen.at_blank_line());
     }
 
     #[test]

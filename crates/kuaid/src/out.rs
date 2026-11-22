@@ -13,13 +13,24 @@
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use fr_core::protocol::{self, Response};
 
 /// 队列里积了这么多字节，[`Outbox::send`] 就等写线程发掉一些
 const HIGH_WATER: usize = 4 << 20;
-/// 队列里积了这么多字节，[`Outbox::try_send`] 就不再放
-const TERM_LIMIT: usize = 8 << 20;
+/// 终端的输出（[`Outbox::try_send`]）最多积大约这么久能发完的量：慢线路上积多了，程序刷屏时
+/// 按 Ctrl+C，屏幕还要把积着的旧输出放完才停（300 KB/s 的线路原来要放 27 秒）。速度由写线程量
+/// （见 [`Queue::rate`]），积多少在 [`TERM_MIN`] 和 [`TERM_MAX`] 之间
+const TERM_SECONDS: f64 = 1.0;
+/// 终端的输出至少能积这么多：太少的话慢线路上刷一屏就停发、重画
+const TERM_MIN: usize = 256 << 10;
+/// 还没量出对方收得多快时，终端的输出最多积这么多
+const TERM_START: usize = 512 << 10;
+/// 终端的输出最多积这么多（快的线路上）
+const TERM_MAX: usize = 8 << 20;
+/// 写线程一直有活干时，每隔这么久按写出去的量算一次速度；没积压就不算（那时量的是程序的速度）
+const RATE_WINDOW: Duration = Duration::from_millis(200);
 /// 队列里积了这么多字节还要 [`Outbox::push`]：对方很久没收了，断开（重连以后拿最新的）。比一次
 /// 连上时还原很多个终端屏幕的量大得多
 const PUSH_LIMIT: usize = 128 << 20;
@@ -41,6 +52,40 @@ struct Queue {
     frames: VecDeque<(Option<u64>, Vec<u8>)>,
     bytes: usize,
     closed: bool,
+    /// 对方收得多快（字节每秒），还没量出来是 0。写线程积着活干的时候量，见 [`RATE_WINDOW`]
+    rate: f64,
+    /// 正在量的这一段：从什么时候起一直有活干、这期间写出去多少
+    busy: Option<(Instant, usize)>,
+}
+
+impl Queue {
+    /// 终端的输出最多积多少，见 [`TERM_SECONDS`]。
+    fn term_limit(&self) -> usize {
+        if self.rate <= 0.0 {
+            return TERM_START;
+        }
+        ((self.rate * TERM_SECONDS) as usize).clamp(TERM_MIN, TERM_MAX)
+    }
+
+    /// 写出去 `size` 字节（从 `started` 开始写的），记进速度；`backlog`：后面还有等着写的。
+    fn wrote(&mut self, size: usize, started: Instant, backlog: bool) {
+        let now = Instant::now();
+        let (since, bytes) = self.busy.get_or_insert((started, 0));
+        *bytes += size;
+        let (since, bytes) = (*since, *bytes);
+        let elapsed = now.duration_since(since);
+        if elapsed >= RATE_WINDOW {
+            let sample = bytes as f64 / elapsed.as_secs_f64();
+            self.rate = match self.rate > 0.0 {
+                true => (self.rate + sample) / 2.0,
+                false => sample,
+            };
+            self.busy = backlog.then_some((now, 0));
+        } else if !backlog {
+            // 一下子就写完了：对方收得比程序出得快，量不出来
+            self.busy = None;
+        }
+    }
 }
 
 impl Outbox {
@@ -74,11 +119,16 @@ impl Outbox {
     /// 放一条消息，不等；队列里积得太多时不放，返回 false。已经关了也返回 false。
     pub fn try_send(&self, response: &Response, payload: &[u8]) -> bool {
         let queue = self.0.queue.lock().unwrap();
-        if queue.closed || queue.bytes > TERM_LIMIT {
+        if queue.closed || queue.bytes > queue.term_limit() {
             return false;
         }
         self.enqueue(queue, None, encode(response, payload));
         true
+    }
+
+    /// [`Self::try_send`] 放不进去以后，积着的少到这么多再接着发（停发线的四分之一）。
+    pub fn resume_at(&self) -> usize {
+        self.0.queue.lock().unwrap().term_limit() / 4
     }
 
     /// 放一条消息，不等。只用来发不能丢的、不大的消息（流的开头和结尾、还原屏幕）。积到
@@ -190,21 +240,27 @@ fn write_loop(inner: &Inner, mut writer: impl Write) {
             }
             std::mem::take(&mut queue.frames)
         };
-        let size: usize = batch.iter().map(|(_, frame)| frame.len()).sum();
-        let written = batch
-            .iter()
-            .try_for_each(|(_, frame)| writer.write_all(frame))
-            .and_then(|()| writer.flush());
-        if written.is_err() {
-            close(inner);
-            return;
+        let count = batch.len();
+        for (at, (_, frame)) in batch.into_iter().enumerate() {
+            let started = Instant::now();
+            let last = at + 1 == count;
+            let written = writer
+                .write_all(&frame)
+                .and_then(|()| if last { writer.flush() } else { Ok(()) });
+            if written.is_err() {
+                close(inner);
+                return;
+            }
+            // 写完才算发掉：等空位的看的是「还没到对方手里的」有多少。一条条记，不等整批：
+            // 慢线路上一批要写好几秒，速度、空位都要跟着动
+            // 期间被关掉的话计数已经清零了
+            let mut queue = inner.queue.lock().unwrap();
+            queue.bytes = queue.bytes.saturating_sub(frame.len());
+            let backlog = !last || !queue.frames.is_empty();
+            queue.wrote(frame.len(), started, backlog);
+            drop(queue);
+            inner.room.notify_all();
         }
-        // 写完才算发掉：等空位的看的是「还没到对方手里的」有多少
-        // 期间被关掉的话计数已经清零了
-        let mut queue = inner.queue.lock().unwrap();
-        queue.bytes = queue.bytes.saturating_sub(size);
-        drop(queue);
-        inner.room.notify_all();
     }
 }
 
@@ -249,13 +305,15 @@ mod tests {
         // 管道没人读：写线程卡在写上，队列越积越多
         let (reader, writer) = std::io::pipe().unwrap();
         let out = Outbox::new(writer);
-        let (response, payload) = chunk(1, 1 << 20);
+        let (response, payload) = chunk(1, 64 << 10);
         let mut accepted = 0;
         while out.try_send(&response, &payload) {
             accepted += 1;
-            assert!(accepted < 64, "一直放得进去，没有上限");
+            assert!(accepted < 1024, "一直放得进去，没有上限");
         }
-        assert!(accepted >= 8);
+        // 还没量出对方多快：积到开头的上限就停
+        assert!(accepted >= 4);
+        assert!(out.queued() <= TERM_START + (128 << 10), "{}", out.queued());
         // 不能丢的照样放得进去
         out.push(&Response::default(), &[]);
         // 对方开始收：积着的发出去，又放得进了
@@ -321,5 +379,56 @@ mod tests {
         out.drain(Duration::from_secs(5));
         assert!(out.is_closed());
         assert!(!out.try_send(&response, &payload));
+    }
+
+    /// 按限定的速度收的对方（像一条慢线路）。
+    struct Throttled {
+        rate: f64,
+    }
+
+    impl Write for Throttled {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let len = buf.len().min(16 << 10);
+            std::thread::sleep(Duration::from_secs_f64(len as f64 / self.rate));
+            Ok(len)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 程序一直刷屏、往里放 `secs` 秒，返回最后半秒里队列积到过多少。
+    fn flood(out: &Outbox, secs: f64) -> usize {
+        let (response, payload) = chunk(1, 32 << 10);
+        let started = std::time::Instant::now();
+        let mut most = 0;
+        while started.elapsed().as_secs_f64() < secs {
+            if !out.try_send(&response, &payload) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            if started.elapsed().as_secs_f64() > secs - 0.5 {
+                most = most.max(out.queued());
+            }
+        }
+        most
+    }
+
+    #[test]
+    fn 终端的输出积多少看对方收得多快() {
+        // 300 KB/s 的线路：积到大约一秒的量就停，不会积几 MB（按 Ctrl+C 以后要放半分钟）
+        let slow = Outbox::new(Throttled { rate: 300e3 });
+        let most = flood(&slow, 1.5);
+        assert!(most < 400 << 10, "慢线路上积了 {most} 字节");
+        assert!(most > 200 << 10, "慢线路上只积了 {most} 字节");
+        assert!(slow.resume_at() < 100 << 10);
+        slow.close();
+
+        // 40 MB/s 的线路：积到上限（8 MB），刷屏时少停发、少重画
+        let fast = Outbox::new(Throttled { rate: 40e6 });
+        let most = flood(&fast, 1.5);
+        assert!(most > 4 << 20, "快线路上只积了 {most} 字节");
+        assert!(most <= TERM_MAX + (64 << 10));
+        fast.close();
     }
 }

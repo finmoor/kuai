@@ -280,3 +280,162 @@ fn 文件名里有空格和通配符() {
     let file = repo.diff(patch::staged_args("a [1].txt", None));
     assert_eq!(file.changed_lines(), 1);
 }
+
+/// 一串看着随机、每次都一样的数（xorshift）。
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// 按行拆开，每行带着自己的换行符。
+fn lines_of(text: &[u8]) -> Vec<Vec<u8>> {
+    text.split_inclusive(|&byte| byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// 不经过补丁、直接按选中的行算出来的结果：`base` 是补丁要打到的那一边（暂存时是暂存区，
+/// 反向时是 diff 的新的一边），`keep_unpicked` 是没选中的行留哪一种。
+///
+/// - 正向（暂存）：删除的行选中了才删，增加的行选中了才加；
+/// - 反向（取消暂存、丢弃）：增加的行选中了才去掉，删除的行选中了才加回来。
+fn expected(base: &[u8], file: &FileDiff, reverse: bool, set: &HashSet<(usize, usize)>) -> Vec<u8> {
+    let base = lines_of(base);
+    let mut out = Vec::new();
+    let mut at = 0;
+    for (hi, hunk) in file.hunks.iter().enumerate() {
+        let (start, count) = if reverse {
+            (hunk.new_start, hunk.new_count)
+        } else {
+            (hunk.old_start, hunk.old_count)
+        };
+        // 块前面没动的行
+        let first = (start as usize).saturating_sub(1).max(at);
+        out.extend(base[at..first].iter().flatten());
+        for (li, line) in hunk.lines.iter().enumerate() {
+            let picked = set.contains(&(hi, li));
+            let mut bytes = line.content.clone();
+            bytes.push(b'\n');
+            match (line.kind, reverse) {
+                (LineKind::Context, _) => out.extend(bytes),
+                (LineKind::Removed, false) | (LineKind::Added, true) if !picked => {
+                    out.extend(bytes)
+                }
+                (LineKind::Added, false) | (LineKind::Removed, true) if picked => out.extend(bytes),
+                _ => {}
+            }
+        }
+        at = first + count as usize;
+    }
+    out.extend(base[at..].iter().flatten());
+    out
+}
+
+/// 随机挑一部分改动行（至少一行）。
+fn random_pick(file: &FileDiff, rng: &mut Rng) -> HashSet<(usize, usize)> {
+    let mut all = Vec::new();
+    for (hi, hunk) in file.hunks.iter().enumerate() {
+        for (li, line) in hunk.lines.iter().enumerate() {
+            if line.kind != LineKind::Context {
+                all.push((hi, li));
+            }
+        }
+    }
+    let mut set: HashSet<_> = all.iter().copied().filter(|_| rng.below(2) == 0).collect();
+    if set.is_empty() {
+        set.insert(all[rng.below(all.len() as u64) as usize]);
+    }
+    set
+}
+
+/// 一个随机的文件：行尾 LF、CRLF 混着，有的行重复（diff 对齐时容易错位）。
+fn random_file(rng: &mut Rng, lines: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for _ in 0..lines {
+        let word = match rng.below(10) {
+            0 => "}".to_string(),
+            1 => String::new(),
+            _ => format!("line {}", rng.below(1000)),
+        };
+        out.extend(word.as_bytes());
+        out.extend(if rng.below(4) == 0 {
+            &b"\r\n"[..]
+        } else {
+            b"\n"
+        });
+    }
+    out
+}
+
+/// 在 `base` 上随机删、改、插几行。
+fn random_edit(rng: &mut Rng, base: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for line in lines_of(base) {
+        match rng.below(12) {
+            0 => {}
+            1 => out.extend(format!("changed {}\n", rng.below(1000)).as_bytes()),
+            2 => {
+                out.extend(&line);
+                out.extend(format!("inserted {}\r\n", rng.below(1000)).as_bytes());
+            }
+            _ => out.extend(&line),
+        }
+    }
+    if out == base {
+        out.extend(b"tail\n");
+    }
+    out
+}
+
+#[test]
+fn 随机改动随机选行_暂存取消暂存丢弃的结果都和选中的行一致() {
+    let repo = Repo::new("random");
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    for round in 0..40 {
+        let name = format!("r{round}.txt");
+        let lines = 5 + rng.below(60) as usize;
+        let head = random_file(&mut rng, lines);
+        repo.commit(&name, &head);
+        let work = random_edit(&mut rng, &head);
+        repo.write(&name, &work);
+
+        // 暂存一部分：暂存区按选中的行变，工作区不动
+        let file = repo.diff(patch::unstaged_args(&name));
+        let set = random_pick(&file, &mut rng);
+        let want = expected(&repo.index(&name), &file, false, &set);
+        repo.apply(patch::apply_cached_args(false), partial(&file, false, &set));
+        assert_eq!(repo.index(&name), want, "第 {round} 轮暂存");
+        assert_eq!(repo.read(&name), work, "第 {round} 轮暂存动了工作区");
+
+        // 已暂存的再取消一部分
+        let staged = repo.diff(patch::staged_args(&name, None));
+        if staged.changed_lines() > 0 {
+            let set = random_pick(&staged, &mut rng);
+            let want = expected(&repo.index(&name), &staged, true, &set);
+            repo.apply(patch::apply_cached_args(true), partial(&staged, true, &set));
+            assert_eq!(repo.index(&name), want, "第 {round} 轮取消暂存");
+            assert_eq!(repo.read(&name), work, "第 {round} 轮取消暂存动了工作区");
+        }
+
+        // 工作区里剩下的丢弃一部分：工作区按选中的行变，暂存区不动
+        let index = repo.index(&name);
+        let rest = repo.diff(patch::unstaged_args(&name));
+        if rest.changed_lines() > 0 {
+            let set = random_pick(&rest, &mut rng);
+            let want = expected(&work, &rest, true, &set);
+            repo.apply(patch::discard_args(), partial(&rest, true, &set));
+            assert_eq!(repo.read(&name), want, "第 {round} 轮丢弃");
+            assert_eq!(repo.index(&name), index, "第 {round} 轮丢弃动了暂存区");
+        }
+    }
+}

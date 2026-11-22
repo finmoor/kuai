@@ -1413,8 +1413,16 @@ impl TermOverview {
             .as_ref()
             .filter(|names| row.alive && !names.is_empty())
             .map(|names| {
-                let names: Vec<&str> = names.iter().map(String::as_str).collect();
-                let running = tf!("正在运行：{names}", names = names.join(tr("、")));
+                // 不知道名字的是空串（PowerShell 自己执行的命令、看不到别的用户的进程）
+                let names: Vec<&str> = names
+                    .iter()
+                    .map(|name| name.trim())
+                    .filter(|name| !name.is_empty())
+                    .collect();
+                let running = match names.is_empty() {
+                    true => tr("有程序正在运行").to_string(),
+                    false => tf!("正在运行：{names}", names = names.join(tr("、"))),
+                };
                 format!("\n{running}")
             })
             .unwrap_or_default();

@@ -44,6 +44,9 @@ pub const STATUS_IO_TIMEOUT: NTSTATUS = nt(0xC000_00B5);
 pub const STATUS_DIRECTORY_NOT_EMPTY: NTSTATUS = nt(0xC000_0101);
 
 pub const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+/// 打开时要的权限：写数据、追加（`GrantedAccess` 里的位）
+pub const FILE_WRITE_DATA: u32 = 0x2;
+pub const FILE_APPEND_DATA: u32 = 0x4;
 pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 pub const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
 /// `Create` 的 `CreateOptions` 里：要建的是目录。

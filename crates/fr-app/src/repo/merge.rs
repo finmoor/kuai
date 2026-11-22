@@ -88,6 +88,23 @@ fn assemble(
     out
 }
 
+/// 读出来的文件变成编辑用的文字：换行统一成 LF，第二项是原来是不是 CRLF（保存时换回去，见
+/// [`encode`]）。不是 UTF-8 的返回 None：放进编辑框再写回去会坏。
+fn decode(bytes: Vec<u8>) -> Option<(String, bool)> {
+    let text = String::from_utf8(bytes).ok()?;
+    let crlf = text.contains("\r\n");
+    Some((text.replace("\r\n", "\n"), crlf))
+}
+
+/// 编辑好的文字变回要写进文件的字节。
+fn encode(text: &str, crlf: bool) -> Vec<u8> {
+    if crlf {
+        text.replace('\n', "\r\n").into_bytes()
+    } else {
+        text.as_bytes().to_vec()
+    }
+}
+
 /// 文件里有几处冲突；冲突标记不完整（只有开头没有结尾之类）时返回 None。
 fn count_conflicts(path: &str, text: &str) -> Option<usize> {
     DiffFile::parse_conflicts(path.to_string(), text)
@@ -122,9 +139,9 @@ impl RepoView {
                     view.hash = hash;
                     text
                 });
-                let text = match result.map(String::from_utf8) {
-                    Ok(Ok(text)) => text,
-                    Ok(Err(_)) => {
+                let (text, crlf) = match result.map(decode) {
+                    Ok(Some(decoded)) => decoded,
+                    Ok(None) => {
                         view.error = Some(
                             tr("此文件不是 UTF-8 编码，无法在此编辑。请在外部编辑器中解决，再在「本地修改」中点击「标记为已解决」。")
                                 .into(),
@@ -139,8 +156,8 @@ impl RepoView {
                         return;
                     }
                 };
-                view.crlf = text.contains("\r\n");
-                view.text = text.replace("\r\n", "\n");
+                view.crlf = crlf;
+                view.text = text;
                 let file = DiffFile::parse_conflicts(view.path.clone(), &view.text);
                 match file {
                     Ok(file) if !file.conflicts().is_empty() => {
@@ -314,11 +331,7 @@ impl RepoView {
             }
         }
         let path = view.path.clone();
-        let bytes = if view.crlf {
-            text.replace('\n', "\r\n").into_bytes()
-        } else {
-            text.into_bytes()
-        };
+        let bytes = encode(&text, view.crlf);
         // 打开以后文件被别的程序改过（外部编辑器、终端里的 git）：不写，编辑的内容留在编辑器里
         let changed =
             tr("文件在编辑期间已被其他程序修改，未保存。可先复制编辑内容，再重新打开此文件。");
@@ -525,8 +538,12 @@ impl RepoView {
 
 #[cfg(test)]
 mod tests {
-    use super::{assemble, count_conflicts};
+    use super::{assemble, count_conflicts, decode, encode};
+    use fr_core::workfile;
     use gpui_kit::component::diff::{DiffConflictResolution, DiffFile};
+    use std::io::Write as _;
+    use std::path::{Path, PathBuf};
+    use std::process::{Output, Stdio};
 
     const TEXT: &str = "head
 <<<<<<< HEAD
@@ -589,5 +606,150 @@ tail
             Some(DiffConflictResolution::Both)
         });
         assert_eq!(out, "a\nours\ntheirs\nz");
+    }
+
+    /// 一个临时仓库，用真的 git。
+    struct Repo(PathBuf);
+
+    impl Repo {
+        fn new(name: &str) -> Repo {
+            let dir = std::env::temp_dir().join(format!("fr-merge-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = Repo(dir);
+            repo.ok(&["init", "-q", "-b", "main"]);
+            repo.ok(&["config", "user.name", "测试"]);
+            repo.ok(&["config", "user.email", "test@example.com"]);
+            repo.ok(&["config", "core.autocrlf", "false"]);
+            repo
+        }
+
+        fn run(&self, args: &[String], stdin: Option<&[u8]>) -> Output {
+            let mut child = fr_core::git::command(&self.0, args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut pipe = child.stdin.take().unwrap();
+            if let Some(bytes) = stdin {
+                let _ = pipe.write_all(bytes);
+            }
+            drop(pipe);
+            child.wait_with_output().unwrap()
+        }
+
+        fn ok(&self, args: &[&str]) -> Vec<u8> {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let out = self.run(&args, None);
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "git {args:?}：{err}");
+            out.stdout
+        }
+
+        fn commit(&self, name: &str, bytes: &[u8], message: &str) {
+            std::fs::write(self.0.join(name), bytes).unwrap();
+            self.ok(&["add", "--", name]);
+            self.ok(&["commit", "-q", "-m", message]);
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 在两个分支上改同两处，合并时冲突：返回仓库，冲突的文件是 `name`。两处隔开四行，
+    /// 挨得太近 git 会把它们并成一处。
+    fn conflicted(tag: &str, name: &str, eol: &str) -> Repo {
+        let repo = Repo::new(tag);
+        let text = |a: &str, b: &str| {
+            ["head", a, "m1", "m2", "m3", "m4", b, "tail", ""]
+                .join(eol)
+                .into_bytes()
+        };
+        repo.commit(name, &text("a", "b"), "base");
+        repo.ok(&["checkout", "-q", "-b", "feature"]);
+        let theirs = text("a theirs", "b theirs");
+        repo.commit(name, &theirs, "theirs");
+        repo.ok(&["checkout", "-q", "main"]);
+        let ours = text("a ours", "b ours");
+        repo.commit(name, &ours, "ours");
+        let out = repo.run(&["merge".into(), "feature".into()], None);
+        assert!(!out.status.success(), "应该冲突");
+        repo
+    }
+
+    /// 像合并编辑器那样走一遍：读出来、逐处选、写回去、`git add`。返回写进文件的字节。
+    fn resolve(repo: &Repo, name: &str, pick: [DiffConflictResolution; 2]) -> Vec<u8> {
+        let out = repo.run(&workfile::read_args(name), None);
+        assert!(out.status.success());
+        let (hash, bytes) = workfile::split_read(&out.stdout).unwrap();
+        let (text, crlf) = decode(bytes.to_vec()).unwrap();
+        let file = DiffFile::parse_conflicts(name, &text).unwrap();
+        assert_eq!(file.conflicts().len(), 2, "{text}");
+        let merged = assemble(&text, file.conflicts(), |ix| Some(pick[ix]));
+        assert_eq!(count_conflicts(name, &merged), Some(0));
+        let bytes = encode(&merged, crlf);
+        let write = repo.run(&workfile::write_args(name, &hash, "changed"), Some(&bytes));
+        let err = String::from_utf8_lossy(&write.stderr);
+        assert!(write.status.success(), "{err}");
+        repo.ok(&["add", "--", name]);
+        bytes
+    }
+
+    #[test]
+    fn 真的冲突_逐处选完写回_标记为已解决后能提交() {
+        use DiffConflictResolution::{Both, Current};
+        let repo = conflicted("lf", "a.txt", "\n");
+        let bytes = resolve(&repo, "a.txt", [Current, Both]);
+        assert_eq!(
+            bytes,
+            b"head\na ours\nm1\nm2\nm3\nm4\nb ours\nb theirs\ntail\n"
+        );
+        assert_eq!(std::fs::read(repo.path().join("a.txt")).unwrap(), bytes);
+        // 没有没解决的文件了，合并能提交，提交有两个父提交
+        assert!(
+            repo.ok(&["diff", "--name-only", "--diff-filter=U"])
+                .is_empty()
+        );
+        repo.ok(&["commit", "-q", "--no-edit"]);
+        let parents = repo.ok(&["rev-list", "--parents", "-n", "1", "HEAD"]);
+        let parents = String::from_utf8_lossy(&parents).split_whitespace().count();
+        assert_eq!(parents, 3);
+    }
+
+    #[test]
+    fn 真的冲突_crlf_的文件写回去还是_crlf() {
+        use DiffConflictResolution::{Current, Incoming};
+        let repo = conflicted("crlf", "w.txt", "\r\n");
+        let bytes = resolve(&repo, "w.txt", [Incoming, Current]);
+        assert_eq!(
+            bytes,
+            b"head\r\na theirs\r\nm1\r\nm2\r\nm3\r\nm4\r\nb ours\r\ntail\r\n"
+        );
+        assert!(
+            repo.ok(&["diff", "--name-only", "--diff-filter=U"])
+                .is_empty()
+        );
+        repo.ok(&["commit", "-q", "--no-edit"]);
+        // 提交进去的也是 CRLF，没有多出、少掉换行
+        assert_eq!(repo.ok(&["show", "HEAD:w.txt"]), bytes);
+    }
+
+    #[test]
+    fn 不是_utf8_的文件不接_crlf_来回不变() {
+        assert_eq!(decode(b"\xc4\xe3\xba\xc3\n".to_vec()), None);
+        assert_eq!(
+            decode(b"a\r\nb\r\n".to_vec()),
+            Some(("a\nb\n".to_string(), true))
+        );
+        assert_eq!(encode("a\nb\n", true), b"a\r\nb\r\n");
+        assert_eq!(encode("a\nb\n", false), b"a\nb\n");
     }
 }

@@ -1555,6 +1555,7 @@
   "重命名、删除": "Rename or delete",
   "主机地址": "Address",
   "正在运行：{names}": "Running: {names}",
+  "有程序正在运行": "A program is running",
   "{name}（{repo}，{state}{since}）": "{name} ({repo}, {state}{since})",
   "{path}（{place}）": "{path} ({place})",
   "{title}：{detail}": "{title}: {detail}",

@@ -267,6 +267,11 @@ fn main() -> Result<()> {
             let terms = block_on(conn.term_list())?;
             println!("终端会话 {} 个", terms.len());
             for term in terms {
+                // 结束终端前确认框里写的就是这个：shell 以外还在跑的程序
+                match block_on(conn.term_programs(&term.term)) {
+                    Ok(programs) => println!("  {} 里在跑：{programs:?}", term.term),
+                    Err(err) => println!("  {} 里在跑：问不出来（{err:#}）", term.term),
+                }
                 println!(
                     "  {}  {}  {}×{}  {}  接着 {} 个客户端  开了 {} 秒  {}",
                     term.term,
@@ -344,7 +349,17 @@ fn terminal(
     let mut restore_ends: std::collections::VecDeque<usize> = Default::default();
     // 敲完命令的时候和终端名，到点送 `keys`
     let mut typed: Option<(Instant, String)> = None;
+    // 命令敲进去以后隔一会儿再单独按回车，和人敲的一样（kuaid 只把单独的回车当发出了一条命令）
+    const ENTER_AFTER: Duration = Duration::from_millis(300);
+    let mut enter = !command.is_empty();
     while let Some(left) = duration.checked_sub(started.elapsed()) {
+        if let Some((at, term)) = &typed
+            && enter
+            && at.elapsed() >= ENTER_AFTER
+        {
+            conn.term_input(term, b"\r".to_vec());
+            enter = false;
+        }
         if let Some((at, term)) = &typed
             && at.elapsed() >= KEYS_AFTER
             && let Some(keys) = keys.take()
@@ -381,7 +396,7 @@ fn terminal(
                     })
                     .collect();
                 if !command.is_empty() {
-                    conn.term_input(&term, format!("{command}\r").into_bytes());
+                    conn.term_input(&term, command.as_bytes().to_vec());
                 }
                 typed = Some((Instant::now(), term));
             }

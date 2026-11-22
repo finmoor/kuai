@@ -86,19 +86,37 @@ fn mtime(meta: &Metadata) -> u64 {
         .map_or(0, |since| since.as_millis() as u64)
 }
 
-fn stat_of(meta: &Metadata) -> FsStat {
+fn stat_of(meta: &Metadata, full: &Path) -> FsStat {
     FsStat {
         exists: true,
         dir: meta.is_dir(),
         size: if meta.is_dir() { 0 } else { meta.len() },
         mtime: mtime(meta),
-        readonly: meta.permissions().readonly(),
+        readonly: readonly(meta, full),
     }
+}
+
+/// 这个用户写不了它（目录：在里面建、删不了）。Linux 上按这个用户实际的权限问系统：root 的
+/// 644 文件只看权限位算可写，别的用户其实写不了，映射盘上的程序打开它追加时原来不报错，写不进去
+/// 只在 Kuai 里提示一句。Windows 上看只读属性。
+#[cfg(unix)]
+fn readonly(meta: &Metadata, full: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    match std::ffi::CString::new(full.as_os_str().as_bytes()) {
+        // SAFETY: 传的是以 0 结尾的路径，只读不写
+        Ok(path) => unsafe { libc::access(path.as_ptr(), libc::W_OK) != 0 },
+        Err(_) => meta.permissions().readonly(),
+    }
+}
+
+#[cfg(not(unix))]
+fn readonly(meta: &Metadata, _full: &Path) -> bool {
+    meta.permissions().readonly()
 }
 
 fn stat_at(full: &Path) -> Result<FsStat> {
     match fs::metadata(full) {
-        Ok(meta) => Ok(stat_of(&meta)),
+        Ok(meta) => Ok(stat_of(&meta, full)),
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(FsStat::default()),
         Err(err) => Err(err).with_context(|| tf!("无法读取 {path}", path = full.display())),
     }
@@ -134,7 +152,10 @@ pub fn list_with(repo: &str, dir: &str, all: bool) -> Result<Vec<FsEntry>> {
             true => fs::metadata(entry.path()).ok(),
             false => entry.metadata().ok(),
         };
-        let stat = meta.as_ref().map(stat_of).unwrap_or_default();
+        let stat = meta
+            .as_ref()
+            .map(|meta| stat_of(meta, &entry.path()))
+            .unwrap_or_default();
         listed.push(FsEntry {
             name,
             dir: stat.dir,
@@ -164,7 +185,7 @@ pub fn read(
     let full = resolve_inside(repo, path)?;
     let unreadable = || tf!("无法读取 {path}", path = full.display());
     let mut file = File::open(&full).with_context(unreadable)?;
-    let stat = stat_of(&file.metadata().with_context(unreadable)?);
+    let stat = stat_of(&file.metadata().with_context(unreadable)?, &full);
     if stat.dir {
         bail!("{}", tf!("{path} 是目录", path));
     }
@@ -194,7 +215,7 @@ pub fn sync(repo: &str, path: &str) -> Result<FsStat> {
         .open(&full)
         .with_context(failed)?;
     file.sync_all().with_context(failed)?;
-    Ok(stat_of(&file.metadata().with_context(failed)?))
+    Ok(stat_of(&file.metadata().with_context(failed)?, &full))
 }
 
 /// 写一个文件（整个换掉）。见 [`FsWrite`]。
@@ -501,7 +522,7 @@ pub fn write_at(repo: &str, path: &str, offset: u64, bytes: &[u8], create: bool)
         file.seek(SeekFrom::Start(offset)).with_context(failed)?;
         file.write_all(bytes).with_context(failed)?;
     }
-    Ok(stat_of(&file.metadata().with_context(failed)?))
+    Ok(stat_of(&file.metadata().with_context(failed)?, &full))
 }
 
 /// 把文件截短或接长到 `size` 字节。`new` 为真是新建一个文件：已经有了就失败。
@@ -518,7 +539,7 @@ pub fn resize(repo: &str, path: &str, size: u64, new: bool) -> Result<FsStat> {
             _ => anyhow::Error::new(err).context(failed()),
         })?;
     file.set_len(size).with_context(failed)?;
-    Ok(stat_of(&file.metadata().with_context(failed)?))
+    Ok(stat_of(&file.metadata().with_context(failed)?, &full))
 }
 
 /// 改修改时间（1970 年起的毫秒数）。
@@ -535,7 +556,7 @@ pub fn set_mtime(repo: &str, path: &str, mtime: u64) -> Result<FsStat> {
         .open(&full)
         .with_context(failed)?;
     file.set_modified(time).with_context(failed)?;
-    Ok(stat_of(&file.metadata().with_context(failed)?))
+    Ok(stat_of(&file.metadata().with_context(failed)?, &full))
 }
 
 /// 目录所在的盘一共多大、当前用户还能用多少。
@@ -1070,6 +1091,32 @@ mod tests {
         ] {
             assert!(resolve(root, good).is_ok(), "{good}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 按这个用户实际能不能写算只读() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // root 什么都写得了，这个测试要用普通用户跑
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("用 root 跑的，跳过");
+            return;
+        }
+        let repo = TempRepo::new();
+        let root = repo.repo();
+        repo.write("mine.txt", b"x");
+        repo.write("ro.txt", b"x");
+        fs::set_permissions(repo.0.join("ro.txt"), fs::Permissions::from_mode(0o444)).unwrap();
+        fs::create_dir(repo.0.join("locked")).unwrap();
+        fs::set_permissions(repo.0.join("locked"), fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(!stat(root, "mine.txt").unwrap().readonly);
+        assert!(stat(root, "ro.txt").unwrap().readonly);
+        assert!(stat(root, "locked").unwrap().readonly);
+        let listed = list(root, "").unwrap();
+        let flag = |name: &str| listed.iter().find(|e| e.name == name).unwrap().readonly;
+        assert!((flag("ro.txt"), flag("locked"), flag("mine.txt")) == (true, true, false));
+        // 让清理删得掉
+        fs::set_permissions(repo.0.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[cfg(unix)]

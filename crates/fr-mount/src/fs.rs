@@ -1382,9 +1382,36 @@ impl Mount {
         self.remember(&path, FsStat::default());
     }
 
+    /// 要写内容（`granted` 里有写数据、追加）而主机上这个用户写不了这个文件：打开时就拒绝。原来
+    /// 打开照样成功，写入在后台失败，程序以为写好了（只在 Kuai 里提示一句）。只改属性、时间的不拦。
+    fn check_write(&self, node: &Node, granted: u32) -> Nt<()> {
+        let state = lock(&node.state);
+        let writing = granted & (FILE_WRITE_DATA | FILE_APPEND_DATA) != 0;
+        match writing && !state.stat.dir && state.stat.readonly {
+            true => Err(STATUS_ACCESS_DENIED),
+            false => Ok(()),
+        }
+    }
+
     /// Windows 的规矩：目录里有东西就不能删。问服务器要现在的，Windows 上显示不了的名字也算。
+    /// 所在目录主机上的这个用户写不了的，也不能删：系统真正删的时候（Cleanup）已经报不了错，
+    /// 程序会以为删掉了。
     fn can_delete(&self, node: &Node) -> Nt<()> {
         self.writable()?;
+        // 只看 Linux 主机：那边的只读是按这个用户实际的权限算的。Windows 上目录的只读属性不管删
+        // 里面的东西，「文档」「桌面」这些文件夹还都带着它
+        if !self.windows {
+            let path = lock(&node.state).path.clone();
+            let parent = split(&path).0;
+            // 映射的根目录 `lookup` 不问主机（当它一直在），这里要真的问一次
+            let parent = match parent.is_empty() {
+                true => self.wait("fs_stat", "", self.channel()?.fs_stat(&self.root, ""))?,
+                false => self.lookup(parent)?,
+            };
+            if parent.readonly {
+                return Err(STATUS_ACCESS_DENIED);
+            }
+        }
         let state = lock(&node.state);
         if !state.stat.dir {
             return Ok(());
@@ -1754,13 +1781,14 @@ unsafe extern "C" fn open(
     fs: Fs,
     name: PWSTR,
     _options: u32,
-    _granted: u32,
+    granted: u32,
     context: *mut Ctx,
     info: *mut FileInfo,
 ) -> NTSTATUS {
     guard(|| unsafe {
         let mount = mount(fs);
         let node = mount.open(&remote_path(name))?;
+        mount.check_write(&node, granted)?;
         hand_out(mount, node, context, info);
         Ok(())
     })
@@ -2110,6 +2138,58 @@ mod tests {
         buffer
     }
 
+    /// 把文件或目录设成只读（或者去掉只读）。
+    fn set_readonly(path: &std::path::Path, readonly: bool) {
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_readonly(readonly);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
+    fn 写不了的文件打开来写内容就拒绝_读和改属性不拦() {
+        let dir = TempDir::new();
+        dir.write("ro.txt", b"keep");
+        set_readonly(&dir.0.join("ro.txt"), true);
+        let mount = local_mount(&dir);
+        let node = mount.open("ro.txt").unwrap();
+        for granted in [FILE_WRITE_DATA, FILE_APPEND_DATA, 0x1 | FILE_APPEND_DATA] {
+            assert_eq!(mount.check_write(&node, granted), Err(STATUS_ACCESS_DENIED));
+        }
+        // 读、改属性和时间（0x100）照样打得开
+        assert_eq!(mount.check_write(&node, 0x1 | 0x80 | 0x100), Ok(()));
+        dir.write("rw.txt", b"x");
+        let writable = mount.open("rw.txt").unwrap();
+        assert_eq!(mount.check_write(&writable, FILE_WRITE_DATA), Ok(()));
+        set_readonly(&dir.0.join("ro.txt"), false);
+    }
+
+    #[test]
+    fn 删之前看所在目录写不写得了_windows_上目录的只读属性不算() {
+        let dir = TempDir::new();
+        std::fs::create_dir(dir.0.join("locked")).unwrap();
+        dir.write("locked/keep.txt", b"x");
+        set_readonly(&dir.0.join("locked"), true);
+        // Windows 主机：「文档」这些文件夹都带只读属性，里面的照样能删
+        let mount = local_mount(&dir);
+        let node = mount.open("locked/keep.txt").unwrap();
+        assert_eq!(mount.can_delete(&node), Ok(()));
+        // Linux 主机：只读是按这个用户的权限算的，写不了的目录里不让删（不然系统以为删掉了）
+        let settings = Settings {
+            root: dir.0.to_string_lossy().into_owned(),
+            place: "T:".into(),
+            read_only: false,
+            windows: false,
+            label: "test".into(),
+        };
+        let linux = Mount::new(Channel::Local, settings, no_dir_info, Box::new(|_| {})).unwrap();
+        let node = linux.open("locked/keep.txt").unwrap();
+        assert_eq!(linux.can_delete(&node), Err(STATUS_ACCESS_DENIED));
+        set_readonly(&dir.0.join("locked"), false);
+        let node = linux.open("locked/keep.txt").unwrap();
+        linux.set_channel(Some(Channel::Local));
+        assert_eq!(linux.can_delete(&node), Ok(()));
+    }
+
     #[test]
     fn 只看开头时只拉一格() {
         let dir = TempDir::new();
@@ -2440,5 +2520,246 @@ mod tests {
             pace.landed(16 * UNIT, 16 * UNIT as usize, issued, landed);
         }
         assert_eq!(pace.budget(), AHEAD_MAX);
+    }
+
+    /// 经真的 kuaid 映射：和 Kuai 一样经转接程序（`kuaid --connect`）说协议，盘上的读写变成
+    /// `fs_*` 请求。主目录放在 target/tmp 下（Defender 会拦系统临时目录里没签名的程序），
+    /// 要先编好 kuaid（`cargo test --workspace` 会编；或者用 `KUAID_BIN` 指过去）。
+    struct Daemon {
+        dir: std::path::PathBuf,
+        exe: std::path::PathBuf,
+    }
+
+    impl Daemon {
+        fn new() -> Daemon {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            // 测试程序在 target/<档>/deps 下
+            let test_exe = std::env::current_exe().unwrap();
+            let profile = test_exe.parent().unwrap().parent().unwrap();
+            let kuaid = std::env::var_os("KUAID_BIN")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| profile.join("kuaid.exe"));
+            assert!(
+                kuaid.is_file(),
+                "找不到 {}：先 cargo build -p kuaid",
+                kuaid.display()
+            );
+            let dir = profile.parent().unwrap().join("tmp").join(format!(
+                "fr-mount-kuaid-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let build = dir.join(".kuai").join("test");
+            std::fs::create_dir_all(&build).unwrap();
+            std::fs::create_dir_all(dir.join("files")).unwrap();
+            let exe = build.join("kuaid.exe");
+            if std::fs::hard_link(&kuaid, &exe).is_err() {
+                std::fs::copy(&kuaid, &exe).unwrap();
+            }
+            Daemon { dir, exe }
+        }
+
+        fn command(&self) -> std::process::Command {
+            let mut cmd = std::process::Command::new(&self.exe);
+            cmd.env("FR_KUAID_HOME", &self.dir)
+                .env_remove("SSH_AUTH_SOCK")
+                .current_dir(&self.dir);
+            cmd
+        }
+
+        fn connect(&self) -> Channel {
+            let mut cmd = self.command();
+            cmd.arg("--connect");
+            Channel::Remote(Arc::new(fr_channel::Connection::spawn_stdio(cmd).unwrap()))
+        }
+
+        /// 映射的那个目录（主机上的）
+        fn files(&self) -> std::path::PathBuf {
+            self.dir.join("files")
+        }
+
+        /// 线路断了：强行结束转接程序，等于 ssh 没了（常驻进程不动）。
+        fn cut(&self) {
+            let script = format!(
+                "Get-CimInstance Win32_Process -Filter \"Name='kuaid.exe'\" | Where-Object {{ $_.ExecutablePath -and $_.ExecutablePath.StartsWith('{}', 'OrdinalIgnoreCase') -and $_.CommandLine -like '*--connect*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }}",
+                self.dir.display()
+            );
+            let out = std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &script,
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                !String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+                "没找到转接程序"
+            );
+        }
+    }
+
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = self.command().arg("--stop").output();
+            for _ in 0..50 {
+                if std::fs::remove_dir_all(&self.dir).is_ok() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    /// 经 kuaid 映射 `daemon` 的 files 目录；告诉用户的话收进 `errors`。
+    fn remote_mount(daemon: &Daemon, errors: &Arc<Mutex<Vec<String>>>) -> Mount {
+        let settings = Settings {
+            root: daemon.files().to_string_lossy().into_owned(),
+            place: "T:".into(),
+            read_only: false,
+            windows: true,
+            label: "test".into(),
+        };
+        let errors = errors.clone();
+        let sink = Box::new(move |text: String| errors.lock().unwrap().push(text));
+        Mount::new(daemon.connect(), settings, no_dir_info, sink).unwrap()
+    }
+
+    #[test]
+    fn 经_kuaid_写入_截断_新建_改名盖掉_删除_主机上的文件都对() {
+        let daemon = Daemon::new();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let files = daemon.files();
+        let mut model = noise(3_000_000, 21);
+        std::fs::write(files.join("a.bin"), &model).unwrap();
+        let mount = remote_mount(&daemon, &errors);
+
+        // 改中间、写到末尾以外、截短，落地以后主机上的和算的一样
+        let node = mount.open("a.bin").unwrap();
+        let data = noise(700_000, 22);
+        mount.write(&node, &data, 1_000_000, false, false).unwrap();
+        model[1_000_000..1_700_000].copy_from_slice(&data);
+        mount.write(&node, &data, 3_100_000, false, false).unwrap();
+        model.resize(3_100_000, 0);
+        model.extend_from_slice(&data);
+        mount.flush_file(&node).unwrap();
+        assert!(std::fs::read(files.join("a.bin")).unwrap() == model);
+        mount.resize(&node, 2_000_000, false).unwrap();
+        model.truncate(2_000_000);
+        mount.commit(&node).unwrap();
+        assert!(std::fs::read(files.join("a.bin")).unwrap() == model);
+        assert!(read_at(&mount, &node, 0, 4_000_000) == model);
+        mount.close(node);
+
+        // 新建一个（含新目录），写进去，再改名盖掉 a.bin：资源管理器、编辑器存盘就是这样
+        mount.create("sub", true).unwrap();
+        let made = mount.create("sub/b.txt", false).unwrap();
+        let text = "新的内容\r\n".repeat(1000).into_bytes();
+        mount.write(&made, &text, 0, false, false).unwrap();
+        mount.commit(&made).unwrap();
+        assert_eq!(
+            std::fs::read(files.join("sub").join("b.txt")).unwrap(),
+            text
+        );
+        mount.rename(&made, "a.bin", true).unwrap();
+        assert_eq!(std::fs::read(files.join("a.bin")).unwrap(), text);
+        assert!(!files.join("sub").join("b.txt").exists());
+        mount.remove(&made);
+        mount.close(made);
+        assert!(!files.join("a.bin").exists());
+        assert!(
+            errors.lock().unwrap().is_empty(),
+            "{:?}",
+            errors.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn 线路断了_没落到主机上的写入不报成功_换上新连接接着写() {
+        let daemon = Daemon::new();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let files = daemon.files();
+        std::fs::write(files.join("c.bin"), b"").unwrap();
+        let mount = Arc::new(remote_mount(&daemon, &errors));
+        let node = mount.open("c.bin").unwrap();
+
+        // 先写好一份、刷到主机上：之后断线不能把它弄坏
+        const SIZE: usize = 8 << 20;
+        const PIECE: usize = 256 * 1024;
+        let mut model = noise(SIZE, 50);
+        mount.write(&node, &model, 0, false, false).unwrap();
+        mount.flush_file(&node).unwrap();
+        assert!(std::fs::read(files.join("c.bin")).unwrap() == model);
+
+        // 一边在这 8 MB 里来回覆盖着写，一边把线路断掉。写入不等主机回音就返回（像本机
+        // 磁盘的写缓存），断线时总有几块在路上：落不了地的，之后的写入或刷盘必须报错，不能
+        // 一直报成功
+        let (writer_mount, writer_node) = (mount.clone(), node.clone());
+        let writer = std::thread::spawn(move || {
+            let started = Instant::now();
+            for round in 0u64.. {
+                let at = (round as usize * PIECE) % SIZE;
+                let data = noise(PIECE, 100 + round);
+                if let Err(status) =
+                    writer_mount.write(&writer_node, &data, at as u64, false, false)
+                {
+                    return (round, Some(status), model);
+                }
+                model[at..at + PIECE].copy_from_slice(&data);
+                if started.elapsed() > Duration::from_secs(20) {
+                    return (round, None, model);
+                }
+            }
+            unreachable!()
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        daemon.cut();
+        let (rounds, failed, model) = writer.join().unwrap();
+        assert!(
+            failed.is_some(),
+            "线路断了 20 秒，写入还一直报成功（写了 {rounds} 块）"
+        );
+        let flushed = mount.flush_file(&node);
+        let told = errors.lock().unwrap().clone();
+        eprintln!(
+            "断线前后写了 {rounds} 块，第 {rounds} 块报错 {:#x}；刷盘{}；告诉用户：{told:?}",
+            failed.unwrap(),
+            if flushed.is_ok() { "成功" } else { "报错" },
+        );
+        // 刷盘也照实报：没落地的不能报成刷好了
+        assert!(flushed.is_err(), "有写入没落地，刷盘却报成功");
+        let on_disk = std::fs::read(files.join("c.bin")).unwrap();
+        assert_eq!(on_disk.len(), SIZE, "断线把文件长度弄坏了");
+        let _ = model;
+        // 断了以后再写：马上报断开，不卡
+        let started = Instant::now();
+        while lock(&mount.channel)
+            .as_ref()
+            .is_some_and(|channel| match channel {
+                Channel::Remote(conn) => conn.is_alive(),
+                Channel::Local => true,
+            })
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "断了 10 秒还当连着"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let again = mount.write(&node, b"x", 0, false, false);
+        assert_eq!(again.err(), Some(STATUS_CONNECTION_DISCONNECTED));
+
+        // 重新连上（Kuai 换上新连接）：同一个打开着的文件接着写，落地以后主机上是新的
+        mount.set_channel(Some(daemon.connect()));
+        let _ = mount.commit(&node); // 断线时记下的错在这里取走
+        let fresh = noise(100_000, 999);
+        mount.write(&node, &fresh, 0, false, false).unwrap();
+        mount.resize(&node, fresh.len() as u64, false).unwrap();
+        mount.flush_file(&node).unwrap();
+        assert!(std::fs::read(files.join("c.bin")).unwrap() == fresh);
+        mount.close(node);
     }
 }
