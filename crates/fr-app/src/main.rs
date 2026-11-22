@@ -229,13 +229,20 @@ pub(crate) fn with_main_window(cx: &mut App, f: impl FnOnce(&mut Window, &mut Ap
 
 /// 安装版的卸载程序在删文件之前调用（`tools/installer/kuai.iss`），不开窗口：
 /// - `--has-saved-passwords`：凭据管理器里存着 Kuai 的密码、口令时退出码 0，没有是 1；
+/// - `--has-local-kuaid`：这台电脑上有本机 kuaid 的目录（`~/.kuai`）时退出码 0，没有是 1；
 /// - `--uninstall`：开机自启指向这个程序的话删掉（指向别处的，比如另一份解压版，不动）；
-///   再带 `--forget-passwords` 时把存的密码、口令也删掉；发系统通知用的标识和图标也删掉。
+///   再带 `--forget-passwords` 时把存的密码、口令也删掉；再带 `--remove-local-kuaid` 时停掉本机的
+///   kuaid、删掉 `~/.kuai`（见 [`remove_local_kuaid`]）；发系统通知用的标识和图标也删掉。
 fn uninstall_command() -> Option<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|arg| arg == flag);
     if has("--has-saved-passwords") {
         return Some(if secrets::saved_count() > 0 { 0 } else { 1 });
+    }
+    if has("--has-local-kuaid") {
+        let root = fr_channel::local_kuai_root();
+        let found = std::fs::read_dir(&root).is_ok_and(|mut entries| entries.next().is_some());
+        return Some(if found { 0 } else { 1 });
     }
     if !has("--uninstall") {
         return None;
@@ -247,7 +254,75 @@ fn uninstall_command() -> Option<i32> {
     if has("--forget-passwords") {
         secrets::forget_all();
     }
+    if has("--remove-local-kuaid") {
+        remove_local_kuaid();
+    }
     Some(0)
+}
+
+/// 卸载时选了「同时停止本机的 kuaid」：让常驻进程结束所有终端、退出（`kuaid --stop`），再删掉
+/// `~/.kuai`（各版本的 kuaid 和它运行时的文件；仓库列表、工作区在 `%APPDATA%\kuai`，和设置一起留着）。
+/// 这台电脑的 kuaid 也给连到这台电脑的别的电脑用，它们在这里开的终端一起结束，所以卸载程序先问。
+/// 程序退出、文件解开要一会儿：删不掉的隔一会儿再试，最多等 15 秒，还删不掉的留着。
+fn remove_local_kuaid() {
+    use std::time::{Duration, Instant};
+    let root = fr_channel::local_kuai_root();
+    let current = std::fs::read_to_string(root.join("run").join("current")).unwrap_or_default();
+    let current = current.trim().to_string();
+    // 常驻进程正在用的那一版放最前面；哪一版的 `--stop` 都能叫它退出，前面的不成再试下一个
+    let mut versions: Vec<PathBuf> = std::fs::read_dir(&root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(|c: char| c.is_ascii_digit())
+                })
+                .map(|entry| entry.path())
+                .collect()
+        })
+        .unwrap_or_default();
+    versions.sort_by_key(|dir| {
+        dir.file_name()
+            .is_none_or(|name| name.to_string_lossy() != current)
+    });
+    for dir in versions {
+        let exe = dir.join("kuaid.exe");
+        if !exe.is_file() {
+            continue;
+        }
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("--stop")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        fr_core::ssh::no_window(&mut cmd);
+        let Ok(mut child) = cmd.spawn() else {
+            continue;
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let stopped = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.success(),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                _ => {
+                    let _ = child.kill();
+                    break false;
+                }
+            }
+        };
+        if stopped {
+            break;
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while root.exists() && std::fs::remove_dir_all(&root).is_err() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 /// 测试实例（设了 `FR_SETTINGS`）没另设 `FR_KUAID_HOME` 时，给它在设置文件旁边单独一套本机

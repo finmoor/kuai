@@ -9,3 +9,12 @@ linker = "rust-lld"
 
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
+
+# Windows 版（kuai.exe、kuaid.exe）把 C 运行库静态链接进去。不然要 VCRUNTIME140.dll（VC++ 运行库），
+# 新装的 Windows 上没有，打开 Kuai 只弹「找不到 VCRUNTIME140.dll」；kuaid.exe 传到没装运行库的
+# Windows 主机上也起不来。用 dumpbin /dependents 看，导入表里不该有 VCRUNTIME140、api-ms-win-crt-*。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

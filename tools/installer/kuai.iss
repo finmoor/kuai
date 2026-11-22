@@ -11,7 +11,9 @@
 ; /waitpid：先等老的 Kuai 退出（最多 30 秒）；/relaunch=1：装好后打开新的 Kuai。
 ;
 ; 卸载：先确认 Kuai 没在运行；开机自启指向这里的话删掉（kuai.exe --uninstall）；
-; 凭据管理器里存着服务器密码的话问一句删不删；设置文件（%APPDATA%\kuai）留着。
+; 凭据管理器里存着服务器密码的话问一句删不删；有本机 kuaid 的目录（~/.kuai）的话问一句要不要
+; 停掉它、删掉这个目录（默认不删：这台电脑的 kuaid 也给连到这台电脑的别的电脑用）；
+; 设置文件（%APPDATA%\kuai）留着。
 
 #ifndef AppVersion
   #error 要用 /DAppVersion=<版本号> 编译
@@ -77,6 +79,8 @@ en.ForgetPasswords=Also delete the host passwords and key passphrases Kuai saved
 zh.ForgetPasswords=是否同时删除 Kuai 保存在 Windows 凭据管理器中的主机密码和私钥口令？
 en.CloseKuai=Kuai is running. Quit Kuai (including from the system tray), then click Retry.
 zh.CloseKuai=Kuai 正在运行。请先退出 Kuai（包括托盘中的 Kuai），然后点击「重试」。
+en.RemoveKuaid=Also stop the kuaid background service and delete %1? All terminals on this computer will close, including those opened from other computers connected to it.
+zh.RemoveKuaid=是否同时停止后台服务 kuaid 并删除 %1？这台电脑上的终端都会关闭，包括其他电脑连接到这台电脑后打开的终端。
 
 [Messages]
 ; 不显示「准备安装」页，任务页上的按钮是「安装」（见 CurPageChanged），说明跟着改
@@ -191,5 +195,10 @@ begin
   if Exec(Exe, '--has-saved-passwords', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0) then
     if SuppressibleMsgBox(CustomMessage('ForgetPasswords'), mbConfirmation, MB_YESNO, IDNO) = IDYES then
       Params := Params + ' --forget-passwords';
+  { 默认按钮是「否」，静默卸载也当「否」 }
+  if Exec(Exe, '--has-local-kuaid', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0) then
+    if SuppressibleMsgBox(FmtMessage(CustomMessage('RemoveKuaid'), [ExpandConstant('{%USERPROFILE}') + '\.kuai']),
+        mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES then
+      Params := Params + ' --remove-local-kuaid';
   Exec(Exe, Params, '', SW_HIDE, ewWaitUntilTerminated, Code);
 end;

@@ -253,9 +253,10 @@ fn ssh_version() -> Result<(String, String), String> {
     let mut cmd = std::process::Command::new(&program);
     cmd.arg("-V");
     fr_core::ssh::no_window(&mut cmd);
-    let out = cmd
-        .output()
-        .map_err(|err| tf!("无法运行 ssh：{err}", err))?;
+    let out = cmd.output().map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => fr_core::ssh::missing().to_string(),
+        _ => tf!("无法运行 ssh：{err}", err),
+    })?;
     let text = String::from_utf8_lossy(&out.stderr).trim().to_string();
     let text = match text.is_empty() {
         true => String::from_utf8_lossy(&out.stdout).trim().to_string(),

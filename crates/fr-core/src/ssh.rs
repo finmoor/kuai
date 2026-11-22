@@ -1,6 +1,7 @@
 //! 起 ssh 用的那几样：系统的 ssh 在哪、每次都带的选项、登录一台服务器的选项。
 //! 客户端连服务器、kuaid 替客户端连它配置的服务器（协议 10，见 kuaid 的 `relay`）共用。
 
+use crate::i18n::tr;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -37,6 +38,16 @@ pub fn program() -> PathBuf {
         }
     }
     PathBuf::from("ssh")
+}
+
+/// 找不到 ssh 时给人看的话。Windows 上 OpenSSH 客户端是「可选功能」，一般都装着，精简过的系统、
+/// Windows 沙盒里没有。
+pub fn missing() -> &'static str {
+    if cfg!(windows) {
+        tr("找不到 ssh。请在 Windows 设置的「可选功能」中添加「OpenSSH 客户端」，然后重试。")
+    } else {
+        tr("找不到 ssh。请安装 OpenSSH 客户端，然后重试。")
+    }
 }
 
 /// Windows 上起进程时不弹出控制台窗口。

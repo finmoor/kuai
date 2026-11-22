@@ -1,7 +1,6 @@
 //! 启动 git 进程、读它的输出，并且能从别的线程取消。kuaid 和客户端的本机通道共用这一套。
 
 use crate::i18n::tr;
-use crate::tf;
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
@@ -277,8 +276,7 @@ pub fn spawn_env(
     .stderr(Stdio::piped());
     let started = Instant::now();
     // 取消时连子进程一起结束（见 [`Tree`]）
-    let (tree, pipes) =
-        Tree::spawn(&mut cmd).with_context(|| tf!("无法启动 git {join}", join = args.join(" ")))?;
+    let (tree, pipes) = Tree::spawn(&mut cmd).map_err(|err| crate::git::spawn_error(err, args))?;
     let stdout = pipes.stdout.context(tr("无法获取 git 的标准输出"))?;
     let mut stderr = pipes.stderr.context(tr("无法获取 git 的标准错误"))?;
     let stdin_writer = match (stdin, pipes.stdin) {

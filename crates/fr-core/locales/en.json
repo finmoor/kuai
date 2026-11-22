@@ -1791,5 +1791,9 @@
   "这次连接时刚装上": "installed during this connection",
   "连接失败：{err}": "Connection failed: {err}",
   "通过": "Passed",
-  "重新诊断": "Run Again"
+  "重新诊断": "Run Again",
+  "找不到 git。请安装 Git for Windows {min} 或更高版本（git-scm.com），然后重新打开 Kuai。": "git was not found. Install Git for Windows {min} or later (git-scm.com), then reopen Kuai.",
+  "找不到 git。请安装 git {min} 或更高版本。": "git was not found. Install git {min} or later.",
+  "找不到 ssh。请在 Windows 设置的「可选功能」中添加「OpenSSH 客户端」，然后重试。": "ssh was not found. Add \"OpenSSH Client\" under Optional features in Windows Settings, then try again.",
+  "找不到 ssh。请安装 OpenSSH 客户端，然后重试。": "ssh was not found. Install the OpenSSH client, then try again."
 }

@@ -70,7 +70,7 @@ pub fn title_pill(updater: &Entity<Updater>, cx: &App) -> Option<AnyElement> {
 fn popover_body(
     updater: &Entity<Updater>,
     popover: &Entity<PopoverState>,
-    _: &mut Window,
+    window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
     let this = updater.read(cx);
@@ -82,6 +82,9 @@ fn popover_body(
         theme.success,
     );
     let body = v_flex().w(px(340.)).gap_3().p_1();
+    // 要点多、窗口矮（小屏幕、放大显示）时要点滚动，下面的按钮不能被挤出窗口：
+    // 减去的是标题栏、小窗的边距、上面的版本号和下面的说明、按钮
+    let notes_height = (window.viewport_size().height - px(300.)).max(px(80.));
     let body = match &this.stage {
         Stage::Available(release) => body
             .child(header(
@@ -91,7 +94,13 @@ fn popover_body(
                 Some(release_meta(release)),
                 cx,
             ))
-            .child(notes(release, cx))
+            .child(
+                div()
+                    .id("update-notes")
+                    .max_h(notes_height)
+                    .overflow_y_scroll()
+                    .child(notes(release, cx)),
+            )
             .child(
                 v_flex()
                     .gap_2()

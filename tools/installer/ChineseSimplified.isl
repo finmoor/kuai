@@ -28,11 +28,13 @@ LanguageID=$0804
 LanguageCodePage=936
 ; If the language you are translating to requires special font faces or
 ; sizes, uncomment any of the following entries and change them accordingly.
-;DialogFontName=
+; Kuai：中文向导直接用微软雅黑。默认的 Segoe UI 里没有中文字，要靠系统的字体链接（FontLink）
+; 借雅黑的字，个别系统（比如 Windows 沙盒）没有这项设置，向导里的中文全是方框
+DialogFontName=Microsoft YaHei UI
 ;DialogFontSize=9
 ;DialogFontBaseScaleWidth=7
 ;DialogFontBaseScaleHeight=15
-;WelcomeFontName=Segoe UI
+WelcomeFontName=Microsoft YaHei UI
 ;WelcomeFontSize=14
 
 [Messages]

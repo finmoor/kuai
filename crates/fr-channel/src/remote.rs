@@ -308,11 +308,19 @@ fn spawn_pipes(mut cmd: Command) -> Result<Pipes> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     no_window(&mut cmd);
-    let mut child = cmd.spawn().with_context(|| {
-        tf!(
+    let mut child = cmd.spawn().map_err(|err| {
+        let program = std::path::Path::new(cmd.get_program());
+        if err.kind() == std::io::ErrorKind::NotFound
+            && program
+                .file_stem()
+                .is_some_and(|stem| stem.eq_ignore_ascii_case("ssh"))
+        {
+            return anyhow!("{}", fr_core::ssh::missing());
+        }
+        anyhow::Error::new(err).context(tf!(
             "无法启动 {to_string_lossy}",
-            to_string_lossy = cmd.get_program().to_string_lossy()
-        )
+            to_string_lossy = program.to_string_lossy()
+        ))
     })?;
     let stdin = child.stdin.take().context(tr("无法获取 ssh 的标准输入"))?;
     let stdout = child.stdout.take().context(tr("无法获取 ssh 的标准输出"))?;

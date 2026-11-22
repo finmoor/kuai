@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
 
 /// 每次调用 git 都带的配置：路径里的中文不转义、日志按 UTF-8 输出、不显示签名、不带颜色。
 const CONFIG: &[&str] = &[
@@ -53,6 +53,29 @@ pub fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
 /// --autostash`（2.27）、`stash push --pathspec-from-file`（2.26）。工作树清单的 `-z` 要 2.36，
 /// 更老的按行读（Ubuntu 22.04 自带 2.34），见 [`crate::worktree::has_nul`]。
 pub const MIN_VERSION: (u32, u32, u32) = (2, 31, 0);
+
+/// 起 git 失败时的报错。找不到 git（新装的 Windows 上没有）时说清楚要装什么，别的照原样带上命令。
+pub fn spawn_error<S: AsRef<str>>(err: std::io::Error, args: &[S]) -> anyhow::Error {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        return anyhow::anyhow!("{}", missing());
+    }
+    let join = args.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(" ");
+    anyhow::Error::new(err).context(tf!("无法启动 git {join}", join))
+}
+
+/// 找不到 git 时给人看的话。
+pub fn missing() -> String {
+    let (major, minor, _) = MIN_VERSION;
+    let min = format!("{major}.{minor}");
+    if cfg!(windows) {
+        tf!(
+            "找不到 git。请安装 Git for Windows {min} 或更高版本（git-scm.com），然后重新打开 Kuai。",
+            min
+        )
+    } else {
+        tf!("找不到 git。请安装 git {min} 或更高版本。", min)
+    }
+}
 
 /// git 比 [`MIN_VERSION`] 旧时返回它的版本号（`2.25.1`），给人看。认不出版本的（没装 git、输出
 /// 认不得）不算旧：照常执行，出错时 git 自己会说。
@@ -149,7 +172,7 @@ pub fn run(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let out = command(repo, args)
         .stdin(Stdio::null())
         .output()
-        .with_context(|| tf!("无法启动 git {join}", join = args.join(" ")))?;
+        .map_err(|err| spawn_error(err, args))?;
     if !out.status.success() {
         bail!(
             "{}",
@@ -161,6 +184,25 @@ pub fn run(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
         );
     }
     Ok(out.stdout)
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    use super::{missing, spawn_error};
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn 找不到_git_时说要装什么() {
+        let err = spawn_error(Error::from(ErrorKind::NotFound), &["status"]);
+        assert_eq!(err.to_string(), missing());
+        assert!(missing().contains("2.31"));
+    }
+
+    #[test]
+    fn 别的错照原样带上命令() {
+        let err = spawn_error(Error::from(ErrorKind::PermissionDenied), &["log", "-1"]);
+        assert!(format!("{err:#}").contains("git log -1"));
+    }
 }
 
 #[cfg(test)]
