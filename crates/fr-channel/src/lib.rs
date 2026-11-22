@@ -40,6 +40,8 @@ pub use fr_core::protocol::{
     DirEntry, DirListing, FsEntry, FsExpect, FsSpace, FsStat, FsWrite, FsWritten, Hello, SubRepos,
     TermInfo, TermMark,
 };
+#[cfg(unix)]
+pub use remote::local_run_dir;
 pub use remote::{
     ConnectOptions, Connection, FailedAt, Jump, LoginFailure, Probe, StageHandler, local_kuai_root,
     login_failure,
@@ -308,8 +310,13 @@ pub fn init_prompts(
         bail!(tr("init_prompts 只能调用一次"));
     }
     let exe = std::env::current_exe()?;
+    // Unix 上的套接字放运行目录（Windows 上听本机端口，用不到目录）
+    #[cfg(unix)]
+    let dir = local_run_dir();
+    #[cfg(not(unix))]
+    let dir = std::env::temp_dir();
     // 这次连接存了密码、口令的先自动回答；没存的、答过一次还问的，才交给界面弹窗
-    let env = fr_core::askpass::serve_tagged(&exe, move |prompt, tag| {
+    let env = fr_core::askpass::serve_tagged_in(&dir, &exe, move |prompt, tag| {
         if let Some(answer) = saved_answer(tag, prompt) {
             return Some(answer);
         }

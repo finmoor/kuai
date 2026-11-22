@@ -33,9 +33,12 @@ alacritty_terminal = "0.26"
 # 往终端里发剪贴板里的图片：位图转成 PNG；文件页读图片的宽高（GPUI 也用它，不多带一个库）
 image = { version = "0.25", default-features = false, features = ["png", "bmp", "tiff", "ico", "pnm", "jpeg", "gif", "webp"] }
 # 检查更新、点一下升级（update.rs）：问 GitHub Releases、下载发布包（ureq，rustls），
-# 核对 SHA-256，解压 zip，换掉正在运行的 kuai.exe（Windows 上只能改名、不能删，self-replace 处理）
+# 核对 SHA-256，解压 zip（Windows）或 tar.gz（Linux），换掉正在运行的程序（Windows 上只能改名、
+# 不能删，self-replace 处理）。flate2 已经跟着 zip 编进来了
 ureq = { version = "3.5.2", features = ["json"] }
 zip = { version = "9.5.1", default-features = false, features = ["deflate"] }
+tar = { version = "0.4.44", default-features = false }
+flate2 = "1.1.11"
 self-replace = "1.5.1"
 semver = "1.0.28"
 sha2 = "0.10"

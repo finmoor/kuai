@@ -482,7 +482,8 @@ mod imp {
 
 /// Linux 等 Unix 系统：有没有已经运行的看文件锁 `kuai-<键>.lock`（进程退出、崩溃时系统自动放开）；
 /// 请求经 Unix 套接字 `kuai-<键>.sock` 交过去，一样是一行 JSON、处理完回一个字节。两个文件放在
-/// `$XDG_RUNTIME_DIR`（只有本人能进的目录），没有这个变量时放在 `~/.kuai/run/`。
+/// `$XDG_RUNTIME_DIR/kuai`（只有本人能进的目录），没有这个变量时放在 `~/.kuai/run/`
+/// （[`fr_channel::local_run_dir`]）。
 ///
 /// kuaid 在 Unix 上自己拉起常驻进程，不来找 Kuai（Windows 上那样做是为了离开会话 0），所以不写
 /// `kuai.pipe`。
@@ -507,14 +508,7 @@ mod imp {
 
     /// 放锁和套接字的目录。
     fn dir() -> PathBuf {
-        match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
-            Some(dir) if dir.is_absolute() && dir.is_dir() => dir,
-            _ => {
-                let dir = fr_channel::local_kuai_root().join("run");
-                let _ = std::fs::create_dir_all(&dir);
-                dir
-            }
-        }
+        fr_channel::local_run_dir()
     }
 
     fn socket_path(key: &str) -> PathBuf {
@@ -771,11 +765,7 @@ mod tests {
                 let _ = incoming.done.send(());
             }
         });
-        let dir = match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
-            Some(dir) if dir.is_absolute() && dir.is_dir() => dir,
-            _ => fr_channel::local_kuai_root().join("run"),
-        };
-        let socket = dir.join(format!("kuai-{key}.sock"));
+        let socket = fr_channel::local_run_dir().join(format!("kuai-{key}.sock"));
         // 一个连上来不说话的
         let silent = std::os::unix::net::UnixStream::connect(&socket).unwrap();
         let request = Request {
@@ -800,7 +790,8 @@ mod tests {
             .expect("放开以后拿不到");
         drop(again);
         let _ = std::fs::remove_file(&socket);
-        let _ = std::fs::remove_file(dir.join(format!("kuai-{key}.lock")));
+        let lock = fr_channel::local_run_dir().join(format!("kuai-{key}.lock"));
+        let _ = std::fs::remove_file(lock);
     }
 
     #[cfg(unix)]

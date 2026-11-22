@@ -623,7 +623,7 @@ fn no_code() -> &'static str {
     if cfg!(windows) {
         tr("未找到 VS Code 命令行工具（code）。请安装 VS Code 时勾选「添加到 PATH」，并重启 Kuai。")
     } else {
-        tr("未找到 VS Code 命令行工具（code）。请安装 VS Code 后重启 Kuai。")
+        tr("未找到 VS Code 命令行工具（code）。请安装 VS Code，并确认 code 在 PATH 中。")
     }
 }
 

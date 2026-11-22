@@ -1,5 +1,7 @@
-# 推 v1.8.0 这样的标签就发版：测试、打包，把安装程序 kuai-<版本>-windows-x64-setup.exe 和
-# 解压版 kuai-<版本>-windows-x64.zip 传到 GitHub Releases。
+# 推 v1.8.0 这样的标签就发版：测试、打包，把 Windows 的安装程序 kuai-<版本>-windows-x64-setup.exe、
+# 解压版 kuai-<版本>-windows-x64.zip 和 Linux 版 kuai-<版本>-linux-x64.tar.gz 传到 GitHub Releases。
+# 先编 Windows 版，Linux 版拿它打好的 kuaid 文件夹（两个平台的包里带一模一样的 kuaid，见
+# tools/package-linux.sh），两边都打好了才建 Release，不会出现只有一半附件的版本。
 # 发布说明取自 CHANGELOG.md 里这个版本的那一节。GitHub 会给附件算 SHA-256（API 的 assets[].digest），
 # Kuai 升级时拿它核对下载的文件，所以不另传校验文件。
 name: Release
@@ -12,7 +14,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  windows:
     runs-on: windows-latest
     env:
       TAG: ${{ github.ref_name }}
@@ -51,23 +53,96 @@ jobs:
 
       - name: 打包
         shell: pwsh
-        run: ./tools/package.ps1
+        run: |
+          ./tools/package.ps1
+          # Linux 版的包要同一批 kuaid：拷到固定的位置再交出去
+          $version = $env:TAG.TrimStart('v')
+          Copy-Item -Recurse "dist\kuai-$version-windows-x64\Kuai\kuaid" kuaid-for-linux
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/kuai-*-windows-x64-setup.exe
+            dist/kuai-*-windows-x64.zip
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kuaid
+          path: kuaid-for-linux/
+          if-no-files-found: error
+
+  # 在 22.04 上编：在哪个系统上编，就要那个版本及以上的 glibc（22.04 是 2.35）
+  linux:
+    needs: windows
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 装 GPUI 要的开发包
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libfontconfig-dev libfreetype-dev libwayland-dev libx11-xcb-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libvulkan-dev libzstd-dev
+
+      - name: 测试
+        run: cargo test --workspace
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: kuaid
+          path: kuaid-from-windows
+
+      - name: 打包
+        run: ./tools/package-linux.sh --kuaid kuaid-from-windows
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/kuai-*-linux-x64.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux
+          path: dist
 
       - name: 发布说明
         shell: pwsh
         run: |
           $version = $env:TAG.TrimStart('v')
           $notes = ./tools/release-notes.ps1 $version
-          $download = "下载：安装版 kuai-$version-windows-x64-setup.exe（推荐），解压版 kuai-$version-windows-x64.zip。" +
+          $windows = "Windows：安装版 kuai-$version-windows-x64-setup.exe（推荐），解压版 kuai-$version-windows-x64.zip。" +
             "程序未进行代码签名，首次运行时 Windows 可能提示「Windows 已保护你的电脑」，请点击「更多信息」，再点击「仍要运行」。"
-          "$notes`n`n$download" | Set-Content -Encoding utf8NoBOM notes.md
+          $linux = "Linux：kuai-$version-linux-x64.tar.gz（x86_64，glibc 2.35 及以上，例如 Ubuntu 22.04、Debian 12），" +
+            "解压后运行 Kuai/kuai，说明见其中的「使用说明.txt」。"
+          # 下载说明不用「- 」开头：Kuai 的更新提示把发布说明里「- 」开头的行当作改了什么
+          "$notes`n`n$windows`n`n$linux" | Set-Content -Encoding utf8NoBOM notes.md
 
       - name: 传到 GitHub Releases
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $zip = Get-ChildItem dist -Filter 'kuai-*-windows-x64.zip' | Select-Object -First 1
-          $setup = Get-ChildItem dist -Filter 'kuai-*-windows-x64-setup.exe' | Select-Object -First 1
-          if (-not $zip -or -not $setup) { throw '缺发布包或安装程序' }
-          gh release create $env:TAG $setup.FullName $zip.FullName --title "Kuai $env:TAG" --notes-file notes.md --verify-tag
+          $files = 'kuai-*-windows-x64-setup.exe', 'kuai-*-windows-x64.zip', 'kuai-*-linux-x64.tar.gz' | ForEach-Object {
+            $file = Get-ChildItem dist -Filter $_ | Select-Object -First 1
+            if (-not $file) { throw "缺 $_" }
+            $file.FullName
+          }
+          gh release create $env:TAG @files --title "Kuai $env:TAG" --notes-file notes.md --verify-tag

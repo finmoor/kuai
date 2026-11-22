@@ -1,11 +1,13 @@
 """生成发布包里的第三方许可证清单：Kuai 和 kuaid 编进去的每个库的名字、版本、许可证，
 和这些库自带的许可证全文。MIT、Apache-2.0 这类许可证要求随程序附上它们的声明。
 
-用法：python tools/third-party-licenses.py <输出文件>（tools/package.ps1 打包时调用）
+用法：python tools/third-party-licenses.py <输出文件> [windows|linux]
+（tools/package.ps1 打 Windows 版时调用，默认 windows；tools/package-linux.sh 打 Linux 版时带 linux）
 
-只算编进程序的依赖：Windows 上 fr-app 的、Linux 上 kuaid 的普通依赖（连带过程宏），
-不算只在编译时跑的构建脚本依赖和测试用的。全文一样的许可证只印一次，后面列出用它的库。
-另外加上不是 cargo 依赖、原样随包带的程序文件（VENDORED）。
+只算编进程序的依赖：这个平台的客户端 fr-app，和包里带的 kuaid（Linux 版、Windows 版）的
+普通依赖（连带过程宏），不算只在编译时跑的构建脚本依赖和测试用的。全文一样的许可证只印一次，
+后面列出用它的库。另外加上不是 cargo 依赖、原样随包带的程序文件（VENDORED）。
+Windows 版的清单用 CRLF，Linux 版的用 LF。
 """
 import collections
 import hashlib
@@ -14,7 +16,9 @@ import pathlib
 import subprocess
 import sys
 
-ROOTS = [('fr-app', 'x86_64-pc-windows-msvc'), ('kuaid', 'x86_64-unknown-linux-musl')]
+# 客户端按平台；两个平台的包里带的是同一批 kuaid（见 tools/package-linux.sh）
+CLIENT = {'windows': 'x86_64-pc-windows-msvc', 'linux': 'x86_64-unknown-linux-gnu'}
+KUAID = ['x86_64-unknown-linux-musl', 'x86_64-pc-windows-msvc']
 LICENSE_PREFIXES = ('license', 'licence', 'copying', 'notice', 'unlicense', 'copyright')
 REPO = pathlib.Path(__file__).resolve().parent.parent
 # 原样随包带的程序文件：许可证全文在 manifest_path 所在的目录里。换版本时和 vendor/conpty/README.md 一起改
@@ -66,8 +70,12 @@ def license_files(package):
 
 def main():
     out = pathlib.Path(sys.argv[1])
+    platform = sys.argv[2] if len(sys.argv) > 2 else 'windows'
+    if platform not in CLIENT:
+        sys.exit(f'不认识的平台：{platform}（windows 或 linux）')
+    roots = [('fr-app', CLIENT[platform])] + [('kuaid', target) for target in KUAID]
     packages = {}
-    for root, target in ROOTS:
+    for root, target in roots:
         for package in runtime_packages(metadata(target), root):
             packages[(package['name'], package['version'])] = package
     for package in VENDORED:
@@ -105,7 +113,8 @@ def main():
                   for p in missing]
     for text, users in texts.values():
         lines += ['', '=' * 78, '用到这份许可证的库 / used by: ' + ', '.join(users), '=' * 78, '', text]
-    out.write_text('\n'.join(lines) + '\n', encoding='utf-8', newline='\r\n')
+    newline = '\r\n' if platform == 'windows' else '\n'
+    out.write_text('\n'.join(lines) + '\n', encoding='utf-8', newline=newline)
     print(f'{out}: {len(rows)} libraries, {len(texts)} distinct license texts, '
           f'{len(missing)} without a license file')
 

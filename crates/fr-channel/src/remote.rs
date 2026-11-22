@@ -1465,6 +1465,23 @@ pub fn local_kuai_root() -> PathBuf {
     local_home().join(".kuai")
 }
 
+/// 客户端放套接字、锁文件的目录（Unix 上的单实例、askpass）：`$XDG_RUNTIME_DIR/kuai`（只给自己，
+/// 退出登录就清掉），没有 `XDG_RUNTIME_DIR` 时是 `~/.kuai/run`。不放程序所在的目录：装在 /opt
+/// 这类目录时写不进去，路径长了还会超过 Unix 套接字地址的上限（108 字节）。
+#[cfg(unix)]
+pub fn local_run_dir() -> PathBuf {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let dir = match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() && dir.is_dir() => dir.join("kuai"),
+        _ => local_kuai_root().join("run"),
+    };
+    let _ = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir);
+    dir
+}
+
 /// 结束 ssh 和它启动的进程。经跳板机连接时，ssh 下面还挂着转接用的那几层（见 `hop`）：正常情况下
 /// 外面的 ssh 一走它们跟着走，但跳板机那头卡住时它们会留下，还占着我们读的那根管道，所以一起结束。
 fn kill_tree(child: &mut Child) {

@@ -14,6 +14,7 @@ pub const AVAILABLE: bool = cfg!(windows);
 
 /// 用户在托盘上做了什么。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub enum TrayAction {
     /// 把窗口叫出来
     Show,

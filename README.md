@@ -290,14 +290,17 @@ Kuai 不自建连接和认证，全部交给 SSH。思路与 VS Code 的 Remote 
 | `tools/gen-test-repo.py` | 生成性能测试用的大仓库 |
 | `tools/ui-test/` | 界面测试脚本：建测试仓库、截窗口、往测试窗口投递点击和输入（不动真实鼠标） |
 | `tools/package.ps1` | 打发布包：客户端加 Linux 版、Windows 版 kuaid，出安装程序和解压版的 zip，输出到 `dist/` |
+| `tools/package-linux.sh` | 打 Linux 版的发布包（tar.gz）：Linux 客户端加 Windows 版的包里那一批 kuaid |
 | `tools/installer/` | 安装程序的脚本（Inno Setup 6，`kuai.iss`）和简体中文的界面文字 |
 | `tools/release-notes.ps1`、`CHANGELOG.md` | 发版时的发布说明：取 `CHANGELOG.md` 里这个版本的那一节 |
-| `.github/workflows/` | 推代码时跑测试（`ci.yml`，kuaid 常驻那一套在 Windows、Linux 上各跑各的）；推 `v*` 标签时打包发版（`release.yml`） |
+| `.github/workflows/` | 推代码时在 Windows、Linux 上各跑一遍全部测试（`ci.yml`）；推 `v*` 标签时打包发版（`release.yml`：先打 Windows 版，Linux 版用它的 kuaid，都打好了再建 Release） |
 | `tools/make-icon.py` | 画应用图标，输出 `crates/fr-app/assets/icon.ico` |
 
 ### 构建与运行
 
 需要 Rust（stable，MSVC 工具链）和 Visual Studio 生成工具（「使用 C++ 的桌面开发」：MSVC 和 Windows SDK）。第一次编译约 5 分钟。
+
+Linux 客户端在 Linux 上编，要先装 GPUI 的开发包（Ubuntu、Debian 上的包名见 `.github/workflows/ci.yml`），命令和下面一样（程序是 `target/release/fr-app`）。发布的 Linux 版在 Ubuntu 22.04 上编，要 glibc 2.35 及以上。
 
 ```bash
 # Linux 版 kuaid：连主机时客户端从 target/x86_64-unknown-linux-musl/release/ 取它上传
@@ -322,7 +325,7 @@ cargo test --workspace
 # kuaid 常驻那一套（拉起、终端断开后还在、升级不断终端）两个系统各有一份实现、各测各的。
 # Windows 版：上面的 cargo test --workspace 里就有（crates/kuaid/tests/windows.rs，拿真的 kuaid.exe 测）。
 # Linux 版：交叉编译出测试程序，连同 kuaid 拷到 Linux 机器上跑，见 crates/kuaid/tests/linux.rs 开头；
-# GitHub Actions 的 ci.yml 在 ubuntu 上直接跑
+# 在 Linux 上直接 cargo test --workspace 也行（ci.yml 就是这样）
 cargo test --no-run --release -p kuaid --target x86_64-unknown-linux-musl
 
 # Windows 版 kuaid：连 Windows 主机、开本机终端时，客户端从自己旁边（target/release/kuaid.exe）取它

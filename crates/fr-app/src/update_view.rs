@@ -484,7 +484,7 @@ fn problem_text(problem: &Problem) -> (SharedString, SharedString) {
         Problem::NotWritable(_) => (tr("无法安装"), tr("Kuai 所在的文件夹没有写入权限").into()),
         Problem::DevBuild => (
             tr("开发版不支持自动更新"),
-            tr("当前程序不是发布版的 kuai.exe").into(),
+            tf!("当前程序不是发布版的 {exe}", exe = crate::update::EXE),
         ),
         Problem::Install(err) => (tr("安装失败"), err.clone()),
     };

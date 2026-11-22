@@ -313,6 +313,11 @@ mod stub {
 
     pub struct Mounted(());
 
+    /// 和 Windows 上的一样，丢掉就是断开（这里本来就没有映射）。调用的地方在后台线程里 `drop` 它
+    impl Drop for Mounted {
+        fn drop(&mut self) {}
+    }
+
     pub fn mount(
         _channel: Channel,
         _options: Options,

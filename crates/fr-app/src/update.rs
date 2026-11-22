@@ -4,17 +4,19 @@
 //! `releases/latest`（设置里能关，「设置 → 关于」里能手动问），比自己新就在标题栏上提示
 //! （没问成的过一会儿再试，见 [`wait_before_next`]；窗口从托盘叫回来、再次启动时也问，见
 //! [`Updater::window_shown`]）
-//! （`update_view.rs`）。点「升级」才下载，下到 `%LOCALAPPDATA%\kuai\update\`，和 GitHub 给附件记的
+//! （`update_view.rs`）。点「升级」才下载，下到 `%LOCALAPPDATA%\kuai\update\`（Linux 上是
+//! `~/.cache/kuai/update/`），和 GitHub 给附件记的
 //! SHA-256（API 里的 `digest`）对一遍，放进暂存目录。下哪个、怎么换看这份 Kuai 是怎么装的（[`Kind`]）：
 //! - 安装版（`tools/installer/kuai.iss` 装的）：下新的安装程序。点「重启完成升级」时在后台跑它
 //!   （不弹向导），它等这个进程退出后装上、打开新的 Kuai。这样「设置 → 应用」里的版本号也跟着变。
 //! - 解压版：下 zip 解压。点「重启完成升级」时别的文件直接覆盖，kuai.exe 用 self-replace 换
 //!   （运行中的 exe 只能改名、不能删），再拉起新的 Kuai、自己退出。
+//! - Linux：只有解压版，下 tar.gz（`kuai-<版本>-linux-x64.tar.gz`），换法和解压版一样，程序叫 `kuai`。
 //!
 //! 下好了没点重启就退出的，下次启动时先换上再开（[`apply_staged_at_startup`]）。
 //!
 //! 服务器上的 kuaid 不用管：新版客户端连上时，常驻进程原地换成新程序（见 docs/架构.md 第 4 节）。
-//! 只有打好的包（exe 叫 kuai.exe）会换程序；开发时的 fr-app.exe 只检查、不换。
+//! 只有打好的包（程序叫 kuai.exe，Linux 上叫 kuai，见 [`EXE`]）会换程序；开发时的 fr-app 只检查、不换。
 //!
 //! 测试用的环境变量：`FR_UPDATE_API` 换掉 `https://api.github.com`（指到本机的假服务），
 //! `FR_UPDATE_DIR` 换掉下载和暂存的目录。
@@ -58,6 +60,14 @@ const TICK: Duration = Duration::from_secs(30);
 const RECHECK_ON_SHOW: Duration = Duration::from_secs(30 * 60);
 /// 发布说明里最多取几条要点
 const MAX_NOTES: usize = 6;
+/// 打好的包里客户端程序的名字（开发时编出来的叫 fr-app，不换）
+pub(crate) const EXE: &str = if cfg!(windows) { "kuai.exe" } else { "kuai" };
+/// 这个平台的发布包：名字是 `kuai-<版本>` 加上这个
+const PACKAGE_SUFFIX: &str = if cfg!(windows) {
+    "-windows-x64.zip"
+} else {
+    "-linux-x64.tar.gz"
+};
 /// 暂存目录里的这个文件表示解压完了
 const READY_MARK: &str = ".kuai-update-ready";
 /// 换上新版本时写下原来的版本号，新的 Kuai 启动时读到就提示「已升到 …」。
@@ -650,10 +660,10 @@ fn parse_release(mut release: GhRelease, kind: Kind) -> Option<Release> {
     })
 }
 
-/// 发布包的名字：`kuai-<版本>-windows-x64.zip`。
+/// 这个平台的发布包的名字：`kuai-<版本>-windows-x64.zip`、`kuai-<版本>-linux-x64.tar.gz`。
 fn is_package(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    name.starts_with("kuai-") && name.ends_with("-windows-x64.zip")
+    name.starts_with("kuai-") && name.ends_with(PACKAGE_SUFFIX)
 }
 
 /// 安装程序的名字：`kuai-<版本>-windows-x64-setup.exe`。
@@ -723,12 +733,13 @@ fn staging_dir(version: &Version) -> PathBuf {
     update_dir().join(version.to_string())
 }
 
-/// 能升级的话返回程序所在的文件夹：得是打好的包（kuai.exe），文件夹得能写。
+/// 能升级的话返回程序所在的文件夹：得是打好的包（[`EXE`]），文件夹得能写。
 fn install_dir() -> Result<PathBuf, Problem> {
     let exe = std::env::current_exe().map_err(|err| Problem::Install(err.to_string()))?;
-    let packaged = exe
-        .file_name()
-        .is_some_and(|name| name.eq_ignore_ascii_case("kuai.exe"));
+    let packaged = exe.file_name().is_some_and(|name| match cfg!(windows) {
+        true => name.eq_ignore_ascii_case(EXE),
+        false => name == EXE,
+    });
     if !packaged {
         return Err(Problem::DevBuild);
     }
@@ -746,13 +757,13 @@ fn install_dir() -> Result<PathBuf, Problem> {
     }
 }
 
-/// 在下载线程里跑：下载、核对校验值、放进暂存目录（安装程序直接放，zip 解压）。
+/// 在下载线程里跑：下载、核对校验值、放进暂存目录（安装程序直接放，发布包解压）。
 fn fetch_and_stage(release: &Release, got: &AtomicU64, cancel: &AtomicBool) -> Result<(), Problem> {
     let Some(expected) = &release.asset.sha256 else {
         return Err(Problem::Download(tr("GitHub 未提供此文件的校验值").into()));
     };
     // 这一次自己的工作目录：下载、核对、解压都在里面，做完整个目录一次改名放进暂存目录。原来
-    // 几次下载共用同一个 .part、zip 和暂存目录，取消以后马上重下，旧线程还在写、删、解压同一份
+    // 几次下载共用同一个 .part、发布包和暂存目录，取消以后马上重下，旧线程还在写、删、解压同一份
     let n = NEXT_DOWNLOAD.fetch_add(1, Ordering::Relaxed);
     let work = update_dir().join(format!("{WORK_PREFIX}{}-{n}", std::process::id()));
     let _ = fs::remove_dir_all(&work);
@@ -773,7 +784,7 @@ fn fetch_and_stage(release: &Release, got: &AtomicU64, cancel: &AtomicBool) -> R
     result
 }
 
-/// 下到 `work` 里、核对校验值，在 `staged` 里摆好要换上的东西（安装程序直接放，zip 解压）。
+/// 下到 `work` 里、核对校验值，在 `staged` 里摆好要换上的东西（安装程序直接放，发布包解压）。
 /// 核对的就是要放进去的那一份文件。
 fn fetch_into(
     release: &Release,
@@ -783,7 +794,7 @@ fn fetch_into(
     got: &AtomicU64,
     cancel: &AtomicBool,
 ) -> Result<(), Problem> {
-    let zip = work.join(&release.asset.name);
+    let package = work.join(&release.asset.name);
     let part = work.join(format!("{}.part", release.asset.name));
     let actual = download(&release.asset.url, &part, got, cancel)
         .map_err(|err| Problem::Download(format!("{err:#}")))?;
@@ -793,8 +804,8 @@ fn fetch_into(
     if is_setup(&release.asset.name) {
         return stage_setup(&part, staged).map_err(|err| Problem::Install(format!("{err:#}")));
     }
-    fs::rename(&part, &zip).map_err(|err| Problem::Install(err.to_string()))?;
-    extract(&zip, staged).map_err(|err| Problem::Install(format!("{err:#}")))
+    fs::rename(&part, &package).map_err(|err| Problem::Install(err.to_string()))?;
+    extract(&package, staged).map_err(|err| Problem::Install(format!("{err:#}")))
 }
 
 /// 下好的安装程序挪进暂存目录。
@@ -896,12 +907,29 @@ fn download(url: &str, dest: &Path, got: &AtomicU64, cancel: &AtomicBool) -> Res
         .collect())
 }
 
-/// 解压发布包。包里最外层的文件夹（`Kuai\`）去掉，解出来的文件直接放在 `out` 下。
-fn extract(zip: &Path, out: &Path) -> Result<()> {
+/// 解压发布包（Windows 是 zip，Linux 是 tar.gz）。包里最外层的文件夹（`Kuai/`）去掉，解出来的
+/// 文件直接放在 `out` 下。
+fn extract(package: &Path, out: &Path) -> Result<()> {
     if out.exists() {
         fs::remove_dir_all(out)?;
     }
     fs::create_dir_all(out)?;
+    let name = package
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if name.ends_with(".tar.gz") {
+        extract_tar_gz(package, out)?;
+    } else {
+        extract_zip(package, out)?;
+    }
+    if !out.join(EXE).is_file() {
+        bail!("{}", tf!("发布包中缺少 {exe}", exe = EXE));
+    }
+    write_ready(out)
+}
+
+fn extract_zip(zip: &Path, out: &Path) -> Result<()> {
     let mut archive = zip::ZipArchive::new(File::open(zip)?)?;
     let mut entries = Vec::new();
     for i in 0..archive.len() {
@@ -913,10 +941,7 @@ fn extract(zip: &Path, out: &Path) -> Result<()> {
     }
     let top = common_top(&entries);
     for (i, (name, is_dir)) in entries.iter().enumerate() {
-        let rel = match &top {
-            Some(top) => name.strip_prefix(top).unwrap_or(name),
-            None => name.as_path(),
-        };
+        let rel = below_top(name, &top);
         if rel.as_os_str().is_empty() {
             continue;
         }
@@ -931,10 +956,74 @@ fn extract(zip: &Path, out: &Path) -> Result<()> {
         let mut file = archive.by_index(i)?;
         io::copy(&mut file, &mut File::create(&path)?)?;
     }
-    if !out.join("kuai.exe").is_file() {
-        bail!(tr("发布包中缺少 kuai.exe"));
+    Ok(())
+}
+
+/// Linux 的发布包。只解普通文件和文件夹，带链接、`..`、绝对路径的不解；
+/// 文件的权限（可执行）照包里记的。
+fn extract_tar_gz(package: &Path, out: &Path) -> Result<()> {
+    let open = || -> Result<tar::Archive<flate2::read::GzDecoder<File>>> {
+        let file = File::open(package)?;
+        Ok(tar::Archive::new(flate2::read::GzDecoder::new(file)))
+    };
+    // 先过一遍名字，看最外层的文件夹是哪个
+    let mut entries = Vec::new();
+    for entry in open()?.entries()? {
+        if let Some(found) = tar_entry(&entry?)? {
+            entries.push(found);
+        }
     }
-    write_ready(out)
+    let top = common_top(&entries);
+    for entry in open()?.entries()? {
+        let mut entry = entry?;
+        let Some((name, is_dir)) = tar_entry(&entry)? else {
+            continue;
+        };
+        let rel = below_top(&name, &top);
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let path = out.join(rel);
+        if is_dir {
+            fs::create_dir_all(&path)?;
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        entry.unpack(&path)?;
+    }
+    Ok(())
+}
+
+/// tar 里的一条：普通文件、文件夹返回（路径，是不是文件夹）；只带说明的（pax 头）、`./` 跳过；
+/// 链接、设备、不安全的路径报错。
+fn tar_entry<R: Read>(entry: &tar::Entry<R>) -> Result<Option<(PathBuf, bool)>> {
+    use std::path::Component;
+    use tar::EntryType;
+    let is_dir = match entry.header().entry_type() {
+        EntryType::Regular | EntryType::Continuous => false,
+        EntryType::Directory => true,
+        EntryType::XGlobalHeader | EntryType::XHeader => return Ok(None),
+        _ => bail!(tr("发布包中包含不安全的路径")),
+    };
+    let mut clean = PathBuf::new();
+    for part in entry.path()?.components() {
+        match part {
+            Component::Normal(part) => clean.push(part),
+            Component::CurDir => {}
+            _ => bail!(tr("发布包中包含不安全的路径")),
+        }
+    }
+    Ok((!clean.as_os_str().is_empty()).then_some((clean, is_dir)))
+}
+
+/// 去掉最外层的文件夹以后的路径。
+fn below_top<'a>(name: &'a Path, top: &Option<PathBuf>) -> &'a Path {
+    match top {
+        Some(top) => name.strip_prefix(top).unwrap_or(name),
+        None => name,
+    }
 }
 
 /// 所有条目都在同一个最外层文件夹里：返回它。
@@ -999,13 +1088,14 @@ fn raw_switch(command: &mut std::process::Command, name: &str, value: &str) {
     command.arg(format!("/{name}={value}"));
 }
 
-/// 解压版：把暂存目录里的新版本换到程序所在的文件夹：别的文件直接覆盖，kuai.exe 最后换。
+/// 解压版：把暂存目录里的新版本换到程序所在的文件夹：别的文件直接覆盖，程序（[`EXE`]）最后换。
 /// 返回 exe 的路径（已经是新版本了）。调用方先核对过暂存目录（[`verify_staged`]）。
 fn install(staging: &Path) -> Result<PathBuf> {
     let exe = std::env::current_exe()?;
     let dir = exe.parent().context(tr("未找到程序所在的文件夹"))?;
     copy_tree(staging, staging, dir)?;
-    self_replace::self_replace(staging.join("kuai.exe")).context(tr("无法替换 kuai.exe"))?;
+    self_replace::self_replace(staging.join(EXE))
+        .with_context(|| tf!("无法替换 {path}", path = EXE))?;
     let _ = fs::write(update_dir().join(DONE_MARK), env!("CARGO_PKG_VERSION"));
     // 换上了就删掉：万一新程序报的版本号不比现在新（发版时标签打错），启动时也不会一遍遍地换
     let _ = fs::remove_dir_all(staging);
@@ -1017,7 +1107,7 @@ fn copy_tree(root: &Path, from: &Path, to: &Path) -> Result<()> {
         let entry = entry?;
         let path = entry.path();
         let rel = path.strip_prefix(root)?;
-        if rel == Path::new("kuai.exe") || rel == Path::new(READY_MARK) {
+        if rel == Path::new(EXE) || rel == Path::new(READY_MARK) {
             continue;
         }
         let target = to.join(rel);
@@ -1097,7 +1187,7 @@ fn clean_old_downloads() {
         let old = Version::parse(&name).is_ok_and(|v| v <= current);
         if old || name.starts_with(WORK_PREFIX) {
             let _ = fs::remove_dir_all(entry.path());
-        } else if name.ends_with(".part") || name.ends_with(".zip") {
+        } else if name.ends_with(".part") || name.ends_with(".zip") || name.ends_with(".tar.gz") {
             let _ = fs::remove_file(entry.path());
         }
     }
@@ -1108,8 +1198,8 @@ mod tests {
     // 不能 `use super::*`：gpui_kit 里也有个叫 test 的属性宏，会盖住标准库的 #[test]
     use super::{CHECK_EVERY, wait_before_next};
     use super::{
-        GhAsset, GhRelease, Kind, READY_MARK, Version, common_top, copy_tree, extract, stage_setup,
-        verify_staged,
+        EXE, GhAsset, GhRelease, Kind, PACKAGE_SUFFIX, READY_MARK, Version, common_top, copy_tree,
+        extract, stage_setup, verify_staged,
     };
     use super::{parse_release, plain};
     use std::fs::{self, File};
@@ -1147,21 +1237,24 @@ mod tests {
         assert!(wait_before_next(99) < CHECK_EVERY);
     }
 
+    /// 这个平台的发布包的名字
+    fn package(version: &str) -> String {
+        format!("kuai-{version}{PACKAGE_SUFFIX}")
+    }
+
     #[test]
     fn 认出发布包和校验值() {
+        let name = package("1.8.0");
         let release = parse_release(
             gh(
                 "v1.8.0",
-                &[
-                    ("notes.txt", None),
-                    ("kuai-1.8.0-windows-x64.zip", Some("sha256:ABCD")),
-                ],
+                &[("notes.txt", None), (&name, Some("sha256:ABCD"))],
             ),
             Kind::Portable,
         )
         .unwrap();
         assert_eq!(release.version, Version::new(1, 8, 0));
-        assert_eq!(release.asset.name, "kuai-1.8.0-windows-x64.zip");
+        assert_eq!(release.asset.name, name);
         assert_eq!(release.asset.sha256.as_deref(), Some("abcd"));
         assert_eq!(release.date.as_deref(), Some("2026-11-20"));
         assert_eq!(release.notes, ["点一下升级：见 说明", "修了 kuaid 的问题"]);
@@ -1173,11 +1266,12 @@ mod tests {
 
     #[test]
     fn 安装版要安装程序_解压版要zip() {
+        let zip = package("1.8.0");
         let both = || {
             gh(
                 "v1.8.0",
                 &[
-                    ("kuai-1.8.0-windows-x64.zip", Some("sha256:aa")),
+                    (&zip, Some("sha256:aa")),
                     ("kuai-1.8.0-windows-x64-setup.exe", Some("sha256:bb")),
                 ],
             )
@@ -1186,22 +1280,39 @@ mod tests {
         assert_eq!(installed.asset.name, "kuai-1.8.0-windows-x64-setup.exe");
         assert_eq!(installed.asset.sha256.as_deref(), Some("bb"));
         let portable = parse_release(both(), Kind::Portable).unwrap();
-        assert_eq!(portable.asset.name, "kuai-1.8.0-windows-x64.zip");
+        assert_eq!(portable.asset.name, zip);
         // 安装版遇到只有 zip 的版本：退回 zip
-        let zip_only = gh("v1.8.0", &[("kuai-1.8.0-windows-x64.zip", None)]);
+        let zip_only = gh("v1.8.0", &[(&zip, None)]);
         let fallback = parse_release(zip_only, Kind::Installed).unwrap();
-        assert_eq!(fallback.asset.name, "kuai-1.8.0-windows-x64.zip");
+        assert_eq!(fallback.asset.name, zip);
         // 解压版遇到只有安装程序的版本：当作没有
         let setup_only = gh("v1.8.0", &[("kuai-1.8.0-windows-x64-setup.exe", None)]);
         assert!(parse_release(setup_only, Kind::Portable).is_none());
     }
 
     #[test]
+    fn 只认这个平台的发布包() {
+        let assets = [
+            ("kuai-1.8.0-windows-x64-setup.exe", None),
+            ("kuai-1.8.0-windows-x64.zip", None),
+            ("kuai-1.8.0-linux-x64.tar.gz", None),
+        ];
+        let release = parse_release(gh("v1.8.0", &assets), Kind::Portable).unwrap();
+        assert_eq!(release.asset.name, package("1.8.0"));
+        // 只发了别的平台的：当作没有
+        let other = match cfg!(windows) {
+            true => "kuai-1.8.0-linux-x64.tar.gz",
+            false => "kuai-1.8.0-windows-x64.zip",
+        };
+        assert!(parse_release(gh("v1.8.0", &[(other, None)]), Kind::Portable).is_none());
+    }
+
+    #[test]
     fn 没有发布包或者版本号不对就当没有() {
         let portable = |release| parse_release(release, Kind::Portable);
         assert!(portable(gh("v1.8.0", &[("source.zip", None)])).is_none());
-        assert!(portable(gh("nightly", &[("kuai-x-windows-x64.zip", None)])).is_none());
-        let mut pre = gh("v1.9.0-beta.1", &[("kuai-1.9.0-windows-x64.zip", None)]);
+        assert!(portable(gh("nightly", &[(&package("x"), None)])).is_none());
+        let mut pre = gh("v1.9.0-beta.1", &[(&package("1.9.0"), None)]);
         pre.prerelease = true;
         assert!(portable(pre).is_none());
     }
@@ -1239,7 +1350,7 @@ mod tests {
         {
             let mut zip = zip::ZipWriter::new(File::create(&zip_path).unwrap());
             let options = zip::write::SimpleFileOptions::default();
-            zip.start_file("Kuai/kuai.exe", options).unwrap();
+            zip.start_file(format!("Kuai/{EXE}"), options).unwrap();
             zip.write_all(b"new exe").unwrap();
             zip.start_file("Kuai/kuaid/x86_64-unknown-linux-musl/kuaid", options)
                 .unwrap();
@@ -1248,14 +1359,14 @@ mod tests {
         }
         let staging = root.join("9.9.9");
         extract(&zip_path, &staging).unwrap();
-        assert_eq!(fs::read(staging.join("kuai.exe")).unwrap(), b"new exe");
+        assert_eq!(fs::read(staging.join(EXE)).unwrap(), b"new exe");
         assert!(staging.join(READY_MARK).is_file());
         verify_staged(&staging).unwrap();
 
-        // 别的文件覆盖到安装目录，kuai.exe 和记号不动（exe 由 self-replace 换）
+        // 别的文件覆盖到安装目录，程序和记号不动（程序由 self-replace 换）
         let installed = root.join("installed");
         fs::create_dir_all(installed.join("kuaid/x86_64-unknown-linux-musl")).unwrap();
-        fs::write(installed.join("kuai.exe"), b"old exe").unwrap();
+        fs::write(installed.join(EXE), b"old exe").unwrap();
         fs::write(
             installed.join("kuaid/x86_64-unknown-linux-musl/kuaid"),
             b"old",
@@ -1264,8 +1375,121 @@ mod tests {
         copy_tree(&staging, &staging, &installed).unwrap();
         let kuaid = installed.join("kuaid/x86_64-unknown-linux-musl/kuaid");
         assert_eq!(fs::read(kuaid).unwrap(), b"new kuaid");
-        assert_eq!(fs::read(installed.join("kuai.exe")).unwrap(), b"old exe");
+        assert_eq!(fs::read(installed.join(EXE)).unwrap(), b"old exe");
         assert!(!installed.join(READY_MARK).exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 往 tar 里加一条：名字直接写进头里（`append_data` 不让写 `..`，测不了不安全的路径）
+    fn tar_add(
+        tar: &mut tar::Builder<impl std::io::Write>,
+        name: &str,
+        kind: tar::EntryType,
+        mode: u32,
+        data: &[u8],
+    ) {
+        let mut header = tar::Header::new_gnu();
+        let field = &mut header.as_gnu_mut().unwrap().name;
+        field[..name.len()].copy_from_slice(name.as_bytes());
+        header.set_entry_type(kind);
+        header.set_mode(mode);
+        header.set_size(data.len() as u64);
+        if kind == tar::EntryType::Symlink {
+            header.set_link_name("/etc/passwd").unwrap();
+        }
+        header.set_cksum();
+        tar.append(&header, data).unwrap();
+    }
+
+    /// tar 里的一条：名字、类型、权限、内容
+    type TarItem<'a> = (&'a str, tar::EntryType, u32, &'a [u8]);
+
+    fn tar_gz(path: &std::path::Path, entries: &[TarItem]) {
+        let gz = flate2::write::GzEncoder::new(
+            File::create(path).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut tar = tar::Builder::new(gz);
+        for (name, kind, mode, data) in entries {
+            tar_add(&mut tar, name, *kind, *mode, data);
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+
+    #[test]
+    fn 解压_tar_gz() {
+        use tar::EntryType::{Directory, Regular};
+        let root = std::env::temp_dir().join(format!("kuai-update-tar-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        // 和 tools/package-linux.sh 打的一样：最外层一个 Kuai 文件夹，程序可执行
+        let package = root.join("kuai-9.9.9-linux-x64.tar.gz");
+        let exe = format!("Kuai/{EXE}");
+        tar_gz(
+            &package,
+            &[
+                ("Kuai/", Directory, 0o755, b""),
+                (&exe, Regular, 0o755, b"new exe"),
+                (
+                    "Kuai/kuaid/x86_64-unknown-linux-musl/kuaid",
+                    Regular,
+                    0o755,
+                    b"new kuaid",
+                ),
+                ("Kuai/README.txt", Regular, 0o644, b"readme"),
+            ],
+        );
+        let staging = root.join("9.9.9");
+        extract(&package, &staging).unwrap();
+        assert_eq!(fs::read(staging.join(EXE)).unwrap(), b"new exe");
+        assert_eq!(fs::read(staging.join("README.txt")).unwrap(), b"readme");
+        let kuaid = staging.join("kuaid/x86_64-unknown-linux-musl/kuaid");
+        assert_eq!(fs::read(&kuaid).unwrap(), b"new kuaid");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(staging.join(EXE)), 0o755);
+            assert_eq!(mode(kuaid), 0o755);
+            assert_eq!(mode(staging.join("README.txt")), 0o644);
+        }
+        verify_staged(&staging).unwrap();
+        // 没带程序的不算
+        let empty = root.join("kuai-0.0.0-linux-x64.tar.gz");
+        tar_gz(&empty, &[("Kuai/README.txt", Regular, 0o644, b"x")]);
+        assert!(extract(&empty, &root.join("empty")).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tar_gz_里的链接和不安全的路径不解() {
+        use tar::EntryType::{Regular, Symlink};
+        let root = std::env::temp_dir().join(format!("kuai-update-tarslip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let exe = format!("Kuai/{EXE}");
+        let cases: [&[TarItem]; 3] = [
+            &[
+                (&exe, Regular, 0o755, b"x"),
+                ("Kuai/../../evil.txt", Regular, 0o644, b"x"),
+            ],
+            &[
+                (&exe, Regular, 0o755, b"x"),
+                ("/tmp/evil.txt", Regular, 0o644, b"x"),
+            ],
+            &[
+                (&exe, Regular, 0o755, b"x"),
+                ("Kuai/link", Symlink, 0o777, b""),
+            ],
+        ];
+        for (i, entries) in cases.iter().enumerate() {
+            let package = root.join(format!("bad-{i}.tar.gz"));
+            tar_gz(&package, entries);
+            let out = root.join(format!("out-{i}"));
+            assert!(extract(&package, &out).is_err(), "第 {i} 个");
+            assert!(!out.join("link").exists());
+        }
+        assert!(!root.join("evil.txt").exists());
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -1,7 +1,7 @@
-# 推到 main、提 PR 时跑测试。
+# 推到 main、提 PR 时跑测试：Windows、Linux 各跑一遍整个工作区的测试。
 # kuaid 常驻那一套（拉起、终端断开后还在、升级不断终端）两个系统各有一份实现、各测各的：
-# Windows 版（crates/kuaid/tests/windows.rs）跟着 windows 任务的全部测试一起跑，
-# Linux 版（tests/linux.rs）单独一个 ubuntu 的任务。
+# Windows 版（crates/kuaid/tests/windows.rs）在 windows 任务里，Linux 版（tests/linux.rs）在 linux 任务里。
+# Linux 任务和发版时一样在 ubuntu-22.04 上（发布的 Linux 版客户端要 glibc 2.35 及以上）。
 name: CI
 
 on:
@@ -22,11 +22,18 @@ jobs:
       - name: 测试
         run: cargo test --workspace
 
-  kuaid-linux:
-    runs-on: ubuntu-latest
+  linux:
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: kuaid 的测试（含 tests/linux.rs）
-        run: cargo test -p kuaid
+      # 和 release.yml 的 linux 任务一样
+      - name: 装 GPUI 要的开发包
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libfontconfig-dev libfreetype-dev libwayland-dev libx11-xcb-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libvulkan-dev libzstd-dev
+      - name: 测试（含 kuaid 的 tests/linux.rs）
+        run: cargo test --workspace
