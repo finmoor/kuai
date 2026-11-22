@@ -147,7 +147,8 @@ impl ManagerView {
     /// 主机、端口、用户名分开填，存的时候拼成 ssh 的目标；登录方式选密钥或密码。
     /// 填了的密码、私钥口令存进系统的凭据管理器（见 `secrets`），不进设置文件。
     ///
-    /// 「测试连接」拿表单里现在填的去登录一次（不保存，不装 kuaid），结果写在对话框里。
+    /// 「测试连接」拿表单里现在填的打开诊断对话框（[`crate::diagnose::Diagnose::open_form`]）：
+    /// 逐步登录一次，不保存，不装、不启动 kuaid。
     fn server_dialog(&mut self, edit: Option<Server>, window: &mut Window, cx: &mut Context<Self>) {
         let editing = edit.is_some();
         let old = edit.unwrap_or_default();
@@ -239,18 +240,11 @@ impl ManagerView {
         let forget = Rc::new(Cell::new(false));
         // 没填对时的提示，显示在对话框里
         let problem: Rc<RefCell<Option<SharedString>>> = Rc::default();
-        let test: Rc<RefCell<TestState>> = Rc::default();
-        // 第几次测试：改了表单再测时，上一次晚到的结果不算
-        let test_run = Rc::new(Cell::new(0u64));
         window.open_dialog(cx, move |dialog, window, cx| {
             if first_build.replace(false) {
                 host.focus_handle(cx).focus(window, cx);
             }
-            let (muted, danger, success) = (
-                cx.theme().muted_foreground,
-                cx.theme().danger,
-                cx.theme().success,
-            );
+            let (muted, danger) = (cx.theme().muted_foreground, cx.theme().danger);
             // 把表单里填的读成一台服务器，连同这次填的密码或口令；没填对就是该提示的那句话
             let collect = {
                 let (host, port, user, key) =
@@ -383,18 +377,17 @@ impl ManagerView {
                     }
                 }
             };
-            // 测试连接：拿表单里现在填的登录一次，不保存。密码、口令用这次填的；没填、存着的又还作数
-            // 就用存着的；都没有就照常弹窗问。跳板机照它们自己存着的设置登录
+            // 测试连接：拿表单里现在填的打开诊断对话框，逐步登录一次，不保存。密码、口令用这次填的；
+            // 没填、存着的又还作数就用存着的；都没有就照常弹窗问。跳板机照它们自己存着的设置登录
             let run_test = {
                 let (collect, app, forget) = (collect.clone(), app.clone(), forget.clone());
                 let old = old.clone();
-                let (problem, test, test_run) = (problem.clone(), test.clone(), test_run.clone());
+                let problem = problem.clone();
                 move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                     let (server, secret) = match collect(cx) {
                         Ok(read) => read,
                         Err(message) => {
                             *problem.borrow_mut() = Some(message.into());
-                            *test.borrow_mut() = TestState::Idle;
                             window.refresh();
                             return;
                         }
@@ -408,54 +401,32 @@ impl ManagerView {
                         false => Some(secret),
                         true => options.secret.filter(|_| keep),
                     };
-                    options.jumps = {
+                    // 依次经过的跳板机：连接选项，和对话框里显示的名字、地址
+                    let jumps: Vec<(String, String)> = {
                         let settings = &app.read(cx).settings;
                         let last = server.jump.as_deref().and_then(|id| settings.server(id));
                         let before = last.map(|jump| settings.route(&jump.id));
-                        let route = before.into_iter().flatten().chain(last);
-                        route.map(crate::app_state::jump_options).collect()
+                        let route: Vec<&Server> = before.into_iter().flatten().chain(last).collect();
+                        options.jumps = route
+                            .iter()
+                            .map(|jump| crate::app_state::jump_options(jump))
+                            .collect();
+                        route
+                            .iter()
+                            .map(|jump| (jump.name.clone(), jump.destination.clone()))
+                            .collect()
                     };
-                    let run = test_run.get() + 1;
-                    test_run.set(run);
-                    *test.borrow_mut() = TestState::Running;
                     window.refresh();
-                    let destination = server.destination.clone();
-                    let probing = cx.background_executor().spawn(async move {
-                        fr_channel::Connection::probe(&destination, &options)
-                    });
-                    let (test, test_run) = (test.clone(), test_run.clone());
-                    window
-                        .spawn(cx, async move |cx| {
-                            let result = probing.await;
-                            if test_run.get() != run {
-                                return;
-                            }
-                            *test.borrow_mut() = match result {
-                                // 不写用了多久：中间可能停下来等人填密码
-                                Ok(probe) if probe.supported => TestState::Passed(
-                                    tf!(
-                                        "连接成功 · {os} {arch}",
-                                        os = probe.os,
-                                        arch = probe.arch
-                                    )
-                                    .into(),
-                                ),
-                                Ok(probe) => TestState::Failed(
-                                    tf!(
-                                        "目前仅支持 Linux 和 Windows 主机，该主机为 {os}",
-                                        os = probe.os
-                                    )
-                                    .into(),
-                                ),
-                                Err(err) => TestState::Failed(format!("{err:#}").into()),
-                            };
-                            cx.update(|window, _| window.refresh()).ok();
-                        })
-                        .detach();
+                    crate::diagnose::Diagnose::open_form(
+                        app.clone(),
+                        &server,
+                        jumps,
+                        options,
+                        window,
+                        cx,
+                    );
                 }
             };
-            let test_now = test.borrow().clone();
-            let testing = matches!(test_now, TestState::Running);
             let auth_now = auth.get();
             let pick_auth = |to: Auth| {
                 let auth = auth.clone();
@@ -736,30 +707,6 @@ impl ManagerView {
                         .when_some(problem.borrow().clone(), |body, found| {
                             body.child(div().text_sm().text_color(danger).child(found))
                         })
-                        // 测试连接的结果：报错可能很长（带着 ssh 的原话），让它折行
-                        .map(|body| match test_now {
-                            TestState::Idle => body,
-                            TestState::Running => body.child(
-                                div()
-                                    .text_sm()
-                                    .text_color(muted)
-                                    .child(tr("正在测试连接…")),
-                            ),
-                            TestState::Passed(text) => body.child(
-                                h_flex()
-                                    .gap(px(6.))
-                                    .text_sm()
-                                    .text_color(success)
-                                    .child(ui::icon(IconName::Check).flex_none())
-                                    .child(text),
-                            ),
-                            TestState::Failed(text) => body.child(
-                                div()
-                                    .text_sm()
-                                    .text_color(danger)
-                                    .child(tf!("连接测试失败：{err}", err = text)),
-                            ),
-                        })
                         // 这句说的是上面的登录信息，紧跟着它们；映射是单独的一节，放在最后
                         .child(div().text_xs().text_color(muted).child(if jump_now.is_some() {
                             tr(
@@ -777,8 +724,6 @@ impl ManagerView {
                         .child(
                             Button::new("test")
                                 .label(tr("测试连接"))
-                                .loading(testing)
-                                .disabled(testing)
                                 .on_click(run_test),
                         )
                         .child(
@@ -1014,16 +959,6 @@ pub(crate) fn confirm_in(
 
 fn field(label: &'static str, input: impl IntoElement) -> impl IntoElement {
     field_with(label, None, input)
-}
-
-/// 「测试连接」走到哪了。
-#[derive(Clone, Default)]
-enum TestState {
-    #[default]
-    Idle,
-    Running,
-    Passed(SharedString),
-    Failed(SharedString),
 }
 
 /// 选了跳板机以后，主机那一格的提示

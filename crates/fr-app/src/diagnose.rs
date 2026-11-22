@@ -4,15 +4,18 @@
 //!   登录、kuaid、主机上的 git、映射用的 WinFsp，哪一步失败就停在哪，后面写「未检查」。连接走的是
 //!   平常那条路（`AppState::connect`）：诊断通过时仓库页也就连上了。哪一步失败靠
 //!   [`fr_channel::login_failure`]（登录阶段的失败带着是哪一台）。
+//! - 主机设置里的「测试连接」打开同一个对话框（[`Diagnose::open_form`]）：拿表单里填的（还没保存）
+//!   只登录一次（[`Connection::probe`]），看系统、主机上的 git、这一版的 kuaid 装了没有；不保存，
+//!   也不在主机上装、启动 kuaid。
 //! - 设置 →「关于」里的「复制诊断信息…」打开 [`Summary`]：各主机现在的连接情况和最近的错误，不重新连。
 //! - 复制的文字默认隐藏主机地址、用户名（[`Redact`]）；密码、口令、令牌本来就不在里面。
 //! - 最近的错误（连接失败、git 命令失败）只在内存里留 [`MAX_ERRORS`] 条（[`record_error`]），不落盘。
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Local};
-use fr_channel::{Connection, FailedAt, LoginFailure};
+use fr_channel::{ConnectOptions, Connection, FailedAt, LoginFailure, Probe};
 use fr_core::i18n::tr;
 use fr_core::tf;
 use gpui_kit::assets::IconName;
@@ -329,7 +332,9 @@ fn fill_failure(
             }
         }
     };
-    let note = match (bad_at == layout.login(), failure.is_some(), target.auth) {
+    // 换密钥、改密码只对登录被拒绝有用；连不上、超时时还没走到认证，不提
+    let denied = failure.is_some_and(LoginFailure::denied);
+    let note = match (bad_at == layout.login(), denied, target.auth) {
         (true, true, Auth::Password) => {
             format!(
                 "{}{}",
@@ -392,18 +397,63 @@ fn fill_connected(
         ),
         note.join(" · "),
     );
+    fill_git(&mut steps[layout.git()], &hello.git);
+}
+
+/// 主机上的 git：`raw` 是 `git --version` 的输出，空的是没找到 git。
+fn fill_git(step: &mut Step, raw: &str) {
     let (min_major, min_minor, _) = fr_core::git::MIN_VERSION;
     let minimum = tf!("最低要求 {v}", v = format!("{min_major}.{min_minor}"));
-    match fr_core::git::parse_version(&hello.git) {
+    match fr_core::git::parse_version(raw) {
         Some(version) => match fr_core::git::too_old(Some(version)) {
-            Some(old) => steps[layout.git()].set(State::Bad, tf!("{old}，版本过低", old), minimum),
+            Some(old) => step.set(State::Bad, tf!("{old}，版本过低", old), minimum),
             None => {
                 let (major, minor, patch) = version;
-                steps[layout.git()].set(State::Ok, format!("{major}.{minor}.{patch}"), minimum)
+                step.set(State::Ok, format!("{major}.{minor}.{patch}"), minimum)
             }
         },
-        None => steps[layout.git()].set(State::Bad, tr("主机上没有找到 git"), ""),
+        None => step.set(State::Bad, tr("主机上没有找到 git"), ""),
     }
+}
+
+/// 表单里的「测试连接」登录上了：系统、这一版的 kuaid 装了没有、主机上的 git。没装 kuaid 不算失败：
+/// 保存后第一次连接时自动装。
+fn fill_probe(steps: &mut [Step], layout: &Layout, target: &Target, probe: &Probe) {
+    for index in 0..layout.jumps {
+        steps[layout.jump(index)].set(State::Ok, tr("已连接"), "");
+    }
+    steps[layout.login()].set(State::Ok, tr("已登录"), target.auth_text());
+    let system = format!("{} {}", probe.os, probe.arch);
+    let kuaid = &mut steps[layout.kuaid()];
+    if !probe.supported {
+        kuaid.set(
+            State::Bad,
+            tf!(
+                "目前仅支持 Linux 和 Windows 主机，该主机为 {os}",
+                os = &probe.os
+            ),
+            "",
+        );
+        steps[layout.git()].skip(tr("该主机上无法运行 kuaid"));
+        return;
+    }
+    match probe.kuaid {
+        Some(true) => kuaid.set(
+            State::Ok,
+            tf!("已安装 {version}", version = env!("CARGO_PKG_VERSION")),
+            tf!("{system} · 测试连接不启动 kuaid", system),
+        ),
+        Some(false) => kuaid.set(
+            State::Note,
+            tr("尚未安装"),
+            tf!("{system} · 保存后首次连接时自动安装", system),
+        ),
+        None => kuaid.set(State::Note, tr("未检查"), system),
+    }
+    fill_git(
+        &mut steps[layout.git()],
+        probe.git.as_deref().unwrap_or_default(),
+    );
 }
 
 fn fill_winfsp(step: &mut Step) {
@@ -633,10 +683,29 @@ fn errors_section() -> String {
 
 // ---------- 诊断对话框 ----------
 
+/// 怎么连。
+enum Source {
+    /// 已保存的主机：走平常那条路（`AppState::connect`），诊断通过时也就连上了
+    Saved,
+    /// 主机设置里的「测试连接」：拿表单里填的只登录一次（[`Connection::probe`]）
+    Form(ConnectOptions),
+}
+
+/// 连出来的结果。
+enum Outcome {
+    /// 本机没有可用的 ssh，没连
+    NoSsh,
+    Connected(Arc<Connection>, Option<usize>),
+    Probed(Probe),
+    /// 报错和登录阶段在哪一步失败的（已保存的主机从 `AppState` 读）
+    Failed(String, Option<LoginFailure>),
+}
+
 /// 诊断一台主机的对话框。
 pub struct Diagnose {
     app: Entity<AppState>,
     target: Target,
+    source: Source,
     steps: Vec<Step>,
     running: bool,
     at: DateTime<Local>,
@@ -664,12 +733,50 @@ impl Diagnose {
         let Some(target) = Target::of(app.read(cx), id) else {
             return;
         };
-        let title: SharedString = tf!("诊断 {name}", name = &target.name).into();
+        let title = tf!("诊断 {name}", name = &target.name);
+        Self::show(app, target, Source::Saved, on_connected, title, window, cx);
+    }
+
+    /// 主机设置里的「测试连接」：`server` 是表单里填的（还没保存），`jumps` 是依次经过的跳板机的
+    /// 名字和地址，`options` 是照表单拼好的连接选项（带着这次填的密码或口令）。只登录一次，不保存，
+    /// 也不在主机上装、启动 kuaid。
+    pub fn open_form(
+        app: Entity<AppState>,
+        server: &Server,
+        jumps: Vec<(String, String)>,
+        options: ConnectOptions,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let target = Target {
+            id: server.id.clone(),
+            name: server.name.clone(),
+            destination: server.destination.clone(),
+            jumps,
+            via: None,
+            auth: server.auth,
+            identity_file: server.identity_file.clone(),
+        };
+        let title = tf!("测试连接 {name}", name = &target.name);
+        Self::show(app, target, Source::Form(options), None, title, window, cx);
+    }
+
+    fn show(
+        app: Entity<AppState>,
+        target: Target,
+        source: Source,
+        on_connected: Option<Connected>,
+        title: String,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let title: SharedString = title.into();
         let view = cx.new(|cx| {
             let mut this = Diagnose {
                 app,
                 steps: initial_steps(&target),
                 target,
+                source,
                 running: false,
                 at: Local::now(),
                 hide: true,
@@ -699,9 +806,21 @@ impl Diagnose {
         self.at = Local::now();
         let id = self.target.id.clone();
         let ssh = cx.background_executor().spawn(async { ssh_version() });
+        // 表单里的「测试连接」：和找 ssh 一起开始（没有 ssh 时它很快失败，结果不用）
+        let probing = match &self.source {
+            Source::Saved => None,
+            Source::Form(options) => {
+                let (destination, options) = (self.target.destination.clone(), options.clone());
+                Some(
+                    cx.background_executor()
+                        .spawn(async move { Connection::probe(&destination, &options) }),
+                )
+            }
+        };
         self.task = Some(cx.spawn(async move |this, cx| {
             let ssh = ssh.await;
             let ssh_ok = ssh.is_ok();
+            let probing = probing.filter(|_| ssh_ok);
             let connecting = this.update(cx, |this, cx| {
                 match &ssh {
                     Ok((version, path)) => {
@@ -711,36 +830,52 @@ impl Diagnose {
                 }
                 cx.notify();
                 // 本机的 ssh 都没有：不用再连（经别的电脑转接的不用本机的 ssh 连目标，但要连那台）
-                ssh_ok.then(|| this.app.update(cx, |app, cx| app.connect(&id, cx)))
+                let saved = matches!(this.source, Source::Saved);
+                (ssh_ok && saved).then(|| this.app.update(cx, |app, cx| app.connect(&id, cx)))
             });
             let Ok(connecting) = connecting else {
                 return;
             };
-            let result = match connecting {
-                Some(connecting) => Some(connecting.await),
-                None => None,
-            };
-            // 连上了：问 kuaid 现在有几个终端
-            let terms = match &result {
-                Some(Ok(conn)) => conn.term_list().await.ok().map(|list| list.len()),
-                _ => None,
+            let outcome = match (connecting, probing) {
+                (Some(connecting), _) => match connecting.await {
+                    Ok(conn) => {
+                        // 连上了：问 kuaid 现在有几个终端
+                        let terms = conn.term_list().await.ok().map(|list| list.len());
+                        Outcome::Connected(conn, terms)
+                    }
+                    Err(message) => Outcome::Failed(message.to_string(), None),
+                },
+                (None, Some(probing)) => match probing.await {
+                    Ok(probe) => Outcome::Probed(probe),
+                    Err(err) => Outcome::Failed(
+                        format!("{err:#}"),
+                        fr_channel::login_failure(&err).cloned(),
+                    ),
+                },
+                (None, None) => Outcome::NoSsh,
             };
             this.update(cx, |this, cx| {
                 let layout = this.layout();
-                match &result {
-                    None => {
+                match &outcome {
+                    Outcome::NoSsh => {
                         for step in this.steps.iter_mut().take(layout.git() + 1).skip(1) {
                             step.skip(tr("本机没有可用的 ssh"));
                         }
                     }
-                    Some(Ok(conn)) => {
-                        fill_connected(&mut this.steps, &layout, &this.target, conn, terms);
+                    Outcome::Connected(conn, terms) => {
+                        fill_connected(&mut this.steps, &layout, &this.target, conn, *terms);
                         if let Some(on_connected) = this.on_connected.clone() {
                             on_connected(cx);
                         }
                     }
-                    Some(Err(message)) => {
-                        let failure = this.app.read(cx).last_login_failure(&this.target.id);
+                    Outcome::Probed(probe) => {
+                        fill_probe(&mut this.steps, &layout, &this.target, probe)
+                    }
+                    Outcome::Failed(message, failure) => {
+                        let failure = match this.source {
+                            Source::Saved => this.app.read(cx).last_login_failure(&this.target.id),
+                            Source::Form(_) => failure.clone(),
+                        };
                         fill_failure(
                             &mut this.steps,
                             &layout,
@@ -801,7 +936,13 @@ impl Render for Diagnose {
                 names = names.join(" → ")
             );
         }
-        let intro = tf!("{intro}。逐步检查，哪一步失败就停在哪。", intro);
+        let intro = match self.source {
+            Source::Saved => tf!("{intro}。逐步检查，哪一步失败就停在哪。", intro),
+            Source::Form(_) => tf!(
+                "{intro}。按表单中的设置逐步检查；不保存设置，也不在主机上安装或启动 kuaid。",
+                intro
+            ),
+        };
         // 看要复制的内容时，它换掉检查结果（两样都放的话对话框比窗口还高）
         let body = match self.preview {
             true => report_box(self.report(), cx),
@@ -1151,7 +1292,85 @@ impl Render for Summary {
 
 #[cfg(test)]
 mod tests {
-    use super::{Redact, hide_ipv4, without_raw};
+    use super::{Layout, Redact, State, Target, fill_probe, hide_ipv4, initial_steps, without_raw};
+    use crate::settings::Auth;
+    use fr_channel::Probe;
+
+    fn target(jumps: usize) -> Target {
+        Target {
+            id: "s1".into(),
+            name: "dev".into(),
+            destination: "dev@host".into(),
+            jumps: (0..jumps)
+                .map(|n| (format!("j{n}"), format!("ops@j{n}")))
+                .collect(),
+            via: None,
+            auth: Auth::Key,
+            identity_file: None,
+        }
+    }
+
+    fn probe(os: &str, kuaid: Option<bool>, git: Option<&str>) -> Probe {
+        Probe {
+            os: os.into(),
+            arch: "x86_64".into(),
+            supported: os == "Linux" || os == "Windows",
+            kuaid,
+            git: git.map(String::from),
+        }
+    }
+
+    /// 测试连接登录上了：kuaid 没装不算失败（保存后连接时装），git 照版本判断。
+    #[test]
+    fn 测试连接登录上了_kuaid_没装不算失败() {
+        let target = target(1);
+        let layout = Layout { jumps: 1 };
+        let mut steps = initial_steps(&target);
+        fill_probe(
+            &mut steps,
+            &layout,
+            &target,
+            &probe("Linux", Some(false), Some("git version 2.43.0")),
+        );
+        assert_eq!(steps[layout.jump(0)].state, State::Ok);
+        assert_eq!(steps[layout.login()].state, State::Ok);
+        assert_eq!(steps[layout.kuaid()].state, State::Note);
+        assert!(steps[layout.kuaid()].note.starts_with("Linux x86_64"));
+        assert_eq!(steps[layout.git()].state, State::Ok);
+        assert_eq!(steps[layout.git()].text, "2.43.0");
+
+        let mut steps = initial_steps(&target);
+        fill_probe(
+            &mut steps,
+            &layout,
+            &target,
+            &probe("Linux", Some(true), Some("git version 2.25.1")),
+        );
+        assert_eq!(steps[layout.kuaid()].state, State::Ok);
+        assert_eq!(steps[layout.git()].state, State::Bad);
+
+        let mut steps = initial_steps(&target);
+        fill_probe(&mut steps, &layout, &target, &probe("Linux", None, None));
+        assert_eq!(steps[layout.kuaid()].state, State::Note);
+        assert_eq!(steps[layout.git()].state, State::Bad);
+    }
+
+    #[test]
+    fn 测试连接遇到不支持的系统_kuaid_那一步失败_git_不查() {
+        let target = target(0);
+        let layout = Layout { jumps: 0 };
+        let mut steps = initial_steps(&target);
+        fill_probe(
+            &mut steps,
+            &layout,
+            &target,
+            &probe("Darwin", None, Some("git version 2.43.0")),
+        );
+        assert_eq!(steps[layout.login()].state, State::Ok);
+        assert_eq!(steps[layout.kuaid()].state, State::Bad);
+        assert!(steps[layout.kuaid()].text.contains("Darwin"));
+        assert_eq!(steps[layout.git()].state, State::Skip);
+    }
 
     #[test]
     fn 隐藏地址和用户名() {

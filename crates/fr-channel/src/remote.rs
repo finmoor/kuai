@@ -420,6 +420,10 @@ enum Started {
     Missing {
         os: String,
         arch: String,
+        /// 测试连接的脚本另外报的：这一版的 kuaid 装了没有（启动脚本不报，是 None）
+        installed: Option<bool>,
+        /// 测试连接的脚本在标记前打的 `git --version`；没有 git、启动脚本是 None
+        git: Option<String>,
     },
     /// 登录上了，但服务器跑不了启动脚本（比如拿 Linux 的写法去问 Windows）。里面是报错
     Refused(String),
@@ -469,6 +473,14 @@ pub enum FailedAt {
     Forward(usize),
     /// 连不上、登录不了目标主机
     Login,
+}
+
+impl LoginFailure {
+    /// ssh 说登录被拒绝（Permission denied）：密钥、密码不对，或者用户取消了输入。连不上、超时
+    /// 不算。
+    pub fn denied(&self) -> bool {
+        self.denied
+    }
 }
 
 impl std::fmt::Display for LoginFailure {
@@ -545,6 +557,11 @@ pub struct Probe {
     pub arch: String,
     /// 这种系统上装不装得了 kuaid
     pub supported: bool,
+    /// 这个客户端要的那一版 kuaid 装了没有（只看在不在，不启动）；None 是没查：本机找不到随带的
+    /// kuaid，不知道是哪一版
+    pub kuaid: Option<bool>,
+    /// 主机上 `git --version` 的输出（`git version 2.43.0`）；找不到 git 是 None
+    pub git: Option<String>,
 }
 
 /// 报告连接进度的函数，见 [`ConnectOptions::on_stage`]。
@@ -626,25 +643,33 @@ impl Connection {
         Self::connect_on(Route::Via { via, server }, destination, options)
     }
 
-    /// 测试连接：只登录上去问一句是什么系统。不装、不启动 kuaid，服务器上什么都不留。
-    /// 登录不了、连不上时的报错和 [`Self::connect`] 一样。会阻塞，放在后台线程里调用。
+    /// 测试连接：只登录上去问一句是什么系统、有没有 git、这一版的 kuaid 装了没有。不装、不启动
+    /// kuaid，服务器上什么都不留。登录不了、连不上时的报错和 [`Self::connect`] 一样。
+    /// 会阻塞，放在后台线程里调用。
     pub fn probe(destination: &str, options: &ConnectOptions) -> Result<Probe> {
         with_plain_retry(options, |options| Self::probe_once(destination, options))
     }
 
     fn probe_once(destination: &str, options: &ConnectOptions) -> Result<Probe> {
+        // 要装的那一版 kuaid 在哪个目录：本机找不到随带的 kuaid 就不查
+        let dir = Binaries::find().ok().map(|binaries| binaries.dir_name());
         // 和连接时一样：先按 Linux 的写法问（已经知道是 Windows 的先按 Windows），跑不了再换另一种
         let mut windows = known_windows(destination);
         let (mut tried_sh, mut tried_cmd) = (false, false);
         let mut refused: Option<String> = None;
         loop {
             let script = match windows {
-                true => windows_probe_script(),
-                false => probe_script(),
+                true => windows_probe_script(dir.as_deref()),
+                false => probe_script(dir.as_deref()),
             };
             let (pipes, _saved) = Route::Direct.run(destination, &script, options, false)?;
             match start(pipes, true, destination, Some(options))? {
-                Started::Missing { os, arch } => {
+                Started::Missing {
+                    os,
+                    arch,
+                    installed,
+                    git,
+                } => {
                     let kind = server_os(&os);
                     return Ok(Probe {
                         os: match kind {
@@ -654,6 +679,8 @@ impl Connection {
                         },
                         arch,
                         supported: kind.is_some(),
+                        kuaid: installed,
+                        git,
                     });
                 }
                 Started::Refused(message) => {
@@ -715,7 +742,7 @@ impl Connection {
                     }
                     windows = !windows;
                 }
-                Started::Missing { os, arch } => {
+                Started::Missing { os, arch, .. } => {
                     if installed {
                         bail!(tr("上传 kuaid 后仍无法启动"));
                     }
@@ -1779,6 +1806,15 @@ fn start(
                 return Ok(Started::Missing {
                     os: parts.next().unwrap_or_default().to_string(),
                     arch: parts.next().unwrap_or_default().to_string(),
+                    installed: match parts.next() {
+                        Some("1") => Some(true),
+                        Some("0") => Some(false),
+                        _ => None,
+                    },
+                    git: noise
+                        .iter()
+                        .find(|line| line.starts_with("git version "))
+                        .cloned(),
                 });
             }
             if noise.len() < 10 {
@@ -2350,14 +2386,33 @@ fn bootstrap_script(dir: &str) -> String {
     )
 }
 
-/// 测试连接用的脚本：只报告系统和架构，报法和 [`bootstrap_script`] 没装 kuaid 时一样。
-fn probe_script() -> String {
-    format!(r#"sh -c 'echo "{MISSING_MARKER} $(uname -s) $(uname -m)"'"#)
+/// 测试连接用的脚本：先打 `git --version`（[`start`] 在标记前的几行里找它），再照 [`bootstrap_script`]
+/// 没装 kuaid 时的报法报告系统和架构，后面加一位 `dir` 那一版的 kuaid 在不在（1 或 0；`dir` 是
+/// None 时不报）。只看，不装、不启动 kuaid。
+fn probe_script(dir: Option<&str>) -> String {
+    let (check, flag) = match dir {
+        Some(dir) => (
+            format!(r#"K=0; [ -x "$HOME/.kuai/{dir}/kuaid" ] && K=1; "#),
+            " $K",
+        ),
+        None => (String::new(), ""),
+    };
+    format!(
+        r#"sh -c 'git --version 2>/dev/null; {check}echo "{MISSING_MARKER} $(uname -s) $(uname -m){flag}"'"#
+    )
 }
 
-/// Windows 服务器上测试连接用的脚本，报法和 [`windows_bootstrap_script`] 没装 kuaid 时一样。
-fn windows_probe_script() -> String {
-    format!(r#"cmd /c "echo {MISSING_MARKER} Windows %PROCESSOR_ARCHITECTURE%""#)
+/// Windows 服务器上测试连接用的脚本，报法和 [`probe_script`] 一样。看 kuaid 在不在时先进到版本目录
+/// （主目录带空格时路径不用加引号，同 [`windows_bootstrap_script`]）；`!K!` 要延迟展开。
+fn windows_probe_script(dir: Option<&str>) -> String {
+    match dir {
+        Some(dir) => format!(
+            r#"cmd /v:on /c "set K=0& (2>nul cd /d !USERPROFILE!\.kuai\{dir} && if exist kuaid.exe set K=1)& git --version 2>nul & echo {MISSING_MARKER} Windows %PROCESSOR_ARCHITECTURE% !K!""#
+        ),
+        None => format!(
+            r#"cmd /c "git --version 2>nul & echo {MISSING_MARKER} Windows %PROCESSOR_ARCHITECTURE%""#
+        ),
+    }
 }
 
 /// 服务器报的系统名是哪种系统。Windows 上经 Git 带的 sh 问到的是 `MINGW64_NT-10.0-…` 这类。
@@ -2703,16 +2758,78 @@ mod tests {
     }
 
     #[test]
-    fn 测试连接的脚本只报告系统_不碰_kuaid() {
-        let (sh, cmd) = (probe_script(), windows_probe_script());
-        for script in [&sh, &cmd] {
-            assert!(script.contains(MISSING_MARKER), "{script}");
-            assert!(!script.contains("kuai"), "{script}");
+    fn 测试连接的脚本只看_kuaid_在不在_不装也不启动() {
+        for dir in [Some("1.20.0-abc"), None] {
+            let (sh, cmd) = (probe_script(dir), windows_probe_script(dir));
+            for script in [&sh, &cmd] {
+                assert!(script.contains(MISSING_MARKER), "{script}");
+                assert!(script.contains("git --version"), "{script}");
+                assert!(!script.contains(START_MARKER), "{script}");
+                assert!(!script.contains("--connect"), "{script}");
+                assert!(
+                    !script.contains("tar ") && !script.contains("mkdir"),
+                    "{script}"
+                );
+                assert_eq!(script.contains("1.20.0-abc"), dir.is_some(), "{script}");
+            }
+            assert_eq!(sh.matches('\'').count(), 2, "{sh}");
+            // 交给 cmd 的那一条：外面一对双引号，里面没有会被 PowerShell 改掉的字符
+            assert_eq!(cmd.matches('"').count(), 2, "{cmd}");
+            assert!(!cmd.contains('$') && !cmd.contains('`'), "{cmd}");
+            assert!(!cmd.contains("%USERPROFILE%"), "{cmd}");
         }
-        assert_eq!(sh.matches('\'').count(), 2, "{sh}");
-        // 交给 cmd 的那一条：外面一对双引号，里面没有会被 PowerShell 改掉的字符
-        assert_eq!(cmd.matches('"').count(), 2, "{cmd}");
-        assert!(!cmd.contains('$') && !cmd.contains('`'), "{cmd}");
+    }
+
+    /// 照 Windows 的 sshd（默认 shell 是 cmd）那样跑测试连接的脚本：`cmd /c <脚本>`。主目录里带空格、
+    /// `&` 和括号，kuaid 在不在都报得对，`git --version` 在标记之前。
+    #[cfg(windows)]
+    #[test]
+    fn windows_上测试连接的脚本报出_kuaid_在不在和_git() {
+        use std::os::windows::process::CommandExt as _;
+        let home = std::env::temp_dir().join(format!("kuai probe & (test) {}", std::process::id()));
+        let dir = "1.20.0-abc";
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let run = || {
+            let out = std::process::Command::new("cmd")
+                .raw_arg("/c")
+                .raw_arg(windows_probe_script(Some(dir)))
+                .env("USERPROFILE", &home)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let marker = |out: &str| {
+            out.lines()
+                .find(|line| line.starts_with(MISSING_MARKER))
+                .map(|line| line.trim_end().to_string())
+        };
+        let out = run();
+        let arch = std::env::var("PROCESSOR_ARCHITECTURE").unwrap();
+        assert_eq!(
+            marker(&out),
+            Some(format!("{MISSING_MARKER} Windows {arch} 0")),
+            "{out}"
+        );
+        // 有 git 时它那一行在标记之前（CI 和开发机上都装着 git）
+        let git = out
+            .lines()
+            .position(|line| line.starts_with("git version "));
+        let at = out
+            .lines()
+            .position(|line| line.starts_with(MISSING_MARKER));
+        assert!(git.is_some() && git < at, "{out}");
+
+        let installed = home.join(".kuai").join(dir);
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::write(installed.join("kuaid.exe"), b"").unwrap();
+        let out = run();
+        assert_eq!(
+            marker(&out),
+            Some(format!("{MISSING_MARKER} Windows {arch} 1")),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

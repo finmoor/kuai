@@ -104,7 +104,7 @@ fn main() -> Result<()> {
         let started = Instant::now();
         let probe = Connection::probe(&destination, &options)?;
         println!(
-            "登录成功：{} {}，{}，{} ms",
+            "登录成功：{} {}，{}，这一版的 kuaid {}，{}，{} ms",
             probe.os,
             probe.arch,
             if probe.supported {
@@ -112,6 +112,12 @@ fn main() -> Result<()> {
             } else {
                 "不支持的系统"
             },
+            match probe.kuaid {
+                Some(true) => "已安装",
+                Some(false) => "未安装",
+                None => "没查",
+            },
+            probe.git.as_deref().unwrap_or("没有 git"),
             started.elapsed().as_millis()
         );
         return Ok(());
