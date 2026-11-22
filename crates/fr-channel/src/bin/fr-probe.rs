@@ -97,6 +97,8 @@ fn main() -> Result<()> {
             .collect(),
         on_stage: Some(Arc::new(|n| println!("已登录 {n} 台"))),
         no_prompt: false,
+        // 没有界面可以核对指纹：没见过的主机直接记下
+        accept_new_host_keys: true,
     };
     if let Some(destination) = value("--test-login") {
         let started = Instant::now();

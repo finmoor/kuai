@@ -4,15 +4,21 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-/// 每个 ssh 都带的：第一次连的主机自动记进 known_hosts（记录过的密钥对不上仍然拒绝）；保活
+/// 每个 ssh 都带的：保活。
+///
+/// 主机密钥怎么核对不在这里设，照 ssh 自己的规矩和用户的 `~/.ssh/config`：没见过的主机 ssh 会问
+/// 一句要不要信任，这句话经 askpass 交给界面，显示指纹让用户确认（见 `askpass::host_key_prompt`）；
+/// 记录过的密钥对不上，ssh 直接拒绝。没有人可以问的（`BatchMode=yes`、不许弹窗的连接）这一次连不上。
 pub const KEEP_OPTIONS: &[&str] = &[
-    "-o",
-    "StrictHostKeyChecking=accept-new",
     "-o",
     "ServerAliveInterval=15",
     "-o",
     "ServerAliveCountMax=4",
 ];
+
+/// 没见过的主机不问，直接记进 known_hosts。只给测试工具用，界面不用
+/// （见 `fr_channel::ConnectOptions::accept_new_host_keys`）
+pub const ACCEPT_NEW_HOSTS: &[&str] = &["-o", "StrictHostKeyChecking=accept-new"];
 
 /// 经跳板机连接时每个 ssh 都带的：登录成功时打一行「Authenticated to …」，用来看进度
 pub const STAGE_OPTIONS: &[&str] = &["-o", "LogLevel=VERBOSE"];

@@ -357,9 +357,147 @@ pub fn is_secret(prompt: &str) -> bool {
     !(lower.starts_with("username") || lower.contains("(yes/no"))
 }
 
+/// 提示是不是要回答 yes 或 no 的确认（ssh 问要不要信任一台没见过的主机）。
+pub fn is_confirm(prompt: &str) -> bool {
+    prompt.to_lowercase().contains("(yes/no")
+}
+
+/// ssh 第一次连一台主机时问的那一句（`The authenticity of host … can't be established.`）里的内容。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostKeyPrompt {
+    /// 主机，照 ssh 的写法：`example.com`、`[127.0.0.1]:2222`
+    pub host: String,
+    /// 解析出来的地址，和 `host` 不一样时才有
+    pub address: Option<String>,
+    /// 密钥类型：`ED25519`、`ECDSA`、`RSA`
+    pub key_type: String,
+    /// 指纹：`SHA256:…`
+    pub fingerprint: String,
+    /// 提示里别的话，原样一行一条：这把密钥还记在哪些名字下、DNS 里对没对上
+    pub notes: Vec<String>,
+}
+
+/// 从 ssh 的提示文字里拆出主机和指纹。不是这一问、或者拆不出来（别的程序、很旧的 ssh）返回 None，
+/// 那时照原文显示。
+pub fn host_key_prompt(prompt: &str) -> Option<HostKeyPrompt> {
+    if !is_confirm(prompt) {
+        return None;
+    }
+    let (mut host, mut key) = (None, None);
+    let mut notes = Vec::new();
+    for line in prompt
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if let Some(rest) = line.strip_prefix("The authenticity of host '") {
+            // 引号里是「主机 (地址)」；经 ProxyCommand 连的，地址那里是一句说明。
+            // 后面那句 can't 里也有一个单引号，所以找的是第一个
+            let inner = rest.split_once('\'')?.0;
+            let (name, address) = match inner.rsplit_once(" (") {
+                Some((name, address)) => (name, Some(address.trim_end_matches(')'))),
+                None => (inner, None),
+            };
+            let address = address
+                .filter(|address| *address != name && !address.starts_with('<'))
+                .map(str::to_string);
+            host = Some((name.to_string(), address));
+        } else if let Some((kind, print)) = line.split_once(" key fingerprint is ") {
+            key = Some((
+                kind.trim().to_string(),
+                print.trim().trim_end_matches('.').to_string(),
+            ));
+        } else if is_confirm(line)
+            || line.starts_with("This key is not known by any other names")
+            // 设了 `VisualHostKey yes` 时提示里带一幅字符画
+            || line.starts_with('+')
+            || line.starts_with('|')
+        {
+            // 这几行不用显示
+        } else {
+            notes.push(line.to_string());
+        }
+    }
+    let ((host, address), (key_type, fingerprint)) = (host?, key?);
+    if host.is_empty() || fingerprint.is_empty() {
+        return None;
+    }
+    Some(HostKeyPrompt {
+        host,
+        address,
+        key_type,
+        fingerprint,
+        notes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 拆出主机和指纹() {
+        let ask = "Are you sure you want to continue connecting (yes/no/[fingerprint])? ";
+        let plain = [
+            "The authenticity of host '[127.0.0.1]:2291 ([127.0.0.1]:2291)' can't be established.",
+            "RSA key fingerprint is SHA256:abcDEF/123+456.",
+            "This key is not known by any other names.",
+            ask,
+        ]
+        .join("\n");
+        let key = host_key_prompt(&plain).unwrap();
+        assert_eq!(key.host, "[127.0.0.1]:2291");
+        assert_eq!(key.address, None);
+        assert_eq!(key.key_type, "RSA");
+        assert_eq!(key.fingerprint, "SHA256:abcDEF/123+456");
+        assert!(key.notes.is_empty());
+
+        // 名字和地址不一样；同一把密钥已经记在别的名字下（Windows 的换行）
+        let known = [
+            "The authenticity of host 'dev.example.com (203.0.113.7)' can't be established.",
+            "ED25519 key fingerprint is SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU.",
+            "This host key is known by the following other names/addresses:",
+            r"    C:\Users\me/.ssh/known_hosts:3: dev",
+            ask,
+        ]
+        .join("\r\n");
+        let key = host_key_prompt(&known).unwrap();
+        assert_eq!(key.host, "dev.example.com");
+        assert_eq!(key.address.as_deref(), Some("203.0.113.7"));
+        assert_eq!(key.key_type, "ED25519");
+        assert_eq!(
+            key.fingerprint,
+            "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU"
+        );
+        assert_eq!(
+            key.notes,
+            [
+                "This host key is known by the following other names/addresses:",
+                r"C:\Users\me/.ssh/known_hosts:3: dev"
+            ]
+        );
+
+        // 经跳板机连的：地址那里是一句说明；旧版 ssh 只问 (yes/no)；字符画不算进别的话里
+        let proxied = [
+            "The authenticity of host 'inner (<no hostip for proxy command>)' can't be established.",
+            "ECDSA key fingerprint is SHA256:xyz.",
+            "+---[ECDSA 256]---+",
+            "|  .o+            |",
+            "+----[SHA256]-----+",
+            "Are you sure you want to continue connecting (yes/no)? ",
+        ]
+        .join("\n");
+        let key = host_key_prompt(&proxied).unwrap();
+        assert_eq!((key.host.as_str(), key.address), ("inner", None));
+        assert_eq!(key.fingerprint, "SHA256:xyz");
+        assert!(key.notes.is_empty());
+
+        // 不是这一问的、拆不出来的
+        assert!(is_confirm(ask));
+        assert_eq!(host_key_prompt(ask), None);
+        assert_eq!(host_key_prompt("user@host's password: "), None);
+        assert!(!is_confirm("Verification code: "));
+    }
 
     #[test]
     fn 认出不许弹窗的命令() {

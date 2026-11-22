@@ -65,6 +65,8 @@ fn main() -> Result<()> {
         (None, [target, root, place]) => {
             let options = ConnectOptions {
                 identity_file: key,
+                // 没有界面可以核对指纹：没见过的主机直接记下
+                accept_new_host_keys: true,
                 ..ConnectOptions::default()
             };
             let conn = Connection::connect(target, &options)?;

@@ -29,7 +29,9 @@ use fr_core::protocol::{
     PROTOCOL_VERSION, Request, Response, SubRepos, TermExit, TermInfo, TermMarks, TermOpen,
     TermOpened,
 };
-use fr_core::ssh::{KEEP_OPTIONS, STAGE_OPTIONS, no_window, program as ssh_program};
+use fr_core::ssh::{
+    ACCEPT_NEW_HOSTS, KEEP_OPTIONS, STAGE_OPTIONS, no_window, program as ssh_program,
+};
 use fr_core::store::{Op, Store};
 use futures::FutureExt as _;
 use futures::channel::{mpsc, oneshot};
@@ -493,6 +495,9 @@ pub struct ConnectOptions {
     /// 要密码、口令、确认主机密钥时不弹窗，存着的答不了就当作取消（启动时自动连接用：没人点它，
     /// 突然弹窗问密码不合适）。跳板机也一样
     pub no_prompt: bool,
+    /// 没见过的主机不问，直接记下它的密钥（目标服务器和跳板机都是）。只给没有界面的测试工具用：
+    /// 界面上一律让用户核对指纹
+    pub accept_new_host_keys: bool,
 }
 
 /// 测试连接的结果（见 [`Connection::probe`]）。
@@ -2093,6 +2098,7 @@ fn connect_error(
             hint = forward_hint(&stderr, timed_out)
         ),
     };
+    let stderr = without_banner(&stderr);
     if !stderr.is_empty() {
         message.push_str(&tf!("（ssh：{stderr}）", stderr));
     }
@@ -2100,6 +2106,16 @@ fn connect_error(
         message.push_str(&tf!("（主机输出：{join}）", join = noise.join(" / ")));
     }
     message
+}
+
+/// ssh 的大字警告（主机密钥变了那一种）四周围着一圈 `@`：去掉这一圈，只留里面的字。
+fn without_banner(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(|line| line.trim().trim_matches('@').trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 连不上、登录不了一台服务器的原因。
@@ -2112,10 +2128,11 @@ fn login_hint(stderr: &str, timed_out: bool) -> &'static str {
         tr("连接超时")
     } else if stderr.contains("Connection refused") {
         tr("连接被拒绝，请检查 SSH 服务和端口")
-    } else if stderr.contains("Host key verification failed")
-        || stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
-    {
+    } else if stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") {
         tr("主机密钥与 known_hosts 中的记录不一致，请先在终端中用 ssh 确认")
+    } else if stderr.contains("Host key verification failed") {
+        // 没见过的主机：确认框里点了取消，或者这次连接不许弹窗
+        tr("尚未信任此主机的密钥")
     } else {
         tr("连接失败")
     }
@@ -2221,6 +2238,9 @@ fn ssh(
                 options.no_prompt,
             );
             args.extend(STAGE_OPTIONS.iter().map(|item| item.to_string()));
+            if options.accept_new_host_keys {
+                args.extend(ACCEPT_NEW_HOSTS.iter().map(|item| item.to_string()));
+            }
             let tag = env
                 .iter()
                 .find(|(name, _)| name == fr_core::askpass::TAG_ENV)
@@ -2239,6 +2259,9 @@ fn ssh(
         cmd.args(STAGE_OPTIONS);
     }
     cmd.arg("-T");
+    if options.accept_new_host_keys {
+        cmd.args(ACCEPT_NEW_HOSTS);
+    }
     cmd.args(KEEP_OPTIONS);
     cmd.args(["--", destination, remote_command]);
     (cmd, held)
@@ -2470,6 +2493,35 @@ mod tests {
     }
 
     #[test]
+    fn 主机密钥的两种报错分得开_警告四周的一圈去掉() {
+        let changed = [
+            "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@",
+            "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @",
+            "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@",
+            "IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!",
+            "Host key verification failed.",
+        ]
+        .join("\r\n");
+        assert!(login_hint(&changed, false).contains("known_hosts"));
+        // 没见过的主机：确认框里点了取消，或者这次连接不许弹窗
+        let untrusted = "Host key verification failed.";
+        assert_eq!(login_hint(untrusted, false), tr("尚未信任此主机的密钥"));
+        assert_eq!(
+            without_banner(&changed).lines().collect::<Vec<_>>(),
+            [
+                "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!",
+                "IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!",
+                "Host key verification failed.",
+            ]
+        );
+        // 别的报错里的 @ 不动
+        assert_eq!(
+            without_banner("user@host: Permission denied"),
+            "user@host: Permission denied"
+        );
+    }
+
+    #[test]
     fn 私钥文件和密码登录变成ssh的选项() {
         let has = |args: &[String], what: &str| args.iter().any(|arg| arg == what);
         let plain = args(&ConnectOptions::default());
@@ -2477,6 +2529,17 @@ mod tests {
         assert!(!plain.iter().any(|arg| arg.starts_with("Preferred")));
         // 目标和命令在最后，前面有 --
         assert_eq!(plain[plain.len() - 3..], ["--", "ssh://u@h:2222", "true"]);
+        // 主机密钥怎么核对不设：没见过的主机由 ssh 来问。测试工具才直接记下
+        assert!(
+            !plain
+                .iter()
+                .any(|arg| arg.contains("StrictHostKeyChecking"))
+        );
+        let trusting = args(&ConnectOptions {
+            accept_new_host_keys: true,
+            ..Default::default()
+        });
+        assert!(has(&trusting, "StrictHostKeyChecking=accept-new"));
 
         let key = args(&ConnectOptions {
             identity_file: Some("C:/keys/id".into()),

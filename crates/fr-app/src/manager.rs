@@ -1199,8 +1199,11 @@ impl ManagerView {
         match app.status(key) {
             ConnStatus::Idle => (off, tr("未连接").into(), true, None),
             ConnStatus::Connecting => (colors.accent, app.connecting_text(key), false, None),
-            // 连过，但订阅断了（还没来得及重连）
-            ConnStatus::Ready(_) | ConnStatus::Failed(_) if loaded == Some(false) => {
+            // 连过，但订阅断了（还没来得及重连）。重连没连上的不在这里：照下面写「连接失败」和原因，
+            // 不然主机密钥变了这样的原因看不到
+            ConnStatus::Ready(_) | ConnStatus::Failed(_)
+                if loaded == Some(false) && !app.connect_failed(key) =>
+            {
                 (off, tr("已断开").into(), true, None)
             }
             ConnStatus::Ready(conn) => {

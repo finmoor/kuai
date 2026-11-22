@@ -134,6 +134,11 @@ impl AppState {
         }
     }
 
+    /// 最近一次连这台是不是没连上（连上以后又断开的不算）。
+    pub fn connect_failed(&self, id: &str) -> bool {
+        matches!(self.conns.get(id).map(|c| c.peek()), Some(Some(Err(_))))
+    }
+
     /// 连这台电脑上的 kuaid（本机仓库的终端开在它里面）；已经连上或正在连就沿用。
     pub fn connect_local(&mut self, cx: &mut Context<Self>) -> Connecting {
         if let Some(existing) = self.conns.get(LOCAL) {
