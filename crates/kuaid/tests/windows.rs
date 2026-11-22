@@ -37,8 +37,12 @@ impl Home {
     fn new() -> Home {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         // 放在 cargo 的 target/tmp 下，不放系统的临时目录：Defender 把复制到临时目录里再启动的
-        // 没签名的程序当成木马拦下来（实测报 Trojan:Win32/Bearfoos.A!ml）
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        // 没签名的程序当成木马拦下来（实测报 Trojan:Win32/Bearfoos.A!ml）。CARGO_TARGET_DIR 写成
+        // target/xxx 时这里是正反斜杠混着的，和终端里的 $PWD 对不上，逐段重拼成反斜杠
+        let tmp: PathBuf = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .components()
+            .collect();
+        let dir = tmp.join(format!(
             "kuaid-test-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)

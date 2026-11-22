@@ -28,15 +28,19 @@ fn kuaid_bin() -> PathBuf {
     if let Some(bin) = std::env::var_os("KUAID_BIN") {
         return PathBuf::from(bin);
     }
-    // 测试程序在 target/<档>/deps 下，kuaid.exe 在 target/<档> 下
+    // kuaid.exe 在 target/<档> 下。测试程序原来在 target/<档>/deps 下，rustc 1.100 起在
+    // target/<档>/build/<包>/<哈希>/ 下面，所以往上逐级找
     let exe = std::env::current_exe().unwrap();
-    let bin = exe.parent().unwrap().parent().unwrap().join("kuaid.exe");
-    assert!(
-        bin.is_file(),
-        "找不到 {}：先 cargo build -p kuaid",
-        bin.display()
-    );
-    bin
+    exe.ancestors()
+        .skip(1)
+        .map(|dir| dir.join("kuaid.exe"))
+        .find(|bin| bin.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "{} 的上级目录里没有 kuaid.exe：先 cargo build -p kuaid",
+                exe.display()
+            )
+        })
 }
 
 /// 一个临时的主目录，里面按客户端上传的样子装着 kuaid。丢弃时让常驻进程退出、删掉目录。
@@ -48,7 +52,12 @@ struct Home {
 impl Home {
     fn new() -> Home {
         static NEXT: AtomicU32 = AtomicU32::new(0);
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        // CARGO_TARGET_DIR 写成 target/xxx 时这里是正反斜杠混着的，`cut` 按进程的路径找不到，
+        // 逐段重拼成反斜杠
+        let tmp: PathBuf = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .components()
+            .collect();
+        let dir = tmp.join(format!(
             "with-kuaid-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -108,7 +117,8 @@ impl Home {
         let killed = String::from_utf8_lossy(&out.stdout);
         assert!(
             !killed.trim().is_empty(),
-            "没找到转接程序：{}",
+            "{} 里没找到转接程序：{}",
+            self.dir.display(),
             String::from_utf8_lossy(&out.stderr)
         );
     }

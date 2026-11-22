@@ -2533,18 +2533,28 @@ mod tests {
     impl Daemon {
         fn new() -> Daemon {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
-            // 测试程序在 target/<档>/deps 下
+            // kuaid.exe 在 target/<档> 下。测试程序原来在 target/<档>/deps 下，rustc 1.100 起在
+            // target/<档>/build/<包>/<哈希>/ 下面，所以往上逐级找
             let test_exe = std::env::current_exe().unwrap();
-            let profile = test_exe.parent().unwrap().parent().unwrap();
+            let profile = test_exe
+                .ancestors()
+                .skip(1)
+                .find(|dir| dir.join("kuaid.exe").is_file());
             let kuaid = std::env::var_os("KUAID_BIN")
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| profile.join("kuaid.exe"));
-            assert!(
-                kuaid.is_file(),
-                "找不到 {}：先 cargo build -p kuaid",
-                kuaid.display()
-            );
-            let dir = profile.parent().unwrap().join("tmp").join(format!(
+                .or_else(|| profile.map(|dir| dir.join("kuaid.exe")));
+            let Some(kuaid) = kuaid.filter(|kuaid| kuaid.is_file()) else {
+                panic!(
+                    "{} 的上级目录里没有 kuaid.exe：先 cargo build -p kuaid",
+                    test_exe.display()
+                );
+            };
+            // 放在 target/tmp 下；用 KUAID_BIN、target 里没编 kuaid 时放在测试程序旁边
+            let tmp = profile
+                .and_then(std::path::Path::parent)
+                .map(|target| target.join("tmp"))
+                .unwrap_or_else(|| test_exe.parent().unwrap().to_path_buf());
+            let dir = tmp.join(format!(
                 "fr-mount-kuaid-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Relaxed)
