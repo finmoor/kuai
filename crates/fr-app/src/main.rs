@@ -6,6 +6,7 @@ mod appearance;
 mod autostart;
 mod browser;
 mod clone;
+mod diagnose;
 mod graph_paint;
 mod instance;
 mod machines;

@@ -4,6 +4,8 @@
 //! 对话框里，新的在上，和提交列表一个顺序。排好以后交给 `git rebase -i`，清单怎么送进去见
 //! [`fr_core::rebase`]。中途遇到冲突和普通的变基一样：停下来，工具栏下面出横幅，解决后继续。
 
+use std::collections::HashSet;
+
 use fr_core::i18n::{tr, tr_key, trc};
 use fr_core::rebase::{self, Action, Candidate, Item, Problem};
 use fr_core::tf;
@@ -19,6 +21,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::RepoView;
+use super::impact::{Row as ImpactRow, Tone, rows_box};
 use super::ops::Step;
 use crate::ui;
 
@@ -84,6 +87,8 @@ pub(super) struct RebaseEditor {
     /// 打开时的顺序，用来看是不是什么都没改
     original: Vec<String>,
     problem: Option<SharedString>,
+    /// 已推送的提交（在某个远程分支上）：标出来，整理后推送要强推
+    pushed: HashSet<String>,
 }
 
 impl RebaseEditor {
@@ -191,6 +196,7 @@ impl Render for RebaseEditor {
             .upgrade()
             .is_some_and(|repo| repo.read(cx).has_tracked_changes());
         let theme = cx.theme();
+        let warning = theme.warning;
         let (muted, border, danger, panel) = (
             theme.muted_foreground,
             theme.border,
@@ -269,6 +275,19 @@ impl Render for RebaseEditor {
                             .text_color(muted)
                             .child(row.commit.id.chars().take(8).collect::<String>()),
                     )
+                    .when(self.pushed.contains(&row.commit.id), |line| {
+                        line.child(
+                            div()
+                                .flex_none()
+                                .px(px(5.))
+                                .rounded(px(4.))
+                                .border_1()
+                                .border_color(warning.opacity(0.5))
+                                .text_xs()
+                                .text_color(warning)
+                                .child(tr("已推送")),
+                        )
+                    })
                     .when(melded, |line| {
                         line.child(ui::icon_small(IconName::CornerRightDown).text_color(muted))
                     })
@@ -325,16 +344,42 @@ impl Render for RebaseEditor {
             dropped,
             left = count - melded - dropped
         );
+        let pushed = self.pushed.len();
+        let mut impact = Vec::new();
+        if pushed > 0 {
+            impact.push(ImpactRow::new(
+                Tone::Warn,
+                IconName::ArrowUp,
+                "已推送",
+                tf!("{pushed} 个已推送，完成后推送要强制推送。", pushed),
+            ));
+        }
+        impact.push(ImpactRow::new(
+            Tone::Good,
+            IconName::ArchiveRestore,
+            "怎么找回",
+            tr("整理前的位置记在侧栏的「找回提交」里。"),
+        ));
         v_flex()
             .gap_3()
-            .child(div().text_xs().text_color(muted).whitespace_normal().child(tr(
-                "最新的提交在最上方。用箭头调整顺序，在下拉列表中选择操作。提交将重新生成，已推送的需强制推送。",
-            )))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .whitespace_normal()
+                    .child(tr(
+                        "最新的提交在最上方。用箭头调整顺序，在下拉列表中选择操作。",
+                    )),
+            )
             // 按现在的状态说：对话框开着时工作区可能变了
             .when(dirty, |d| {
-                d.child(div().text_xs().text_color(muted).whitespace_normal().child(tr(
-                    "未提交的改动将先贮藏，完成后自动恢复（--autostash）。",
-                )))
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .whitespace_normal()
+                        .child(tr("未提交的改动将先贮藏，完成后自动恢复（--autostash）。")),
+                )
             })
             .child(
                 div()
@@ -347,6 +392,7 @@ impl Render for RebaseEditor {
                     .bg(panel.opacity(0.35))
                     .child(v_flex().children(rows)),
             )
+            .child(rows_box(&impact, cx))
             .children(
                 self.problem
                     .clone()
@@ -412,9 +458,26 @@ impl RepoView {
             ],
         );
         let list = channel.git(&repo, rebase::list_args(&base));
+        // 没推送过的：其余的已推送
+        let unpushed = channel.git(
+            &repo,
+            vec![
+                "rev-list".into(),
+                format!("{base}..HEAD"),
+                "--not".into(),
+                "--remotes".into(),
+                "--".into(),
+            ],
+        );
         let view = cx.entity().downgrade();
         cx.spawn_in(window, async move |_, cx| {
-            let (is_ancestor, list) = futures::join!(is_ancestor, list);
+            let (is_ancestor, list, unpushed) = futures::join!(is_ancestor, list, unpushed);
+            let unpushed: Option<HashSet<String>> = unpushed.and_then(|out| out.ok()).ok().map(|out| {
+                String::from_utf8_lossy(&out)
+                    .lines()
+                    .map(|line| line.trim().to_string())
+                    .collect()
+            });
             cx.update(|window, cx| {
                 let on_branch = is_ancestor.is_ok_and(|out| out.success());
                 let commits = list
@@ -446,6 +509,15 @@ impl RepoView {
                     return;
                 }
                 let original: Vec<String> = commits.iter().map(|c| c.id.clone()).collect();
+                // 读不出来就当都没推送（不标）
+                let pushed: HashSet<String> = match &unpushed {
+                    Some(unpushed) => original
+                        .iter()
+                        .filter(|id| !unpushed.contains(*id))
+                        .cloned()
+                        .collect(),
+                    None => HashSet::new(),
+                };
                 let short: String = base.chars().take(8).collect();
                 let editor = cx.new(|_| RebaseEditor {
                     repo: view.clone(),
@@ -460,6 +532,7 @@ impl RepoView {
                         .collect(),
                     original,
                     problem: None,
+                    pushed,
                 });
                 window.open_dialog(cx, move |dialog, _, _| {
                     dialog

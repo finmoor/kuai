@@ -47,10 +47,32 @@ pub(super) struct Entry {
     output: SharedString,
 }
 
-#[derive(Default)]
+impl Entry {
+    /// 结束的时间（Unix 秒）；还在跑的按开始算
+    fn end(&self) -> i64 {
+        let elapsed = self.elapsed.map_or(0, |elapsed| elapsed.as_secs() as i64);
+        self.at.timestamp() + elapsed + 1
+    }
+}
+
 pub(super) struct Log {
+    /// 哪个仓库（失败的命令记进诊断的「最近的错误」时写上）
+    pub(super) name: String,
     entries: VecDeque<Entry>,
     next_id: u64,
+    /// 从什么时候起记的（Unix 秒）：开始记录，或者最旧的几条挤掉以后剩下的最早那条
+    since: i64,
+}
+
+impl Default for Log {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            entries: VecDeque::new(),
+            next_id: 0,
+            since: chrono::Utc::now().timestamp(),
+        }
+    }
 }
 
 impl Log {
@@ -58,8 +80,10 @@ impl Log {
     /// 开始执行一条命令；`command` 是给人看的命令行（`git …`）。
     pub(super) fn begin(&mut self, label: SharedString, command: String) -> u64 {
         self.next_id += 1;
-        if self.entries.len() >= MAX_ENTRIES {
-            self.entries.pop_back();
+        if self.entries.len() >= MAX_ENTRIES
+            && let Some(old) = self.entries.pop_back()
+        {
+            self.since = self.since.max(old.end());
         }
         self.entries.push_front(Entry {
             id: self.next_id,
@@ -100,6 +124,29 @@ impl Log {
                     .into();
             }
         }
+        // 失败的记进诊断的「最近的错误」：哪个仓库、什么操作、git 说的第一句
+        if entry.outcome == Outcome::Failed {
+            let said = entry
+                .output
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or_default();
+            let text = format!("{}：{said}", entry.label);
+            crate::diagnose::record_error(&self.name, &text);
+        }
+    }
+
+    /// 找回提交里认哪些记录是 Kuai 做的：从什么时候起记的，和每条执行完的命令开始、结束的时间
+    /// （Unix 秒）。
+    pub(super) fn spans(&self) -> (i64, Vec<(i64, i64)>) {
+        let spans = self
+            .entries
+            .iter()
+            .filter(|entry| entry.outcome != Outcome::Running)
+            .map(|entry| (entry.at.timestamp(), entry.end()))
+            .collect();
+        (self.since, spans)
     }
 
     fn running(&self) -> usize {

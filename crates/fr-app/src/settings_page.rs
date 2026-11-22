@@ -711,6 +711,25 @@ impl SettingsPage {
             tr("映射主机上的目录需要 WinFsp，须单独安装。"),
             fr_mount::WINFSP_NOTICE
         ));
+        // 诊断信息：版本、系统、各主机的连接情况、最近的错误，复制前可以先看
+        let diagnose = {
+            let app = self.app.clone();
+            SettingItem::new(
+                tr("诊断信息"),
+                SettingField::render(move |_, _, _| {
+                    let app = app.clone();
+                    Button::new("copy-diagnose")
+                        .small()
+                        .label(tr("复制诊断信息…"))
+                        .on_click(move |_, window, cx| {
+                            crate::diagnose::Summary::open(app.clone(), window, cx)
+                        })
+                }),
+            )
+            .description(tr(
+                "版本、系统、各主机最近一次的连接结果、最近的错误。复制前可以先看内容，密码、口令和令牌不会复制。",
+            ))
+        };
         let file = crate::settings::file();
         let folder = file.parent().map(|dir| dir.to_string_lossy().to_string());
         let path: SharedString = file.to_string_lossy().to_string().into();
@@ -724,6 +743,7 @@ impl SettingsPage {
                     .item(check_updates)
                     .item(source)
                     .item(winfsp)
+                    .item(diagnose)
                     .item(SettingItem::render(move |_, _, cx| {
                         let muted = cx.theme().muted_foreground;
                         let folder = folder.clone();

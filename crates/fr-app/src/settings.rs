@@ -57,7 +57,7 @@ pub struct Layout {
     // （仓库页上「全部仓库」展开着）也一样，改成服务器页以后不要了
 }
 
-/// 一个仓库自己记的东西：起的名字、隐藏了哪些分支、最近用过的提交说明。
+/// 一个仓库自己记的东西：起的名字、隐藏了哪些分支、最近用过的提交说明、在 Kuai 里删掉的分支。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoMemo {
     #[serde(flatten)]
@@ -71,14 +71,48 @@ pub struct RepoMemo {
     /// 最近用过的提交说明，新的在前
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_messages: Vec<String>,
+    /// 在 Kuai 里删掉的分支，新的在前。git 删分支会连它的 reflog 一起删，不记下来就不知道它原来
+    /// 指向哪；「找回提交」里列出来，可以按原名恢复。只留 [`RepoMemo::KEEP_DELETED`] 秒
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_branches: Vec<DeletedBranch>,
+}
+
+/// 删掉的一个分支：名字、删除时指向的提交、什么时候删的（Unix 秒）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedBranch {
+    pub name: String,
+    pub id: String,
+    pub at: i64,
 }
 
 impl RepoMemo {
     /// 最多记几条提交说明
     pub const MAX_MESSAGES: usize = 10;
+    /// 删掉的分支记多久：和 git 默认留不在分支上的 reflog 一样，30 天
+    pub const KEEP_DELETED: i64 = 30 * 24 * 3600;
+    /// 最多记几个删掉的分支
+    pub const MAX_DELETED: usize = 100;
 
     pub fn is_empty(&self) -> bool {
-        self.name.is_none() && self.hidden_refs.is_empty() && self.recent_messages.is_empty()
+        self.name.is_none()
+            && self.hidden_refs.is_empty()
+            && self.recent_messages.is_empty()
+            && self.deleted_branches.is_empty()
+    }
+
+    /// 记下刚删掉的分支，顺便去掉过期的（`now` 是 Unix 秒）。
+    pub fn remember_deleted(&mut self, name: &str, id: &str, now: i64) {
+        self.deleted_branches
+            .retain(|old| now - old.at < Self::KEEP_DELETED && !(old.name == name && old.id == id));
+        self.deleted_branches.insert(
+            0,
+            DeletedBranch {
+                name: name.to_string(),
+                id: id.to_string(),
+                at: now,
+            },
+        );
+        self.deleted_branches.truncate(Self::MAX_DELETED);
     }
 
     /// 记下一条刚用过的提交说明：放到最前面，重复的去掉，多了去掉最旧的。
@@ -900,6 +934,7 @@ impl Settings {
                     name: None,
                     hidden_refs: Vec::new(),
                     recent_messages: Vec::new(),
+                    deleted_branches: Vec::new(),
                 });
                 self.repo_memos.len() - 1
             }

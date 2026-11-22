@@ -77,6 +77,8 @@ pub(super) enum SideItem {
     Worktrees,
     /// 比较两端
     Compare,
+    /// 找回提交
+    Recover,
     Header(SideSection),
     /// 目录树里的文件夹；数字是它的键（`前缀/路径`）的哈希
     Folder(u64),
@@ -308,6 +310,14 @@ impl RepoView {
                 count: self.live_worktrees(),
             });
         }
+        rows.push(SideRow {
+            item: SideItem::Recover,
+            depth: 0,
+            label: String::new(),
+            key: None,
+            open: false,
+            count: 0,
+        });
         // 一棵目录树 → 侧栏的行。`prefix` 是收起键的前缀，`base` 是这棵树整体缩进几层
         let push_tree = |rows: &mut Vec<SideRow>,
                          names: &[(&str, usize)],
@@ -939,6 +949,13 @@ impl RepoView {
                     SideItem::Compare => inner
                         .child(ui::icon(IconName::GitCompare).flex_none().text_color(muted))
                         .child(name(tr("比较").to_string())),
+                    SideItem::Recover => inner
+                        .child(
+                            ui::icon(IconName::ArchiveRestore)
+                                .flex_none()
+                                .text_color(muted),
+                        )
+                        .child(name(tr("找回提交").to_string())),
                     SideItem::SubRepos => inner
                         .child(ui::icon(IconName::FolderTree).flex_none().text_color(muted))
                         .child(name(tr("子仓库").to_string()))
@@ -1170,6 +1187,7 @@ impl RepoView {
             Mode::Subs => SideItem::SubRepos,
             Mode::Worktrees => SideItem::Worktrees,
             Mode::Compare => SideItem::Compare,
+            Mode::Recover => SideItem::Recover,
         });
     }
 
@@ -1329,6 +1347,7 @@ impl RepoView {
             SideItem::SubRepos => self.show_subs(window, cx),
             SideItem::Worktrees => self.show_worktrees(window, cx),
             SideItem::Compare => self.show_compare(window, cx),
+            SideItem::Recover => self.show_recover(window, cx),
             SideItem::History => {
                 self.sidebar.selected = item;
                 self.mode = Mode::History;

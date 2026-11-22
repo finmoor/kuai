@@ -250,7 +250,7 @@ impl RepoView {
             })
             .collect();
         let mut args: Vec<String> = vec!["branch".into(), "-D".into(), "--".into()];
-        args.extend(names.into_iter().map(|(name, _)| name));
+        args.extend(names.iter().map(|(name, _)| name.clone()));
         self.verify_then(checks, window, cx, move |this, window, cx| {
             this.run_op(
                 tr("清理分支"),
@@ -258,7 +258,9 @@ impl RepoView {
                 None,
                 window,
                 cx,
-                move |_, _, window, cx| {
+                move |this, _, window, cx| {
+                    // 记进「找回提交」，按原名能恢复
+                    this.remember_deleted(names.clone(), cx);
                     let text = tf!("已删除 {n} 个分支", n = count);
                     window.push_notification(Notification::success(text), cx);
                 },

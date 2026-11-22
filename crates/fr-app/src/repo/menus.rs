@@ -8,6 +8,7 @@ use fr_core::i18n::{tr, tr_key};
 use fr_core::state::InProgress;
 use fr_core::status::{Entry, Kind};
 use fr_core::tf;
+use gpui_kit::assets::IconName;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
@@ -17,6 +18,7 @@ use super::changes::Area;
 use super::compare::End;
 use super::dialogs::{Ask, Hint, ref_name_error};
 use super::history::Scope;
+use super::impact::{Impact, Listed, Row, Tone, find_row, list_commits};
 use super::ops::{Step, args, failure};
 use super::sidebar::SideItem;
 use super::sidebar::SideSection;
@@ -139,6 +141,34 @@ fn copy_item(label: impl Into<SharedString>, text: String) -> PopupMenuItem {
     PopupMenuItem::new(label).on_click(move |_, _, cx| {
         cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
     })
+}
+
+/// 推送一个本地分支的参数。强制推送时 `lease` 是远程上的那个分支应当指向哪（里面是 None 表示远程上
+/// 应当还没有它），不强推是 None。
+fn push_args(
+    name: &str,
+    remote: &str,
+    remote_branch: &str,
+    set_upstream: bool,
+    lease: Option<&Option<String>>,
+) -> Vec<String> {
+    let mut push = args(&["push", "--progress"]);
+    if let Some(expect) = lease {
+        let id = expect.as_deref().unwrap_or_default();
+        push.push(format!(
+            "--force-with-lease=refs/heads/{remote_branch}:{id}"
+        ));
+    }
+    if set_upstream {
+        push.push("--set-upstream".into());
+    }
+    // 写完整引用名：本地有同名的标签时短名会认错；`--` 之后名字以 `-` 开头也不会被当成选项
+    push.extend([
+        "--".into(),
+        remote.to_string(),
+        format!("refs/heads/{name}:refs/heads/{remote_branch}"),
+    ]);
+    push
 }
 
 fn short(id: &str) -> &str {
@@ -371,6 +401,67 @@ impl RepoView {
                 .item(copy_item(tr("复制哈希"), id.clone()))
                 .item(copy_item(tr("复制说明"), subject.clone()))
         }))
+    }
+
+    /// 不在提交列表里的一个提交（找回提交里选中的）的菜单：比较、检出、打标签、重置到这里、复制。
+    pub(super) fn object_menu(
+        &self,
+        id: String,
+        subject: String,
+        cx: &mut Context<Self>,
+    ) -> MenuFn {
+        let view = cx.entity().downgrade();
+        let cur = self.current_label();
+        Box::new(move |menu, window, cx| {
+            let (target, tag) = (id.clone(), (id.clone(), subject.clone()));
+            let mut menu = menu
+                .item(item(&view, tr("与 HEAD 比较"), {
+                    let base = id.clone();
+                    move |this, w, cx| {
+                        this.compare_ends(End::Commit(base.clone()), End::Head, w, cx)
+                    }
+                }))
+                .item(item(&view, tr("与本地修改比较"), {
+                    let base = id.clone();
+                    move |this, w, cx| {
+                        this.compare_ends(End::Commit(base.clone()), End::Worktree, w, cx)
+                    }
+                }))
+                .separator()
+                .item(item(
+                    &view,
+                    tr("检出此提交（分离 HEAD）"),
+                    move |this, w, cx| this.checkout_detached(target.clone(), w, cx),
+                ))
+                .item(item(
+                    &view,
+                    tr("在此新建标签…"),
+                    move |this, w, cx| this.new_tag_dialog(tag.0.clone(), tag.1.clone(), w, cx),
+                ));
+            {
+                let (view2, id2) = (view.clone(), id.clone());
+                menu = menu.submenu(
+                    tf!("将 {cur} 重置到此提交", cur = &cur),
+                    window,
+                    cx,
+                    move |sub, _, _| {
+                        let mode = |label: &'static str, flag: &'static str| {
+                            let id = id2.clone();
+                            item(&view2, label, move |this, w, cx| {
+                                this.reset_to(id.clone(), flag, w, cx)
+                            })
+                        };
+                        sub.item(mode(tr("保留改动并暂存（soft）…"), "--soft"))
+                            .item(mode(tr("保留改动，不暂存（mixed）…"), "--mixed"))
+                            .separator()
+                            .item(mode(tr("丢弃所有改动（hard）…"), "--hard"))
+                    },
+                );
+            }
+            menu.separator()
+                .item(copy_item(tr("复制哈希"), id.clone()))
+                .item(copy_item(tr("复制说明"), subject.clone()))
+        })
     }
 
     /// 侧栏里一项的菜单。
@@ -965,6 +1056,13 @@ impl RepoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let target = short(&rev).to_string();
+        self.leave_detached_then(target, window, cx, move |this, window, cx| {
+            this.checkout_detached_now(rev.clone(), window, cx)
+        });
+    }
+
+    fn checkout_detached_now(&mut self, rev: String, window: &mut Window, cx: &mut Context<Self>) {
         self.with_local_changes(
             tf!("检出 {rev}", rev = short(&rev)),
             tr("保留改动并切换"),
@@ -1047,17 +1145,20 @@ impl RepoView {
         cx: &mut Context<Self>,
     ) {
         let cur = self.current_label();
-        let is_head = self.status.as_ref().and_then(|s| s.head.as_deref()) == Some(&*id);
-        let moved = if is_head {
-            String::new()
-        } else {
-            tf!(
-                "{cur} 将指向 {id}，之后的提交将从此分支移除（可通过 reflog 找回）。",
-                cur,
-                id = short(&id)
-            )
-        };
+        let head = self.status.as_ref().and_then(|s| s.head.clone());
+        // 丢掉的改动：工作区里改了的（没跟踪的 reset --hard 不动）、暂存区里的
+        let (worktree, staged) = self.status.as_ref().map_or((0, 0), |status| {
+            let worktree = status
+                .entries
+                .iter()
+                .filter(|entry| entry.unstaged.is_some_and(|kind| kind != Kind::Untracked))
+                .count();
+            let staged = status.entries.iter().filter(|e| e.staged.is_some()).count();
+            (worktree, staged)
+        });
         let reset = vec!["reset".into(), flag.into(), id.clone()];
+        let range = vec![format!("{id}..HEAD")];
+        let (target, label) = (short(&id).to_string(), cur.clone());
         // 确认框写的是现在这个分支：确认时 HEAD 已经换了（切了分支、别处提交了）就不重置，不然动的
         // 是确认框里没写的那个分支，--hard 还丢掉它的改动
         let checks = self.head_checks();
@@ -1070,44 +1171,79 @@ impl RepoView {
                 });
             });
         };
-        match flag {
-            "--hard" => {
-                let description = tf!(
-                    "{moved}工作区和暂存区中的所有改动将被丢弃，此操作无法撤销。",
-                    moved
-                );
-                self.confirm(
-                    tr("重置并丢弃所有改动？"),
-                    description,
-                    tr("重置"),
-                    window,
-                    cx,
-                    run,
-                );
-            }
-            "--soft" => {
-                let description = tf!("{moved}这些提交的改动将保留在暂存区，工作区不变。", moved);
-                self.confirm_plain(
-                    tr("重置（soft）？"),
-                    description,
-                    tr("重置"),
-                    window,
-                    cx,
-                    run,
-                );
-            }
-            _ => {
-                let description = tf!("{moved}改动将保留在工作区，暂存区将被清空。", moved);
-                self.confirm_plain(
-                    tr("重置（mixed）？"),
-                    description,
-                    tr("重置"),
-                    window,
-                    cx,
-                    run,
-                );
-            }
-        }
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        // 先数出离开这个分支的提交（在现在的位置上、不在目标上的），再弹确认框
+        let leaving = list_commits(channel, self.entry.path.clone(), range, false, true);
+        cx.spawn_in(window, async move |this, cx| {
+            let leaving = leaving.await;
+            this.update_in(cx, |this, window, cx| {
+                let (cur, target) = (label, target);
+                let from = head.as_deref().map(short).unwrap_or("?");
+                let mut rows = vec![Row::new(
+                    Tone::Plain,
+                    IconName::GitBranch,
+                    "分支",
+                    tf!("{cur}：{from} → {target}", cur, from, target),
+                )];
+                if leaving.total > 0 {
+                    let mut text = leaving.count_text();
+                    if leaving.pushed > 0 {
+                        text.push_str(tr("（重置后推送要强制推送）"));
+                    }
+                    rows.push(
+                        Row::new(Tone::Warn, IconName::GitCommitHorizontal, "离开此分支", text)
+                            .listed(&leaving),
+                    );
+                }
+                let (description, title, danger) = match flag {
+                    "--hard" => {
+                        let lost = match worktree + staged {
+                            0 => Row::new(
+                                Tone::Plain,
+                                IconName::CircleMinus,
+                                "丢弃的改动",
+                                tr("没有未提交的改动。"),
+                            ),
+                            _ => Row::new(
+                                Tone::Bad,
+                                IconName::CircleMinus,
+                                "丢弃的改动",
+                                tf!(
+                                    "工作区 {worktree} 个文件、暂存区 {staged} 个文件。没有提交过的改动无法找回。",
+                                    worktree,
+                                    staged
+                                ),
+                            ),
+                        };
+                        rows.push(lost);
+                        let description = tr("工作区和暂存区的改动会被丢弃（--hard），没有跟踪的文件不动。");
+                        (description, tf!("把 {cur} 重置到 {target}？", cur, target), true)
+                    }
+                    "--soft" => (
+                        tr("离开此分支的提交的改动保留在暂存区，工作区不变（--soft）。"),
+                        tf!("把 {cur} 重置到 {target}（soft）？", cur, target),
+                        false,
+                    ),
+                    _ => (
+                        tr("改动保留在工作区，暂存区清空（--mixed）。"),
+                        tf!("把 {cur} 重置到 {target}（mixed）？", cur, target),
+                        false,
+                    ),
+                };
+                if leaving.total > 0 {
+                    rows.push(find_row());
+                }
+                let impact = Impact {
+                    description: description.into(),
+                    rows,
+                };
+                this.confirm_impact(title, impact, tr("重置"), danger, window, cx, run);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// 合并：先问怎么合（默认、总是生成合并提交、只快进、压缩成一份改动），要不要先不提交。
@@ -1176,15 +1312,73 @@ impl RepoView {
         cx: &mut Context<Self>,
     ) {
         let cur = self.current_label();
-        let description = tf!(
-            "{cur} 独有的提交将在 {shown} 之后重新生成。已推送的分支变基后需强制推送。",
-            cur,
-            shown
-        );
-        self.confirm_plain(
-            tf!("将 {cur} 变基到 {shown}？", cur, shown),
-            description,
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        // 数出会重新生成的提交（当前分支有、目标上没有的），其中几个已推送
+        let range = vec![format!("{target}..HEAD")];
+        let moved = list_commits(channel, self.entry.path.clone(), range, false, true);
+        cx.spawn_in(window, async move |this, cx| {
+            let moved = moved.await;
+            this.update_in(cx, |this, window, cx| {
+                this.confirm_rebase_onto(target, shown, cur, moved, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn confirm_rebase_onto(
+        &mut self,
+        target: String,
+        shown: String,
+        cur: String,
+        moved: Listed,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut rows = vec![
+            Row::new(
+                Tone::Plain,
+                IconName::GitCommitHorizontal,
+                "重新生成",
+                moved.count_text(),
+            )
+            .listed(&moved),
+        ];
+        if moved.pushed > 0 {
+            rows.push(Row::new(
+                Tone::Warn,
+                IconName::ArrowUp,
+                "已推送",
+                tf!(
+                    "其中 {pushed} 个已推送，变基后推送要强制推送。",
+                    pushed = moved.pushed
+                ),
+            ));
+        }
+        if moved.total > 0 {
+            rows.push(Row::new(
+                Tone::Good,
+                IconName::ArchiveRestore,
+                "怎么找回",
+                tr("变基前的位置记在侧栏的「找回提交」里。"),
+            ));
+        }
+        let impact = Impact {
+            description: tf!(
+                "{cur} 独有的提交将在 {shown} 之后重新生成。",
+                cur = &cur,
+                shown = &shown
+            )
+            .into(),
+            rows,
+        };
+        self.confirm_impact(
+            tf!("将 {cur} 变基到 {shown}？", cur, shown = &shown),
+            impact,
             tr("变基"),
+            false,
             window,
             cx,
             move |this, window, cx| {
@@ -1264,69 +1458,208 @@ impl RepoView {
                 None => (self.default_remote(), name.clone(), true),
             };
         let to = format!("{remote}/{remote_branch}");
-        // 强制推送时远程上的那个分支应当是什么：确认框打开时看到的远程跟踪分支，没有就是「远程上还
-        // 没有」。不写期望值时 git 拿推送那一刻的远程跟踪分支比，自动获取可能刚把它更新过，没看过的
-        // 新提交照样被盖掉
-        let tracking = upstream.unwrap_or(&to);
-        let expect = self
-            .refs
-            .remotes
-            .iter()
-            .find(|remote| remote.name == tracking)
-            .map(|remote| remote.target.clone());
-        let mut push = args(&["push", "--progress"]);
         if force {
-            let id = expect.as_deref().unwrap_or_default();
-            push.push(format!(
-                "--force-with-lease=refs/heads/{remote_branch}:{id}"
+            return self.force_push(name, remote, remote_branch, set_upstream, window, cx);
+        }
+        let text = tf!("{name} 已推送到 {to}", name, to);
+        let push = push_args(&name, &remote, &remote_branch, set_upstream, None);
+        self.run_net_op(tr("推送"), push, window, cx, move |_, _, w, cx| {
+            w.push_notification(Notification::success(text), cx);
+        });
+    }
+
+    /// 强制推送：先取一次远程的这个分支，列出只在远程上、推送后会被移除的提交，再确认。
+    fn force_push(
+        &mut self,
+        name: String,
+        remote: String,
+        remote_branch: String,
+        set_upstream: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        let repo = self.entry.path.clone();
+        let tracking = format!("refs/remotes/{remote}/{remote_branch}");
+        let mut fetch: Vec<String> = fr_core::askpass::NO_PROMPT.map(String::from).to_vec();
+        fetch.extend(args(&["fetch", "--quiet", "--", &remote]));
+        fetch.push(format!("+refs/heads/{remote_branch}:{tracking}"));
+        let id = self.activity.begin(
+            tr("强制推送前获取").into(),
+            format!("git {}", fetch.join(" ")),
+        );
+        self.op_progress = Some(tr("正在获取远程…").into());
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let fetched = channel.git(&repo, fetch).await;
+            let fetch_error = match &fetched {
+                Ok(out) if out.success() => None,
+                Ok(out) => Some(out.stderr.trim().to_string()),
+                Err(err) => Some(format!("{err:#}")),
+            };
+            // 远程上的这个分支现在指向哪（取不到时是上次取到的）：推送时按它比（--force-with-lease）
+            let verify = args(&[
+                "rev-parse",
+                "-q",
+                "--verify",
+                &format!("{tracking}^{{commit}}"),
+            ]);
+            let expect = channel
+                .git(&repo, verify)
+                .await
+                .ok()
+                .filter(GitOutput::success)
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                .filter(|id| !id.is_empty());
+            let local = format!("refs/heads/{name}");
+            let (lost, pushed) = match &expect {
+                Some(_) => {
+                    let lost = list_commits(
+                        channel.clone(),
+                        repo.clone(),
+                        vec![format!("{local}..{tracking}")],
+                        true,
+                        false,
+                    );
+                    let mine = list_commits(
+                        channel.clone(),
+                        repo.clone(),
+                        vec![format!("{tracking}..{local}")],
+                        false,
+                        false,
+                    );
+                    (lost.await, mine.await)
+                }
+                None => (Listed::default(), Listed::default()),
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.op_progress = None;
+                this.activity.end(id, &fetched, false);
+                let push = push_args(&name, &remote, &remote_branch, set_upstream, Some(&expect));
+                this.confirm_force_push(
+                    name,
+                    remote,
+                    remote_branch,
+                    expect,
+                    lost,
+                    pushed,
+                    fetch_error,
+                    push,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn confirm_force_push(
+        &mut self,
+        name: String,
+        remote: String,
+        remote_branch: String,
+        expect: Option<String>,
+        lost: Listed,
+        pushed: Listed,
+        fetch_error: Option<String>,
+        push: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let to = format!("{remote}/{remote_branch}");
+        let mut description = match &expect {
+            Some(_) => tf!("用本地的 {name} 覆盖 {to}。", name = &name, to = &to),
+            None => tf!(
+                "把本地的 {name} 推送到 {to}，远程上还没有这个分支。",
+                name = &name,
+                to = &to
+            ),
+        };
+        match &fetch_error {
+            None => description.push_str(tr("刚才取过一次远程。")),
+            Some(err) => {
+                description.push_str(&tf!("没能取到远程（{err}），下面按上次取到的远程算。", err))
+            }
+        }
+        let mut rows = Vec::new();
+        if expect.is_some() {
+            rows.push(match lost.total {
+                0 => Row::new(
+                    Tone::Plain,
+                    IconName::Cloud,
+                    "远程会丢",
+                    tr("远程上没有会丢的提交。"),
+                ),
+                total => Row::new(
+                    Tone::Bad,
+                    IconName::Cloud,
+                    "远程会丢",
+                    tf!(
+                        "{total} 个提交只在远程上，推送后从 {to} 移除：",
+                        total,
+                        to = &to
+                    ),
+                )
+                .listed(&lost),
+            });
+            if pushed.total > 0 {
+                rows.push(
+                    Row::new(
+                        Tone::Plain,
+                        IconName::ArrowUp,
+                        "本地推上去",
+                        tf!("{total} 个提交", total = pushed.total),
+                    )
+                    .listed(&pushed),
+                );
+            }
+        }
+        rows.push(Row::new(
+            Tone::Plain,
+            IconName::Info,
+            "保护",
+            tr("推送时远程若又有了新提交，则不推送（--force-with-lease）。"),
+        ));
+        if lost.total > 0 {
+            rows.push(Row::new(
+                Tone::Warn,
+                IconName::ArchiveRestore,
+                "怎么找回",
+                tf!(
+                    "远程上被移除的提交，本机在 {to} 的记录里还能找到；别人电脑上的要他们自己找回。",
+                    to = &to
+                ),
             ));
         }
-        if set_upstream {
-            push.push("--set-upstream".into());
-        }
-        // 写完整引用名：本地有同名的标签时短名会认错；`--` 之后名字以 `-` 开头也不会被当成选项
-        push.extend([
-            "--".into(),
-            remote.clone(),
-            format!("refs/heads/{name}:refs/heads/{remote_branch}"),
-        ]);
-        let description = match &expect {
-            Some(id) => tf!(
-                "{to} 上的提交将被本地的 {name} 覆盖。若远程上的 {to} 已不是 {id}，则不推送（--force-with-lease）。",
-                to,
-                name,
-                id = short(id)
-            ),
-            None => tf!(
-                "将本地的 {name} 推送到 {to}。若远程上已有 {to}，则不推送（--force-with-lease）。",
-                to,
-                name
-            ),
+        let impact = Impact {
+            description: description.into(),
+            rows,
         };
-        let run = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
-            let text = tf!("{name} 已推送到 {to}", name, to);
-            this.run_net_op(
-                tr("推送"),
-                push.clone(),
-                window,
-                cx,
-                move |_, _, w, cx| {
-                    w.push_notification(Notification::success(text), cx);
-                },
-            );
-        };
-        if force {
-            self.confirm(
-                tr("强制推送？"),
-                description,
-                tr("强制推送"),
-                window,
-                cx,
-                run,
-            );
-        } else {
-            run(self, window, cx);
-        }
+        let text = tf!("{name} 已推送到 {to}", name = &name, to = &to);
+        self.confirm_impact(
+            tf!("强制推送 {name}？", name = &name),
+            impact,
+            tr("强制推送"),
+            true,
+            window,
+            cx,
+            move |this, window, cx| {
+                let text = text.clone();
+                this.run_net_op(
+                    tr("推送"),
+                    push.clone(),
+                    window,
+                    cx,
+                    move |_, _, w, cx| {
+                        w.push_notification(Notification::success(text), cx);
+                    },
+                );
+            },
+        );
     }
 
     fn rename_branch_dialog(&mut self, old: String, window: &mut Window, cx: &mut Context<Self>) {

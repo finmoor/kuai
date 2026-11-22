@@ -365,6 +365,19 @@ impl RepoView {
             .then(|| self.history.selected_commit())
             .flatten()
             .map(|c| (c.id.to_string(), c.subject.to_string()));
+        self.new_branch_at(start, String::new(), true, window, cx);
+    }
+
+    /// 新建分支的对话框：`start` 是从哪个提交（哈希、说明）建，没有就从 HEAD；`value` 是预先填的
+    /// 名字，`switch` 是「创建后切换」默认勾不勾。
+    pub(super) fn new_branch_at(
+        &mut self,
+        start: Option<(String, String)>,
+        value: String,
+        switch: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let hint = match &start {
             Some((id, subject)) => {
                 tf!(
@@ -378,9 +391,10 @@ impl RepoView {
         let ask = Ask {
             title: tr("新建分支").into(),
             placeholder: tr("分支名称，例如 feature/login").into(),
+            value,
             hint: hint.into(),
             ok: tr("创建"),
-            checks: vec![(tr("创建后切换").into(), true)],
+            checks: vec![(tr("创建后切换").into(), switch)],
             validate: Some(Box::new(|this, answer| {
                 ref_name_error(&answer.text).or_else(|| this.branch_exists_error(&answer.text))
             })),

@@ -252,7 +252,9 @@ impl RepoView {
             Mode::Changes if self.changes_showing_diff() => Where::Changes,
             Mode::Compare => Where::Compare,
             // 提交历史里 Ctrl+F 平常是搜提交；焦点在改动里（点过它）时才是在改动里搜
-            Mode::History if self.history_diff_focused(window, cx) => Where::History,
+            Mode::History | Mode::Recover if self.history_diff_focused(window, cx) => {
+                Where::History
+            }
             _ => return false,
         };
         self.open_diff_search(at, window, cx);

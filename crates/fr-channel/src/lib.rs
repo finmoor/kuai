@@ -40,7 +40,10 @@ pub use fr_core::protocol::{
     DirEntry, DirListing, FsEntry, FsExpect, FsSpace, FsStat, FsWrite, FsWritten, Hello, SubRepos,
     TermInfo, TermMark,
 };
-pub use remote::{ConnectOptions, Connection, Jump, Probe, StageHandler, local_kuai_root};
+pub use remote::{
+    ConnectOptions, Connection, FailedAt, Jump, LoginFailure, Probe, StageHandler, local_kuai_root,
+    login_failure,
+};
 
 /// 一次 git 调用的结果。
 #[derive(Debug, Clone, Default)]

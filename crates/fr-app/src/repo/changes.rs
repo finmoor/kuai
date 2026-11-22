@@ -99,6 +99,9 @@ pub(super) struct Changes {
     /// 勾选「修改上次提交」时自动填进去的说明；取消勾选时如果没改过就清空
     amend_message: Option<String>,
     amend_task: Option<Task<()>>,
+    /// 勾选「修改上次提交」时，上次提交在哪些远程分支上（已推送）；没推送、还没读到是空的
+    amend_pushed: Vec<String>,
+    amend_pushed_task: Option<Task<()>>,
 }
 
 impl Changes {
@@ -187,6 +190,8 @@ impl Changes {
             amend: false,
             amend_message: None,
             amend_task: None,
+            amend_pushed: Vec::new(),
+            amend_pushed_task: None,
         };
         (changes, vec![subscription, split_events, filter_events])
     }
@@ -216,6 +221,7 @@ impl Changes {
         self.message.update(cx, |m, cx| m.set_value("", window, cx));
         self.amend = false;
         self.amend_message = None;
+        self.amend_pushed.clear();
     }
 
     fn scroll(&self, area: Area) -> &UniformListScrollHandle {
@@ -1336,6 +1342,40 @@ impl RepoView {
     /// 勾选「修改上次提交」：说明是空的就填上上次提交的说明。
     fn set_amend(&mut self, checked: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.changes.amend = checked;
+        self.changes.amend_pushed.clear();
+        self.changes.amend_pushed_task = None;
+        // 上次提交已经推送过的，提交框下面提醒：修改后要强制推送
+        if checked && let Some(channel) = self.channel.clone() {
+            let args = [
+                "branch",
+                "-r",
+                "--contains",
+                "HEAD",
+                "--format=%(refname:short)",
+            ]
+            .map(String::from)
+            .to_vec();
+            let request = channel.git(&self.entry.path, args);
+            self.changes.amend_pushed_task = Some(cx.spawn(async move |this, cx| {
+                let Ok(out) = request.await.and_then(|out| out.ok()) else {
+                    return;
+                };
+                let remotes: Vec<String> = String::from_utf8_lossy(&out)
+                    .lines()
+                    .map(str::trim)
+                    // `origin/HEAD` 只是指向默认分支的别名
+                    .filter(|name| !name.is_empty() && !name.ends_with("/HEAD"))
+                    .map(str::to_string)
+                    .collect();
+                this.update(cx, |this, cx| {
+                    if this.changes.amend {
+                        this.changes.amend_pushed = remotes;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }));
+        }
         let current = self.changes.message.read(cx).value().to_string();
         if checked {
             if current.trim().is_empty()
@@ -1419,6 +1459,7 @@ impl RepoView {
                     // 说明在提交期间又改过：留着，只把「修改上次提交」取消掉
                     this.changes.amend = false;
                     this.changes.amend_message = None;
+                    this.changes.amend_pushed.clear();
                     let text = tr("已提交。提交期间说明已被修改，因此未清空。");
                     window.push_notification(Notification::info(text), cx);
                 }
@@ -1906,8 +1947,16 @@ impl RepoView {
             .as_deref()
             .is_some_and(|op| op == tr("提交") || op == tr("修改提交"));
         let view = cx.entity().downgrade();
+        // 不在任何分支上（分离的 HEAD）：变基、挑拣这些进行中的操作也会这样，那时不提醒
+        let detached = self.in_progress.is_none()
+            && self
+                .status
+                .as_ref()
+                .is_some_and(|status| status.branch.is_none() && status.head.is_some());
         let label: SharedString = if amend {
             tr("修改上次提交").into()
+        } else if detached {
+            tr("提交到分离的 HEAD").into()
         } else if staged > 0 {
             tf!("提交（{staged} 个文件）", staged).into()
         } else {
@@ -1917,12 +1966,46 @@ impl RepoView {
         let recent_view = view.clone();
         let push_view = view.clone();
         let can_commit = !busy && (amend || staged > 0);
+        let detached_note = detached.then(|| {
+            let head = self
+                .status
+                .as_ref()
+                .and_then(|status| status.head.as_deref())
+                .unwrap_or_default();
+            let text = tf!(
+                "当前不在任何分支上（分离的 HEAD，位于 {head}）。在这里提交后切换到别的分支，新提交就不在任何分支上了。",
+                head = &head[..head.len().min(8)]
+            );
+            let button = Button::new("detached-new-branch")
+                .xsmall()
+                .label(tr("新建分支…"))
+                .on_click(cx.listener(|this, _, window, cx| this.new_branch_dialog(window, cx)));
+            let action = h_flex()
+                .gap_2()
+                .child(button)
+                .child(div().text_xs().text_color(c.muted).child(tr("新建后提交到新分支上")));
+            super::impact::note(text.into(), Some(action.into_any_element()), cx)
+        });
+        let pushed_note = (amend && !self.changes.amend_pushed.is_empty()).then(|| {
+            let head = self
+                .status
+                .as_ref()
+                .and_then(|status| status.head.as_deref())
+                .unwrap_or_default();
+            let text = tf!(
+                "上次提交 {head} 已推送到 {remotes}。修改后要强制推送；别人如果已经基于它继续提交，会和你的分叉。",
+                head = &head[..head.len().min(8)],
+                remotes = self.changes.amend_pushed.join(tr("、"))
+            );
+            super::impact::note(text.into(), None, cx)
+        });
         v_flex()
             .flex_none()
             .p_2()
             .gap_2()
             .border_t_1()
             .border_color(c.border)
+            .children(detached_note)
             .child(
                 h_flex()
                     .h(px(20.))
@@ -2017,6 +2100,7 @@ impl RepoView {
                             }),
                     ),
             )
+            .children(pushed_note)
             .into_any_element()
     }
 

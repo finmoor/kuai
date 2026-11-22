@@ -11,6 +11,7 @@ use fr_core::pull;
 use fr_core::state;
 use futures::channel::oneshot;
 use futures::{FutureExt as _, StreamExt as _};
+use gpui_kit::assets::IconName;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
@@ -20,6 +21,7 @@ use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::*;
 
 use super::RepoView;
+use super::impact::{Impact, Row, Tone, list_commits};
 
 /// 写操作里的一步。
 #[derive(Clone)]
@@ -772,7 +774,13 @@ impl RepoView {
         if self.offer_tree_holding(name, window, cx) {
             return;
         }
-        let name = name.to_string();
+        let target = name.to_string();
+        self.leave_detached_then(target.clone(), window, cx, move |this, window, cx| {
+            this.checkout_branch_now(target.clone(), window, cx)
+        });
+    }
+
+    fn checkout_branch_now(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         self.with_local_changes(
             tf!("切换到 {name}", name = &name),
             tr("保留改动并切换"),
@@ -1053,6 +1061,13 @@ impl RepoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let target = remote.to_string();
+        self.leave_detached_then(target.clone(), window, cx, move |this, window, cx| {
+            this.checkout_remote_now(&target, window, cx)
+        });
+    }
+
+    fn checkout_remote_now(&mut self, remote: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some((remote_name, local)) = remote.split_once('/') else {
             return;
         };
@@ -1157,6 +1172,13 @@ impl RepoView {
     ) {
         let flag = if force { "-D" } else { "-d" };
         let delete = vec!["branch".into(), flag.into(), "--".into(), name.clone()];
+        // 删掉以后 git 连它的 reflog 一起删：先记下它指着哪，删成了存进「找回提交」
+        let tip = self
+            .refs
+            .branches
+            .iter()
+            .find(|branch| branch.name == name)
+            .map(|branch| branch.target.clone());
         self.run_op_with(
             tr("删除分支"),
             delete,
@@ -1164,33 +1186,122 @@ impl RepoView {
             cx,
             move |this, result, window, cx| match result {
                 Ok(_) => {
+                    if let Some(tip) = tip.clone() {
+                        this.remember_deleted(vec![(name.clone(), tip)], cx);
+                    }
                     window.push_notification(
                         Notification::success(tf!("已删除分支 {name}", name)),
                         cx,
                     );
                 }
-                // `-d` 不肯删，一般是分支还没合并。不去认 git 的报错文字（它跟着系统语言变），
-                // 原样给用户看，由用户决定要不要强制删
-                Err(text) if !force => {
-                    let description = tf!(
-                        "git 未删除 {name}：\n{text}\n\n强制删除后，仅在此分支上的提交将难以找回。",
-                        name,
-                        text
-                    );
-                    this.confirm(
-                        tr("强制删除分支？"),
-                        description,
-                        tr("强制删除"),
-                        window,
-                        cx,
-                        move |this, window, cx| {
-                            this.run_delete_branch(name.clone(), true, window, cx)
-                        },
-                    );
-                }
+                // `-d` 不肯删，一般是分支还没合并。不去认 git 的报错文字（它跟着系统语言变）：
+                // 数出只在这条分支上的提交，由用户决定要不要强制删
+                Err(text) if !force => this.confirm_force_delete(name, text, window, cx),
                 Err(text) => failure(window, cx, tr("删除分支"), text),
             },
         );
+    }
+
+    /// `git branch -d` 没删掉：列出只在这条分支上的提交、远程上有没有同名分支，问要不要强制删。
+    fn confirm_force_delete(
+        &mut self,
+        name: String,
+        git_said: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        let tip = self
+            .refs
+            .branches
+            .iter()
+            .find(|branch| branch.name == name)
+            .map(|branch| branch.target.clone());
+        // 同名的远程分支：`origin/name` 这样的
+        let remote_same: Vec<String> = self
+            .refs
+            .remotes
+            .iter()
+            .filter(|remote| remote.name.split_once('/').is_some_and(|(_, b)| b == name))
+            .map(|remote| remote.name.clone())
+            .collect();
+        let range = vec![
+            format!("refs/heads/{name}"),
+            "--not".into(),
+            format!("--exclude={name}"),
+            "--branches".into(),
+            "--remotes".into(),
+            "--tags".into(),
+        ];
+        let only = list_commits(channel, self.entry.path.clone(), range, false, false);
+        cx.spawn_in(window, async move |this, cx| {
+            let only = only.await;
+            this.update_in(cx, |this, window, cx| {
+                let description = match only.total {
+                    0 => tf!(
+                        "git 未删除 {name}：{text}",
+                        name = &name,
+                        text = git_said.trim()
+                    ),
+                    _ => tr("这条分支有没合并到其他分支的提交。").to_string(),
+                };
+                let mut rows = vec![match only.total {
+                    0 => Row::new(
+                        Tone::Plain,
+                        IconName::GitCommitHorizontal,
+                        "只在此分支",
+                        tr("没有只在这条分支上的提交，别的分支上都有。"),
+                    ),
+                    _ => Row::new(
+                        Tone::Warn,
+                        IconName::GitCommitHorizontal,
+                        "只在此分支",
+                        only.count_text(),
+                    )
+                    .listed(&only),
+                }];
+                rows.push(Row::new(
+                    Tone::Plain,
+                    IconName::Cloud,
+                    "远程",
+                    match remote_same.is_empty() {
+                        true => tr("远程上没有同名分支。").to_string(),
+                        false => tf!(
+                            "远程上有 {names}，删除本地分支不影响它。",
+                            names = remote_same.join(tr("、"))
+                        ),
+                    },
+                ));
+                if let (Some(tip), true) = (&tip, only.total > 0) {
+                    rows.push(Row::new(
+                        Tone::Good,
+                        IconName::ArchiveRestore,
+                        "怎么找回",
+                        tf!(
+                            "Kuai 会记下它指向 {id}，在侧栏的「找回提交」里可以按原名恢复。",
+                            id = &tip[..tip.len().min(8)]
+                        ),
+                    ));
+                }
+                let impact = Impact {
+                    description: description.into(),
+                    rows,
+                };
+                this.confirm_impact(
+                    tf!("强制删除分支 {name}？", name = &name),
+                    impact,
+                    tr("强制删除"),
+                    true,
+                    window,
+                    cx,
+                    move |this, window, cx| this.run_delete_branch(name.clone(), true, window, cx),
+                );
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// 工具栏上的「弹出贮藏」：先说清楚是哪一条、会从列表里删掉，确认了再做。

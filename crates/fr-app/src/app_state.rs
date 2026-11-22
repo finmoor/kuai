@@ -29,6 +29,9 @@ pub fn save_failures() -> futures::channel::mpsc::UnboundedReceiver<String> {
 }
 
 /// 一台服务器的连接状态。
+/// 一次连接在登录阶段失败的详情，见 [`AppState::last_login_failure`]。
+type FailureSlot = Arc<std::sync::Mutex<Option<fr_channel::LoginFailure>>>;
+
 pub enum ConnStatus {
     Idle,
     Connecting,
@@ -41,6 +44,9 @@ pub struct AppState {
     conns: HashMap<String, Connecting>,
     /// 经跳板机连接、还在连的：已经登录上几台了（跳板机按顺序算）
     stages: HashMap<String, usize>,
+    /// 最近一次连接失败在登录阶段的哪一步（诊断用，见 `diagnose`）；登录上以后才失败的是空的。
+    /// 开始连接时就放进来，后台线程在连接结果出来之前写好：等同一个结果的诊断框读到的一定是这一次的
+    login_failures: HashMap<String, FailureSlot>,
     /// 过一会儿再存设置的任务（拖动窗口时位置一直在变，不每次都写文件）
     save_later: Option<Task<()>>,
     /// 映射到本机的目录（见 `mapping`）
@@ -76,6 +82,7 @@ impl AppState {
             settings,
             conns: HashMap::new(),
             stages: HashMap::new(),
+            login_failures: HashMap::new(),
             save_later: None,
             mounts: crate::mapping::Mounts::new(),
             machines: HashMap::new(),
@@ -132,6 +139,11 @@ impl AppState {
             Some(Some(Ok(_))) => ConnStatus::Failed(tr("连接已断开").into()),
             Some(Some(Err(err))) => ConnStatus::Failed(err.clone()),
         }
+    }
+
+    /// 最近一次连这台失败在登录阶段的哪一步；没失败、登录上以后才失败的是 None。
+    pub fn last_login_failure(&self, id: &str) -> Option<fr_channel::LoginFailure> {
+        self.login_failures.get(id)?.lock().unwrap().clone()
     }
 
     /// 最近一次连这台是不是没连上（连上以后又断开的不算）。
@@ -206,6 +218,9 @@ impl AppState {
         }
         // 经跳板机的：后台线程每登录上一台报一次，这边记下来、刷新列表上的那句话
         self.stages.remove(id);
+        let failure_slot = FailureSlot::default();
+        self.login_failures
+            .insert(id.to_string(), failure_slot.clone());
         let (stage_tx, mut stage_rx) = futures::channel::mpsc::unbounded::<usize>();
         let on_stage = Arc::new(move |done: usize| drop(stage_tx.unbounded_send(done)))
             as fr_channel::StageHandler;
@@ -255,6 +270,7 @@ impl AppState {
             None => {
                 let server = self.server(id).cloned();
                 let route: Vec<Server> = self.settings.route(id).into_iter().cloned().collect();
+                let slot = failure_slot.clone();
                 cx.background_executor()
                     .spawn(async move {
                         let server =
@@ -265,7 +281,11 @@ impl AppState {
                         options.no_prompt = no_prompt;
                         Connection::connect(&server.destination, &options)
                             .map(Arc::new)
-                            .map_err(|err| SharedString::from(format!("{err:#}")))
+                            .map_err(|err| {
+                                // 登录阶段在哪一步失败的，留给诊断
+                                *slot.lock().unwrap() = fr_channel::login_failure(&err).cloned();
+                                SharedString::from(format!("{err:#}"))
+                            })
                     })
                     .shared()
             }
@@ -290,6 +310,11 @@ impl AppState {
                 Err(err) => log::warn!("连接服务器 {id} 失败：{err}"),
             }
             this.update(cx, |this, cx| {
+                // 最近的错误里记一条（诊断用）
+                if let Some(Err(err)) = this.conns.get(&id).and_then(|c| c.peek()) {
+                    let name = this.machine_name(&id).to_string();
+                    crate::diagnose::record_error(&name, err);
+                }
                 // 连上了：记下它是哪台；这台服务器的映射换到新连接上，设了自动映射的映射上；
                 // 订阅它的仓库列表和工作区
                 if let Some(Ok(conn)) = this.conns.get(&id).and_then(|c| c.peek()) {

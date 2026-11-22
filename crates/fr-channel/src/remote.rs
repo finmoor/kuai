@@ -437,17 +437,44 @@ fn remember_windows(destination: &str, windows: bool) {
     }
 }
 
-/// 登录被拒绝了（ssh 说 Permission denied）：密钥、密码不对，或者用户取消了输入。
-#[derive(Debug)]
-struct LoginDenied(String);
+/// 连接在登录阶段失败了：连不上、登录不了某台跳板机或目标主机，或者跳板机转接不过去。登录上以后
+/// 的失败（启动不了 kuaid、握手不成）是别的错误。诊断时用它分清是哪一步（见 [`login_failure`]）。
+#[derive(Debug, Clone)]
+pub struct LoginFailure {
+    pub at: FailedAt,
+    /// ssh 的原话（去掉了主机密钥警告四周的那圈 `@`）
+    pub ssh: String,
+    /// 原因，不带是哪台、ssh 的原话（「登录被拒绝：…」「连接超时」）；跳板机转接不过去的是整句
+    pub reason: String,
+    /// 给人看的整句（含 ssh 的原话）
+    message: String,
+    /// ssh 说登录被拒绝（Permission denied）：密钥、密码不对，或者用户取消了输入
+    denied: bool,
+}
 
-impl std::fmt::Display for LoginDenied {
+/// 登录阶段的哪一步失败了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedAt {
+    /// 连不上、登录不了第几台跳板机（从 0 数）
+    Jump(usize),
+    /// 第几台跳板机登录上了，但从它连不到下一台（或者目标主机）
+    Forward(usize),
+    /// 连不上、登录不了目标主机
+    Login,
+}
+
+impl std::fmt::Display for LoginFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
-impl std::error::Error for LoginDenied {}
+impl std::error::Error for LoginFailure {}
+
+/// 连接失败的错误是不是在登录阶段，是的话在哪一步。不是的（返回 None）是登录上以后出的错。
+pub fn login_failure(err: &anyhow::Error) -> Option<&LoginFailure> {
+    err.downcast_ref::<LoginFailure>()
+}
 
 /// 存着的私钥口令只在只用公钥认证的那次 ssh 里自动回答（见 [`login`]）：服务器在键盘交互认证
 /// 里也能问一句像解私钥的话，8.3 以前的 OpenSSH（Windows 10 自带的就是）分不出是谁在问。
@@ -458,7 +485,8 @@ fn with_plain_retry<T>(
     attempt: impl Fn(&ConnectOptions) -> Result<T>,
 ) -> Result<T> {
     let result = attempt(options);
-    let denied = matches!(&result, Err(err) if err.downcast_ref::<LoginDenied>().is_some());
+    let denied =
+        matches!(&result, Err(err) if login_failure(err).is_some_and(|failure| failure.denied));
     if !denied || options.no_prompt || !options.saved_passphrase() {
         return result;
     }
@@ -1725,13 +1753,13 @@ fn start(
             if read.unwrap_or(0) == 0 {
                 let code = link.wait();
                 let timed_out = timed_out();
-                let message = give_up(&noise);
+                let failure = give_up(&noise);
                 // ssh 自己出的错（连不上、登录不了）退出码是 255；别的退出码是服务器上那条命令的：
                 // 登录上了，只是这种写法它跑不了
                 if code.is_some_and(|code| code != 255) && !timed_out {
-                    return Ok(Started::Refused(message));
+                    return Ok(Started::Refused(failure.message));
                 }
-                return Err(failed(&stderr, message));
+                return Err(failed(&stderr, failure));
             }
             let line = line.trim_end();
             if line == START_MARKER {
@@ -2043,25 +2071,51 @@ fn trouble(
     }
 }
 
-/// 把 ssh 的报错翻译成用户看得懂的话。
-/// 连接失败的错误：ssh 说登录被拒绝的是 [`LoginDenied`]（见 [`with_plain_retry`]）。
-fn failed(log: &StderrLog, message: String) -> anyhow::Error {
-    match log.tail.lock().unwrap().contains("Permission denied") {
-        true => LoginDenied(message).into(),
-        false => anyhow!(message),
+/// 登录阶段失败的错误（[`LoginFailure`]）：ssh 说登录被拒绝的，[`with_plain_retry`] 会再试一次。
+fn failed(log: &StderrLog, failure: GaveUp) -> anyhow::Error {
+    LoginFailure {
+        at: match failure.trouble {
+            Trouble::Jump(index) => FailedAt::Jump(index),
+            Trouble::Beyond(index) => FailedAt::Forward(index),
+            Trouble::Target => FailedAt::Login,
+        },
+        ssh: failure.ssh,
+        reason: failure.reason,
+        message: failure.message,
+        denied: log.tail.lock().unwrap().contains("Permission denied"),
     }
+    .into()
 }
 
+/// 连接失败：给人看的话、问题在哪一段、原因、ssh 的原话。
+struct GaveUp {
+    message: String,
+    trouble: Trouble,
+    reason: String,
+    ssh: String,
+}
+
+/// 把 ssh 的报错翻译成用户看得懂的话。
 fn connect_error(
     destination: &str,
     log: &StderrLog,
     noise: &[String],
     jumps: &[Jump],
     timed_out: bool,
-) -> String {
+) -> GaveUp {
     // 读线程可能还没把最后的报错收齐
     std::thread::sleep(Duration::from_millis(50));
-    let mut stderr = log.tail.lock().unwrap().trim().to_string();
+    // 首次连接时 ssh 说的「已把主机记进 known_hosts」不是问题，不放进报错
+    let mut stderr = log
+        .tail
+        .lock()
+        .unwrap()
+        .lines()
+        .filter(|line| !line.starts_with("Warning: Permanently added"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
     let forward_failed = stderr.contains("open failed") || stderr.contains("forwarding failed");
     let trouble = trouble(
         jumps.len(),
@@ -2078,6 +2132,10 @@ fn connect_error(
             .collect::<Vec<_>>()
             .join("\n");
     }
+    let reason = match trouble {
+        Trouble::Beyond(_) => String::new(),
+        _ => login_hint(&stderr, timed_out).to_string(),
+    };
     let mut message = match trouble {
         Trouble::Target => {
             let hint = login_hint(&stderr, timed_out);
@@ -2098,14 +2156,23 @@ fn connect_error(
             hint = forward_hint(&stderr, timed_out)
         ),
     };
+    let reason = match reason.is_empty() {
+        true => message.clone(),
+        false => reason,
+    };
     let stderr = without_banner(&stderr);
     if !stderr.is_empty() {
-        message.push_str(&tf!("（ssh：{stderr}）", stderr));
+        message.push_str(&tf!("（ssh：{stderr}）", stderr = &stderr));
     }
     if !noise.is_empty() {
         message.push_str(&tf!("（主机输出：{join}）", join = noise.join(" / ")));
     }
-    message
+    GaveUp {
+        message,
+        trouble,
+        reason,
+        ssh: stderr,
+    }
 }
 
 /// ssh 的大字警告（主机密钥变了那一种）四周围着一圈 `@`：去掉这一圈，只留里面的字。
@@ -2423,6 +2490,17 @@ fn install(
 
 #[cfg(test)]
 mod tests {
+    /// 登录被拒绝的错误（测试重试用）
+    fn denied_for_test() -> super::LoginFailure {
+        super::LoginFailure {
+            at: super::FailedAt::Login,
+            ssh: String::new(),
+            reason: "登录被拒绝".into(),
+            message: "登录被拒绝".into(),
+            denied: true,
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -2441,7 +2519,7 @@ mod tests {
             tried
                 .borrow_mut()
                 .push((options.secret.clone(), options.jumps[0].secret.clone()));
-            Err(LoginDenied("登录被拒绝".into()).into())
+            Err(denied_for_test().into())
         });
         assert!(result.is_err());
         // 第二次不带私钥口令；跳板机用的是密码，照旧带着
@@ -2466,12 +2544,12 @@ mod tests {
             no_prompt: true,
             ..options.clone()
         };
-        assert_eq!(once(&silent, || LoginDenied(String::new()).into()), 1);
+        assert_eq!(once(&silent, || denied_for_test().into()), 1);
         let password = ConnectOptions {
             password_auth: true,
             ..options.clone()
         };
-        assert_eq!(once(&password, || LoginDenied(String::new()).into()), 1);
+        assert_eq!(once(&password, || denied_for_test().into()), 1);
         // 带着口令的那次只用公钥认证
         let key = args(&options);
         assert!(
@@ -2819,12 +2897,39 @@ mod tests {
             destination: "ops@203.0.113.10".into(),
             ..Default::default()
         }];
-        let message = connect_error("me@10.20.1.15", &log, &[], &jumps, false);
+        let failure = connect_error("me@10.20.1.15", &log, &[], &jumps, false);
+        assert_eq!(failure.trouble, Trouble::Beyond(0));
+        assert!(failure.ssh.starts_with("channel 0: open failed"));
+        assert!(
+            failure
+                .reason
+                .starts_with("已连接跳板机 bastion，但它无法连接")
+        );
+        assert!(!failure.reason.contains("ssh"));
         assert_eq!(
-            message,
+            failure.message,
             "已连接跳板机 bastion，但它无法连接 me@10.20.1.15：连接被拒绝。请确认跳板机能访问该主机地址。\
              （ssh：channel 0: open failed: connect failed: Connection refused\nstdio forwarding failed）"
         );
+    }
+
+    #[test]
+    fn 首次记下主机密钥的那句不算报错() {
+        let log = StderrLog::default();
+        for line in [
+            "Warning: Permanently added '[127.0.0.1]:2232' (RSA) to the list of known hosts.\r",
+            "tester@127.0.0.1: Permission denied (publickey).\r",
+        ] {
+            log.line(line);
+        }
+        let failure = connect_error("ssh://tester@127.0.0.1:2232", &log, &[], &[], false);
+        assert_eq!(failure.trouble, Trouble::Target);
+        assert_eq!(
+            failure.ssh,
+            "tester@127.0.0.1: Permission denied (publickey)."
+        );
+        assert_eq!(failure.reason, "登录被拒绝：密钥或密码错误，或已取消输入");
+        assert!(!failure.message.contains("Permanently added"));
     }
 
     #[test]

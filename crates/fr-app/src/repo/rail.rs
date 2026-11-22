@@ -70,6 +70,7 @@ fn section_of(item: SideItem) -> Option<SideSection> {
         | SideItem::SubRepos
         | SideItem::Worktrees
         | SideItem::Compare
+        | SideItem::Recover
         | SideItem::Folder(_) => None,
     }
 }
@@ -389,6 +390,18 @@ impl RepoView {
                 .into_any_element(),
             );
         }
+        items.push(
+            rail_button(
+                "rail-recover",
+                IconName::ArchiveRestore,
+                selected == SideItem::Recover,
+            )
+            .tooltip(tr("找回提交"))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.click_sidebar(SideItem::Recover, 1, window, cx)
+            }))
+            .into_any_element(),
+        );
         items.push(separator(cx).into_any_element());
         let mut sections = vec![
             SideSection::Branches,

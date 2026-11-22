@@ -1273,6 +1273,12 @@ impl RepoView {
         self.compare_ends(End::Commit(base), End::Commit(other), window, cx);
     }
 
+    /// 收起或展开下面的提交详情（提交历史、找回提交共用）。
+    pub(super) fn toggle_history_details(&mut self, cx: &mut Context<Self>) {
+        self.history.collapsed = !self.history.collapsed;
+        cx.notify();
+    }
+
     /// 显示不在提交列表里的东西（比如贮藏）的详情和改动；列表里不选中任何提交。
     pub(super) fn show_object(&mut self, id: String, cx: &mut Context<Self>) {
         self.history.selected = None;
@@ -2134,182 +2140,193 @@ impl RepoView {
         };
         let info_bg = cx.theme().secondary;
 
-        v_flex()
-            .size_full()
-            .when_some(self.history.file.clone(), |view, path| {
-                view.child(
+        // 找回提交这一页换掉上半部分（列表），下面的详情和改动照用
+        let top = if self.mode == super::Mode::Recover {
+            self.render_recover(collapsed, cx)
+        } else {
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .when_some(self.history.file.clone(), |view, path| {
+                    view.child(
+                        h_flex()
+                            .h(px(30.))
+                            .flex_none()
+                            .px_3()
+                            .gap_2()
+                            .border_b_1()
+                            .border_color(border)
+                            .text_sm()
+                            .child(div().text_color(muted).child(tr("文件历史")))
+                            .child(ui::clipped("file-history-path", path.clone()).flex_1())
+                            .child(
+                                Button::new("file-blame")
+                                    .xsmall()
+                                    .label(tr("逐行追溯"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.show_blame(path.clone(), cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("close-file-history")
+                                    .xsmall()
+                                    .label(tr("返回所有提交"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_file_history(window, cx)
+                                    })),
+                            ),
+                    )
+                })
+                .child(
                     h_flex()
-                        .h(px(30.))
+                        .h(px(40.))
                         .flex_none()
-                        .px_3()
+                        .px(px(10.))
+                        .gap_2()
+                        .children(search_by)
+                        .child(
+                            div().w(px(320.)).flex_shrink(1.).min_w(px(140.)).child(
+                                Input::new(&self.history.search)
+                                    .small()
+                                    .cleanable(true)
+                                    .prefix(ui::icon(IconName::Search).text_color(muted)),
+                            ),
+                        )
+                        .child(
+                            ui::clipped("match-info", match_info)
+                                .flex_shrink(1.)
+                                .text_xs()
+                                .text_color(muted),
+                        )
+                        .when(has_matches, |bar| {
+                            bar.child(
+                                Button::new("match-prev")
+                                    .xsmall()
+                                    .ghost()
+                                    .icon(ui::icon(IconName::ChevronUp))
+                                    .tooltip(tr("上一个匹配的提交（Shift+Enter）"))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.next_match(-1, cx)),
+                                    ),
+                            )
+                            .child(
+                                Button::new("match-next")
+                                    .xsmall()
+                                    .ghost()
+                                    .icon(ui::icon(IconName::ChevronDown))
+                                    .tooltip(tr("下一个匹配的提交（Enter）"))
+                                    .on_click(cx.listener(|this, _, _, cx| this.next_match(1, cx))),
+                            )
+                        })
+                        .child(div().flex_1())
+                        .children(pending)
+                        .when(self.history.file.is_none(), |bar| {
+                            bar.child(self.render_scope_button(cx))
+                        })
+                        .child(
+                            Button::new("pick-file")
+                                .small()
+                                .ghost()
+                                .icon(ui::icon(IconName::FileClock))
+                                .label(tr("文件历史…"))
+                                .tooltip(tr("选择文件以查看其历史或逐行追溯"))
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.pick_file(window, cx)),
+                                ),
+                        ),
+                )
+                .when_some(find_info, |view, info| {
+                    view.child(
+                        h_flex()
+                            .h(px(26.))
+                            .flex_none()
+                            .px_3()
+                            .gap_2()
+                            .bg(info_bg)
+                            .text_xs()
+                            .text_color(muted)
+                            .child(ui::icon_small(IconName::Info).flex_none())
+                            .child(ui::clipped("find-info", info).flex_1()),
+                    )
+                })
+                .child(
+                    h_flex()
+                        .h(px(24.))
+                        .flex_none()
+                        .pr_2()
                         .gap_2()
                         .border_b_1()
                         .border_color(border)
-                        .text_sm()
-                        .child(div().text_color(muted).child(tr("文件历史")))
-                        .child(ui::clipped("file-history-path", path.clone()).flex_1())
-                        .child(
-                            Button::new("file-blame")
-                                .xsmall()
-                                .label(tr("逐行追溯"))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.show_blame(path.clone(), cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("close-file-history")
-                                .xsmall()
-                                .label(tr("返回所有提交"))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.close_file_history(window, cx)
-                                })),
-                        ),
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(muted)
+                        .when(marks, |header| {
+                            header.child(div().w(px(MARK_WIDTH)).ml(px(4.)).mr(px(-4.)).flex_none())
+                        })
+                        // 提交图那一列不写标题：分支少时这一列很窄，放不下字（Fork 也不写）
+                        .child(div().w(graph_width).flex_none())
+                        .child(div().flex_1().child(tr("说明")))
+                        .child(div().w(px(AUTHOR_WIDTH)).flex_none().child(tr("作者")))
+                        .child(div().w(px(DATE_WIDTH)).flex_none().child(tr("时间")))
+                        .child(div().w(px(SHA_WIDTH)).flex_none().child(tr("哈希"))),
                 )
-            })
-            .child(
-                h_flex()
-                    .h(px(40.))
-                    .flex_none()
-                    .px(px(10.))
-                    .gap_2()
-                    .children(search_by)
-                    .child(
-                        div().w(px(320.)).flex_shrink(1.).min_w(px(140.)).child(
-                            Input::new(&self.history.search)
-                                .small()
-                                .cleanable(true)
-                                .prefix(ui::icon(IconName::Search).text_color(muted)),
-                        ),
-                    )
-                    .child(
-                        ui::clipped("match-info", match_info)
-                            .flex_shrink(1.)
-                            .text_xs()
-                            .text_color(muted),
-                    )
-                    .when(has_matches, |bar| {
-                        bar.child(
-                            Button::new("match-prev")
-                                .xsmall()
-                                .ghost()
-                                .icon(ui::icon(IconName::ChevronUp))
-                                .tooltip(tr("上一个匹配的提交（Shift+Enter）"))
-                                .on_click(cx.listener(|this, _, _, cx| this.next_match(-1, cx))),
-                        )
-                        .child(
-                            Button::new("match-next")
-                                .xsmall()
-                                .ghost()
-                                .icon(ui::icon(IconName::ChevronDown))
-                                .tooltip(tr("下一个匹配的提交（Enter）"))
-                                .on_click(cx.listener(|this, _, _, cx| this.next_match(1, cx))),
-                        )
-                    })
-                    .child(div().flex_1())
-                    .children(pending)
-                    .when(self.history.file.is_none(), |bar| {
-                        bar.child(self.render_scope_button(cx))
-                    })
-                    .child(
-                        Button::new("pick-file")
-                            .small()
-                            .ghost()
-                            .icon(ui::icon(IconName::FileClock))
-                            .label(tr("文件历史…"))
-                            .tooltip(tr("选择文件以查看其历史或逐行追溯"))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.pick_file(window, cx)),
-                            ),
-                    ),
-            )
-            .when_some(find_info, |view, info| {
-                view.child(
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(78.))
+                        .overflow_hidden()
+                        .track_focus(&self.history.focus)
+                        .on_key_down(cx.listener(Self::history_key))
+                        .child(list),
+                )
+                .child(
                     h_flex()
                         .h(px(26.))
                         .flex_none()
                         .px_3()
                         .gap_2()
-                        .bg(info_bg)
+                        .border_t_1()
+                        .border_color(border)
                         .text_xs()
-                        .text_color(muted)
-                        .child(ui::icon_small(IconName::Info).flex_none())
-                        .child(ui::clipped("find-info", info).flex_1()),
+                        .text_color(status_color)
+                        .child(match status_detail {
+                            // 有详细说明的（读了多久、多大）：停上去看说明
+                            Some(detail) => div()
+                                .id("history-status")
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(status)
+                                .tooltip(move |window, cx| {
+                                    ui::full_text_tip(detail.clone(), window, cx)
+                                }),
+                            None => ui::clipped("history-status", status).flex_1(),
+                        })
+                        .child(
+                            Button::new("toggle-details")
+                                .xsmall()
+                                .ghost()
+                                .icon(ui::icon(if collapsed {
+                                    IconName::PanelBottomOpen
+                                } else {
+                                    IconName::PanelBottomClose
+                                }))
+                                .label(if collapsed {
+                                    tr("展开详情")
+                                } else {
+                                    tr("收起详情")
+                                })
+                                .tooltip(tr("收起或展开提交详情"))
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.toggle_history_details(cx)),
+                                ),
+                        ),
                 )
-            })
-            .child(
-                h_flex()
-                    .h(px(24.))
-                    .flex_none()
-                    .pr_2()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(border)
-                    .text_size(px(11.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(muted)
-                    .when(marks, |header| {
-                        header.child(div().w(px(MARK_WIDTH)).ml(px(4.)).mr(px(-4.)).flex_none())
-                    })
-                    // 提交图那一列不写标题：分支少时这一列很窄，放不下字（Fork 也不写）
-                    .child(div().w(graph_width).flex_none())
-                    .child(div().flex_1().child(tr("说明")))
-                    .child(div().w(px(AUTHOR_WIDTH)).flex_none().child(tr("作者")))
-                    .child(div().w(px(DATE_WIDTH)).flex_none().child(tr("时间")))
-                    .child(div().w(px(SHA_WIDTH)).flex_none().child(tr("哈希"))),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(78.))
-                    .overflow_hidden()
-                    .track_focus(&self.history.focus)
-                    .on_key_down(cx.listener(Self::history_key))
-                    .child(list),
-            )
-            .child(
-                h_flex()
-                    .h(px(26.))
-                    .flex_none()
-                    .px_3()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(border)
-                    .text_xs()
-                    .text_color(status_color)
-                    .child(match status_detail {
-                        // 有详细说明的（读了多久、多大）：停上去看说明
-                        Some(detail) => div()
-                            .id("history-status")
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .child(status)
-                            .tooltip(move |window, cx| {
-                                ui::full_text_tip(detail.clone(), window, cx)
-                            }),
-                        None => ui::clipped("history-status", status).flex_1(),
-                    })
-                    .child(
-                        Button::new("toggle-details")
-                            .xsmall()
-                            .ghost()
-                            .icon(ui::icon(if collapsed {
-                                IconName::PanelBottomOpen
-                            } else {
-                                IconName::PanelBottomClose
-                            }))
-                            .label(if collapsed {
-                                tr("展开详情")
-                            } else {
-                                tr("收起详情")
-                            })
-                            .tooltip(tr("收起或展开提交详情"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.history.collapsed = !this.history.collapsed;
-                                cx.notify();
-                            })),
-                    ),
-            )
+                .into_any_element()
+        };
+        v_flex()
+            .size_full()
+            .child(top)
             .when(!collapsed, |view| {
                 view.child(
                     h_flex()

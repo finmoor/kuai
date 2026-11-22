@@ -23,6 +23,7 @@ mod auto_fetch;
 mod blame;
 mod changes;
 mod compare;
+mod detached;
 mod dialogs;
 mod diff_search;
 mod diff_tools;
@@ -33,6 +34,7 @@ mod files_ops;
 mod files_view;
 mod history;
 mod image_diff;
+mod impact;
 mod inline_diff;
 mod layout;
 mod menus;
@@ -40,6 +42,7 @@ mod merge;
 mod ops;
 mod rail;
 mod rebase;
+mod recover;
 mod sidebar;
 mod stage_diff;
 mod subs;
@@ -95,6 +98,8 @@ enum Mode {
     Worktrees,
     /// 比较两端，见 [`compare`]
     Compare,
+    /// 找回提交，见 [`recover`]；下半部分的详情和改动和提交历史共用
+    Recover,
 }
 
 /// 显示哪一页（侧栏里的切换，Ctrl+` 来回切）。
@@ -196,6 +201,8 @@ pub struct RepoView {
     worktrees: worktrees::Worktrees,
     /// 比较：两端、文件清单、选中文件的改动
     compare: compare::Compare,
+    /// 找回提交：HEAD 和各分支移动过的记录
+    recover: recover::Recover,
     /// 看改动时忽略空白（这个标签页里三处共用，不存盘），见 [`diff_tools`]
     ignore_ws: bool,
     /// 在改动中搜索：三处各一个搜索条，见 [`diff_search`]
@@ -227,6 +234,8 @@ impl RepoView {
         subscriptions.push(subs_subscription);
         let (compare, compare_subscription) = compare::Compare::new(window, cx);
         subscriptions.push(compare_subscription);
+        let (recover, recover_subscription) = recover::Recover::new(window, cx);
+        subscriptions.push(recover_subscription);
         let (diff_search, search_subscriptions) = diff_search::DiffSearches::new(window, cx);
         subscriptions.extend(search_subscriptions);
         let mut this = Self {
@@ -270,10 +279,19 @@ impl RepoView {
             subs,
             worktrees: worktrees::Worktrees::default(),
             compare,
+            recover,
             ignore_ws: false,
             diff_search,
             _subscriptions: subscriptions,
         };
+        // 失败的命令记进诊断的「最近的错误」时写上是哪个仓库
+        this.activity.name = this
+            .entry
+            .path
+            .rsplit(['/', '\\'])
+            .find(|part| !part.is_empty())
+            .unwrap_or_default()
+            .to_string();
         // 测试开关：FR_TEST_VIEW=changes 打开仓库时直接显示本地修改
         if std::env::var("FR_TEST_VIEW").is_ok_and(|v| v == "changes") {
             this.show_changes(cx);
@@ -506,6 +524,7 @@ impl RepoView {
                 if this.history_key.as_ref() != Some(&key) {
                     this.history_key = Some(key);
                     this.reload_history(cx);
+                    this.recover_refs_changed(cx);
                 }
                 cx.notify();
             })
@@ -520,6 +539,7 @@ impl RepoView {
         match self.mode {
             Mode::Subs => self.load_sub_summaries(cx),
             Mode::Worktrees => self.load_worktree_summaries(cx),
+            Mode::Recover => self.load_recover(cx),
             _ => {}
         }
     }
@@ -1065,15 +1085,48 @@ impl RepoView {
                     .child(text),
             )
             .when(error, |d| {
+                // 连不上主机：旁边多一个「诊断…」，逐步查是哪一步出的问题
+                let server = self.entry.server.clone().filter(|_| self.channel.is_none());
                 d.child(
-                    Button::new("retry")
-                        .small()
-                        .label(tr("重试"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.error = None;
-                            this.history_key = None;
-                            this.refresh(cx);
-                        })),
+                    h_flex()
+                        .gap_2()
+                        .child(Button::new("retry").small().label(tr("重试")).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.error = None;
+                                this.history_key = None;
+                                this.refresh(cx);
+                            }),
+                        ))
+                        .when_some(server, |row, server| {
+                            row.child(
+                                Button::new("diagnose")
+                                    .small()
+                                    .icon(ui::icon(IconName::Stethoscope))
+                                    .label(tr("诊断…"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        // 诊断连上了：这一页借这个连接重新读取
+                                        let view = cx.entity().downgrade();
+                                        let retry: crate::diagnose::Connected =
+                                            std::rc::Rc::new(move |cx: &mut App| {
+                                                view.update(cx, |this, cx| {
+                                                    if this.channel.is_none() {
+                                                        this.error = None;
+                                                        this.history_key = None;
+                                                        this.refresh(cx);
+                                                    }
+                                                })
+                                                .ok();
+                                            });
+                                        crate::diagnose::Diagnose::open(
+                                            this.app.clone(),
+                                            &server,
+                                            Some(retry),
+                                            window,
+                                            cx,
+                                        )
+                                    })),
+                            )
+                        }),
                 )
             })
             .into_any_element()
@@ -1104,6 +1157,7 @@ impl RepoView {
                 Mode::Subs => self.render_subs(cx),
                 Mode::Worktrees => self.render_worktrees(cx),
                 Mode::Compare => self.render_compare(cx),
+                Mode::Recover => self.render_history(cx),
             }
         };
         let banner = self
