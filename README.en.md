@@ -92,6 +92,7 @@ A full graphical Git client, modelled on Fork. When Claude Code is done, switch 
 - **Conflict resolution**: pick the current version, the incoming one or both for each conflict, or edit by hand
 - **Compare** any two branches, tags, commits or the local changes; file history and blame
 - **Worktrees, sub-repository overview, submodules**; background auto-fetch; Activity lists every git command that ran, with its output
+- **Recover commits**: every move of HEAD and your branches, including resets and rebases Claude Code ran in the terminal; pick a step and create a branch there. Resets, rebases and force pushes spell out which commits they affect before they run
 
 ### ③ Edit: files on the server, as if they were local
 
@@ -141,7 +142,7 @@ Also: Chinese and English UI, system tray and start at sign-in, pinned and reope
 **With [Fork](https://fork.dev/).** Kuai's Git UI follows Fork closely, and aims to replace it for everyday use.
 
 - **What Kuai adds**: repositories on remote hosts; built-in terminals that outlive the app; the Files page and directory mapping; a Chinese UI; open source.
-- **What is still missing**: reflog, bisect, a dedicated Git LFS UI, git-flow, custom commands, batch operations on several selected commits, and account integration and pull requests for GitHub, GitLab and the like.
+- **What is still missing**: bisect, a dedicated Git LFS UI, git-flow, custom commands, batch operations on several selected commits, and account integration and pull requests for GitHub, GitLab and the like.
 
 **With an IDE.** Kuai is not an IDE. The Files page is for reading and small edits: there is no code completion, go-to-definition or debugger. For heavier editing, map the directory on the host to this computer and open it in VS Code or another editor.
 
