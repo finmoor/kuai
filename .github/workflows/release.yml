@@ -143,16 +143,8 @@ jobs:
       - name: 发布说明
         shell: pwsh
         run: |
-          $version = $env:TAG.TrimStart('v')
-          $notes = ./tools/release-notes.ps1 $version
-          $windows = "Windows：安装版 kuai-$version-windows-x64-setup.exe（推荐），解压版 kuai-$version-windows-x64.zip。" +
-            "程序未进行代码签名，首次运行时 Windows 可能提示「Windows 已保护你的电脑」，请点击「更多信息」，再点击「仍要运行」。"
-          $linux = "Linux（x86_64，glibc 2.35 及以上，例如 Ubuntu 22.04、Debian 12、Fedora 36）：" +
-            "Ubuntu、Debian 用 kuai_${version}_amd64.deb（sudo apt install ./kuai_${version}_amd64.deb）；" +
-            "其他发行版用 kuai-$version-linux-x64.AppImage（加上可执行权限后直接运行）" +
-            "或解压版 kuai-$version-linux-x64.tar.gz（解压后运行 Kuai/kuai，说明见其中的「使用说明.txt」）。"
-          # 下载说明不用「- 」开头：Kuai 的更新提示把发布说明里「- 」开头的行当作改了什么
-          "$notes`n`n$windows`n`n$linux" | Set-Content -Encoding utf8NoBOM notes.md
+          # 只放 CHANGELOG 里的条目；装哪个包、怎么装见 README
+          ./tools/release-notes.ps1 $env:TAG.TrimStart('v') | Set-Content -Encoding utf8NoBOM notes.md
 
       - name: 传到 GitHub Releases
         shell: pwsh

@@ -1,6 +1,6 @@
 # 更新记录
 
-各版本发布在 [GitHub Releases](https://github.com/finmoor/kuai/releases)，发布说明取自本文件中对应版本的一节（`tools/release-notes.ps1`）。Kuai 的更新提示会列出该节中以 `- ` 开头的条目，因此每条应简短，并面向用户描述变化。
+各版本发布在 [GitHub Releases](https://github.com/finmoor/kuai/releases)，发布说明取自本文件中对应版本的一节（`tools/release-notes.ps1`）。Kuai 的更新提示会列出该节中以 `- ` 开头的条目。每条一句话，只写用户感受得到的变化，越短越好。
 
 ## 1.22.0
 
