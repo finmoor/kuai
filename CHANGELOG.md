@@ -2,6 +2,16 @@
 
 各版本发布在 [GitHub Releases](https://github.com/finmoor/kuai/releases)，发布说明取自本文件中对应版本的一节（`tools/release-notes.ps1`）。Kuai 的更新提示会列出该节中以 `- ` 开头的条目，因此每条应简短，并面向用户描述变化。
 
+## 1.22.0
+
+- Linux 版新增 .deb 安装包（Ubuntu、Debian）和 AppImage，两者都可一键更新；.deb 更新时由系统询问管理员密码
+- Linux 版支持托盘图标（KDE；Ubuntu 的 GNOME 自带的 AppIndicator 扩展）、最小化和关闭到托盘；Wayland 桌面上「关闭到托盘」改为最小化
+- Linux 版支持将主机上的目录映射为本机的文件夹（需安装 fuse3）
+- Linux 版点击系统通知、托盘图标或再次启动 Kuai 时，窗口回到前台
+- 修复 Linux 版点击窗口的关闭按钮时直接退出、不询问终端中仍在运行的程序的问题；注销或结束 Kuai 时映射的文件夹不再残留
+- Linux 版不再显示「资源管理器」「Windows 凭据管理器」等 Windows 上的说法；英文界面的「开机时自动启动」不再写 Windows
+- 终端左侧的消息刻度只显示还在可回看记录里的消息；最新一条消息尚未显示时，之前的消息仍可点击跳转
+
 ## 1.21.0
 
 - 新增 Linux 版（x86_64，glibc 2.35 及以上，例如 Ubuntu 22.04、Debian 12）：解压即用，首次运行时添加到应用菜单；支持系统通知、开机自动启动，密码和私钥口令保存在系统钥匙圈中，有新版本时可一键更新。暂不支持托盘图标和目录映射

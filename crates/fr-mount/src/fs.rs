@@ -2257,7 +2257,7 @@ mod tests {
 
         /// 跑这个测试自己的 kuaid。主目录换成测试的临时目录：Windows 上 kuaid 认 `FR_KUAID_HOME`，
         /// Linux 上只认 `HOME`（运行目录、套接字在 `$HOME/.kuai/run`）。不换的话会连到这个用户
-        /// 真的常驻进程上，测完的 `--stop` 把它连同里面的终端一起结束（2026-11-23 在开发机上出过）。
+        /// 真的常驻进程上，测完的 `--stop` 会把它连同里面的终端一起结束。
         fn command(&self) -> std::process::Command {
             let mut cmd = std::process::Command::new(&self.exe);
             cmd.env("FR_KUAID_HOME", &self.dir)

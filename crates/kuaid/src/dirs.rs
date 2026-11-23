@@ -9,8 +9,8 @@ use anyhow::Result;
 use fr_core::protocol::DirListing;
 
 /// `~/.kuai` 放在谁的主目录下。可以用环境变量 `FR_KUAID_HOME` 换一个（测试用、Kuai 的测试实例
-/// 用，不碰平时在用的那一套）。Linux 上原来只认 `HOME`，测试实例的本机 kuaid 连到了日常在用的
-/// 常驻进程上（2026-11-23）。
+/// 用，不碰平时在用的那一套）。Linux 上原来只认 `HOME`，测试实例的本机 kuaid 会连到平时在用的
+/// 常驻进程上。
 pub fn home_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("FR_KUAID_HOME").filter(|dir| !dir.is_empty()) {
         return PathBuf::from(dir);
