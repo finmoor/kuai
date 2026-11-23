@@ -494,8 +494,10 @@ pub fn normalize(text: &str) -> String {
 /// 从最后一条往前找，每条只在后一条的上面找：先找提示符后面就是这条消息的行（Claude Code 记录里的
 /// `❯ 消息`、shell 的 `PS …> 命令`），找不到再找含有它的行（回复里提到同样几个字的不会抢在前面）。
 /// 拿消息第一行开头的 [`NEEDLE`] 个字去比：长的消息在屏幕上折成了几行。写满折到下一行的几行连起来
-/// 当一行比：提示符很长时命令从哪里折开都有可能，第一行可能只剩一两个字。有一条找不到（往回翻的
-/// 记录只留那么多行，早的已经丢了），它和更早的都是 `None`，不再往上找。给的是消息开头那一行。
+/// 当一行比：提示符很长时命令从哪里折开都有可能，第一行可能只剩一两个字。找不到的是 `None`（往回翻
+/// 的记录只留那么多行、程序清过屏，早的已经没了；最新的一条还排着队、没显示出来），跳过它接着往上找；
+/// 有一条找不到以后，更早的只认提示符后面的：早的记录丢了，回复里碰巧有同样几个字的行不能冒充。
+/// 给的是消息开头那一行。
 pub fn locate_all(rows: &[Row], messages: &[&str]) -> Vec<Option<usize>> {
     // 连起来的每一行从第几行开始、连起来的字
     let mut starts: Vec<usize> = Vec::new();
@@ -516,25 +518,30 @@ pub fn locate_all(rows: &[Row], messages: &[&str]) -> Vec<Option<usize>> {
         .collect();
     let mut found = vec![None; messages.len()];
     let mut end = lines.len();
+    let mut missed = false;
     for (at, message) in messages.iter().enumerate().rev() {
         let first = message.lines().next().unwrap_or_default();
         let needle: String = normalize(first).chars().take(NEEDLE).collect();
         if needle.is_empty() {
-            break;
+            continue;
         }
         let after_prompt = (0..end).rev().find(|&line| {
             prompts[line]
                 .as_ref()
                 .is_some_and(|rest| rest.starts_with(&needle))
         });
-        let hit =
-            after_prompt.or_else(|| (0..end).rev().find(|&line| norms[line].contains(&needle)));
+        let hit = match missed {
+            true => after_prompt,
+            false => {
+                after_prompt.or_else(|| (0..end).rev().find(|&line| norms[line].contains(&needle)))
+            }
+        };
         match hit {
             Some(line) => {
                 found[at] = Some(starts[line]);
                 end = line;
             }
-            None => break,
+            None => missed = true,
         }
     }
     found
@@ -962,10 +969,24 @@ mod tests {
         assert_eq!(locate_all(&history, &["发版的步骤"]), [Some(2)]);
         // 多行的消息按第一行找；空白不算
         assert_eq!(locate_all(&history, &["git   status\n第二行"]), [Some(5)]);
-        // 找不到的一条（早的已经不在记录里了）：它和更早的都不找了
+        // 找不到的一条跳过，更早的接着找（最新的一条还排着队、没显示出来时，前面的照样找得到）
         assert_eq!(
             locate_all(&history, &["发版", "没有的", "git status"]),
-            [None, None, Some(5)]
+            [Some(3), None, Some(5)]
+        );
+        assert_eq!(
+            locate_all(&history, &["发版", "git status", "还在排队的"]),
+            [Some(3), Some(5), None]
+        );
+        // 有一条找不到以后，更早的只认提示符后面的：只在回复里有的不算
+        assert_eq!(
+            locate_all(&history, &["发版的步骤", "git status", "还在排队的"]),
+            [None, Some(5), None]
+        );
+        // 空的消息（只按了回车）跳过
+        assert_eq!(
+            locate_all(&history, &["发版", "", "git status"]),
+            [Some(3), None, Some(5)]
         );
     }
 

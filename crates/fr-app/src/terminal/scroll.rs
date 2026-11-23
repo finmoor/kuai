@@ -7,7 +7,8 @@
 //! - 发出去的消息（kuaid 在按回车时记下的，协议 16；开在 Kuai 进程里的终端由 Kuai 自己记）在左边
 //!   一列短横线，一条一道。鼠标停上去出卡片，点一道跳到那条消息，排在最上面一行、闪一下。消息在
 //!   哪一行按字到往回翻的记录里找（[`term_text::locate_all`]），不记行号：Claude Code 改窗口大小、
-//!   压缩上下文时会把整段对话重画一遍。
+//!   压缩上下文时会把整段对话重画一遍。找不到的（早的已经不在记录里、最新的还排着队没显示出来）不画，
+//!   位置、悬停、点击都按画出来的那些排（[`shown`]）。
 //!
 //! 全屏程序（备用屏）没有往回翻的记录，三样都不出现。
 
@@ -40,6 +41,8 @@ pub(super) const TOP: f32 = 4.;
 const FLASH: Duration = Duration::from_millis(900);
 /// 往回翻的记录在长（有新输出）时，消息在哪一行最多隔这么久重新找一次，中间按多出来的行数挪
 const RELOCATE: Duration = Duration::from_millis(300);
+/// 同上，在最底下、鼠标没停在刻度上时：这时只要知道哪几条找得到（画哪几道），不用那么勤
+const RELOCATE_IDLE: Duration = Duration::from_secs(3);
 /// 刻度之间最宽、最窄（消息多了挤紧，再多只显示最近的那些）
 const TICK_GAP: (f32, f32) = (9., 4.);
 /// 回到底部的圆按钮多大、离输入区多远
@@ -94,13 +97,13 @@ impl ScrollUi {
     }
 
     /// 各条消息在网格上的哪一行（往回翻的记录是负的），找不到的是 `None`。按条数、往回翻的行数缓存：
-    /// 记录在长时最多隔 [`RELOCATE`] 重新找一次，中间按多出来的行数往上挪；`fresh` 是现在就要准的
-    /// （点了刻度要跳过去）。
+    /// 记录在长时最多隔 `within` 重新找一次，中间按多出来的行数往上挪；`Duration::ZERO` 是现在就要
+    /// 准的（点了刻度要跳过去）。
     pub fn mark_lines(
         &self,
         term: &Term<Proxy>,
         marks: &[TermMark],
-        fresh: bool,
+        within: Duration,
     ) -> Vec<Option<i32>> {
         let grid = term.grid();
         let history = grid.history_size();
@@ -111,7 +114,7 @@ impl ScrollUi {
                 return lines.rows.clone();
             }
             let grown = history as i32 - lines.history as i32;
-            if !fresh && grown > 0 && lines.at.elapsed() < RELOCATE {
+            if grown > 0 && lines.at.elapsed() < within {
                 return lines
                     .rows
                     .iter()
@@ -316,15 +319,19 @@ pub(super) fn message(term: &Term<Proxy>) -> Option<(String, bool)> {
 }
 
 /// 画面上面往回翻到的那一行属于哪一条消息（「所在的那一条」，刻度画得长一点、亮一点）：在最底下是
-/// 最后一条；往回翻着是位置在画面最上面一行或者更上面的最后一条。
+/// 找得到的最后一条；往回翻着是位置在画面最上面一行或者更上面的最后一条。
 pub(super) fn current(lines: &[Option<i32>], offset: usize) -> Option<usize> {
-    if offset == 0 {
-        return lines.len().checked_sub(1);
-    }
     let top = -(offset as i32);
     lines
         .iter()
-        .rposition(|line| line.is_some_and(|line| line <= top))
+        .rposition(|line| line.is_some_and(|line| offset == 0 || line <= top))
+}
+
+/// 画出来的刻度是哪几条（从早到晚）：找不到的不画。`lines` 比条数短（还没找）的当作找得到。
+pub(super) fn shown(lines: &[Option<i32>], count: usize) -> Vec<usize> {
+    (0..count)
+        .filter(|&index| lines.get(index).is_none_or(Option::is_some))
+        .collect()
 }
 
 /// 刻度怎么排：第一道的 y、两道之间多远、从第几条起画（放不下时只画最近的）。整列竖着居中。
@@ -445,14 +452,17 @@ impl TerminalView {
             let term = session.term.lock();
             let grid = term.grid();
             let offset = grid.display_offset();
-            // 刻度画「所在的那一条」：往回翻着时、鼠标停着时才找各条在哪
-            let need = !self.marks.is_empty() && (offset > 0 || self.scroll.hovered.is_some());
-            let lines = match need {
-                true => self.scroll.mark_lines(&term, &self.marks, false),
-                false => Vec::new(),
+            // 找不到的刻度不画，所以总要找；往回翻着、鼠标停着时要画「所在的那一条」、卡片，找得勤些
+            let busy = offset > 0 || self.scroll.hovered.is_some();
+            let lines = match self.marks.is_empty() {
+                true => Vec::new(),
+                false => {
+                    let within = if busy { RELOCATE } else { RELOCATE_IDLE };
+                    self.scroll.mark_lines(&term, &self.marks, within)
+                }
             };
-            let reply = match (self.scroll.hovered, need) {
-                (Some(index), true) => match lines.get(index).copied().flatten() {
+            let reply = match self.scroll.hovered {
+                Some(index) => match lines.get(index).copied().flatten() {
                     Some(line) => {
                         let end = lines
                             .iter()
@@ -465,7 +475,7 @@ impl TerminalView {
                     }
                     None => Vec::new(),
                 },
-                _ => Vec::new(),
+                None => Vec::new(),
             };
             Look {
                 offset,
@@ -515,13 +525,11 @@ impl TerminalView {
     fn render_ticks(&self, look: &Look, track: f32, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let (muted, fg, accent) = (theme.muted_foreground, theme.foreground, theme.primary);
-        let count = self.marks.len();
-        let ticks = Ticks::new(count, track);
-        let current = match look.offset {
-            0 => count.checked_sub(1),
-            offset => current(&look.lines, offset),
-        };
+        let shown = shown(&look.lines, self.marks.len());
+        let ticks = Ticks::new(shown.len(), track);
+        let current = current(&look.lines, look.offset);
         let hovered = self.scroll.hovered;
+        let hits = shown.clone();
         let mut gutter = div()
             .id("terminal-marks")
             .absolute()
@@ -532,7 +540,9 @@ impl TerminalView {
             .when(hovered.is_some(), |el| el.cursor_pointer())
             .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
                 let y = f32::from(event.position.y - this.geometry.get().origin.y);
-                let hit = Ticks::new(this.marks.len(), track).hit(y, this.marks.len());
+                let hit = Ticks::new(hits.len(), track)
+                    .hit(y, hits.len())
+                    .map(|at| hits[at]);
                 if this.scroll.hovered != hit {
                     if let Some(index) = hit {
                         log::info!("鼠标停在第 {} 条消息的刻度上", index + 1);
@@ -556,8 +566,7 @@ impl TerminalView {
                     }
                 }),
             );
-        for index in ticks.first..count {
-            let lost = !look.lines.is_empty() && look.lines[index].is_none();
+        for (at, &index) in shown.iter().enumerate().skip(ticks.first) {
             let (width, color) = if hovered == Some(index) {
                 (10., accent)
             } else if current == Some(index) {
@@ -565,12 +574,11 @@ impl TerminalView {
             } else {
                 (6., muted.opacity(0.55))
             };
-            let color = if lost { color.opacity(0.35) } else { color };
             gutter = gutter.child(
                 div()
                     .absolute()
                     .left(px((GUTTER - width) / 2.))
-                    .top(px(ticks.y(index) - 1.))
+                    .top(px(ticks.y(at) - 1.))
                     .w(px(width))
                     .h(px(2.))
                     .rounded(px(1.))
@@ -591,10 +599,15 @@ impl TerminalView {
             theme.muted_foreground,
             theme.border,
         );
-        let ticks = Ticks::new(self.marks.len(), track);
-        let lost = look.lines.get(index).is_some_and(Option::is_none);
+        // 只给画出来的那几道出卡片（停着的那条刚变成找不到、挤出了能画的范围时不出）
+        let shown = shown(&look.lines, self.marks.len());
+        let ticks = Ticks::new(shown.len(), track);
+        let at = shown.iter().position(|&shown| shown == index)?;
+        if at < ticks.first {
+            return None;
+        }
         // 卡片的上边对着刻度往上一点，放不下时往上挪
-        let top = (ticks.y(index) - 14.).clamp(0., (track - 120.).max(0.)) + TOP;
+        let top = (ticks.y(at) - 14.).clamp(0., (track - 120.).max(0.)) + TOP;
         let head = tf!(
             "第 {n} 条 · {time}",
             n = (index + 1).to_string(),
@@ -634,14 +647,6 @@ impl TerminalView {
                             .text_ellipsis()
                             .whitespace_normal()
                             .child(reply),
-                    )
-                })
-                .when(lost, |card| {
-                    card.child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(muted)
-                            .child(tr("已不在可回看的记录里，无法跳转")),
                     )
                 })
                 .into_any_element(),
@@ -790,7 +795,7 @@ impl TerminalView {
         };
         let line = {
             let mut term = session.term.lock();
-            let lines = self.scroll.mark_lines(&term, &self.marks, true);
+            let lines = self.scroll.mark_lines(&term, &self.marks, Duration::ZERO);
             let Some(Some(line)) = lines.get(index).copied() else {
                 return;
             };
@@ -838,7 +843,7 @@ pub(super) fn flash_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{Fixed, Ticks, current, dragged, thumb};
+    use super::{Fixed, Ticks, current, dragged, shown, thumb};
 
     #[test]
     fn 固定的输入区画在最下面_画的是现在屏幕上的那几行() {
@@ -885,6 +890,17 @@ mod tests {
         // 比第一条还上面
         assert_eq!(current(&lines, 100), None);
         assert_eq!(current(&[], 0), None);
+        // 最后一条找不到（还排着队）：在最底下时是找得到的最后一条
+        assert_eq!(current(&[Some(-9), None], 0), Some(0));
+        assert_eq!(current(&[None, None], 0), None);
+    }
+
+    #[test]
+    fn 找不到的刻度不画() {
+        assert_eq!(shown(&[Some(-90), None, Some(-5), None], 4), [0, 2]);
+        // 还没找（没有位置）的都画
+        assert_eq!(shown(&[], 3), [0, 1, 2]);
+        assert_eq!(shown(&[None], 0), Vec::<usize>::new());
     }
 
     #[test]

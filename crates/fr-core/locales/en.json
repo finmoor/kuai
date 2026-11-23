@@ -1621,7 +1621,6 @@
   "文件名里有无法识别的字符（不是 UTF-8 编码）：{path}": "The file name contains unrecognizable characters (not UTF-8 encoded): {path}",
   "：{sent} / {total}": ": {sent} / {total}",
   "第 {n} 条 · {time}": "Message {n} · {time}",
-  "已不在可回看的记录里，无法跳转": "No longer in the scrollback; can't jump to it",
   "回到底部": "Scroll to bottom",
   "确认主机密钥": "Confirm host key",
   "首次连接 {host}，请核对密钥指纹。": "First connection to {host}. Check its key fingerprint.",
