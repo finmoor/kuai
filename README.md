@@ -9,7 +9,7 @@
 <p><b>合上电脑，它还在写；打开电脑，逐行验收。</b></p>
 
 <p>
-为在 VPS 上运行 Claude Code、Codex 的人而做的 Windows 客户端：<br>
+为在 VPS 上运行 Claude Code、Codex 的人而做的桌面客户端（Windows、Linux）：<br>
 断网不断的终端、逐行审查改动的 Git 界面、直接修改服务器文件的编辑器，合在一个窗口中。
 </p>
 
@@ -19,6 +19,7 @@
 <a href="https://github.com/finmoor/kuai/releases/latest"><img src="https://img.shields.io/github/v/release/finmoor/kuai?style=flat-square&label=release&color=3b82f6" alt="最新版本"></a>
 <a href="https://github.com/finmoor/kuai/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/finmoor/kuai/ci.yml?branch=main&style=flat-square&label=CI" alt="CI"></a>
 <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square" alt="Windows 10 | 11">
+<img src="https://img.shields.io/badge/Linux-x86__64-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux x86_64">
 <img src="https://img.shields.io/badge/Rust-GPUI-DEA584?style=flat-square&logo=rust&logoColor=white" alt="Rust + GPUI">
 <a href="#许可证"><img src="https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-22c55e?style=flat-square" alt="MIT 或 Apache-2.0"></a>
 </p>
@@ -62,7 +63,7 @@
 | 同时运行几个任务，不知道哪一个停下来等你确认 | 所有仓库的终端汇总在一页，哪个停下来了会提醒 |
 | 换一台电脑，要重新配置一遍 | 工作区保存在服务器上，换一台电脑连接，仓库和终端都在 |
 
-Kuai 在服务器上安装一个常驻的小程序 `kuaid`（约 3 MB，无需 root，不对外开放端口），经 SSH 与它通信：终端在服务器上运行，git 命令在服务器上执行，文件在服务器上读写，Windows 端只负责显示。本机的仓库用法相同。
+Kuai 在服务器上安装一个常驻的小程序 `kuaid`（约 3 MB，无需 root，不对外开放端口），经 SSH 与它通信：终端在服务器上运行，git 命令在服务器上执行，文件在服务器上读写，电脑上的 Kuai 只负责显示。本机的仓库用法相同。
 
 > 名字取自筷子：不用叉子（Fork）改用筷子，「筷」也谐音「快」。
 
@@ -74,7 +75,7 @@ Kuai 在服务器上安装一个常驻的小程序 `kuaid`（约 3 MB，无需 r
 
 ![「终端」页：左侧按工作区列出各仓库的终端，右侧是 Claude Code 的画面](assets/screenshots/zh-CN/terminals.png)
 
-- **停下来就提醒**：「终端」页汇总所有工作区中各仓库的终端，图标区分 AI 助手、其他命令和空闲的 shell；终端停止输出时提醒，Kuai 不在前台时发送 Windows 通知
+- **停下来就提醒**：「终端」页汇总所有工作区中各仓库的终端，图标区分 AI 助手、其他命令和空闲的 shell；终端停止输出时提醒，Kuai 不在前台时发送系统通知
 - **截图直接发给它**：复制截图后粘贴，或将图片、文件拖进终端；文件自动上传到主机，终端中得到的是它在主机上的路径
 - **同时运行多个任务**：一个仓库可以打开多个终端
 - 本机仓库的终端同样在退出 Kuai 后继续运行
@@ -117,7 +118,7 @@ Kuai 在服务器上安装一个常驻的小程序 `kuaid`（约 3 MB，无需 r
 
 - 主机可以是 **Linux（x86_64）** 的 VPS、云服务器或开发机，也可以是开启了 OpenSSH 服务的 **Windows** 电脑；暂不支持 ARM
 - 首次连接时自动将 `kuaid` 安装到用户目录 `~/.kuai`：**不需要 root 权限，不对外开放端口**，主机也无需联网
-- 使用 Windows 自带的 OpenSSH，沿用 `~/.ssh/config`、密钥和 ssh-agent；密码和私钥口令保存在 Windows 凭据管理器中
+- 使用系统的 OpenSSH 客户端（Windows 自带的，或 Linux 上的 ssh），沿用 `~/.ssh/config`、密钥和 ssh-agent；密码和私钥口令保存在 Windows 凭据管理器或 Linux 的系统钥匙圈中
 - 支持多级**跳板机**，跳板机上不安装任何程序
 - **工作区**将常一起使用的仓库归为一组，保存在仓库所在的主机上：换一台电脑连接，看到的是同一份
 - 新版 Kuai 连接时自动更新主机上的 kuaid，正在运行的终端不受影响
@@ -148,22 +149,25 @@ Kuai 在服务器上安装一个常驻的小程序 `kuaid`（约 3 MB，无需 r
 
 ## 下载
 
-从 [GitHub Releases](https://github.com/finmoor/kuai/releases/latest) 下载，以下两种任选其一：
+从 [GitHub Releases](https://github.com/finmoor/kuai/releases/latest) 下载。Windows 版以下两种任选其一：
 
 - **安装版** `kuai-<版本>-windows-x64-setup.exe`（推荐）：安装在用户目录下（`%LOCALAPPDATA%\Programs\Kuai`），无需管理员权限；可从开始菜单启动，可在「设置 → 应用」中卸载。
 - **解压版** `kuai-<版本>-windows-x64.zip`：解压得到的 Kuai 文件夹可放在任意位置，双击 `kuai.exe` 运行。
+
+Linux 版 `kuai-<版本>-linux-x64.tar.gz`：解压得到的 Kuai 文件夹可放在任意位置，运行其中的 `kuai`，首次运行时添加到应用菜单。暂不支持托盘图标和目录映射。
 
 运行要求：
 
 | 位置 | 要求 |
 |---|---|
-| 本机 | 64 位 Windows 10 或 11；PATH 中有 git 2.31 或更新的版本；使用 Windows 自带的 OpenSSH |
+| 本机（Windows） | 64 位 Windows 10 或 11；PATH 中有 git 2.31 或更新的版本；使用 Windows 自带的 OpenSSH |
+| 本机（Linux） | x86_64，glibc 2.35 及以上（Ubuntu 22.04、Debian 12 及更新的版本），X11 或 Wayland 桌面，显卡驱动支持 Vulkan（Mesa 即可）；PATH 中有 git 2.31 或更新的版本和 ssh；保存密码需要 Secret Service（GNOME 钥匙圈、KWallet 等） |
 | 远程主机 | Linux（x86_64，暂不支持 ARM），或开启了 OpenSSH 服务的 Windows；已安装 git 2.31 或更新的版本；无需 root 权限 |
-| 目录映射 | 需安装 [WinFsp](https://winfsp.dev/)，未安装时 Kuai 可经 winget 代为安装 |
+| 目录映射（仅 Windows） | 需安装 [WinFsp](https://winfsp.dev/)，未安装时 Kuai 可经 winget 代为安装 |
 
 程序未进行代码签名，首次运行时 Windows 可能提示「Windows 已保护你的电脑」，请点击「更多信息」，再点击「仍要运行」。
 
-有新版本时，标题栏齿轮左侧会显示更新提示，点击可查看更新内容并一键更新（安装版在后台运行新的安装程序，解压版直接替换文件）；也可在「设置 → 关于」中检查更新。主机上的 kuaid 无需单独更新，新版 Kuai 连接时会自动替换。各版本的更新内容见 [CHANGELOG.md](CHANGELOG.md)。
+有新版本时，标题栏齿轮左侧会显示更新提示，点击可查看更新内容并一键更新（安装版在后台运行新的安装程序，解压版和 Linux 版直接替换文件）；也可在「设置 → 关于」中检查更新。主机上的 kuaid 无需单独更新，新版 Kuai 连接时会自动替换。各版本的更新内容见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 快速上手
 
@@ -181,7 +185,7 @@ Claude Code、Codex 需自行在主机上安装并登录，Kuai 不代为安装�
 
 ```mermaid
 flowchart LR
-    subgraph pc["Windows 电脑"]
+    subgraph pc["你的电脑 · Windows 或 Linux"]
         app["Kuai<br/>GPUI 客户端"]
     end
     subgraph host["远程主机 · Linux 或 Windows"]
@@ -196,7 +200,7 @@ flowchart LR
     kd --> files
 ```
 
-- **git 在主机上执行。** Windows 端只接收结果并负责显示；解析输出、计算提交图布局的代码（`fr-core`）由客户端和 kuaid 共用。
+- **git 在主机上执行。** 客户端只接收结果并负责显示；解析输出、计算提交图布局的代码（`fr-core`）由客户端和 kuaid 共用。
 - **kuaid 是一个静态链接的单文件程序**（Linux 版约 3 MB），经 SSH 上传到 `~/.kuai` 下。所有客户端断开且终端全部结束 10 分钟后，它自动退出。
 - **通信只经过 SSH 的标准输入输出**，沿用系统已有的密钥和配置，不需要在防火墙上另开端口，也不需要额外的账号。
 - **原生界面。** 客户端使用 Rust 和 [GPUI](https://www.gpui.rs/)（经 [gpui-kit](https://github.com/longbridge/gpui-kit) 引入）编写，由显卡绘制。技术验证时，在 20 万个提交、13 条并行泳道的测试仓库上，解析历史用时 79 ms，计算泳道布局用时 14 ms，滚动时每帧绘制平均 2.7 ms。
@@ -205,11 +209,11 @@ flowchart LR
 
 Kuai 不自建连接和认证，全部交给 SSH。思路与 VS Code 的 Remote - SSH 相近：经 SSH 登录，在用户目录中安装一个服务端程序。
 
-- **连接即 SSH。** 使用 Windows 自带的 OpenSSH 客户端，认证和加密由它完成，沿用 `~/.ssh/config`、密钥和 ssh-agent。Kuai 与 kuaid 之间的全部数据，都经这条 SSH 连接的标准输入输出传输。
+- **连接即 SSH。** 使用系统的 OpenSSH 客户端（Windows 自带的，或 Linux 上的 ssh），认证和加密由它完成，沿用 `~/.ssh/config`、密钥和 ssh-agent。Kuai 与 kuaid 之间的全部数据，都经这条 SSH 连接的标准输入输出传输。
 - **没有中转服务器，没有账号。** 数据只在电脑和主机之间传输，不经过第三方服务器。Kuai 不收集使用数据；除 SSH 连接和 git 自身的操作外，它只向 GitHub 检查和下载更新，可在设置中关闭。
 - **主机上不需要 root，不对外开放端口。** kuaid 安装在用户目录中，以登录用户的身份运行，权限不超过该用户经 SSH 登录后原有的权限。Linux 主机上它不监听任何端口，只使用 `~/.kuai/run` 中的 Unix 套接字，目录和套接字仅本人可访问；Windows 主机上它只监听 127.0.0.1 的一个随机端口，连接时须提供保存在用户目录中的随机口令。
 - **主机密钥。** 首次连接一台主机时，Kuai 显示其密钥指纹，确认后才记入 `known_hosts` 并继续连接；此后密钥发生变化，Kuai 拒绝连接。指纹可在主机上用 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` 查看（文件名随密钥类型而定）。
-- **密码和私钥口令**保存在 Windows 凭据管理器中，不写入设置文件，不出现在命令行和日志中。ssh-agent 转发默认关闭，可按主机开启。
+- **密码和私钥口令**保存在 Windows 凭据管理器或 Linux 的系统钥匙圈（Secret Service）中，不写入设置文件，不出现在命令行和日志中。ssh-agent 转发默认关闭，可按主机开启。
 - **更新。** 新版本从 GitHub Releases 下载，安装前核对 SHA-256，核对不通过不安装。主机上的 kuaid 随客户端一同发布，经 SSH 上传，主机无需联网下载。安装包目前没有代码签名。
 - **开源。** 客户端和 kuaid 的源码都在本仓库中，可自行审阅和构建。
 

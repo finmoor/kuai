@@ -158,7 +158,7 @@ Ctrl+C 中断（选中文字时为复制）；Ctrl+Shift+C 复制；Ctrl+V、Shi
 - 连接远程主机使用 Windows 自带的 OpenSSH（C:\Windows\System32\OpenSSH\ssh.exe），
   沿用 ~/.ssh/config 和密钥；未保存的密码或私钥口令在需要时弹窗输入。
   如系统中没有，请在 Windows 设置的「可选功能」中添加「OpenSSH 客户端」。
-- 连接不上主机时，在仓库页点击「诊断…」逐步检查哪一步出错；「设置 → 关于」中可复制诊断信息
+- 连接不上主机时，在仓库页点击「诊断…」逐步检查哪一步出错（主机设置中的「测试连接」也是逐步检查，不保存设置）；「设置 → 关于」中可复制诊断信息
   （默认隐藏主机地址和用户名）。
 - 远程主机为 Linux 或开启了 OpenSSH 服务的 Windows，并已安装 git。
 - 将主机上的目录映射到本机时需安装 WinFsp（https://winfsp.dev/），未安装时 Kuai 可经 winget 代为安装。

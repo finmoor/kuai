@@ -9,7 +9,7 @@
 <p><b>Close the laptop and it keeps coding. Open it and review every line.</b></p>
 
 <p>
-A Windows client for people who run Claude Code or Codex on a VPS.<br>
+A desktop client for Windows and Linux, for people who run Claude Code or Codex on a VPS.<br>
 Terminals that survive disconnects, line-by-line review, in-place file editing, in one window.
 </p>
 
@@ -19,6 +19,7 @@ Terminals that survive disconnects, line-by-line review, in-place file editing, 
 <a href="https://github.com/finmoor/kuai/releases/latest"><img src="https://img.shields.io/github/v/release/finmoor/kuai?style=flat-square&label=release&color=3b82f6" alt="Latest release"></a>
 <a href="https://github.com/finmoor/kuai/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/finmoor/kuai/ci.yml?branch=main&style=flat-square&label=CI" alt="CI"></a>
 <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square" alt="Windows 10 | 11">
+<img src="https://img.shields.io/badge/Linux-x86__64-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux x86_64">
 <img src="https://img.shields.io/badge/Rust-GPUI-DEA584?style=flat-square&logo=rust&logoColor=white" alt="Rust + GPUI">
 <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-22c55e?style=flat-square" alt="MIT or Apache-2.0"></a>
 </p>
@@ -62,7 +63,7 @@ Plenty of people rent a VPS just to run Claude Code or Codex: a task can run for
 | Several tasks are running and you cannot tell which one is waiting for you | One page lists the terminals of every repository and tells you when one stops |
 | On another computer you set everything up again | Workspaces are stored on the server: connect from another computer and the repositories and terminals are there |
 
-Kuai installs a small resident program, `kuaid` (about 3 MB, no root, no open port), on the server and talks to it over SSH: terminals run on the server, git runs on the server, files are read and written on the server, and Windows only draws the result. Repositories on this computer work the same way.
+Kuai installs a small resident program, `kuaid` (about 3 MB, no root, no open port), on the server and talks to it over SSH: terminals run on the server, git runs on the server, files are read and written on the server, and Kuai on your computer only draws the result. Repositories on this computer work the same way.
 
 > The name is the Chinese word for chopsticks (筷子, *kuàizi*): chopsticks instead of a fork. 筷 also sounds like 快, "fast".
 
@@ -74,7 +75,7 @@ Every repository has its own terminals, running on the host the repository lives
 
 ![The Terminals page: terminals of each repository grouped by workspace on the left, a Claude Code session on the right](assets/screenshots/en/terminals.png)
 
-- **Told when it stops**: the Terminals page gathers the terminals of every repository in every workspace; icons tell AI assistants from other commands and idle shells. You are notified when a terminal stops producing output, with a Windows notification when Kuai is in the background
+- **Told when it stops**: the Terminals page gathers the terminals of every repository in every workspace; icons tell AI assistants from other commands and idle shells. You are notified when a terminal stops producing output, with a system notification when Kuai is in the background
 - **Hand it a screenshot**: copy a screenshot and paste, or drop images and files on the terminal. The file is uploaded to the host, and the terminal receives its path there
 - **Several tasks at once**: a repository can have several terminals
 - Terminals of local repositories also keep running after Kuai quits
@@ -117,7 +118,7 @@ Terminal, Git and Files are three pages of the same repository, and you can go s
 
 - A host can be a **Linux (x86_64)** VPS, cloud server or dev box, or a **Windows** computer with the OpenSSH server enabled; ARM is not supported yet
 - On first connection `kuaid` is installed into the user's home directory (`~/.kuai`): **no root, no port open to the network**, and the host does not need Internet access
-- Uses the OpenSSH client that ships with Windows, along with your `~/.ssh/config`, keys and ssh-agent; passwords and key passphrases are kept in Windows Credential Manager
+- Uses the system OpenSSH client (the one that ships with Windows, or ssh on Linux), along with your `~/.ssh/config`, keys and ssh-agent; passwords and key passphrases are kept in Windows Credential Manager or the Linux keyring
 - Multi-level **jump hosts**; nothing is installed on the jump host
 - **Workspaces** group repositories you use together and are stored on the host that holds them: connect from another computer and you see the same list
 - A newer Kuai updates `kuaid` on the host when it connects, without interrupting running terminals
@@ -148,22 +149,25 @@ Also: Chinese and English UI, system tray and start at sign-in, pinned and reope
 
 ## Download
 
-Get it from [GitHub Releases](https://github.com/finmoor/kuai/releases/latest), in either form:
+Get it from [GitHub Releases](https://github.com/finmoor/kuai/releases/latest). For Windows, in either form:
 
 - **Installer** `kuai-<version>-windows-x64-setup.exe` (recommended): installs into your user profile (`%LOCALAPPDATA%\Programs\Kuai`), no administrator rights needed; starts from the Start menu and uninstalls from Settings → Apps.
 - **Portable** `kuai-<version>-windows-x64.zip`: unzip the Kuai folder anywhere and run `kuai.exe`.
+
+For Linux, `kuai-<version>-linux-x64.tar.gz`: extract the Kuai folder anywhere and run `kuai` in it; the first run adds Kuai to the application menu. The tray icon and directory mapping are not available on Linux yet.
 
 Requirements:
 
 | Where | What |
 |---|---|
-| This computer | 64-bit Windows 10 or 11; git 2.31 or newer on PATH; the OpenSSH client that ships with Windows |
+| This computer (Windows) | 64-bit Windows 10 or 11; git 2.31 or newer on PATH; the OpenSSH client that ships with Windows |
+| This computer (Linux) | x86_64 with glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later), an X11 or Wayland desktop, a Vulkan-capable graphics driver (Mesa is fine); git 2.31 or newer and ssh on PATH; saving passwords needs Secret Service (GNOME Keyring, KWallet and so on) |
 | Remote host | Linux (x86_64; ARM is not supported yet), or Windows with the OpenSSH server enabled; git 2.31 or newer; no root needed |
 | Directory mapping | [WinFsp](https://winfsp.dev/); Kuai offers to install it through winget if it is missing |
 
 The binaries are not code-signed, so on first run Windows may show "Windows protected your PC": choose "More info", then "Run anyway".
 
-When a new version is out, a notice appears left of the gear in the title bar; click it to read the changes and update in one step (the installer build runs the new installer in the background, the portable build replaces its files). You can also check from Settings → About. `kuaid` on your hosts needs no separate update: a newer Kuai replaces it on connection. Release notes are in [CHANGELOG.md](CHANGELOG.md) (in Chinese).
+When a new version is out, a notice appears left of the gear in the title bar; click it to read the changes and update in one step (the installer build runs the new installer in the background; the portable build and the Linux build replace their files). You can also check from Settings → About. `kuaid` on your hosts needs no separate update: a newer Kuai replaces it on connection. Release notes are in [CHANGELOG.md](CHANGELOG.md) (in Chinese).
 
 ## Getting started
 
@@ -181,7 +185,7 @@ For a repository on this computer: select "This computer" on the Hosts page and 
 
 ```mermaid
 flowchart LR
-    subgraph pc["Windows computer"]
+    subgraph pc["Your computer · Windows or Linux"]
         app["Kuai<br/>GPUI client"]
     end
     subgraph host["Remote host · Linux or Windows"]
@@ -196,7 +200,7 @@ flowchart LR
     kd --> files
 ```
 
-- **git runs on the host.** Windows only receives the output and draws it; the code that parses it and lays out the commit graph (`fr-core`) is shared by the client and `kuaid`.
+- **git runs on the host.** The client only receives the output and draws it; the code that parses it and lays out the commit graph (`fr-core`) is shared by the client and `kuaid`.
 - **`kuaid` is a single statically linked binary** (about 3 MB on Linux), uploaded over SSH into `~/.kuai`. It exits by itself 10 minutes after the last client has disconnected and the last terminal has ended.
 - **All traffic goes through the stdin and stdout of SSH**, using the keys and configuration you already have: no port to open in a firewall, no extra account.
 - **A native UI.** The client is written in Rust with [GPUI](https://www.gpui.rs/) (via [gpui-kit](https://github.com/longbridge/gpui-kit)) and drawn on the GPU. In the feasibility test, on a repository with 200,000 commits and up to 13 parallel lanes, parsing the history took 79 ms, laying out the lanes 14 ms, and a frame while scrolling 2.7 ms on average.
@@ -205,11 +209,11 @@ flowchart LR
 
 Kuai does not implement its own connection or authentication; it leaves both to SSH. The approach is close to VS Code's Remote - SSH: sign in over SSH and install a server program in the user's home directory.
 
-- **The connection is SSH.** Kuai runs the OpenSSH client that ships with Windows, which does the authentication and encryption with your `~/.ssh/config`, keys and ssh-agent. Everything between Kuai and `kuaid` travels through the stdin and stdout of that SSH connection.
+- **The connection is SSH.** Kuai runs the system OpenSSH client (the one that ships with Windows, or ssh on Linux), which does the authentication and encryption with your `~/.ssh/config`, keys and ssh-agent. Everything between Kuai and `kuaid` travels through the stdin and stdout of that SSH connection.
 - **No relay server, no account.** Data moves only between your computer and your host, never through a third-party server. Kuai collects no usage data; apart from the SSH connections and git's own operations, it only contacts GitHub to check for and download updates, which you can turn off in Settings.
 - **No root and no port open to the network on the host.** `kuaid` lives in the user's home directory and runs as the signed-in user, with no more rights than that user already has over SSH. On Linux hosts it listens on no port at all, only on a Unix socket in `~/.kuai/run`; the directory and the socket are accessible to that user alone. On Windows hosts it listens only on a random port on 127.0.0.1 and requires a random token stored in the user's profile.
 - **Host keys.** The first time you connect to a host, Kuai shows its key fingerprint and records it in `known_hosts` only after you confirm; if the key later changes, Kuai refuses to connect. To look up a fingerprint, run `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the host (the file name depends on the key type).
-- **Passwords and key passphrases** are kept in Windows Credential Manager, not in the settings file, and never appear on a command line or in logs. ssh-agent forwarding is off by default and can be enabled per host.
+- **Passwords and key passphrases** are kept in Windows Credential Manager or the Linux keyring (Secret Service), not in the settings file, and never appear on a command line or in logs. ssh-agent forwarding is off by default and can be enabled per host.
 - **Updates.** New versions are downloaded from GitHub Releases and checked against their SHA-256 before installing; a file that does not match is not installed. `kuaid` ships inside the client and is uploaded over SSH, so the host downloads nothing. The installers are not code-signed yet.
 - **Open source.** The client and `kuaid` are both in this repository, to read and to build yourself.
 
@@ -283,6 +287,8 @@ cargo test --workspace
 # installer and zip into dist/ (needs Inno Setup 6)
 pwsh tools/package.ps1
 ```
+
+The Linux client is built on Linux after installing the GPUI development packages (the Ubuntu and Debian package names are in `.github/workflows/ci.yml`); `tools/package-linux.sh` makes the tar.gz.
 
 | Path | Contents |
 |---|---|
