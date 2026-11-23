@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fr_channel::Connection;
 use fr_core::i18n::tr;
@@ -39,6 +39,12 @@ use crate::settings::{Auth, Front, RepoEntry, Settings, Tabs};
 
 /// 本机在各处当作「哪台电脑」的键：本机是空串，服务器是它的 id。
 pub const LOCAL: &str = "";
+
+/// 断开、连不上以后第一次重连前等多久；之后每次翻倍，最多 [`RECONNECT_MAX`]
+const RECONNECT_FIRST: Duration = Duration::from_secs(2);
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// 窗口回到前台时马上重连（[`AppState::retry_now`]）至少隔这么久
+const RECONNECT_KICK_GAP: Duration = Duration::from_secs(5);
 
 /// 一个工作区：在哪台电脑上（本机为空，服务器是它在本机的 id），和它在那台电脑上的 id。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -802,6 +808,7 @@ impl AppState {
         }
         self.links.insert(key.to_string(), conn.clone());
         self.reconnects.remove(key);
+        cx.emit(crate::app_state::HostConnected(key.to_string()));
         let windows = conn.hello.os == "windows";
         let merge = merge_ops(&self.settings, key);
         let merging = !merge.is_empty();
@@ -902,7 +909,8 @@ impl AppState {
         cx.notify();
     }
 
-    /// 和一台电脑断开了：读到的留着、只读；现在用的就是它上面的工作区的话，过一会儿自己重连。
+    /// 和一台电脑断开了：读到的留着、只读，过一会儿自己重连（断网、电脑睡眠时都会断，网回来要能
+    /// 自己接上；原来只重连现在用的工作区所在的那台，别的服务器、它们上面的仓库标签页和终端一直断着）。
     /// 本机的照样能改（直接读写状态文件），也过一会儿重连。
     fn machine_dropped(&mut self, key: &str, conn: &Arc<Connection>, cx: &mut Context<Self>) {
         // 已经换上了新的连接（重连过了）：旧的断了不算
@@ -920,32 +928,53 @@ impl AppState {
         {
             machine.live = false;
         }
-        if key == LOCAL || self.settings.current.machine == key {
-            self.schedule_reconnect(key, cx);
-        }
+        self.schedule_reconnect(key, cx);
         cx.notify();
     }
 
-    /// 过一会儿重连，连不上隔得越来越久（最多 30 秒）。要密码的不弹窗：存着密码的照样连得上，
-    /// 没存的等用户点「重新连接」。不用了（换到别的工作区、已经连上了）就不连了。
-    fn schedule_reconnect(&mut self, key: &str, cx: &mut Context<Self>) {
-        if self.reconnects.contains_key(key) {
+    /// 断开了、连不上的这台要不要在后台接着连：本机总要；服务器要还在设置里（经别的电脑连的，要那台
+    /// 的配置里还有它）。删掉了、改了地址的不连（改了地址的按新设置连，见 `forget_target`）。
+    fn keep_trying(&self, key: &str) -> bool {
+        key == LOCAL || self.knows_server(key)
+    }
+
+    /// 连这台刚失败了：值不值得过一会儿再试。连不上、超时、名字解析不了（多半是断网、电脑刚醒）值得；
+    /// 登录被拒绝、主机密钥不对要人来处理（见 [`fr_channel::LoginFailure::needs_user`]）；登录上以后才出的
+    /// 错（kuaid 起不来、git 太旧）等也等不好。本机的 kuaid、经别的电脑连的（错误只有一句话）一直试。
+    pub(crate) fn worth_retrying(&self, key: &str) -> bool {
+        if key == LOCAL || split_relay(key).is_some() {
+            return true;
+        }
+        self.last_login_failure(key)
+            .is_some_and(|failure| !failure.needs_user())
+    }
+
+    /// 过一会儿重连，连不上隔得越来越久（2 秒起，最多 30 秒；窗口回到前台时马上试一次，见
+    /// [`Self::retry_now`]）。断开了的、连不上的服务器都在这里接着连，连上以后它上面的仓库标签页、
+    /// 终端跟着接上（[`HostConnected`]）。要密码的不弹窗：存着密码的照样连得上，没存的、登录被拒绝的
+    /// 不再试，等用户点「重试」。不用了（删掉了、已经连上了）就不连了。
+    pub(crate) fn schedule_reconnect(&mut self, key: &str, cx: &mut Context<Self>) {
+        self.schedule_reconnect_after(key, RECONNECT_FIRST, cx);
+    }
+
+    fn schedule_reconnect_after(&mut self, key: &str, first: Duration, cx: &mut Context<Self>) {
+        if self.reconnects.contains_key(key) || !self.keep_trying(key) {
             return;
         }
         let key = key.to_string();
         let task = cx.spawn({
             let key = key.clone();
             async move |this, cx| {
-                let mut wait = 3;
+                let mut wait = first;
                 loop {
-                    cx.background_executor()
-                        .timer(Duration::from_secs(wait))
-                        .await;
+                    cx.background_executor().timer(wait).await;
                     let connecting = this.update(cx, |this, cx| {
-                        let wanted = key == LOCAL || this.settings.current.machine == key;
-                        let linked = this.links.get(&key).is_some_and(|link| link.is_alive());
+                        let linked = match key == LOCAL {
+                            true => this.links.get(&key).is_some_and(|link| link.is_alive()),
+                            false => matches!(this.status(&key), ConnStatus::Ready(_)),
+                        };
                         // 自己在重连：要密码、口令时不弹窗（只管这一次连接，别的操作照常问）
-                        (wanted && !linked).then(|| match key == LOCAL {
+                        (this.keep_trying(&key) && !linked).then(|| match key == LOCAL {
                             true => this.connect_local(cx),
                             false => this.connect_with(&key, true, cx),
                         })
@@ -956,11 +985,40 @@ impl AppState {
                     if connecting.await.is_ok() {
                         break;
                     }
-                    wait = (wait * 2).min(30);
+                    let give_up = this.update(cx, |this, _| !this.worth_retrying(&key));
+                    if give_up.unwrap_or(true) {
+                        log::info!("{key} 连不上，要人来处理，不再自己重连");
+                        break;
+                    }
+                    wait = (wait * 2).min(RECONNECT_MAX);
                 }
+                // 不再连了（连上了、不用了、要人来处理）：从表里去掉，下次断开时还能再安排
+                this.update(cx, |this, _| this.reconnects.remove(&key)).ok();
             }
         });
         self.reconnects.insert(key, task);
+    }
+
+    /// 窗口回到前台：在等着重连的马上试一次（人回来了，多半想马上用；断网时多半已经等到 30 秒一次了）。
+    /// 隔几秒才算一次，来回切窗口不会一直连。
+    pub fn retry_now(&mut self, cx: &mut Context<Self>) {
+        if self.reconnects.is_empty()
+            || self
+                .reconnect_kicked
+                .is_some_and(|at| at.elapsed() < RECONNECT_KICK_GAP)
+        {
+            return;
+        }
+        self.reconnect_kicked = Some(Instant::now());
+        let keys: Vec<String> = self.reconnects.keys().cloned().collect();
+        for key in keys {
+            // 正在连的那一次不打断
+            if matches!(self.status(&key), ConnStatus::Connecting) {
+                continue;
+            }
+            self.reconnects.remove(&key);
+            self.schedule_reconnect_after(&key, Duration::ZERO, cx);
+        }
     }
 
     // ---- 读 ----

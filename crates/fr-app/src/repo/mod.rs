@@ -70,7 +70,7 @@ use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use crate::app_state::AppState;
+use crate::app_state::{AppState, HostConnected};
 use crate::settings::RepoEntry;
 use crate::ui;
 
@@ -224,6 +224,10 @@ impl RepoView {
                 this.refresh(cx);
             }
         }));
+        // 所在的电脑断开以后在后台连回来了：跟着接上
+        subscriptions.push(cx.subscribe(&app, |this, _, event: &HostConnected, cx| {
+            this.host_connected(&event.0, cx)
+        }));
         let (history, history_subscriptions) = history::History::new(window, cx);
         subscriptions.extend(history_subscriptions);
         let (sidebar, sidebar_subscription) = sidebar::Sidebar::new(window, cx);
@@ -341,6 +345,30 @@ impl RepoView {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// 所在的电脑（重新）连上了（断网、睡眠以后在后台连回来，见 `AppState::schedule_reconnect`）：
+    /// 连接断了、连不上停着的重新连，看不见的切过来时再连（见 [`Self::refresh`]）；断开时停下的终端
+    /// （程序还在那台的 kuaid 里跑）接回去，不用按 Enter。
+    fn host_connected(&mut self, key: &str, cx: &mut Context<Self>) {
+        if self
+            .entry
+            .server
+            .as_deref()
+            .unwrap_or(crate::machines::LOCAL)
+            != key
+        {
+            return;
+        }
+        let dead = match &self.channel {
+            Some(Channel::Remote(conn)) => !conn.is_alive(),
+            Some(_) => false,
+            None => true,
+        };
+        if self.entry.server.is_some() && dead && !self.connecting && self.visible {
+            self.connect(cx);
+        }
+        self.terminals.host_back(cx);
     }
 
     /// 监听仓库的变化，有变化就刷新。

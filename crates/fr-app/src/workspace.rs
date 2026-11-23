@@ -227,6 +227,8 @@ impl Workspace {
                 } else {
                     // 回到 Kuai 了：系统通知都收回，哪些停下了看标题栏上的个数
                     this.toast_job(ToastJob::Clear);
+                    // 断网、睡眠后在等着重连的主机马上试一次，不用等到下一次（最多 30 秒）
+                    this.app.update(cx, |app, cx| app.retry_now(cx));
                 }
                 cx.notify();
             }),

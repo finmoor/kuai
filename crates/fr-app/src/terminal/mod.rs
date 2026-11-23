@@ -654,6 +654,8 @@ pub struct TerminalView {
     exited: Option<Option<i32>>,
     /// 和服务器的连接断了，画面留着；终端里的程序还在服务器上跑
     lost: bool,
+    /// 启动时连不上那台电脑（`error` 里写着）：它连上以后自己再开（[`Self::host_back`]）
+    unreachable: bool,
     /// 这是 kuaid 里留着的终端（上次没结束），还没接上：也算有东西在跑
     restored: bool,
     /// 第一次接上时按这个编号接（列表里看到的那个会话，见 [`Self::attach_to`]），不按名字开
@@ -844,6 +846,7 @@ impl TerminalView {
             error: None,
             exited: None,
             lost: false,
+            unreachable: false,
             restored: false,
             attach: None,
             local: false,
@@ -909,6 +912,15 @@ impl TerminalView {
             prefs::write(prefs, cx);
         }
         cx.notify();
+    }
+
+    /// 所在的那台电脑（重新）连上了：断开时停下（程序还在 kuaid 里跑）、启动时连不上的，自己接上、
+    /// 开起来，和按 Enter 一样（看不见的等画出来时再开）。只看的不管，它的画面由终端页换。
+    pub fn host_back(&mut self, cx: &mut Context<Self>) {
+        let stopped = (self.lost && self.exited.is_none()) || self.unreachable;
+        if stopped && self.connecting.is_none() && self.watch.is_none() && self.launcher.is_some() {
+            self.reopen(cx);
+        }
     }
 
     /// 里面的进程还在跑，而且连着（敲的字它收得到）。
@@ -1027,6 +1039,7 @@ impl TerminalView {
         self.error = None;
         self.exited = None;
         self.lost = false;
+        self.unreachable = false;
         self.title = None;
         self.marked = None;
         self.sending = None;
@@ -1111,9 +1124,11 @@ impl TerminalView {
                     }
                     (Err(err), Some(_)) => {
                         this.error = Some(tf!("无法连接 kuaid：{err}", err).into());
+                        this.unreachable = true;
                     }
                     (Err(err), None) => {
                         this.error = Some(tf!("无法连接主机：{err}", err).into());
+                        this.unreachable = true;
                     }
                 }
                 cx.notify();

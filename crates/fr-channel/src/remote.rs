@@ -481,6 +481,14 @@ impl LoginFailure {
     pub fn denied(&self) -> bool {
         self.denied
     }
+
+    /// 要人来处理：登录被拒绝、主机密钥变了或者还没信任。过一会儿自己再试也是一样，登录被拒绝的
+    /// 一直试还会被服务器当成在猜密码。连不上、超时、名字解析不了（多半是断网）不算。
+    pub fn needs_user(&self) -> bool {
+        self.denied
+            || self.ssh.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
+            || self.ssh.contains("Host key verification failed")
+    }
 }
 
 impl std::fmt::Display for LoginFailure {
@@ -2582,6 +2590,31 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn 要人来处理的登录失败() {
+        let failure = |ssh: &str, denied: bool| LoginFailure {
+            at: FailedAt::Login,
+            ssh: ssh.into(),
+            reason: String::new(),
+            message: String::new(),
+            denied,
+        };
+        assert!(denied_for_test().needs_user());
+        let changed =
+            "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nHost key verification failed.";
+        assert!(failure(changed, false).needs_user());
+        assert!(failure("Host key verification failed.", false).needs_user());
+        // 断网时的这些过一会儿再试就好
+        for ssh in [
+            "Connection timed out during banner exchange",
+            "ssh: Could not resolve hostname example.com: No such host is known.",
+            "connect to host 10.0.0.1 port 22: Network is unreachable",
+            "connect to host 10.0.0.1 port 22: Connection refused",
+        ] {
+            assert!(!failure(ssh, false).needs_user(), "{ssh}");
+        }
+    }
 
     #[test]
     fn 只用公钥被拒绝时不带存着的口令再连一次() {

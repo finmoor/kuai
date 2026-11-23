@@ -4,7 +4,7 @@ use fr_core::i18n::tr;
 use fr_core::tf;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fr_channel::{Channel, ConnectOptions, Connection, Jump};
 use futures::FutureExt as _;
@@ -28,16 +28,22 @@ pub fn save_failures() -> futures::channel::mpsc::UnboundedReceiver<String> {
     rx
 }
 
-/// 一台服务器的连接状态。
 /// 一次连接在登录阶段失败的详情，见 [`AppState::last_login_failure`]。
 type FailureSlot = Arc<std::sync::Mutex<Option<fr_channel::LoginFailure>>>;
 
+/// 一台服务器的连接状态。
 pub enum ConnStatus {
     Idle,
     Connecting,
     Ready(Arc<Connection>),
     Failed(SharedString),
 }
+
+/// 一台电脑（重新）连上了，键同 `machines`（本机是 [`crate::machines::LOCAL`]）。断网、睡眠以后
+/// 在后台连回来时，它上面停着的仓库标签页、终端听到这个自己接上。
+pub struct HostConnected(pub String);
+
+impl EventEmitter<HostConnected> for AppState {}
 
 pub struct AppState {
     pub settings: Settings,
@@ -59,8 +65,10 @@ pub struct AppState {
     pub(crate) pending: HashMap<String, Vec<fr_core::store::Op>>,
     /// 订阅各台电脑改动的任务；丢弃就不订阅了
     pub(crate) watches: HashMap<String, Task<()>>,
-    /// 断开以后自动重连的任务
+    /// 断开、连不上以后在后台重连的任务（见 `AppState::schedule_reconnect`），连上、不用了就去掉
     pub(crate) reconnects: HashMap<String, Task<()>>,
+    /// 上一次因为窗口回到前台马上重连是什么时候（`AppState::retry_now`）
+    pub(crate) reconnect_kicked: Option<Instant>,
     /// 工作区页的下拉里选的是哪台电脑（没选过是选中的工作区所在的那台）。只在这次运行里记着
     pub(crate) menu_machine: Option<String>,
     /// 本机的标识（`fr_core::store::machine_id`）：启动时读文件，本机的 kuaid 握手时报的为准
@@ -90,6 +98,7 @@ impl AppState {
             pending: HashMap::new(),
             watches: HashMap::new(),
             reconnects: HashMap::new(),
+            reconnect_kicked: None,
             menu_machine: None,
             local_machine: None,
             machine_ids: HashMap::new(),
@@ -314,6 +323,11 @@ impl AppState {
                 if let Some(Err(err)) = this.conns.get(&id).and_then(|c| c.peek()) {
                     let name = this.machine_name(&id).to_string();
                     crate::diagnose::record_error(&name, err);
+                    // 连不上（断网、电脑刚醒、启动时还没网）：过一会儿自己再连，连上以后打开着的仓库、
+                    // 终端跟着接上。登录被拒绝这类要人来处理的不再试
+                    if this.worth_retrying(&id) {
+                        this.schedule_reconnect(&id, cx);
+                    }
                 }
                 // 连上了：记下它是哪台；这台服务器的映射换到新连接上，设了自动映射的映射上；
                 // 订阅它的仓库列表和工作区

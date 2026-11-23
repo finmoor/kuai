@@ -89,6 +89,15 @@ pub(super) struct Terminals {
     asking: usize,
 }
 
+impl Terminals {
+    /// 仓库所在的电脑（重新）连上了：断开时停下、启动时连不上的终端接上（[`TerminalView::host_back`]）。
+    pub(super) fn host_back(&self, cx: &mut App) {
+        for tab in &self.tabs {
+            tab.view.update(cx, |view, cx| view.host_back(cx));
+        }
+    }
+}
+
 /// 关掉的本机仓库标签页留下的、开在 Kuai 进程里的终端，里面的程序接着运行。再打开这个仓库、到终端页时接回去
 /// （[`RepoView::adopt_parked`]）；同一个仓库在别的工作区里也开着的话，先到终端页的那个接走。
 #[derive(Default)]
