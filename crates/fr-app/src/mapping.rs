@@ -1,5 +1,7 @@
 //! 把服务器上的目录映射到本机（盘符或文件夹）：哪些映射着、怎么映射和断开、服务器上的路径在
-//! 本机怎么写，添加和修改映射的对话框，以及各处菜单里共用的那几项。底下是 `fr-mount`（WinFsp）。
+//! 本机怎么写，添加和修改映射的对话框，以及各处菜单里共用的那几项。底下是 `fr-mount`（Windows 上
+//! 是 WinFsp，Linux 上是 FUSE）。Linux 上没有盘符，只能映射成文件夹；要装的是 fuse3（系统的包，
+//! 由用户自己装，这里只说怎么装）。
 //!
 //! 一台服务器可以有多条映射（`settings::Mapping`），配置跟着服务器存在设置里。映射在 Kuai
 //! 进程里：退出 Kuai 就都没了，关窗口收到托盘时还在。走的是那台服务器现有的连接，不另外登录；
@@ -113,9 +115,13 @@ fn winfsp_present() -> bool {
     fr_mount::installed()
 }
 
-/// 新映射默认放在哪个文件夹：`<用户目录>\Kuai\<服务器名>-<目录名>`。
+/// 新映射默认放在哪个文件夹：`<用户目录>\Kuai\<服务器名>-<目录名>`（Linux 上是
+/// `~/Kuai/<服务器名>-<目录名>`）。
 fn default_folder(server: &str, remote: &str) -> String {
-    let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:".into());
+    let home = match cfg!(windows) {
+        true => std::env::var("USERPROFILE").unwrap_or_else(|_| "C:".into()),
+        false => std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
+    };
     let name: String = match base_name(remote) {
         "" => server.to_string(),
         dir => format!("{server}-{dir}"),
@@ -127,7 +133,20 @@ fn default_folder(server: &str, remote: &str) -> String {
             c => c,
         })
         .collect();
-    format!("{home}\\Kuai\\{name}")
+    match cfg!(windows) {
+        true => format!("{home}\\Kuai\\{name}"),
+        false => format!("{}/Kuai/{name}", home.trim_end_matches('/')),
+    }
+}
+
+/// 没装映射要的东西时怎么说：Windows 上是 WinFsp（有安装按钮），Linux 上是 fuse3（自己装）。
+fn need_install_text() -> &'static str {
+    match cfg!(windows) {
+        true => tr("映射需要 WinFsp，安装时需管理员权限（仅一次）。"),
+        false => tr(
+            "映射需要 fuse3，请先安装：sudo apt install fuse3（Fedora 为 sudo dnf install fuse3）。",
+        ),
+    }
 }
 
 /// 资源管理器里盘符映射显示的名称。和在资源管理器里给网络驱动器重命名一样，写在
@@ -712,22 +731,24 @@ pub fn winfsp_banner(app: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
                     .flex_1()
                     .min_w_0()
                     .text_sm()
-                    .child(tr("映射需要 WinFsp，安装时需管理员权限（仅一次）。")),
+                    .child(need_install_text()),
             )
-            .child(
-                Button::new("install-winfsp")
-                    .small()
-                    .primary()
-                    .flex_none()
-                    .label(if installing {
-                        tr("正在安装…")
-                    } else {
-                        tr("安装 WinFsp")
-                    })
-                    .loading(installing)
-                    .disabled(installing)
-                    .on_click(move |_, _, cx| app.update(cx, |app, cx| app.install_winfsp(cx))),
-            )
+            .when(cfg!(windows), |banner| {
+                banner.child(
+                    Button::new("install-winfsp")
+                        .small()
+                        .primary()
+                        .flex_none()
+                        .label(if installing {
+                            tr("正在安装…")
+                        } else {
+                            tr("安装 WinFsp")
+                        })
+                        .loading(installing)
+                        .disabled(installing)
+                        .on_click(move |_, _, cx| app.update(cx, |app, cx| app.install_winfsp(cx))),
+                )
+            })
             .into_any_element(),
     )
 }
@@ -798,7 +819,9 @@ pub fn map_dialog(
         .cloned()
         .unwrap_or_default();
     let letters = Rc::new(letters);
-    let use_drive = Rc::new(Cell::new(!editing || old.is_drive()));
+    // Linux 上没有盘符，只能选文件夹
+    let drives = cfg!(windows);
+    let use_drive = Rc::new(Cell::new(drives && (!editing || old.is_drive())));
     let drive = Rc::new(RefCell::new(match old.is_drive() {
         true => old.local.to_uppercase(),
         false => first,
@@ -868,7 +891,9 @@ pub fn map_dialog(
                 }
                 let local = match use_drive.get() {
                     true => drive.borrow().clone(),
-                    false => read(&folder_input, cx).trim_end_matches('\\').to_string(),
+                    false => read(&folder_input, cx)
+                        .trim_end_matches(['\\', '/'])
+                        .to_string(),
                 };
                 if local.is_empty() {
                     return fail(
@@ -927,7 +952,11 @@ pub fn map_dialog(
                 app.update(cx, |app, cx| {
                     app.save_mapping(&server, mapping, cx);
                     if !app.winfsp_installed() {
-                        cx.emit(Notice::Info(tr("映射已保存，安装 WinFsp 后生效。").into()));
+                        let text = match cfg!(windows) {
+                            true => tr("映射已保存，安装 WinFsp 后生效。"),
+                            false => tr("映射已保存，安装 fuse3 后生效。"),
+                        };
+                        cx.emit(Notice::Info(text.into()));
                     }
                 });
             }
@@ -1096,44 +1125,46 @@ pub fn map_dialog(
                         v_flex()
                             .gap_1()
                             .child(div().text_sm().child(tr("本机位置")))
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        Radio::new("kind-drive")
-                                            .label(tr("盘符"))
-                                            .checked(as_drive)
-                                            .on_click(pick_kind(true)),
-                                    )
-                                    .child(
-                                        Button::new("letter")
-                                            .outline()
-                                            .w(px(76.))
-                                            .flex_none()
-                                            .disabled(!as_drive)
-                                            .child(
-                                                div()
-                                                    .font_family(crate::fonts::mono())
-                                                    .child(drive.borrow().clone()),
-                                            )
-                                            .dropdown_caret(true)
-                                            .dropdown_menu(letter_menu),
-                                    )
-                                    .child(
-                                        div().pl_2().child(
-                                            Radio::new("kind-folder")
-                                                .label(tr("文件夹"))
-                                                .checked(!as_drive)
-                                                .on_click(pick_kind(false)),
+                            .when(!drives, |row| row.child(Input::new(&folder_input)))
+                            .when(drives, |row| {
+                                row.child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(
+                                            Radio::new("kind-drive")
+                                                .label(tr("盘符"))
+                                                .checked(as_drive)
+                                                .on_click(pick_kind(true)),
+                                        )
+                                        .child(
+                                            Button::new("letter")
+                                                .outline()
+                                                .w(px(76.))
+                                                .flex_none()
+                                                .disabled(!as_drive)
+                                                .child(
+                                                    div()
+                                                        .font_family(crate::fonts::mono())
+                                                        .child(drive.borrow().clone()),
+                                                )
+                                                .dropdown_caret(true)
+                                                .dropdown_menu(letter_menu),
+                                        )
+                                        .child(
+                                            div().pl_2().child(
+                                                Radio::new("kind-folder")
+                                                    .label(tr("文件夹"))
+                                                    .checked(!as_drive)
+                                                    .on_click(pick_kind(false)),
+                                            ),
+                                        )
+                                        .child(
+                                            div().flex_1().min_w_0().child(
+                                                Input::new(&folder_input).disabled(as_drive),
+                                            ),
                                         ),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .child(Input::new(&folder_input).disabled(as_drive)),
-                                    ),
-                            ),
+                                )
+                            }),
                     )
                     // 资源管理器里显示的名称（「名称 (K:)」）：只有盘符有
                     .when(as_drive, |body| {
@@ -1283,12 +1314,12 @@ pub fn menu_items(
                     cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
                 }),
             )
-            .item(
-                PopupMenuItem::new(tr("在资源管理器中显示")).on_click(move |_, window, cx| {
+            .item(PopupMenuItem::new(crate::shell::reveal_label()).on_click(
+                move |_, window, cx| {
                     let result = crate::shell::reveal_in_explorer(&reveal);
                     crate::shell::report(result, window, cx);
-                }),
-            );
+                },
+            ));
         if !dir {
             menu = menu.item(PopupMenuItem::new(tr("用默认程序打开")).on_click(
                 move |_, window, cx| {
@@ -1364,7 +1395,8 @@ fn status_word(status: &MountStatus, installed: bool) -> Option<&'static str> {
         MountStatus::Live => None,
         MountStatus::Busy => Some(tr("正在映射…")),
         MountStatus::Failed(_) => Some(tr("映射失败")),
-        MountStatus::Off if !installed => Some(tr("未安装 WinFsp")),
+        MountStatus::Off if !installed && cfg!(windows) => Some(tr("未安装 WinFsp")),
+        MountStatus::Off if !installed => Some(tr("未安装 fuse3")),
         MountStatus::Off => Some(tr("未映射")),
     }
 }
@@ -1545,9 +1577,12 @@ pub fn section(app: &Entity<AppState>, server: &Server, cx: &App) -> AnyElement 
                         .on_click(add),
                 ),
         )
-        .child(div().text_xs().text_color(muted).child(tr(
-            "将远程主机上的目录映射为本机的盘符或文件夹，供本机程序直接打开。仅在 Kuai 运行时可用。",
-        )))
+        .child(div().text_xs().text_color(muted).child(match cfg!(windows) {
+            true => tr(
+                "将远程主机上的目录映射为本机的盘符或文件夹，供本机程序直接打开。仅在 Kuai 运行时可用。",
+            ),
+            false => tr("将远程主机上的目录映射为本机的文件夹，供本机程序直接打开。仅在 Kuai 运行时可用。"),
+        }))
         .children(winfsp_banner(app, cx))
         .child(list)
         .into_any_element()
@@ -1641,11 +1676,13 @@ pub fn chip(app: &Entity<AppState>, server: &Server, mapping: &Mapping, cx: &App
                 let (open, copy) = (mapping.local_root(), mapping.local_root());
                 let (app, id) = (app.clone(), mapping.id.clone());
                 menu = menu
-                    .item(PopupMenuItem::new(tr("在资源管理器中打开")).on_click(
-                        move |_, window, cx| {
-                            crate::shell::report(crate::shell::open_folder(&open), window, cx)
-                        },
-                    ))
+                    .item(
+                        PopupMenuItem::new(crate::shell::open_folder_label()).on_click(
+                            move |_, window, cx| {
+                                crate::shell::report(crate::shell::open_folder(&open), window, cx)
+                            },
+                        ),
+                    )
                     .item(
                         PopupMenuItem::new(tr("复制本机路径")).on_click(move |_, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
@@ -1654,8 +1691,9 @@ pub fn chip(app: &Entity<AppState>, server: &Server, mapping: &Mapping, cx: &App
                     .item(PopupMenuItem::new(tr("断开")).on_click(move |_, _, cx| {
                         app.update(cx, |app, cx| app.unmount_mapping(&id, cx).detach());
                     }));
-            } else if !installed {
-                // 没装 WinFsp：给出能做的那一步，而不是一个点不了的「立即映射」
+            } else if !installed && cfg!(windows) {
+                // 没装 WinFsp：给出能做的那一步，而不是一个点不了的「立即映射」。Linux 上点「立即映射」
+                // 会提示怎么装 fuse3
                 let app = app.clone();
                 let installing = app.read(cx).winfsp_installing();
                 menu = menu.item(

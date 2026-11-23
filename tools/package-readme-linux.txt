@@ -7,6 +7,10 @@ https://github.com/finmoor/kuai 。
 
 安装和运行
 ----------
+这是解压版。Ubuntu、Debian 上也可以用 .deb 安装包（kuai_<版本>_amd64.deb，装在 /opt/kuai），
+其他发行版也可以用 AppImage（kuai-<版本>-linux-x64.AppImage，加上可执行权限后直接运行），
+均在 https://github.com/finmoor/kuai/releases 下载。
+
 1. 解压后运行 Kuai/kuai。文件夹可放在任意位置（kuaid 文件夹须与 kuai 位于同一目录）。
    也可以在命令行中运行 kuai <仓库路径> 直接打开仓库。
 2. 首次运行时会在应用菜单中添加 Kuai（~/.local/share/applications/kuai.desktop），之后可从应用菜单打开。
@@ -22,8 +26,13 @@ https://github.com/finmoor/kuai 。
 
 与 Windows 版的不同
 -------------------
-- 暂无托盘图标，设置中没有最小化到托盘的选项。
-- 暂不支持将主机上的目录映射到本机。
+- 托盘图标需要桌面支持 StatusNotifierItem：KDE 自带；Ubuntu 的 GNOME 自带 AppIndicator 扩展；
+  其他 GNOME（如 Fedora）需安装「AppIndicator and KStatusNotifierItem Support」扩展。
+  桌面没有托盘时，设置中不显示托盘的选项。
+- Wayland 桌面上窗口无法隐藏到托盘：「关闭窗口时最小化到托盘」改为最小化窗口，
+  没有「最小化到托盘」的选项。X11 桌面上与 Windows 版相同。
+- 将主机上的目录映射到本机需要 fuse3（sudo apt install fuse3，Fedora 为 sudo dnf install fuse3），
+  只能映射为文件夹（空文件夹或尚不存在的文件夹），没有盘符。
 - 密码和私钥口令保存在系统钥匙圈中，名称为「Kuai: <主机地址>」，移除主机时一并删除。
   只有保存时可能弹出系统的对话框（新建或解锁钥匙圈）；钥匙圈锁着时，连接时改为弹窗输入。
 - 本机终端默认使用登录 shell（$SHELL），可在设置中改为 bash、zsh、fish 等。
@@ -44,6 +53,7 @@ https://github.com/finmoor/kuai 。
 有新版本时，标题栏齿轮左侧显示「新版本 x.y.z」，点击可查看更新内容，点击「更新」开始下载，
 下载完成后点击「重启以完成更新」，在原文件夹中替换文件。远程主机上和本机 kuaid 中的终端不受影响。
 文件夹没有写入权限时无法自动更新，请前往 https://github.com/finmoor/kuai/releases 手动下载。
+.deb 安装的会弹出系统的管理员认证，由 apt 安装新的 .deb；AppImage 会替换原来的 .AppImage 文件。
 
 卸载
 ----

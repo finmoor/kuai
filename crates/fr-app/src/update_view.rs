@@ -10,7 +10,7 @@ use fr_core::tf;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::popover::{Popover, PopoverState};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
@@ -43,6 +43,8 @@ pub fn title_pill(updater: &Entity<Updater>, cx: &App) -> Option<AnyElement> {
             "正在下载 {percent}%",
             percent = percent(got.load(Ordering::Relaxed), release.asset.size)
         )),
+        // .deb 的正在等管理员认证、apt 装
+        Stage::Ready(_) if this.installing => button.primary().loading(true).label(tr("正在安装…")),
         Stage::Ready(_) => button
             .primary()
             .icon(ui::icon(IconName::RotateCw))
@@ -164,13 +166,17 @@ fn popover_body(
                 div()
                     .text_xs()
                     .text_color(muted)
-                    .child(tr("也可稍后重启，下次启动时生效。")),
+                    // .deb 的启动时不会自己装（要管理员授权），还得点这个按钮
+                    .child(match crate::packaging::deb() {
+                        true => tr("安装时需要管理员授权；也可以稍后再装。"),
+                        false => tr("也可稍后重启，下次启动时生效。"),
+                    }),
             )
-            .child(
-                h_flex()
-                    .justify_end()
-                    .child(restart_button(updater, Some(popover))),
-            ),
+            .child(h_flex().justify_end().child(restart_button(
+                updater,
+                Some(popover),
+                this.installing,
+            ))),
         Stage::Failed { release, problem } => {
             let (title, detail) = problem_text(problem);
             let retry = matches!(
@@ -256,7 +262,7 @@ pub fn about_version(updater: &Entity<Updater>, cx: &App) -> AnyElement {
             .child(status(
                 tf!("{version} 已下载", version = release.version).into(),
             ))
-            .child(restart_button(updater, None)),
+            .child(restart_button(updater, None, this.installing)),
         Stage::Failed { release, problem } => {
             let (title, detail) = problem_text(problem);
             let text = div()
@@ -371,13 +377,23 @@ fn cancel_button(updater: &Entity<Updater>) -> Button {
 }
 
 /// `popover`：在小窗里的，点了先收起小窗，不然它压在接着弹的确认框上面。
-fn restart_button(updater: &Entity<Updater>, popover: Option<&Entity<PopoverState>>) -> Button {
+/// 「重启完成升级」。`installing`：.deb 的正在等管理员认证、apt 装，按钮转圈、点不了。
+fn restart_button(
+    updater: &Entity<Updater>,
+    popover: Option<&Entity<PopoverState>>,
+    installing: bool,
+) -> Button {
     let restart = act(updater, |u, cx| u.restart(cx));
     let button = Button::new("update-restart")
         .primary()
         .small()
         .icon(ui::icon(IconName::RotateCw))
-        .label(tr("重启以完成更新"));
+        .label(match installing {
+            true => tr("正在安装…"),
+            false => tr("重启以完成更新"),
+        })
+        .loading(installing)
+        .disabled(installing);
     match popover {
         Some(popover) => button.on_click(closing(popover, restart)),
         None => button.on_click(restart),

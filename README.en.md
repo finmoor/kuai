@@ -102,7 +102,7 @@ A full graphical Git client, modelled on Fork. When Claude Code is done, switch 
 - **File tree**: create, rename, delete, upload and download; modified and untracked files are marked, and you can filter by name
 - **Editor**: line numbers, syntax highlighting, find and replace; if another program has changed the file, you are asked before saving over it; images are shown inline
 - Reads and writes go through the SSH connection that is already open: **no SFTP to configure**, and it works through jump hosts too
-- **Directory mapping**: map a directory on the host to a drive letter or folder on this computer and open it with Explorer, VS Code or any local program (needs [WinFsp](https://winfsp.dev/), which Kuai can install for you)
+- **Directory mapping**: map a directory on the host to a drive letter or folder on this computer and open it with Explorer, VS Code or any local program (on Windows it needs [WinFsp](https://winfsp.dev/), which Kuai can install for you; on Linux it needs fuse3 and maps to folders only)
 
 ### Three pages that work together
 
@@ -154,7 +154,13 @@ Get it from [GitHub Releases](https://github.com/finmoor/kuai/releases/latest). 
 - **Installer** `kuai-<version>-windows-x64-setup.exe` (recommended): installs into your user profile (`%LOCALAPPDATA%\Programs\Kuai`), no administrator rights needed; starts from the Start menu and uninstalls from Settings → Apps.
 - **Portable** `kuai-<version>-windows-x64.zip`: unzip the Kuai folder anywhere and run `kuai.exe`.
 
-For Linux, `kuai-<version>-linux-x64.tar.gz`: extract the Kuai folder anywhere and run `kuai` in it; the first run adds Kuai to the application menu. The tray icon and directory mapping are not available on Linux yet.
+For Linux, pick one of three:
+
+- **.deb package** `kuai_<version>_amd64.deb` (Ubuntu, Debian): `sudo apt install ./kuai_<version>_amd64.deb`; it installs into `/opt/kuai` and starts from the application menu or as `kuai`.
+- **AppImage** `kuai-<version>-linux-x64.AppImage` (other distributions): make it executable and run it; the first run adds Kuai to the application menu.
+- **Portable** `kuai-<version>-linux-x64.tar.gz`: extract the Kuai folder anywhere and run `kuai` in it; the first run adds Kuai to the application menu.
+
+The tray icon needs a desktop with StatusNotifierItem support (built into KDE and Ubuntu's GNOME; other GNOME setups need the AppIndicator extension). On Wayland the window cannot be hidden to the tray, so "close to tray" minimizes it instead.
 
 Requirements:
 
@@ -163,11 +169,11 @@ Requirements:
 | This computer (Windows) | 64-bit Windows 10 or 11; git 2.31 or newer on PATH; the OpenSSH client that ships with Windows |
 | This computer (Linux) | x86_64 with glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later), an X11 or Wayland desktop, a Vulkan-capable graphics driver (Mesa is fine); git 2.31 or newer and ssh on PATH; saving passwords needs Secret Service (GNOME Keyring, KWallet and so on) |
 | Remote host | Linux (x86_64; ARM is not supported yet), or Windows with the OpenSSH server enabled; git 2.31 or newer; no root needed |
-| Directory mapping | [WinFsp](https://winfsp.dev/); Kuai offers to install it through winget if it is missing |
+| Directory mapping | On Windows, [WinFsp](https://winfsp.dev/) (Kuai offers to install it through winget if it is missing); on Linux, fuse3, folders only |
 
 The binaries are not code-signed, so on first run Windows may show "Windows protected your PC": choose "More info", then "Run anyway".
 
-When a new version is out, a notice appears left of the gear in the title bar; click it to read the changes and update in one step (the installer build runs the new installer in the background; the portable build and the Linux build replace their files). You can also check from Settings → About. `kuaid` on your hosts needs no separate update: a newer Kuai replaces it on connection. Release notes are in [CHANGELOG.md](CHANGELOG.md) (in Chinese).
+When a new version is out, a notice appears left of the gear in the title bar; click it to read the changes and update in one step (the installer build runs the new installer in the background and the portable build replaces its files; on Linux the .deb is installed by apt after the system asks for administrator authentication, and the AppImage replaces its own file). You can also check from Settings → About. `kuaid` on your hosts needs no separate update: a newer Kuai replaces it on connection. Release notes are in [CHANGELOG.md](CHANGELOG.md) (in Chinese).
 
 ## Getting started
 
@@ -288,7 +294,7 @@ cargo test --workspace
 pwsh tools/package.ps1
 ```
 
-The Linux client is built on Linux after installing the GPUI development packages (the Ubuntu and Debian package names are in `.github/workflows/ci.yml`); `tools/package-linux.sh` makes the tar.gz.
+The Linux client is built on Linux after installing the GPUI development packages (the Ubuntu and Debian package names are in `.github/workflows/ci.yml`); `tools/package-linux.sh` makes the tar.gz, the .deb and the AppImage.
 
 | Path | Contents |
 |---|---|
@@ -296,7 +302,7 @@ The Linux client is built on Linux after installing the GPUI development package
 | `crates/fr-channel` | Repository channel: in-process for local repositories, over SSH to `kuaid` for remote ones |
 | `crates/fr-app` | The GPUI client |
 | `crates/kuaid` | The resident program for Linux and Windows hosts: runs git, hosts terminal sessions |
-| `crates/fr-mount` | Maps a directory on a host to a drive letter or folder (WinFsp) |
+| `crates/fr-mount` | Maps a directory on a host to a drive letter or folder (WinFsp on Windows, FUSE on Linux) |
 | `tools/` | Packaging, installer script, UI test scripts |
 
 The "开发" section of the [Chinese README](README.md#开发) has the full notes on building, testing and releasing.

@@ -161,8 +161,9 @@ mod imp {
         Some(config.join("autostart").join("kuai.desktop"))
     }
 
+    /// 开机自启的程序：AppImage 写那个 .AppImage 文件（见 `packaging::launcher`）。
     fn exe() -> Result<String> {
-        let path = std::env::current_exe().context(tr("无法获取程序路径"))?;
+        let path = crate::packaging::launcher().context(tr("无法获取程序路径"))?;
         path.to_str()
             .map(str::to_string)
             .context(tr("无法获取程序路径"))

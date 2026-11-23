@@ -1,5 +1,6 @@
 # 推 v1.8.0 这样的标签就发版：测试、打包，把 Windows 的安装程序 kuai-<版本>-windows-x64-setup.exe、
-# 解压版 kuai-<版本>-windows-x64.zip 和 Linux 版 kuai-<版本>-linux-x64.tar.gz 传到 GitHub Releases。
+# 解压版 kuai-<版本>-windows-x64.zip 和 Linux 版（kuai_<版本>_amd64.deb、kuai-<版本>-linux-x64.AppImage、
+# 解压版 kuai-<版本>-linux-x64.tar.gz）传到 GitHub Releases。
 # 先编 Windows 版，Linux 版拿它打好的 kuaid 文件夹（两个平台的包里带一模一样的 kuaid，见
 # tools/package-linux.sh），两边都打好了才建 Release，不会出现只有一半附件的版本。
 # 发布说明取自 CHANGELOG.md 里这个版本的那一节。GitHub 会给附件算 SHA-256（API 的 assets[].digest），
@@ -97,13 +98,29 @@ jobs:
           name: kuaid
           path: kuaid-from-windows
 
+      # AppImage 的打包程序和运行时：固定版本，核对校验值（GitHub 给附件记的 SHA-256）
+      - name: 下 AppImage 的打包工具
+        run: |
+          mkdir -p appimage-tools && cd appimage-tools
+          curl -fsSL --retry 3 -o appimagetool-x86_64.AppImage             https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          curl -fsSL --retry 3 -o runtime-x86_64             https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+          sha256sum -c - <<'EOF'
+          ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool-x86_64.AppImage
+          2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d  runtime-x86_64
+          EOF
+          chmod +x appimagetool-x86_64.AppImage
+
       - name: 打包
-        run: ./tools/package-linux.sh --kuaid kuaid-from-windows
+        run: |
+          ./tools/package-linux.sh --kuaid kuaid-from-windows --deb             --appimage appimage-tools/appimagetool-x86_64.AppImage appimage-tools/runtime-x86_64
 
       - uses: actions/upload-artifact@v4
         with:
           name: linux
-          path: dist/kuai-*-linux-x64.tar.gz
+          path: |
+            dist/kuai-*-linux-x64.tar.gz
+            dist/kuai_*_amd64.deb
+            dist/kuai-*-linux-x64.AppImage
           if-no-files-found: error
 
   publish:
@@ -130,8 +147,10 @@ jobs:
           $notes = ./tools/release-notes.ps1 $version
           $windows = "Windows：安装版 kuai-$version-windows-x64-setup.exe（推荐），解压版 kuai-$version-windows-x64.zip。" +
             "程序未进行代码签名，首次运行时 Windows 可能提示「Windows 已保护你的电脑」，请点击「更多信息」，再点击「仍要运行」。"
-          $linux = "Linux：kuai-$version-linux-x64.tar.gz（x86_64，glibc 2.35 及以上，例如 Ubuntu 22.04、Debian 12），" +
-            "解压后运行 Kuai/kuai，说明见其中的「使用说明.txt」。"
+          $linux = "Linux（x86_64，glibc 2.35 及以上，例如 Ubuntu 22.04、Debian 12、Fedora 36）：" +
+            "Ubuntu、Debian 用 kuai_${version}_amd64.deb（sudo apt install ./kuai_${version}_amd64.deb）；" +
+            "其他发行版用 kuai-$version-linux-x64.AppImage（加上可执行权限后直接运行）" +
+            "或解压版 kuai-$version-linux-x64.tar.gz（解压后运行 Kuai/kuai，说明见其中的「使用说明.txt」）。"
           # 下载说明不用「- 」开头：Kuai 的更新提示把发布说明里「- 」开头的行当作改了什么
           "$notes`n`n$windows`n`n$linux" | Set-Content -Encoding utf8NoBOM notes.md
 
@@ -140,7 +159,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $files = 'kuai-*-windows-x64-setup.exe', 'kuai-*-windows-x64.zip', 'kuai-*-linux-x64.tar.gz' | ForEach-Object {
+          $files = 'kuai-*-windows-x64-setup.exe', 'kuai-*-windows-x64.zip', 'kuai-*-linux-x64.tar.gz',
+            'kuai_*_amd64.deb', 'kuai-*-linux-x64.AppImage' | ForEach-Object {
             $file = Get-ChildItem dist -Filter $_ | Select-Object -First 1
             if (-not $file) { throw "缺 $_" }
             $file.FullName

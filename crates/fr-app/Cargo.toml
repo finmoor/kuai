@@ -48,8 +48,18 @@ sha2 = "0.10"
 oo7 = { version = "0.6", default-features = false, features = ["async-std", "native_crypto"] }
 # 系统通知（toast.rs）：经 D-Bus 发 freedesktop 通知。版本、特性和 GPUI 带的 notify-rust 用的一致
 zbus = { version = "6", default-features = false, features = ["proxy", "default-rt"] }
-# X11 上把窗口叫到前面（win.rs 的 raise）。版本和 GPUI 用的一致
+# X11 上把窗口叫到前面、藏起来（win.rs）。版本和 GPUI 用的一致
 x11rb = "0.13.1"
+# Wayland 上拿别人给的激活令牌把窗口叫到前面（win.rs）：借 GPUI 的连接（系统的 libwayland）发
+# xdg_activation_v1.activate。版本、特性和 GPUI 用的一致
+wayland-backend = { version = "0.3.17", features = ["client_system", "dlopen"] }
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
+# 托盘图标（tray.rs）：StatusNotifierItem 和它的菜单，经 D-Bus，不链接 GTK。用 zbus 5 和 async-io，
+# 都是 GPUI 已经带着的
+ksni = { version = "0.3.7", default-features = false, features = ["async-io", "blocking"] }
+# 启动时把继承来的文件描述符设成执行时关闭（packaging.rs）
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # 托盘图标和它的右键菜单（最小化到托盘、关闭到托盘）

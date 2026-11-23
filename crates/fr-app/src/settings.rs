@@ -1103,10 +1103,13 @@ impl Mapping {
             Some(rest) if rest.starts_with('/') => &rest[1..],
             _ => return None,
         };
-        let base = self.local.trim_end_matches('\\');
-        Some(match rest.is_empty() {
-            true => self.local_root(),
-            false => format!("{base}\\{}", rest.replace('/', "\\")),
+        // 按本机位置的写法接：盘符、Windows 的文件夹用反斜杠，Linux 的文件夹（`/` 开头）用正斜杠
+        let windows = self.is_drive() || !self.local.starts_with('/');
+        let base = self.local.trim_end_matches(['\\', '/']);
+        Some(match (rest.is_empty(), windows) {
+            (true, _) => self.local_root(),
+            (false, true) => format!("{base}\\{}", rest.replace('/', "\\")),
+            (false, false) => format!("{base}/{rest}"),
         })
     }
 }
@@ -1882,6 +1885,18 @@ mod tests {
         assert_eq!(
             windows.local_path("D:/repos/kuai").as_deref(),
             Some(r"N:\kuai")
+        );
+        // Linux 上映射成的文件夹：正斜杠
+        let linux = map("/srv/app", "/home/me/Kuai/app/");
+        assert!(!linux.is_drive());
+        assert_eq!(linux.local_root(), "/home/me/Kuai/app/");
+        assert_eq!(
+            linux.local_path("/srv/app/src/main.rs").as_deref(),
+            Some("/home/me/Kuai/app/src/main.rs")
+        );
+        assert_eq!(
+            linux.local_path(r"/srv/app\docs").as_deref(),
+            Some("/home/me/Kuai/app/docs")
         );
 
         // 旧设置里没有映射；有映射的存了再读回来一样

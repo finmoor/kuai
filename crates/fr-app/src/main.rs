@@ -15,6 +15,7 @@ mod machines;
 mod manager;
 mod mapping;
 mod open_dir;
+mod packaging;
 mod palette;
 mod prompt;
 mod redirect_guard;
@@ -26,6 +27,8 @@ mod settings;
 mod settings_page;
 mod shell;
 mod side_split;
+#[cfg(target_os = "linux")]
+mod signals;
 mod tab_fit;
 mod term_board;
 mod term_end;
@@ -194,12 +197,19 @@ fn tell_settings_problems(
         .detach();
 }
 
-/// 设置 FR_LOG=1 时把日志打到标准错误，比如 GPUI 选用了哪块显卡。
+/// 设置 FR_LOG=1 时把日志打到标准错误，比如 GPUI 选用了哪块显卡。zbus、ksni 这些经 D-Bus 的库
+/// 每条消息记一行，只要它们的警告和错误。
 struct StderrLogger;
 
 impl log::Log for StderrLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::Level::Info
+        let chatty = ["zbus", "ksni", "tracing", "fuser"]
+            .iter()
+            .any(|name| metadata.target().starts_with(name));
+        match chatty {
+            true => metadata.level() <= log::Level::Warn,
+            false => metadata.level() <= log::Level::Info,
+        }
     }
 
     fn log(&self, record: &log::Record) {
@@ -345,10 +355,32 @@ fn isolate_test_instance() {
     unsafe { std::env::set_var("FR_KUAID_HOME", &home) };
 }
 
+/// Linux：桌面启动这个进程时给的激活令牌（Wayland 的 `XDG_ACTIVATION_TOKEN`、X11 的
+/// `DESKTOP_STARTUP_ID`）。已经有 Kuai 在运行时交给它，它拿令牌才能把窗口叫到前面。读完从环境变量里
+/// 去掉，免得终端里启动的程序拿到这个用过的令牌（GTK 也这么做）。
+fn take_activation_token() -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let mut token = None;
+    for name in ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"] {
+        if let Some(value) = std::env::var(name).ok().filter(|value| !value.is_empty()) {
+            token.get_or_insert(value);
+        }
+        // SAFETY：启动的头几件事之一，这时还没有别的线程在读环境变量
+        unsafe { std::env::remove_var(name) };
+    }
+    token
+}
+
 fn main() {
     // 甩掉 Redirection Guard 后重新启动的：先把带过来的 FR_* 环境变量设上，后面的都照它们来
     redirect_guard::restore_env();
     isolate_test_instance();
+    let activation = take_activation_token();
+    // Linux：继承来的文件描述符不再往下传；从 AppImage 启动的话记下那个文件，去掉它的环境变量
+    // （别传给终端里的程序）
+    packaging::take_env();
     // 被 git 或 ssh 当作 askpass 启动时：去问已经开着的主程序，打出回答就退出
     if let Some(code) = fr_core::askpass::run_helper() {
         std::process::exit(code);
@@ -380,6 +412,7 @@ fn main() {
     let request = instance::Request {
         open: open_arg.clone(),
         show: !start_minimized,
+        activation,
         ..Default::default()
     };
     let (_instance, incoming) = match instance::claim(&request) {
@@ -396,6 +429,8 @@ fn main() {
     if update::apply_staged_at_startup() {
         return;
     }
+    // Linux：在后台问一下这个桌面有没有托盘，建托盘、设置页显示托盘选项时要用
+    tray::probe();
     // Linux：应用菜单里的 Kuai 和图标（解压即用，没有安装程序）
     desktop::integrate();
 
@@ -527,7 +562,7 @@ fn main() {
                 let workspace = cx.new(|cx| Workspace::new(app, updater, prompts, window, cx));
                 cx.set_global(MainWorkspace(workspace.downgrade(), window.window_handle()));
                 if start_minimized {
-                    workspace.update(cx, |ws, _| ws.start_in_tray());
+                    workspace.update(cx, |ws, _| ws.start_in_tray(window));
                 }
                 if let Some(dir) = open_arg {
                     workspace.update(cx, |ws, cx| ws.open_local_dir(dir, window, cx));

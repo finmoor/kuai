@@ -253,6 +253,11 @@ impl Workspace {
             cx.observe(&updater, |_, _, cx| cx.notify()),
             cx.subscribe_in(&updater, window, |this, _, event, window, cx| match event {
                 UpdateEvent::Restart => this.restart_for_update(window, cx),
+                // .deb 的新版本在后台装好、拉起来了
+                UpdateEvent::Quit => {
+                    this.quitting.set(true);
+                    cx.quit();
+                }
             }),
             // 退出时先撤掉托盘图标：进程退出前没撤的话，托盘里会留一个点不开的图标，鼠标移过去才消失
             cx.on_app_quit(|this, cx| {
@@ -277,6 +282,11 @@ impl Workspace {
                             Notification::warning(text.clone())
                         }
                         crate::mapping::Notice::Error(text) => Notification::error(text.clone()),
+                        crate::mapping::Notice::NeedWinFsp if !cfg!(windows) => {
+                            Notification::warning(tr(
+                                "映射需要 fuse3，请先安装：sudo apt install fuse3（Fedora 为 sudo dnf install fuse3）。",
+                            ))
+                        }
                         crate::mapping::Notice::NeedWinFsp => {
                             let app = app.clone();
                             let text = tr("映射需要先安装 WinFsp。");
@@ -312,29 +322,30 @@ impl Workspace {
                 },
             ),
         ];
-        // 关闭到托盘：点关闭按钮时不退出，把窗口藏起来
+        // 点了关闭（系统的标题栏、Alt+F4；Linux 上自己画的关闭按钮另走 `close_requested`）
+        crate::tray::set_can_hide(win::hwnd(window).is_some());
         {
-            let (app, quitting) = (app.clone(), quitting.clone());
             let this = cx.entity().downgrade();
             window.on_window_should_close(cx, move |window, cx| {
-                let to_tray = app.read(cx).settings.close_to_tray
-                    && !quitting.get()
-                    && this
-                        .read_with(cx, |this, _| this.tray.is_some())
-                        .unwrap_or(false);
-                if let (true, Some(hwnd)) = (to_tray, win::hwnd(window)) {
-                    win::hide(hwnd);
-                    return false;
-                }
-                // 真要退出：本机终端里还有程序在运行就先问一下
-                if quitting.get() {
-                    return true;
-                }
-                let asked = this
-                    .update(cx, |this, cx| this.confirm_quit(window, cx))
-                    .unwrap_or(false);
-                !asked
+                this.update(cx, |this, cx| this.close_requested(window, cx))
+                    .unwrap_or(true)
             });
+        }
+        // Linux：注销桌面、kill、在终端里按 Ctrl+C 时照常退出（映射断开、托盘图标撤掉），见 signals.rs
+        #[cfg(target_os = "linux")]
+        if let Some(mut signals) = crate::signals::listen() {
+            use futures::StreamExt as _;
+            cx.spawn(async move |this, cx| {
+                if let Some(signal) = signals.next().await {
+                    log::info!("收到信号 {signal}，退出");
+                    this.update(cx, |this, cx| {
+                        this.quitting.set(true);
+                        cx.quit();
+                    })
+                    .ok();
+                }
+            })
+            .detach();
         }
         // 刚升级完：说一声，给个看更新说明的按钮
         if updater.read(cx).updated_from.is_some() {
@@ -375,9 +386,9 @@ impl Workspace {
         })
         .detach();
         cx.spawn_in(window, async move |this, cx| {
-            while let Some(tag) = clicks.next().await {
+            while let Some(click) = clicks.next().await {
                 let alive = this.update_in(cx, |this, window, cx| {
-                    this.toast_clicked(&tag, window, cx);
+                    this.toast_clicked(&click, window, cx);
                 });
                 if alive.is_err() {
                     break;
@@ -533,34 +544,66 @@ impl Workspace {
             .update(cx, |updater, cx| updater.window_shown(cx));
     }
 
-    /// 把窗口叫到前面（点了系统通知、又启动了一次 Kuai）。Windows 上 [`Self::show_window`] 会从托盘、
-    /// 最小化里还原；别的系统上请窗口管理器激活它（最小化的也还原）。
-    fn bring_to_front(&self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_window(cx);
-        if !cfg!(windows) {
-            window.activate_window();
-            win::raise(window);
-            // 在 GNOME 的通知面板里点的：面板还开着时窗口管理器不理激活请求，等它关了再请求一次
-            cx.spawn_in(window, async move |_, cx| {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(400))
-                    .await;
-                cx.update(|window, _| win::raise(window)).ok();
-            })
-            .detach();
+    /// 把窗口叫到前面（点了系统通知、托盘图标，又启动了一次 Kuai）。Windows 上 [`Self::show_window`]
+    /// 会从托盘、最小化里还原；Linux 上请窗口管理器激活它（藏起来的、最小化的也还原），`token` 是
+    /// 通知服务、托盘、启动器给的激活令牌（见 `win::activate`）。
+    fn bring_to_front(&self, token: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if cfg!(windows) {
+            self.show_window(cx);
+            return;
+        }
+        self.updater
+            .update(cx, |updater, cx| updater.window_shown(cx));
+        win::activate(window, token.as_deref());
+        // 在 GNOME 的通知面板里点的：面板还开着时窗口管理器不理激活请求，等它关了再请求一次
+        cx.spawn_in(window, async move |_, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(400))
+                .await;
+            cx.update(|window, _| win::activate(window, token.as_deref()))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// 把窗口藏到托盘。和 [`Self::show_window`] 一样放到这一轮更新之后再做。Wayland 上藏不起来
+    /// （没有窗口句柄），最小化。
+    fn hide_window(&self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.hwnd {
+            Some(hwnd) => cx.spawn(async move |_, _| win::hide(hwnd)).detach(),
+            None => window.minimize_window(),
         }
     }
 
-    /// 把窗口藏到托盘。和 [`Self::show_window`] 一样放到这一轮更新之后再做。
-    fn hide_window(&self, cx: &mut Context<Self>) {
-        if let Some(hwnd) = self.hwnd {
-            cx.spawn(async move |_, _| win::hide(hwnd)).detach();
+    /// 点了关闭：返回要不要真的关（关了主窗口就退出）。设了关闭到托盘、托盘也在的，把窗口藏起来
+    /// （Wayland 上藏不起来，最小化）；要退出而本机终端里还有程序在运行，先问一下（问了就先不关，
+    /// 点「退出」时再退出）。
+    fn close_requested(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.quitting.get() {
+            return true;
         }
+        if self.app.read(cx).settings.close_to_tray && self.in_tray() {
+            self.hide_window(window, cx);
+            return false;
+        }
+        !self.confirm_quit(window, cx)
+    }
+
+    /// 托盘图标在，窗口可以收进去（Linux 上托盘可能还没起来，或者中途下线了）。
+    fn in_tray(&self) -> bool {
+        self.tray.is_some() && crate::tray::available()
     }
 
     fn on_tray(&mut self, action: TrayAction, cx: &mut Context<Self>) {
         match action {
-            TrayAction::Show => self.show_window(cx),
+            TrayAction::Show { .. } if cfg!(windows) => self.show_window(cx),
+            TrayAction::Show { token } => {
+                let this = cx.entity().downgrade();
+                crate::with_main_window(cx, move |window, cx| {
+                    this.update(cx, |this, cx| this.bring_to_front(token, window, cx))
+                        .ok();
+                });
+            }
             TrayAction::Quit => self.quit_from_tray(cx),
         }
     }
@@ -573,11 +616,13 @@ impl Workspace {
             cx.quit();
             return;
         }
-        self.show_window(cx);
         let this = cx.entity().downgrade();
         crate::with_main_window(cx, move |window, cx| {
-            this.update(cx, |this, cx| this.confirm_quit(window, cx))
-                .ok();
+            this.update(cx, |this, cx| {
+                this.bring_to_front(None, window, cx);
+                this.confirm_quit(window, cx)
+            })
+            .ok();
         });
     }
 
@@ -620,7 +665,7 @@ impl Workspace {
             _ => tr("结束并退出"),
         };
         let quitting = self.quitting.clone();
-        let to_tray = self.tray.is_some().then(|| cx.entity().downgrade());
+        let to_tray = self.in_tray().then(|| cx.entity().downgrade());
         window.open_alert_dialog(cx, move |alert, _, _| {
             let (quitting, to_tray) = (quitting.clone(), to_tray.clone());
             alert
@@ -638,7 +683,8 @@ impl Workspace {
                             footer.child(Button::new("tray").label(tr("最小化到托盘")).on_click(
                                 move |_, window, cx| {
                                     window.close_dialog(cx);
-                                    this.update(cx, |this, cx| this.hide_window(cx)).ok();
+                                    this.update(cx, |this, cx| this.hide_window(window, cx))
+                                        .ok();
                                 },
                             ))
                         })
@@ -658,9 +704,10 @@ impl Workspace {
     }
 
     /// 最小化到托盘：窗口最小化了、设置里开着、托盘图标也在，就把窗口藏起来。
-    /// 点任务栏上的按钮最小化的不藏：留在任务栏上，再点一下就回来。
+    /// 点任务栏上的按钮最小化的不藏：留在任务栏上，再点一下就回来（Linux 上分不出来，都藏）。
+    /// Wayland 上藏不起来，什么都不做（设置里也没有这一项）。
     fn hide_if_minimized(&mut self, cx: &mut Context<Self>) {
-        let on = self.app.read(cx).settings.minimize_to_tray && self.tray.is_some();
+        let on = self.app.read(cx).settings.minimize_to_tray && self.in_tray();
         if let (true, Some(hwnd)) = (on, self.hwnd)
             && win::is_minimized(hwnd)
             && !win::cursor_on_taskbar()
@@ -669,14 +716,14 @@ impl Workspace {
         }
     }
 
-    /// 开机自启带 `--minimized` 启动：有托盘就直接收进托盘。返回收没收进去。
-    pub fn start_in_tray(&mut self) -> bool {
-        match (self.tray.is_some(), self.hwnd) {
-            (true, Some(hwnd)) => {
-                win::hide(hwnd);
-                true
-            }
-            _ => false,
+    /// 开机自启带 `--minimized` 启动：有托盘就直接收进托盘（Wayland 上最小化）。
+    pub fn start_in_tray(&mut self, window: &mut Window) {
+        if !self.in_tray() {
+            return;
+        }
+        match self.hwnd {
+            Some(hwnd) => win::hide(hwnd),
+            None => window.minimize_window(),
         }
     }
 
@@ -706,7 +753,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if request.show {
-            self.bring_to_front(window, cx);
+            self.bring_to_front(request.activation, window, cx);
         }
         if let Some(dir) = request.open {
             self.open_local_dir(dir, window, cx);
@@ -1326,9 +1373,15 @@ impl Workspace {
     }
 
     /// 点了系统通知：把窗口叫到前面，前往那个终端（它已经不在了就只叫窗口）。
-    fn toast_clicked(&mut self, tag: &str, window: &mut Window, cx: &mut Context<Self>) {
-        log::info!("点了系统通知：{tag}");
-        self.bring_to_front(window, cx);
+    fn toast_clicked(
+        &mut self,
+        click: &crate::toast::Click,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tag = click.tag.as_str();
+        log::info!("点了系统通知：{tag}（激活令牌：{}）", click.token.is_some());
+        self.bring_to_front(click.token.clone(), window, cx);
         let row = tag.rsplit_once('/').and_then(|(machine, term)| {
             let id = TermId {
                 machine: machine.to_string(),
@@ -2057,47 +2110,61 @@ impl Workspace {
             )
             // 这一段是空的：按住可以拖窗口
             .child(div().flex_1().min_w(px(24.)).h_full());
-        TitleBar::new().h(px(TITLE_HEIGHT)).child(
-            h_flex()
-                .h_full()
-                .flex_1()
-                .min_w_0()
-                .gap(px(4.))
-                // 三个页面在最前，后面是标签页
-                .child(servers)
-                .child(terms)
-                .child(workspaces)
-                .child(div().flex_none().w(px(1.)).h(px(16.)).mx(px(4.)).bg(border))
-                // 标签页那一块画在这个占位的块里面（绝对定位）。标题栏的宽度按里面内容的
-                // 最小宽度算，直接把标签页排在这一行里的话，开多了会把整行撑宽，
-                // 右边的设置和窗口按钮被挤出窗口
-                .child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .child(measure)
-                        .child(strip),
-                )
-                // 有新版本、正在下、下好了：齿轮左边一个小牌，点开看说明、升级
-                .children(
-                    crate::update_view::title_pill(&self.updater, cx)
-                        .map(|pill| div().occlude().flex_none().child(pill)),
-                )
-                .child(
-                    div().occlude().mr(px(4.)).text_color(muted).child(
-                        Button::new("open-settings")
-                            .ghost()
-                            .small()
-                            .icon(ui::icon(IconName::Settings))
-                            .tooltip(tr("设置（Ctrl+,）"))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.toggle_settings(window, cx)),
-                            ),
+        // Linux 上标题栏是自己画的，关闭按钮默认直接关窗口，不经 `on_window_should_close`：
+        // 关闭到托盘、退出前问一下都要走一遍
+        let this = cx.entity().downgrade();
+        let close = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            let close = this
+                .update(cx, |this, cx| this.close_requested(window, cx))
+                .unwrap_or(true);
+            if close {
+                window.remove_window();
+            }
+        };
+        TitleBar::new()
+            .h(px(TITLE_HEIGHT))
+            .on_close_window(close)
+            .child(
+                h_flex()
+                    .h_full()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(4.))
+                    // 三个页面在最前，后面是标签页
+                    .child(servers)
+                    .child(terms)
+                    .child(workspaces)
+                    .child(div().flex_none().w(px(1.)).h(px(16.)).mx(px(4.)).bg(border))
+                    // 标签页那一块画在这个占位的块里面（绝对定位）。标题栏的宽度按里面内容的
+                    // 最小宽度算，直接把标签页排在这一行里的话，开多了会把整行撑宽，
+                    // 右边的设置和窗口按钮被挤出窗口
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(measure)
+                            .child(strip),
+                    )
+                    // 有新版本、正在下、下好了：齿轮左边一个小牌，点开看说明、升级
+                    .children(
+                        crate::update_view::title_pill(&self.updater, cx)
+                            .map(|pill| div().occlude().flex_none().child(pill)),
+                    )
+                    .child(
+                        div().occlude().mr(px(4.)).text_color(muted).child(
+                            Button::new("open-settings")
+                                .ghost()
+                                .small()
+                                .icon(ui::icon(IconName::Settings))
+                                .tooltip(tr("设置（Ctrl+,）"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_settings(window, cx)
+                                })),
+                        ),
                     ),
-                ),
-        )
+            )
     }
 }
 

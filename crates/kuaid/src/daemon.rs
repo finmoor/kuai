@@ -53,9 +53,12 @@ pub struct Paths {
 
 impl Paths {
     pub fn new() -> Result<Paths> {
-        let home = std::env::var_os("HOME").context("未设置 HOME 环境变量")?;
+        let isolated = std::env::var_os("FR_KUAID_HOME").is_some_and(|dir| !dir.is_empty());
+        if !isolated && std::env::var_os("HOME").is_none() {
+            bail!("未设置 HOME 环境变量");
+        }
         Ok(Paths {
-            run: PathBuf::from(home).join(".kuai").join("run"),
+            run: crate::dirs::kuai_root().join("run"),
         })
     }
 

@@ -1,8 +1,8 @@
 //! Linux 的桌面集成：应用菜单里的 Kuai（`~/.local/share/applications/kuai.desktop`）和图标
 //! （`~/.local/share/icons/hicolor/256x256/apps/kuai.png`）。
 //!
-//! Linux 版是解压即用的，没有安装程序，每次启动时由 Kuai 自己写一遍：程序挪了位置、升级换了图标都
-//! 跟着变，内容没变就不写。窗口的 app_id 是 `kuai`，桌面靠它对上这个文件，任务栏、通知里才显示
+//! 解压版、AppImage 没有安装程序，每次启动时由 Kuai 自己写一遍：程序挪了位置、升级换了图标都
+//! 跟着变，内容没变就不写。AppImage 写那个 .AppImage 文件。.deb 装的用系统里的（包里带着），不写。窗口的 app_id 是 `kuai`，桌面靠它对上这个文件，任务栏、通知里才显示
 //! Kuai 的名字和图标。测试用的实例（设了 FR_SETTINGS）不写，免得改掉平时用的那个。
 
 use std::path::{Path, PathBuf};
@@ -34,7 +34,23 @@ fn write_files() -> std::io::Result<()> {
     let Some(data) = data_home() else {
         return Ok(());
     };
-    let exe = std::env::current_exe()?;
+    let entry = data.join("applications").join("kuai.desktop");
+    // .deb 装的：系统里有应用菜单项和图标了。以前用解压版时写的那份会盖住系统的，删掉
+    if crate::packaging::deb() {
+        let ours = std::fs::read_to_string(&entry).is_ok_and(|text| {
+            text.contains(
+                "
+StartupWMClass=kuai
+",
+            )
+        });
+        if ours {
+            std::fs::remove_file(&entry)?;
+        }
+        return Ok(());
+    }
+    // AppImage 写那个 .AppImage 文件
+    let exe = crate::packaging::launcher()?;
     let Some(exe) = exe.to_str() else {
         return Ok(());
     };
@@ -45,7 +61,6 @@ fn write_files() -> std::io::Result<()> {
         .join("apps")
         .join("kuai.png");
     write_if_changed(&icon, ICON)?;
-    let entry = data.join("applications").join("kuai.desktop");
     write_if_changed(&entry, desktop_entry(exe).as_bytes())?;
     Ok(())
 }

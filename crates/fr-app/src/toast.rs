@@ -14,8 +14,18 @@
 
 use futures::channel::mpsc;
 
-/// 用户点了哪条通知：[`Toasts::show`] 时给的标记。
-pub type Clicks = mpsc::UnboundedReceiver<String>;
+/// 用户点了一条通知。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Click {
+    /// [`Toasts::show`] 时给的标记
+    pub tag: String,
+    /// 通知服务给的激活令牌（Linux：`ActivationToken`，X11 上是 startup id，Wayland 上是
+    /// xdg-activation 令牌），拿它才能把窗口叫到前面（见 `win::activate`）。Windows 上没有
+    pub token: Option<String>,
+}
+
+/// 用户点了哪条通知。
+pub type Clicks = mpsc::UnboundedReceiver<Click>;
 
 /// 通知里的一行字：去掉控制字符（终端的最后一行可能带着），太长的截短。
 fn clean(text: &str) -> String {
@@ -137,11 +147,11 @@ mod imp {
         notifier: Option<ToastNotifier>,
         /// 发出去还没收回的：留着对象，点它的时候才有回调
         shown: HashMap<String, ToastNotification>,
-        clicks: mpsc::UnboundedSender<String>,
+        clicks: mpsc::UnboundedSender<super::Click>,
     }
 
     impl Toasts {
-        pub fn new(clicks: mpsc::UnboundedSender<String>) -> Self {
+        pub fn new(clicks: mpsc::UnboundedSender<super::Click>) -> Self {
             Self {
                 app_id: HSTRING::from(app_id()),
                 notifier: None,
@@ -177,7 +187,11 @@ mod imp {
             // 回调在系统的线程上：只往主线程递个话
             toast.Activated(&TypedEventHandler::<ToastNotification, IInspectable>::new(
                 move |_, _| {
-                    clicks.unbounded_send(clicked.clone()).ok();
+                    let click = super::Click {
+                        tag: clicked.clone(),
+                        token: None,
+                    };
+                    clicks.unbounded_send(click).ok();
                     Ok(())
                 },
             ))?;
@@ -225,14 +239,14 @@ mod imp {
 /// Linux：freedesktop 的通知接口（`org.freedesktop.Notifications`，经 D-Bus）。GPUI 自带的那一套
 /// 同一个标记不会换掉上一条、也收不回，这里自己来：一个后台线程连着会话总线，记下每个标记的通知号，
 /// 再发时带上它（换掉上一条），收回时按号关掉；用户点了通知（`ActionInvoked` 的 `default`）就把
-/// 标记交出去。
+/// 标记交出去，连同通知服务在这之前发来的激活令牌（`ActivationToken`，规范 1.2 起有）。
 #[cfg(target_os = "linux")]
 mod imp {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use futures::StreamExt as _;
     use futures::channel::mpsc;
+    use futures::{FutureExt as _, StreamExt as _};
 
     enum Job {
         Show {
@@ -250,7 +264,7 @@ mod imp {
     }
 
     impl Toasts {
-        pub fn new(clicks: mpsc::UnboundedSender<String>) -> Self {
+        pub fn new(clicks: mpsc::UnboundedSender<super::Click>) -> Self {
             let (jobs, rx) = mpsc::unbounded();
             let spawned = std::thread::Builder::new()
                 .name("kuai-notify".into())
@@ -288,7 +302,7 @@ mod imp {
 
     async fn serve(
         mut jobs: mpsc::UnboundedReceiver<Job>,
-        clicks: mpsc::UnboundedSender<String>,
+        clicks: mpsc::UnboundedSender<super::Click>,
     ) -> zbus::Result<()> {
         let connection = zbus::Connection::session().await?;
         let proxy = zbus::Proxy::new(
@@ -299,8 +313,11 @@ mod imp {
         )
         .await?;
         let mut actions = proxy.receive_signal("ActionInvoked").await?.fuse();
+        let mut tokens = proxy.receive_signal("ActivationToken").await?.fuse();
         // 标记 → 通知号
         let mut shown: HashMap<String, u32> = HashMap::new();
+        // 通知号 → 点它时通知服务给的激活令牌（先于 ActionInvoked 发来）
+        let mut activation: HashMap<u32, String> = HashMap::new();
         loop {
             futures::select! {
                 job = jobs.next() => {
@@ -309,16 +326,30 @@ mod imp {
                         log::warn!("系统通知没发出去：{err}");
                     }
                 }
+                signal = tokens.next() => {
+                    let Some(signal) = signal else { break };
+                    if let Ok((id, token)) = signal.body().deserialize::<(u32, String)>() {
+                        activation.insert(id, token);
+                    }
+                }
                 signal = actions.next() => {
                     let Some(signal) = signal else { break };
                     let Ok((id, action)) = signal.body().deserialize::<(u32, String)>() else {
                         continue;
                     };
+                    // 两个信号是按顺序来的，可 select! 两边都有的时候随便挑一边：先把已经到了的令牌收完
+                    while let Some(Some(signal)) = tokens.next().now_or_never() {
+                        if let Ok((id, token)) = signal.body().deserialize::<(u32, String)>() {
+                            activation.insert(id, token);
+                        }
+                    }
+                    let token = activation.remove(&id);
                     let tag = shown.iter().find(|(_, shown)| **shown == id).map(|(tag, _)| tag);
                     if let Some(tag) = tag
                         && action == "default"
                     {
-                        clicks.unbounded_send(tag.clone()).ok();
+                        let click = super::Click { tag: tag.clone(), token };
+                        clicks.unbounded_send(click).ok();
                     }
                 }
             }
@@ -384,7 +415,7 @@ mod imp {
     pub struct Toasts;
 
     impl Toasts {
-        pub fn new(_: mpsc::UnboundedSender<String>) -> Self {
+        pub fn new(_: mpsc::UnboundedSender<super::Click>) -> Self {
             Self
         }
         pub fn show(&mut self, _: &str, _: &str, _: &str) {}

@@ -37,6 +37,10 @@ pub struct Request {
     /// 显示窗口（开机自启带 `--minimized` 时不显示）
     #[serde(default)]
     pub show: bool,
+    /// Linux：启动这个进程的桌面给的激活令牌（X11 的 `DESKTOP_STARTUP_ID`、Wayland 的
+    /// `XDG_ACTIVATION_TOKEN`）。运行着的那个 Kuai 拿它才能把窗口叫到前面（见 `win::activate`）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<String>,
     /// kuaid 的转接程序发来的：拉起这个 kuaid 程序的常驻进程。带着它的请求不交给界面
     #[serde(default)]
     pub daemon: Option<String>,
@@ -837,6 +841,7 @@ mod tests {
         let request = Request {
             open: Some(r"C:\work\有空格 的目录".into()),
             show: true,
+            activation: Some("kuai-123_TIME456".into()),
             ..Default::default()
         };
         let line = serde_json::to_string(&request).unwrap();

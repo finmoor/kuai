@@ -11,7 +11,12 @@
 //!   （不弹向导），它等这个进程退出后装上、打开新的 Kuai。这样「设置 → 应用」里的版本号也跟着变。
 //! - 解压版：下 zip 解压。点「重启完成升级」时别的文件直接覆盖，kuai.exe 用 self-replace 换
 //!   （运行中的 exe 只能改名、不能删），再拉起新的 Kuai、自己退出。
-//! - Linux：只有解压版，下 tar.gz（`kuai-<版本>-linux-x64.tar.gz`），换法和解压版一样，程序叫 `kuai`。
+//! - Linux 的解压版：下 tar.gz（`kuai-<版本>-linux-x64.tar.gz`），换法和解压版一样，程序叫 `kuai`。
+//! - .deb 装的（`/opt/kuai`，见 `packaging.rs`）：下新的 .deb（`kuai_<版本>_amd64.deb`）。点「重启完成
+//!   升级」时经 pkexec 交给 apt 装（弹系统的管理员认证），装好了拉起新的 Kuai、自己退出；没授权就
+//!   照旧运行，告诉人。等认证时界面照常（在后台线程上等）。
+//! - AppImage：下新的 AppImage（`kuai-<版本>-linux-x64.AppImage`），换掉启动的那个 .AppImage 文件
+//!   （先写在它旁边再改名），拉起它。
 //!
 //! 下好了没点重启就退出的，下次启动时先换上再开（[`apply_staged_at_startup`]）。
 //!
@@ -75,6 +80,10 @@ const READY_MARK: &str = ".kuai-update-ready";
 const DONE_MARK: &str = "just-updated";
 /// 安装版：下好的安装程序在暂存目录里叫这个
 const SETUP_EXE: &str = "kuai-setup.exe";
+/// .deb 装的：下好的包在暂存目录里叫这个
+const DEB_FILE: &str = "kuai.deb";
+/// AppImage：下好的新版本在暂存目录里叫这个
+const APPIMAGE_FILE: &str = "kuai.AppImage";
 /// 安装版：后台跑安装程序时它写的记录
 const SETUP_LOG: &str = "setup.log";
 /// 启动时换上暂存的新版本没成：记下哪个版本、为什么，界面起来以后告诉人（[`Updater::new`]）
@@ -132,9 +141,19 @@ enum Kind {
     Installed,
     /// 解压版
     Portable,
+    /// Linux：.deb 装的
+    Deb,
+    /// Linux：AppImage
+    AppImage,
 }
 
 fn kind() -> Kind {
+    if crate::packaging::appimage().is_some() {
+        return Kind::AppImage;
+    }
+    if crate::packaging::deb() {
+        return Kind::Deb;
+    }
     let installed = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join("unins000.exe").is_file()))
@@ -184,6 +203,8 @@ pub enum Problem {
 pub enum UpdateEvent {
     /// 点了「重启完成升级」：工作区窗口先问一下本机终端，再调 [`Updater::install_and_relaunch`]
     Restart,
+    /// 新版本装好、拉起来了（.deb 的在后台装完）：工作区窗口退出程序
+    Quit,
 }
 
 pub struct Updater {
@@ -199,6 +220,8 @@ pub struct Updater {
     failures: usize,
     /// 这次启动是从哪个版本升上来的
     pub updated_from: Option<String>,
+    /// .deb：正在等管理员认证、apt 装
+    pub installing: bool,
     _work: Option<Task<()>>,
     /// 「重试」先重新问一遍 GitHub；单放一处，问完开始下载时要换掉 `_work`
     _refetch: Option<Task<()>>,
@@ -261,6 +284,7 @@ impl Updater {
             tried_at: None,
             failures: 0,
             updated_from,
+            installing: false,
             _work: None,
             _refetch: None,
             _schedule: schedule,
@@ -503,13 +527,19 @@ impl Updater {
         }
     }
 
-    /// 换上下好的新版本，拉起新的 Kuai。返回 true 时调用方马上退出程序。
+    /// 换上下好的新版本，拉起新的 Kuai。返回 true 时调用方马上退出程序。.deb 的在后台装（要等
+    /// 人在系统的认证框里授权），这里返回 false，装好以后发 [`UpdateEvent::Quit`]。
     pub fn install_and_relaunch(&mut self, cx: &mut Context<Self>) -> bool {
         let Stage::Ready(release) = &self.stage else {
             return false;
         };
         let release = release.clone();
-        match install_and_launch(&staging_dir(&release.version)) {
+        let staging = staging_dir(&release.version);
+        if staging.join(DEB_FILE).is_file() {
+            self.install_deb_in_background(release, staging, cx);
+            return false;
+        }
+        match install_and_launch(&staging) {
             Ok(()) => true,
             Err(err) => {
                 let problem = Problem::Install(format!("{err:#}"));
@@ -524,8 +554,55 @@ impl Updater {
     }
 }
 
+impl Updater {
+    /// .deb：在后台线程上经 pkexec 让 apt 装，装好了拉起新的 Kuai，发 [`UpdateEvent::Quit`]；
+    /// 没装成（没授权、apt 出错）回到「出错」，暂存的留着，「重试」会重新下载。
+    fn install_deb_in_background(
+        &mut self,
+        release: Release,
+        staging: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if self.installing {
+            return;
+        }
+        self.installing = true;
+        cx.notify();
+        let task = cx.background_executor().spawn(async move {
+            verify_staged(&staging)?;
+            let _ = fs::write(update_dir().join(DONE_MARK), env!("CARGO_PKG_VERSION"));
+            let installed = install_deb(&staging.join(DEB_FILE));
+            if installed.is_err() {
+                let _ = fs::remove_file(update_dir().join(DONE_MARK));
+            }
+            installed?;
+            let _ = fs::remove_dir_all(&staging);
+            relaunch(Path::new(crate::packaging::DEB_EXE))
+        });
+        self._work = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.installing = false;
+                match result {
+                    Ok(()) => cx.emit(UpdateEvent::Quit),
+                    Err(err) => {
+                        log::warn!("装 .deb 没成：{err:#}");
+                        this.stage = Stage::Failed {
+                            release: Some(release),
+                            problem: Problem::Install(format!("{err:#}")),
+                        };
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+}
+
 /// 启动时（画任何界面之前）：上次下好了新版本、没点重启就退出了，先换上，再拉起新版本。
-/// 返回 true 表示新版本已经拉起来了，这个进程该退出了。
+/// 返回 true 表示新版本已经拉起来了，这个进程该退出了。.deb 的不在这时装：要弹管理员认证，
+/// 还没开窗口就弹会让人摸不着头脑。
 pub fn apply_staged_at_startup() -> bool {
     if install_dir().is_err() {
         return false;
@@ -533,6 +610,9 @@ pub fn apply_staged_at_startup() -> bool {
     let Some(version) = newest_staged().filter(|v| *v > current_version()) else {
         return false;
     };
+    if staging_dir(&version).join(DEB_FILE).is_file() {
+        return false;
+    }
     // 上次在后台跑的安装程序没装上：别再试了，等界面起来告诉人（`Updater::new`）
     if peek_done_mark().as_deref() == Some(env!("CARGO_PKG_VERSION")) {
         return false;
@@ -640,6 +720,8 @@ fn parse_release(mut release: GhRelease, kind: Kind) -> Option<Release> {
     let index = match kind {
         Kind::Installed => find(is_setup).or_else(|| find(is_package)),
         Kind::Portable => find(is_package),
+        Kind::Deb => find(is_deb),
+        Kind::AppImage => find(is_appimage),
     }?;
     let asset = release.assets.swap_remove(index);
     let sha256 = asset
@@ -670,6 +752,18 @@ fn is_package(name: &str) -> bool {
 fn is_setup(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     name.starts_with("kuai-") && name.ends_with("-windows-x64-setup.exe")
+}
+
+/// .deb 的名字：`kuai_<版本>_amd64.deb`（Debian 的写法）。
+fn is_deb(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("kuai_") && name.ends_with("_amd64.deb")
+}
+
+/// AppImage 的名字：`kuai-<版本>-linux-x64.AppImage`。
+fn is_appimage(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("kuai-") && name.ends_with("-linux-x64.appimage")
 }
 
 /// 发布说明（Markdown）里最外层的要点：`- `、`* ` 开头的行，去掉加粗、代码、链接的记号。
@@ -733,8 +827,19 @@ fn staging_dir(version: &Version) -> PathBuf {
     update_dir().join(version.to_string())
 }
 
-/// 能升级的话返回程序所在的文件夹：得是打好的包（[`EXE`]），文件夹得能写。
+/// 能升级的话返回程序所在的文件夹：得是打好的包（[`EXE`]），文件夹得能写。.deb 装的由 apt 换
+/// （`/opt/kuai`，不用这个用户能写）；AppImage 看那个 .AppImage 文件所在的文件夹能不能写。
 fn install_dir() -> Result<PathBuf, Problem> {
+    match kind() {
+        Kind::Deb => return Ok(PathBuf::from(crate::packaging::DEB_EXE).with_file_name("")),
+        Kind::AppImage => {
+            let dir = crate::packaging::appimage()
+                .and_then(Path::parent)
+                .ok_or_else(|| Problem::Install(tr("未找到程序所在的文件夹").into()))?;
+            return writable(dir);
+        }
+        Kind::Installed | Kind::Portable => {}
+    }
     let exe = std::env::current_exe().map_err(|err| Problem::Install(err.to_string()))?;
     let packaged = exe.file_name().is_some_and(|name| match cfg!(windows) {
         true => name.eq_ignore_ascii_case(EXE),
@@ -745,15 +850,19 @@ fn install_dir() -> Result<PathBuf, Problem> {
     }
     let dir = exe
         .parent()
-        .ok_or_else(|| Problem::Install(tr("未找到程序所在的文件夹").into()))?
-        .to_path_buf();
+        .ok_or_else(|| Problem::Install(tr("未找到程序所在的文件夹").into()))?;
+    writable(dir)
+}
+
+/// 这个文件夹能写就返回它。
+fn writable(dir: &Path) -> Result<PathBuf, Problem> {
     let probe = dir.join(".kuai-write-test");
     match File::create(&probe) {
         Ok(_) => {
             let _ = fs::remove_file(&probe);
-            Ok(dir)
+            Ok(dir.to_path_buf())
         }
-        Err(_) => Err(Problem::NotWritable(dir)),
+        Err(_) => Err(Problem::NotWritable(dir.to_path_buf())),
     }
 }
 
@@ -801,20 +910,27 @@ fn fetch_into(
     if actual != expected {
         return Err(Problem::Digest);
     }
-    if is_setup(&release.asset.name) {
-        return stage_setup(&part, staged).map_err(|err| Problem::Install(format!("{err:#}")));
+    // 安装程序、.deb、AppImage 不用解压，原样放进暂存目录
+    let single = [
+        (is_setup as fn(&str) -> bool, SETUP_EXE),
+        (is_deb, DEB_FILE),
+        (is_appimage, APPIMAGE_FILE),
+    ];
+    if let Some((_, name)) = single.iter().find(|(is, _)| is(&release.asset.name)) {
+        return stage_single(&part, staged, name)
+            .map_err(|err| Problem::Install(format!("{err:#}")));
     }
     fs::rename(&part, &package).map_err(|err| Problem::Install(err.to_string()))?;
     extract(&package, staged).map_err(|err| Problem::Install(format!("{err:#}")))
 }
 
-/// 下好的安装程序挪进暂存目录。
-fn stage_setup(downloaded: &Path, out: &Path) -> Result<()> {
+/// 下好的安装程序、.deb、AppImage 挪进暂存目录，叫 `name`。
+fn stage_single(downloaded: &Path, out: &Path, name: &str) -> Result<()> {
     if out.exists() {
         fs::remove_dir_all(out)?;
     }
     fs::create_dir_all(out)?;
-    fs::rename(downloaded, out.join(SETUP_EXE))?;
+    fs::rename(downloaded, out.join(name))?;
     write_ready(out)
 }
 
@@ -1045,8 +1161,65 @@ fn install_and_launch(staging: &Path) -> Result<()> {
     if setup.is_file() {
         return run_setup(&setup);
     }
+    let appimage = staging.join(APPIMAGE_FILE);
+    if appimage.is_file() {
+        let file = replace_appimage(&appimage)?;
+        let _ = fs::remove_dir_all(staging);
+        return relaunch(&file);
+    }
     let exe = install(staging)?;
     relaunch(&exe)
+}
+
+/// .deb 装的：经 pkexec 让 apt 装下好的包（弹系统的管理员认证，等它装完）。没有 apt 的用 dpkg。
+fn install_deb(deb: &Path) -> Result<()> {
+    let apt = ["/usr/bin/apt-get", "/bin/apt-get"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file());
+    let mut command = std::process::Command::new("pkexec");
+    match apt {
+        // 装本机的 .deb 要写完整路径；降级（发版撤回时）也照装
+        Some(apt) => command.args([apt, "install", "-y", "--allow-downgrades"]),
+        None => command.args(["/usr/bin/dpkg", "-i"]),
+    };
+    let output = command
+        .arg(deb)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context(tr("无法启动 pkexec"))?;
+    match output.status.code() {
+        Some(0) => Ok(()),
+        // pkexec：126 是没授权（点了取消），127 是认证没通过
+        Some(126 | 127) => bail!(tr("未获得管理员授权，未安装")),
+        _ => {
+            let text = String::from_utf8_lossy(&output.stderr);
+            let last = text.lines().rev().find(|line| !line.trim().is_empty());
+            bail!("{}", last.unwrap_or("").trim())
+        }
+    }
+}
+
+/// AppImage：把启动的那个 .AppImage 文件换成新的（先写在它旁边，再改名盖过去：正在运行的那份
+/// 已经挂出来了，盖掉不碍事）。返回那个文件。
+fn replace_appimage(staged: &Path) -> Result<PathBuf> {
+    let file = crate::packaging::appimage()
+        .context(tr("未找到程序所在的文件夹"))?
+        .to_path_buf();
+    let name = file.file_name().context(tr("未找到程序所在的文件夹"))?;
+    let partial = file.with_file_name(format!(".{}.kuai-update", name.to_string_lossy()));
+    fs::copy(staged, &partial).with_context(|| tf!("无法替换 {path}", path = file.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&partial, fs::Permissions::from_mode(0o755))?;
+    }
+    fs::rename(&partial, &file)
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&partial);
+        })
+        .with_context(|| tf!("无法替换 {path}", path = file.display()))?;
+    let _ = fs::write(update_dir().join(DONE_MARK), env!("CARGO_PKG_VERSION"));
+    Ok(file)
 }
 
 /// 安装版：在后台跑新的安装程序，不弹向导。它先等这个进程退出（`/waitpid`），装到这份 Kuai
@@ -1198,8 +1371,8 @@ mod tests {
     // 不能 `use super::*`：gpui_kit 里也有个叫 test 的属性宏，会盖住标准库的 #[test]
     use super::{CHECK_EVERY, wait_before_next};
     use super::{
-        EXE, GhAsset, GhRelease, Kind, PACKAGE_SUFFIX, READY_MARK, Version, common_top, copy_tree,
-        extract, stage_setup, verify_staged,
+        EXE, GhAsset, GhRelease, Kind, PACKAGE_SUFFIX, READY_MARK, SETUP_EXE, Version, common_top,
+        copy_tree, extract, stage_single, verify_staged,
     };
     use super::{parse_release, plain};
     use std::fs::{self, File};
@@ -1501,7 +1674,7 @@ mod tests {
         let downloaded = root.join("setup.part");
         fs::write(&downloaded, b"installer").unwrap();
         let staging = root.join("9.9.9");
-        stage_setup(&downloaded, &staging).unwrap();
+        stage_single(&downloaded, &staging, SETUP_EXE).unwrap();
         verify_staged(&staging).unwrap();
         // 改了内容、多了文件、少了文件、记号是空的（旧版本留下的）都不换
         let setup = staging.join(super::SETUP_EXE);

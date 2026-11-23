@@ -74,6 +74,8 @@ impl SettingsPage {
             )
             .description(tr("立即生效，已显示的通知不受影响。"))
         };
+        // 托盘：Windows 上总是有；Linux 上看桌面有没有，Wayland 上窗口藏不起来，只能最小化
+        let (tray, can_hide) = (crate::tray::available(), crate::tray::can_hide());
         let autostart = SettingItem::new(
             tr("开机时自动启动"),
             SettingField::switch(
@@ -86,9 +88,11 @@ impl SettingsPage {
                 },
             ),
         )
-        .description(match cfg!(windows) {
-            true => tr("登录 Windows 后自动启动；开启托盘选项时直接进入托盘。"),
-            false => tr("登录桌面后自动启动。"),
+        .description(match (cfg!(windows), tray, can_hide) {
+            (true, ..) => tr("登录 Windows 后自动启动；开启托盘选项时直接进入托盘。"),
+            (false, true, true) => tr("登录桌面后自动启动；开启托盘选项时直接进入托盘。"),
+            (false, true, false) => tr("登录桌面后自动启动；开启托盘选项时启动后最小化。"),
+            (false, false, _) => tr("登录桌面后自动启动。"),
         });
         let minimize = {
             let (get, set) = (app.clone(), app.clone());
@@ -118,7 +122,10 @@ impl SettingsPage {
                     },
                 ),
             )
-            .description(tr("点击关闭按钮仅隐藏窗口，从托盘图标的右键菜单退出。"))
+            .description(match can_hide {
+                true => tr("点击关闭按钮仅隐藏窗口，从托盘图标的右键菜单退出。"),
+                false => tr("点击关闭按钮仅最小化窗口，从托盘图标的右键菜单退出。"),
+            })
         };
         let auto_fetch = {
             let (get, set) = (app.clone(), app.clone());
@@ -181,10 +188,11 @@ impl SettingsPage {
             .group(SettingGroup::new().title(tr("标签页")).item(tab_close))
             .group({
                 let group = SettingGroup::new().title(tr("启动和关闭")).item(autostart);
-                // Linux 上还没有托盘：两个托盘选项不显示
-                match crate::tray::AVAILABLE {
-                    true => group.item(minimize).item(close),
-                    false => group,
+                // 没有托盘：两个托盘选项都不显示；藏不起来（Wayland）：没有「最小化到托盘」
+                match (tray, can_hide) {
+                    (true, true) => group.item(minimize).item(close),
+                    (true, false) => group.item(close),
+                    (false, _) => group,
                 }
             })
             .group(
@@ -757,7 +765,8 @@ impl SettingsPage {
                     .item(version)
                     .item(check_updates)
                     .item(source)
-                    .item(winfsp)
+                    // WinFsp 只有 Windows 上用；Linux 上映射用系统的 fuse3，不随 Kuai 分发
+                    .items(cfg!(windows).then_some(winfsp))
                     .item(diagnose)
                     .item(SettingItem::render(move |_, _, cx| {
                         let muted = cx.theme().muted_foreground;

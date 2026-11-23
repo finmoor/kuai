@@ -708,15 +708,22 @@ impl ManagerView {
                             body.child(div().text_sm().text_color(danger).child(found))
                         })
                         // 这句说的是上面的登录信息，紧跟着它们；映射是单独的一节，放在最后
-                        .child(div().text_xs().text_color(muted).child(if jump_now.is_some() {
-                            tr(
-                                "密码和私钥口令保存在 Windows 凭据管理器中。首次连接时在主机的 ~/.kuai/ 中安装 kuaid，跳板机上不安装。",
-                            )
-                        } else {
-                            tr(
-                                "密码和私钥口令保存在 Windows 凭据管理器中。首次连接时在主机的 ~/.kuai/ 中安装 kuaid。",
-                            )
-                        }))
+                        .child(div().text_xs().text_color(muted).child(
+                            match (cfg!(windows), jump_now.is_some()) {
+                                (true, true) => tr(
+                                    "密码和私钥口令保存在 Windows 凭据管理器中。首次连接时在主机的 ~/.kuai/ 中安装 kuaid，跳板机上不安装。",
+                                ),
+                                (true, false) => tr(
+                                    "密码和私钥口令保存在 Windows 凭据管理器中。首次连接时在主机的 ~/.kuai/ 中安装 kuaid。",
+                                ),
+                                (false, true) => tr(
+                                    "密码和私钥口令保存在系统钥匙圈中。首次连接时在主机的 ~/.kuai/ 中安装 kuaid，跳板机上不安装。",
+                                ),
+                                (false, false) => tr(
+                                    "密码和私钥口令保存在系统钥匙圈中。首次连接时在主机的 ~/.kuai/ 中安装 kuaid。",
+                                ),
+                            },
+                        ))
                         .children(mapping_section),
                 )
                 .footer(

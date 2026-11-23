@@ -246,7 +246,10 @@ fn initial_steps(target: &Target) -> Vec<Step> {
     }));
     steps.push(Step::new("kuaid"));
     steps.push(Step::new(tr("主机上的 git")));
-    steps.push(Step::new(tr("映射（WinFsp）")));
+    steps.push(Step::new(match cfg!(windows) {
+        true => tr("映射（WinFsp）"),
+        false => tr("映射（fuse3）"),
+    }));
     steps
 }
 

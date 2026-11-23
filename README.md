@@ -102,7 +102,7 @@ Kuai 在服务器上安装一个常驻的小程序 `kuaid`（约 3 MB，无需 r
 - **目录树**：新建、重命名、删除、上传、下载；有改动和未跟踪的文件带标记，可按名称过滤
 - **编辑器**：行号、语法高亮、查找和替换；保存时若文件已被其他程序修改，会先提示；图片直接显示
 - 读写经由已建立的 SSH 连接，**无需另行配置 SFTP**，使用跳板机时同样可用
-- **目录映射**：将主机上的目录映射为本机的盘符或文件夹，用资源管理器、VS Code 等本机程序直接打开（需安装 [WinFsp](https://winfsp.dev/)，Kuai 可代为安装）
+- **目录映射**：将主机上的目录映射为本机的盘符或文件夹，用资源管理器、VS Code 等本机程序直接打开（Windows 上需安装 [WinFsp](https://winfsp.dev/)，Kuai 可代为安装；Linux 上需安装 fuse3，只能映射为文件夹）
 
 ### 三页互通
 
@@ -154,7 +154,13 @@ Kuai 在服务器上安装一个常驻的小程序 `kuaid`（约 3 MB，无需 r
 - **安装版** `kuai-<版本>-windows-x64-setup.exe`（推荐）：安装在用户目录下（`%LOCALAPPDATA%\Programs\Kuai`），无需管理员权限；可从开始菜单启动，可在「设置 → 应用」中卸载。
 - **解压版** `kuai-<版本>-windows-x64.zip`：解压得到的 Kuai 文件夹可放在任意位置，双击 `kuai.exe` 运行。
 
-Linux 版 `kuai-<版本>-linux-x64.tar.gz`：解压得到的 Kuai 文件夹可放在任意位置，运行其中的 `kuai`，首次运行时添加到应用菜单。暂不支持托盘图标和目录映射。
+Linux 版以下三种任选其一：
+
+- **.deb 安装包** `kuai_<版本>_amd64.deb`（Ubuntu、Debian）：`sudo apt install ./kuai_<版本>_amd64.deb`，装在 `/opt/kuai`，可从应用菜单启动或运行 `kuai`。
+- **AppImage** `kuai-<版本>-linux-x64.AppImage`（其他发行版）：加上可执行权限后直接运行，首次运行时添加到应用菜单。
+- **解压版** `kuai-<版本>-linux-x64.tar.gz`：解压得到的 Kuai 文件夹可放在任意位置，运行其中的 `kuai`，首次运行时添加到应用菜单。
+
+托盘图标需要桌面支持 StatusNotifierItem（KDE、Ubuntu 的 GNOME 自带；其他 GNOME 需安装 AppIndicator 扩展）；Wayland 桌面上窗口无法隐藏到托盘，「关闭到托盘」改为最小化。
 
 运行要求：
 
@@ -163,11 +169,11 @@ Linux 版 `kuai-<版本>-linux-x64.tar.gz`：解压得到的 Kuai 文件夹可�
 | 本机（Windows） | 64 位 Windows 10 或 11；PATH 中有 git 2.31 或更新的版本；使用 Windows 自带的 OpenSSH |
 | 本机（Linux） | x86_64，glibc 2.35 及以上（Ubuntu 22.04、Debian 12 及更新的版本），X11 或 Wayland 桌面，显卡驱动支持 Vulkan（Mesa 即可）；PATH 中有 git 2.31 或更新的版本和 ssh；保存密码需要 Secret Service（GNOME 钥匙圈、KWallet 等） |
 | 远程主机 | Linux（x86_64，暂不支持 ARM），或开启了 OpenSSH 服务的 Windows；已安装 git 2.31 或更新的版本；无需 root 权限 |
-| 目录映射（仅 Windows） | 需安装 [WinFsp](https://winfsp.dev/)，未安装时 Kuai 可经 winget 代为安装 |
+| 目录映射 | Windows 上需安装 [WinFsp](https://winfsp.dev/)，未安装时 Kuai 可经 winget 代为安装；Linux 上需安装 fuse3，只能映射为文件夹 |
 
 程序未进行代码签名，首次运行时 Windows 可能提示「Windows 已保护你的电脑」，请点击「更多信息」，再点击「仍要运行」。
 
-有新版本时，标题栏齿轮左侧会显示更新提示，点击可查看更新内容并一键更新（安装版在后台运行新的安装程序，解压版和 Linux 版直接替换文件）；也可在「设置 → 关于」中检查更新。主机上的 kuaid 无需单独更新，新版 Kuai 连接时会自动替换。各版本的更新内容见 [CHANGELOG.md](CHANGELOG.md)。
+有新版本时，标题栏齿轮左侧会显示更新提示，点击可查看更新内容并一键更新（安装版在后台运行新的安装程序，解压版直接替换文件；Linux 的 .deb 经系统的管理员认证由 apt 安装，AppImage 替换原文件）；也可在「设置 → 关于」中检查更新。主机上的 kuaid 无需单独更新，新版 Kuai 连接时会自动替换。各版本的更新内容见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 快速上手
 
@@ -290,11 +296,11 @@ Kuai 不自建连接和认证，全部交给 SSH。思路与 VS Code 的 Remote 
 | `crates/fr-channel` | 仓库通道：本机仓库在进程内执行 git，远程主机上的仓库经 ssh 交给 kuaid（连接复用、自动安装 kuaid、终端接口）；测试工具 `fr-probe` |
 | `crates/fr-app` | GPUI 客户端 |
 | `crates/kuaid` | 常驻程序 `kuaid`（Linux、Windows）：执行 git、托管终端会话；装在主机上，Windows 电脑自己也用它开终端 |
-| `crates/fr-mount` | 把主机上的目录映射成本机的盘符或文件夹：WinFsp 的薄绑定（运行时加载它的 DLL）和文件系统，读写变成 kuaid 的 `fs_*` 请求 |
+| `crates/fr-mount` | 把主机上的目录映射成本机的盘符或文件夹，读写变成 kuaid 的 `fs_*` 请求：Windows 上是 WinFsp 的薄绑定（运行时加载它的 DLL），Linux 上是 FUSE（fuser，经系统的 fusermount3） |
 | `tools/gen-test-repo.py` | 生成性能测试用的大仓库 |
 | `tools/ui-test/` | 界面测试脚本：建测试仓库、截窗口、往测试窗口投递点击和输入（不动真实鼠标） |
 | `tools/package.ps1` | 打发布包：客户端加 Linux 版、Windows 版 kuaid，出安装程序和解压版的 zip，输出到 `dist/` |
-| `tools/package-linux.sh` | 打 Linux 版的发布包（tar.gz）：Linux 客户端加 Windows 版的包里那一批 kuaid |
+| `tools/package-linux.sh` | 打 Linux 版的发布包（tar.gz、.deb、AppImage）：Linux 客户端加 Windows 版的包里那一批 kuaid |
 | `tools/installer/` | 安装程序的脚本（Inno Setup 6，`kuai.iss`）和简体中文的界面文字 |
 | `tools/release-notes.ps1`、`CHANGELOG.md` | 发版时的发布说明：取 `CHANGELOG.md` 里这个版本的那一节 |
 | `.github/workflows/` | 推代码时在 Windows、Linux 上各跑一遍全部测试（`ci.yml`）；推 `v*` 标签时打包发版（`release.yml`：先打 Windows 版，Linux 版用它的 kuaid，都打好了再建 Release） |

@@ -10,8 +10,8 @@
 //!   最多 8 MiB，满了才等。写坏了（磁盘满、没权限）在下一次写、Flush、关文件时报出来，同时经
 //!   `on_error` 告诉界面。和在路上的写入重叠的写、读、截断、改名都先等它们落地：服务器上每个请求
 //!   各在各的线程里做，不等的话先后会乱。
-//! - 删除：系统在最后一个句柄关掉时（Cleanup）才真的删，那一步报不了错。服务器不让删（没权限）时
-//!   经 `on_error` 告诉界面，文件照旧留着。
+//! - 删除：Windows 上系统在最后一个句柄关掉时（Cleanup）才真的删，那一步报不了错。服务器不让删
+//!   （没权限）时经 `on_error` 告诉界面，文件照旧留着。Linux 上删除是马上做的，错误直接交给删的程序。
 //! - 列目录、查文件属性的结果留 2 秒：资源管理器会反复问同一批东西，还会试探一堆不存在的名字
 //!   （`desktop.ini` 这类），都从留着的那份目录里答，不再问服务器。
 //! - 等回音有期限（[`REPLY_TIMEOUT`]）：主机上的文件操作卡住时（SSH 照样通着，比如挂死的网络盘），
@@ -19,11 +19,14 @@
 //!   不算卡住。
 //!
 //! 同一个文件被打开几次，共用一个 [`Node`]。
+//!
+//! 这里是两边共用的部分，按路径做事；和系统打交道的在子模块里：Windows 上是 WinFsp 的回调
+//! （`windows`），Linux 上是 FUSE（`linux`，按 inode 做事，换成路径再调这里）。错误码两边都叫
+//! `STATUS_*`：Windows 上是 NTSTATUS，Linux 上是 errno（见 [`codes`]）。
 
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::Poll;
@@ -39,7 +42,20 @@ use futures::executor::block_on;
 use futures::future::{BoxFuture, poll_fn};
 use futures::stream::{FuturesUnordered, StreamExt};
 
+#[cfg(windows)]
 use crate::winfsp::*;
+
+#[cfg(windows)]
+pub(crate) mod windows;
+#[cfg(windows)]
+pub(crate) use windows::{INTERFACE, filetime};
+
+#[cfg(target_os = "linux")]
+pub(crate) mod codes;
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;
+#[cfg(target_os = "linux")]
+use codes::*;
 
 /// 缓存和向服务器要数据都按格算，一格这么多字节。
 const UNIT: u64 = 64 << 10;
@@ -75,16 +91,20 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(120);
 const RESTARTS: u32 = 2;
 
 /// Windows 自己会往盘的根上建的目录。
+#[cfg(windows)]
 const SYSTEM_DIRS: [&str; 2] = ["$RECYCLE.BIN", "System Volume Information"];
 
 type Nt<T> = std::result::Result<T, NTSTATUS>;
 /// 留着的一层目录：什么时候列的、里面有什么。
 type Listed = (Instant, Arc<Vec<FsEntry>>);
 /// 列目录时的一行：名字（UTF-16，排序和翻页用）和它的情况。
+#[cfg(windows)]
 type Row = (Vec<u16>, FsEntry);
 type Reading = BoxFuture<'static, Result<(FsStat, Vec<u8>)>>;
 /// WinFsp 的 `FspFileSystemAddDirInfo`：列目录时往系统给的缓冲区里加一行。
-pub(crate) type AddDirInfo = unsafe extern "C" fn(*mut DirInfo, *mut c_void, u32, *mut u32) -> u8;
+#[cfg(windows)]
+pub(crate) type AddDirInfo =
+    unsafe extern "C" fn(*mut DirInfo, *mut std::ffi::c_void, u32, *mut u32) -> u8;
 
 #[derive(Default)]
 pub struct Counters {
@@ -122,10 +142,13 @@ pub(crate) struct Mount {
     read_only: bool,
     /// 那边是 Windows：名字不分大小写，系统的错误码也是 Windows 的
     windows: bool,
+    #[cfg(windows)]
     label: Vec<u16>,
+    #[cfg(windows)]
     security: Vec<u8>,
+    #[cfg(windows)]
     add_dir_info: AddDirInfo,
-    /// 挂载的时刻：服务器没给修改时间的（根目录）用它
+    /// 挂载的时刻（1970 年起的毫秒数）：服务器没给修改时间的（根目录）用它
     started: u64,
     dirs: Mutex<HashMap<String, Listed>>,
     stats: Mutex<HashMap<String, (Instant, FsStat)>>,
@@ -169,6 +192,7 @@ struct NodeState {
     /// 上次刷盘（[`Mount::flush_file`]）以后写过、改过大小或时间
     unsynced: bool,
     /// 这次列目录用的那一份，按名字排好；翻页时要前后一致
+    #[cfg(windows)]
     listing: Option<Arc<Vec<Row>>>,
 }
 
@@ -516,29 +540,10 @@ fn now_millis() -> u64 {
         .map_or(0, |since| since.as_millis() as u64)
 }
 
-/// 1601 年到 1970 年之间的 100 纳秒数。
-const EPOCH_GAP: u64 = 116_444_736_000_000_000;
-
-/// 1970 年起的毫秒数换成 Windows 的文件时间（1601 年起的 100 纳秒数）。
-pub(crate) fn filetime(millis: u64) -> u64 {
-    millis * 10_000 + EPOCH_GAP
-}
-
 fn split(path: &str) -> (&str, &str) {
     match path.rfind('/') {
         Some(at) => (&path[..at], &path[at + 1..]),
         None => ("", path),
-    }
-}
-
-fn attributes(stat: &FsStat) -> u32 {
-    let kind = match stat.dir {
-        true => FILE_ATTRIBUTE_DIRECTORY,
-        false => FILE_ATTRIBUTE_ARCHIVE,
-    };
-    match stat.readonly {
-        true => kind | FILE_ATTRIBUTE_READONLY,
-        false => kind,
     }
 }
 
@@ -555,9 +560,16 @@ fn stat_of(entry: &FsEntry) -> FsStat {
 
 /// Windows 上能不能有这个名字。Linux 的文件名里可以有 `:`、`*`、`?` 这些，结尾也可以是空格和点，
 /// 这样的名字在映射出来的盘上显示不了，列目录时跳过。
+#[cfg(windows)]
 pub(crate) fn representable(name: &str) -> bool {
     let bad = |c: char| c.is_control() || r#"\/:*?"<>|"#.contains(c);
     !name.is_empty() && !name.contains(bad) && !name.ends_with([' ', '.'])
+}
+
+/// Linux 上能不能有这个名字：除了 `/` 和空字符都行（Windows 主机上的名字也都行）。
+#[cfg(not(windows))]
+pub(crate) fn representable(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\0'])
 }
 
 /// 错误信息里系统给的错误码（`(os error 13)`）。
@@ -647,10 +659,11 @@ fn settle(incoming: mpsc::Receiver<Pending>, sink: Arc<Sink>) {
 /// 写入（`deleting` 为假）或删除落不到服务器上时告诉用户的话：本机上的路径，和认得出来的原因
 /// （认不出来的给原话）。
 fn failure(place: &str, path: &str, status: NTSTATUS, message: &str, deleting: bool) -> String {
-    let root = place.trim_end_matches('\\');
+    let sep = std::path::MAIN_SEPARATOR;
+    let root = place.trim_end_matches(sep);
     let local = match path.is_empty() {
-        true => format!("{root}\\"),
-        false => format!("{root}\\{}", path.replace('/', "\\")),
+        true => format!("{root}{sep}"),
+        false => format!("{root}{sep}{}", path.replace('/', &sep.to_string())),
     };
     let reason = match status {
         STATUS_DISK_FULL => tr("主机磁盘空间不足"),
@@ -674,7 +687,8 @@ pub(crate) struct Settings {
     pub place: String,
     pub read_only: bool,
     pub windows: bool,
-    /// 盘的卷标（资源管理器里显示的名字），最多 32 个字
+    /// 盘的卷标（资源管理器里显示的名字），最多 32 个字。Linux 上不用
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub label: String,
 }
 
@@ -682,7 +696,7 @@ impl Mount {
     pub(crate) fn new(
         channel: Channel,
         settings: Settings,
-        add_dir_info: AddDirInfo,
+        #[cfg(windows)] add_dir_info: AddDirInfo,
         on_error: Box<dyn Fn(String) + Send + Sync>,
     ) -> Result<Mount> {
         let (tx, rx) = mpsc::channel();
@@ -707,10 +721,13 @@ impl Mount {
             root: settings.root,
             read_only: settings.read_only,
             windows: settings.windows,
+            #[cfg(windows)]
             label: settings.label.encode_utf16().take(32).collect(),
+            #[cfg(windows)]
             security: open_security_descriptor()?,
+            #[cfg(windows)]
             add_dir_info,
-            started: filetime(now_millis()),
+            started: now_millis(),
             dirs: Mutex::default(),
             stats: Mutex::default(),
             nodes: Mutex::default(),
@@ -882,6 +899,7 @@ impl Mount {
                             resync: false,
                             dirty: false,
                             unsynced: false,
+                            #[cfg(windows)]
                             listing: None,
                         }),
                         landed: Condvar::new(),
@@ -906,24 +924,6 @@ impl Mount {
         node
     }
 
-    fn info(&self, stat: &FsStat) -> FileInfo {
-        let size = if stat.dir { 0 } else { stat.size };
-        let time = match stat.mtime {
-            0 => self.started,
-            millis => filetime(millis),
-        };
-        FileInfo {
-            FileAttributes: attributes(stat),
-            AllocationSize: size.div_ceil(4096) * 4096,
-            FileSize: size,
-            CreationTime: time,
-            LastAccessTime: time,
-            LastWriteTime: time,
-            ChangeTime: time,
-            ..FileInfo::default()
-        }
-    }
-
     fn open(&self, path: &str) -> Nt<Arc<Node>> {
         let stat = self.lookup(path)?;
         if !stat.exists {
@@ -939,12 +939,15 @@ impl Mount {
         }
         // 系统想在盘的根上建回收站、索引：不让，免得服务器的目录里多出这些。没有回收站时
         // 资源管理器会改成直接删除（删之前会问）
-        let top = path.split('/').next().unwrap_or(path);
-        if SYSTEM_DIRS
-            .iter()
-            .any(|name| top.eq_ignore_ascii_case(name))
+        #[cfg(windows)]
         {
-            return Err(STATUS_ACCESS_DENIED);
+            let top = path.split('/').next().unwrap_or(path);
+            if SYSTEM_DIRS
+                .iter()
+                .any(|name| top.eq_ignore_ascii_case(name))
+            {
+                return Err(STATUS_ACCESS_DENIED);
+            }
         }
         if self.lookup(path)?.exists {
             return Err(STATUS_OBJECT_NAME_COLLISION);
@@ -1229,7 +1232,7 @@ impl Mount {
         offset: u64,
         to_end: bool,
         constrained: bool,
-    ) -> Nt<(usize, FileInfo)> {
+    ) -> Nt<(usize, FsStat)> {
         self.writable()?;
         let mut state = lock(&node.state);
         if let Some(status) = state.failed.take() {
@@ -1246,7 +1249,7 @@ impl Mount {
                 len = len.min(state.stat.size.saturating_sub(offset));
             }
             if len == 0 {
-                return Ok((0, self.info(&state.stat)));
+                return Ok((0, state.stat));
             }
             let overlaps = state
                 .flying
@@ -1296,22 +1299,22 @@ impl Mount {
         state.unsynced = true;
         self.remember(&state.path, state.stat);
         node.arrived.notify_all();
-        Ok((len as usize, self.info(&state.stat)))
+        Ok((len as usize, state.stat))
     }
 
     /// 等写入落地；写过的话让留着的目录作废（大小、时间变了）。
-    fn commit(&self, node: &Node) -> Nt<FileInfo> {
+    fn commit(&self, node: &Node) -> Nt<FsStat> {
         let mut state = self.settled(node, lock(&node.state))?;
         if std::mem::take(&mut state.dirty) {
             self.invalidate(&state.path);
             self.remember(&state.path, state.stat);
         }
-        Ok(self.info(&state.stat))
+        Ok(state.stat)
     }
 
     /// 程序要求刷盘（`FlushFileBuffers`）：等写入落地，写过的再让主机把文件刷到它的磁盘上，
     /// 刷不成照实报。关文件时不刷（[`Self::commit`]），和本机的文件一样交给系统。
-    fn flush_file(&self, node: &Node) -> Nt<FileInfo> {
+    fn flush_file(&self, node: &Node) -> Nt<FsStat> {
         let mut state = self.settled(node, lock(&node.state))?;
         if std::mem::take(&mut state.dirty) {
             self.invalidate(&state.path);
@@ -1324,10 +1327,11 @@ impl Mount {
             state.unsynced = false;
             self.remember(&path, state.stat);
         }
-        Ok(self.info(&state.stat))
+        Ok(state.stat)
     }
 
     /// 刷整个盘：开着的文件里写过的都刷一遍，有一个刷不成就报那一个的错。
+    #[cfg(windows)]
     fn flush_all(&self) -> Nt<()> {
         let nodes: Vec<Arc<Node>> = lock(&self.nodes)
             .values()
@@ -1342,10 +1346,10 @@ impl Mount {
         result
     }
 
-    fn remove(&self, node: &Node) {
-        if self.read_only {
-            return;
-        }
+    /// 在主机上删掉。`notify`：没删成时经 `on_error` 告诉用户（Windows 上真删的时候已经报不了错，
+    /// 程序以为删掉了）；Linux 上错误直接交给删的程序，不另外说。
+    fn remove(&self, node: &Node, notify: bool) -> Nt<()> {
+        self.writable()?;
         // 要删了：没落地的写入成没成都无所谓
         let mut state = self.drain(node, lock(&node.state));
         state.failed = None;
@@ -1368,25 +1372,27 @@ impl Mount {
         match removed {
             // 服务器上已经没有了（别人删的）：也算删掉了
             Ok(()) | Err((STATUS_OBJECT_NAME_NOT_FOUND, _)) => {}
-            // 系统这时已经当作删掉了（Cleanup 报不了错）：告诉用户没删成，留着的照旧
+            // 没删成，留着的照旧
             Err((status, message)) => {
                 log::warn!("fs_remove /{path} 失败：{message}");
-                let text = failure(&self.sink.place, &path, status, &message, true);
-                (self.sink.on_error)(text);
-                return;
+                if notify {
+                    let text = failure(&self.sink.place, &path, status, &message, true);
+                    (self.sink.on_error)(text);
+                }
+                return Err(status);
             }
         }
         state.stat = FsStat::default();
         state.dirty = false;
         self.invalidate_tree(&path);
         self.remember(&path, FsStat::default());
+        Ok(())
     }
 
-    /// 要写内容（`granted` 里有写数据、追加）而主机上这个用户写不了这个文件：打开时就拒绝。原来
-    /// 打开照样成功，写入在后台失败，程序以为写好了（只在 Kuai 里提示一句）。只改属性、时间的不拦。
-    fn check_write(&self, node: &Node, granted: u32) -> Nt<()> {
+    /// 打开来要写内容（`writing`）而主机上这个用户写不了这个文件：打开时就拒绝。原来打开照样
+    /// 成功，写入在后台失败，程序以为写好了（只在 Kuai 里提示一句）。只改属性、时间的不拦。
+    fn check_write(&self, node: &Node, writing: bool) -> Nt<()> {
         let state = lock(&node.state);
-        let writing = granted & (FILE_WRITE_DATA | FILE_APPEND_DATA) != 0;
         match writing && !state.stat.dir && state.stat.readonly {
             true => Err(STATUS_ACCESS_DENIED),
             false => Ok(()),
@@ -1496,12 +1502,12 @@ impl Mount {
     }
 
     /// 截短或接长。`allocation` 是系统在预留空间：比文件小才算截断，别的不用管。
-    fn resize(&self, node: &Node, size: u64, allocation: bool) -> Nt<FileInfo> {
+    fn resize(&self, node: &Node, size: u64, allocation: bool) -> Nt<FsStat> {
         self.writable()?;
         let mut state = self.settled(node, lock(&node.state))?;
         let current = state.stat.size;
         if size == current || (allocation && size >= current) {
-            return Ok(self.info(&state.stat));
+            return Ok(state.stat);
         }
         let path = state.path.clone();
         let resizing = self.channel()?.fs_resize(&self.root, &path, size, false);
@@ -1511,25 +1517,22 @@ impl Mount {
         state.dirty = true;
         state.unsynced = true;
         self.remember(&path, state.stat);
-        Ok(self.info(&state.stat))
+        Ok(state.stat)
     }
 
-    /// 改修改时间。`write` 是 Windows 的文件时间，0 是不改。属性（只读、隐藏）不管。
-    fn set_times(&self, node: &Node, write: u64) -> Nt<FileInfo> {
+    /// 改修改时间（1970 年起的毫秒数），0 是不改。属性（只读、隐藏）不管。
+    fn set_mtime(&self, node: &Node, mtime: u64) -> Nt<FsStat> {
         let mut state = self.settled(node, lock(&node.state))?;
-        // 0 和全 1 都是「不改」；1970 年以前的也不管
-        let keep = write == 0 || write == u64::MAX || write < EPOCH_GAP;
-        if keep || self.read_only || state.stat.dir {
-            return Ok(self.info(&state.stat));
+        if mtime == 0 || self.read_only || state.stat.dir {
+            return Ok(state.stat);
         }
-        let mtime = (write - EPOCH_GAP) / 10_000;
         let path = state.path.clone();
         let touching = self.channel()?.fs_touch(&self.root, &path, mtime);
         state.stat = self.wait("fs_touch", &path, touching)?;
         state.dirty = true;
         state.unsynced = true;
         self.remember(&path, state.stat);
-        Ok(self.info(&state.stat))
+        Ok(state.stat)
     }
 
     fn close(&self, node: Arc<Node>) {
@@ -1571,412 +1574,7 @@ impl Mount {
         *lock(&self.space) = Some((Instant::now(), space));
         space
     }
-
-    /// 列目录。`marker` 是上一批的最后一个名字：只给排在它后面的。
-    fn read_directory(
-        &self,
-        node: &Node,
-        marker: Option<&[u16]>,
-        buffer: *mut c_void,
-        length: u32,
-        transferred: *mut u32,
-    ) -> Nt<()> {
-        let listing = {
-            let mut state = lock(&node.state);
-            if marker.is_none() || state.listing.is_none() {
-                let entries = self.list(&state.path, TTL)?;
-                let mut rows: Vec<(Vec<u16>, FsEntry)> = entries
-                    .iter()
-                    .map(|entry| (entry.name.encode_utf16().collect(), entry.clone()))
-                    .collect();
-                if !state.path.is_empty() {
-                    for name in [".", ".."] {
-                        let entry = FsEntry {
-                            name: name.to_string(),
-                            dir: true,
-                            mtime: state.stat.mtime,
-                            ..FsEntry::default()
-                        };
-                        rows.push((name.encode_utf16().collect(), entry));
-                    }
-                }
-                rows.sort_by(|a, b| a.0.cmp(&b.0));
-                state.listing = Some(Arc::new(rows));
-            }
-            state.listing.clone().unwrap_or_default()
-        };
-        for (name, entry) in listing.iter() {
-            if marker.is_some_and(|marker| name.as_slice() <= marker) {
-                continue;
-            }
-            let bytes = size_of::<DirInfo>() + name.len() * 2;
-            // 用 u64 的数组当缓冲区，对齐才够
-            let mut record = vec![0u64; bytes.div_ceil(8)];
-            let info = record.as_mut_ptr().cast::<DirInfo>();
-            // SAFETY：record 够 bytes 这么大、按 8 字节对齐；名字紧跟在定长部分后面，没有越界。
-            // buffer、transferred 是 WinFsp 给这次回调的
-            let added = unsafe {
-                (*info).Size = bytes as u16;
-                (*info).FileInfo = self.info(&stat_of(entry));
-                std::ptr::copy_nonoverlapping(
-                    name.as_ptr(),
-                    info.cast::<u8>().add(size_of::<DirInfo>()).cast::<u16>(),
-                    name.len(),
-                );
-                (self.add_dir_info)(info, buffer, length, transferred)
-            };
-            if added == 0 {
-                // 这一批装满了，系统会带着最后一个名字再来要
-                return Ok(());
-            }
-        }
-        // SAFETY：空指针是告诉 WinFsp 列完了
-        unsafe { (self.add_dir_info)(std::ptr::null_mut(), buffer, length, transferred) };
-        Ok(())
-    }
-
-    /// # Safety
-    /// 指针是 WinFsp 给回调的那两个。
-    unsafe fn copy_security(&self, descriptor: *mut c_void, size: *mut usize) -> Nt<()> {
-        if size.is_null() {
-            return Ok(());
-        }
-        let need = self.security.len();
-        unsafe {
-            if *size < need {
-                *size = need;
-                return Err(STATUS_BUFFER_OVERFLOW);
-            }
-            *size = need;
-            if !descriptor.is_null() {
-                std::ptr::copy_nonoverlapping(self.security.as_ptr(), descriptor.cast(), need);
-            }
-        }
-        Ok(())
-    }
 }
-
-// ---- WinFsp 的回调：把指针换成上面那些函数的参数 ----
-//
-// 这些函数由 WinFsp 的调度线程调用：`fs` 是 `FspFileSystemCreate` 给的那个，它的 UserContext
-// 指向一个活着的 [`Mount`]（卸载时先停调度线程再放掉它）；`context` 是 `open`、`create` 交出去的
-// `Box<Handle>`，`close` 时收回。别的指针都是这一次回调里有效的。
-
-type Fs = *mut FileSystem;
-type Ctx = *mut c_void;
-
-unsafe fn mount<'a>(fs: Fs) -> &'a Mount {
-    unsafe { &*user_context(fs).cast::<Mount>() }
-}
-
-/// 一次打开。
-struct Handle {
-    node: Arc<Node>,
-    /// 算在「开着的文件」里。程序关掉句柄（Cleanup）就不算了：系统的缓存还会把它留一阵才
-    /// Close，那一阵不算开着
-    counted: AtomicBool,
-}
-
-impl Handle {
-    fn uncount(&self, mount: &Mount) {
-        if self.counted.swap(false, Relaxed) {
-            mount.open_files.fetch_sub(1, Relaxed);
-        }
-    }
-}
-
-unsafe fn handle<'a>(context: Ctx) -> &'a Handle {
-    unsafe { &*context.cast::<Handle>() }
-}
-
-unsafe fn node<'a>(context: Ctx) -> &'a Arc<Node> {
-    unsafe { &handle(context).node }
-}
-
-/// `\目录\文件` 换成 `目录/文件`。
-unsafe fn remote_path(name: PWSTR) -> String {
-    let name = String::from_utf16_lossy(unsafe { wide_slice(name) });
-    name.trim_start_matches('\\').replace('\\', "/")
-}
-
-/// 回调里出了错、崩了，都变成一个状态码交回去；不能让崩溃穿过 C 的调用栈。
-fn guard(run: impl FnOnce() -> Nt<()>) -> NTSTATUS {
-    match catch_unwind(AssertUnwindSafe(run)) {
-        Ok(Ok(())) => STATUS_SUCCESS,
-        Ok(Err(status)) => status,
-        Err(_) => STATUS_UNEXPECTED_IO_ERROR,
-    }
-}
-
-/// 交出去一个打开的文件：记一下有几个文件开着。
-unsafe fn hand_out(mount: &Mount, node: Arc<Node>, context: *mut Ctx, info: *mut FileInfo) {
-    let stat = lock(&node.state).stat;
-    if !stat.dir {
-        mount.open_files.fetch_add(1, Relaxed);
-    }
-    let handle = Handle {
-        node,
-        counted: AtomicBool::new(!stat.dir),
-    };
-    unsafe {
-        *info = mount.info(&stat);
-        *context = Box::into_raw(Box::new(handle)).cast();
-    }
-}
-
-unsafe extern "C" fn get_volume_info(fs: Fs, info: *mut VolumeInfo) -> NTSTATUS {
-    guard(|| unsafe {
-        let mount = mount(fs);
-        let space = mount.volume();
-        let info = &mut *info;
-        info.TotalSize = space.total;
-        info.FreeSize = space.free;
-        info.VolumeLabelLength = (mount.label.len() * 2) as u16;
-        info.VolumeLabel[..mount.label.len()].copy_from_slice(&mount.label);
-        Ok(())
-    })
-}
-
-unsafe extern "C" fn get_security_by_name(
-    fs: Fs,
-    name: PWSTR,
-    attributes_out: *mut u32,
-    descriptor: *mut c_void,
-    size: *mut usize,
-) -> NTSTATUS {
-    guard(|| unsafe {
-        let mount = mount(fs);
-        let stat = mount.lookup(&remote_path(name))?;
-        if !stat.exists {
-            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
-        }
-        if !attributes_out.is_null() {
-            *attributes_out = attributes(&stat);
-        }
-        mount.copy_security(descriptor, size)
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe extern "C" fn create(
-    fs: Fs,
-    name: PWSTR,
-    options: u32,
-    _granted: u32,
-    _attributes: u32,
-    _descriptor: *mut c_void,
-    _allocation: u64,
-    context: *mut Ctx,
-    info: *mut FileInfo,
-) -> NTSTATUS {
-    guard(|| unsafe {
-        let mount = mount(fs);
-        let node = mount.create(&remote_path(name), options & FILE_DIRECTORY_FILE != 0)?;
-        hand_out(mount, node, context, info);
-        Ok(())
-    })
-}
-
-unsafe extern "C" fn open(
-    fs: Fs,
-    name: PWSTR,
-    _options: u32,
-    granted: u32,
-    context: *mut Ctx,
-    info: *mut FileInfo,
-) -> NTSTATUS {
-    guard(|| unsafe {
-        let mount = mount(fs);
-        let node = mount.open(&remote_path(name))?;
-        mount.check_write(&node, granted)?;
-        hand_out(mount, node, context, info);
-        Ok(())
-    })
-}
-
-unsafe extern "C" fn overwrite(
-    fs: Fs,
-    context: Ctx,
-    _attributes: u32,
-    _replace: u8,
-    _allocation: u64,
-    info: *mut FileInfo,
-) -> NTSTATUS {
-    guard(|| unsafe {
-        *info = mount(fs).resize(node(context), 0, false)?;
-        Ok(())
-    })
-}
-
-unsafe extern "C" fn cleanup(fs: Fs, context: Ctx, _name: PWSTR, flags: u32) {
-    guard(|| unsafe {
-        let (mount, node) = (mount(fs), node(context));
-        handle(context).uncount(mount);
-        if flags & CLEANUP_DELETE != 0 {
-            mount.remove(node);
-            return Ok(());
-        }
-        mount.commit(node).map(|_| ())
-    });
-}
-
-unsafe extern "C" fn close(fs: Fs, context: Ctx) {
-    guard(|| unsafe {
-        let mount = mount(fs);
-        let handle = Box::from_raw(context.cast::<Handle>());
-        handle.uncount(mount);
-        mount.close(handle.node);
-        Ok(())
-    });
-}
-
-unsafe extern "C" fn read(
-    fs: Fs,
-    context: Ctx,
-    buffer: *mut c_void,
-    offset: u64,
-    length: u32,
-    transferred: *mut u32,
-) -> NTSTATUS {
-    guard(|| unsafe {
-        let buffer = std::slice::from_raw_parts_mut(buffer.cast::<u8>(), length as usize);
-        *transferred = mount(fs).read(node(context), buffer, offset)? as u32;
-        Ok(())
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe extern "C" fn write(
-    fs: Fs,
-    context: Ctx,
-    buffer: *mut c_void,
-    offset: u64,
-    length: u32,
-    to_end: u8,
-    constrained: u8,
-    transferred: *mut u32,
-    info: *mut FileInfo,
-) -> NTSTATUS {
-    guard(|| unsafe {
-        let data = std::slice::from_raw_parts(buffer.cast::<u8>(), length as usize);
-        let (written, now) =
-            mount(fs).write(node(context), data, offset, to_end != 0, constrained != 0)?;
-        *transferred = written as u32;
-        *info = now;
-        Ok(())
-    })
-}
-
-unsafe extern "C" fn flush(fs: Fs, context: Ctx, info: *mut FileInfo) -> NTSTATUS {
-    guard(|| unsafe {
-        // 空指针是刷整个盘
-        match context.is_null() {
-            true => mount(fs).flush_all(),
-            false => {
-                *info = mount(fs).flush_file(node(context))?;
-                Ok(())
-            }
-        }
-    })
-}
-
-unsafe extern "C" fn get_file_info(fs: Fs, context: Ctx, info: *mut FileInfo) -> NTSTATUS {
-    guard(|| unsafe {
-        *info = mount(fs).info(&lock(&node(context).state).stat);
-        Ok(())
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe extern "C" fn set_basic_info(
-    fs: Fs,
-    context: Ctx,
-    _attributes: u32,
-    _creation: u64,
-    _access: u64,
-    write: u64,
-    _change: u64,
-    info: *mut FileInfo,
-) -> NTSTATUS {
-    guard(|| unsafe {
-        *info = mount(fs).set_times(node(context), write)?;
-        Ok(())
-    })
-}
-
-unsafe extern "C" fn set_file_size(
-    fs: Fs,
-    context: Ctx,
-    size: u64,
-    allocation: u8,
-    info: *mut FileInfo,
-) -> NTSTATUS {
-    guard(|| unsafe {
-        *info = mount(fs).resize(node(context), size, allocation != 0)?;
-        Ok(())
-    })
-}
-
-unsafe extern "C" fn can_delete(fs: Fs, context: Ctx, _name: PWSTR) -> NTSTATUS {
-    guard(|| unsafe { mount(fs).can_delete(node(context)) })
-}
-
-unsafe extern "C" fn rename(
-    fs: Fs,
-    context: Ctx,
-    _name: PWSTR,
-    new_name: PWSTR,
-    replace: u8,
-) -> NTSTATUS {
-    guard(|| unsafe { mount(fs).rename(node(context), &remote_path(new_name), replace != 0) })
-}
-
-unsafe extern "C" fn get_security(
-    fs: Fs,
-    _context: Ctx,
-    descriptor: *mut c_void,
-    size: *mut usize,
-) -> NTSTATUS {
-    guard(|| unsafe { mount(fs).copy_security(descriptor, size) })
-}
-
-unsafe extern "C" fn read_directory(
-    fs: Fs,
-    context: Ctx,
-    _pattern: PWSTR,
-    marker: PWSTR,
-    buffer: *mut c_void,
-    length: u32,
-    transferred: *mut u32,
-) -> NTSTATUS {
-    guard(|| unsafe {
-        let marker = (!marker.is_null()).then(|| wide_slice(marker));
-        mount(fs).read_directory(node(context), marker, buffer, length, transferred)
-    })
-}
-
-pub(crate) static INTERFACE: Interface = Interface {
-    GetVolumeInfo: Some(get_volume_info),
-    SetVolumeLabel: 0,
-    GetSecurityByName: Some(get_security_by_name),
-    Create: Some(create),
-    Open: Some(open),
-    Overwrite: Some(overwrite),
-    Cleanup: Some(cleanup),
-    Close: Some(close),
-    Read: Some(read),
-    Write: Some(write),
-    Flush: Some(flush),
-    GetFileInfo: Some(get_file_info),
-    SetBasicInfo: Some(set_basic_info),
-    SetFileSize: Some(set_file_size),
-    CanDelete: Some(can_delete),
-    Rename: Some(rename),
-    GetSecurity: Some(get_security),
-    SetSecurity: 0,
-    ReadDirectory: Some(read_directory),
-    Rest: [0; 45],
-};
 
 #[cfg(test)]
 mod tests {
@@ -2007,6 +1605,7 @@ mod tests {
         assert_eq!(linux("连接已关闭"), STATUS_UNEXPECTED_IO_ERROR);
     }
 
+    #[cfg(windows)]
     #[test]
     fn 哪些名字在_windows_上显示不了() {
         for good in ["a.txt", "中文 名字.md", ".git", "a b", "x-1_2"] {
@@ -2027,6 +1626,46 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_上除了斜杠和空字符都能显示() {
+        for good in [
+            "a.txt",
+            "a:b",
+            "what?.txt",
+            "dot.",
+            "space ",
+            "tab\there",
+            ".git",
+        ] {
+            assert!(representable(good), "{good}");
+        }
+        for bad in ["", ".", "..", "a/b", "nul\0"] {
+            assert!(!representable(bad), "{bad}");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_上写入删除失败时说本机路径() {
+        let message = "无法写入 /data/x/a.txt: Permission denied (os error 13)";
+        assert_eq!(
+            failure(
+                "/home/u/map/",
+                "src/a.txt",
+                STATUS_ACCESS_DENIED,
+                message,
+                false
+            ),
+            "无法写入 /home/u/map/src/a.txt：没有写入权限"
+        );
+        assert_eq!(
+            failure("/home/u/map", "", STATUS_DISK_FULL, message, false),
+            "无法写入 /home/u/map/：主机磁盘空间不足"
+        );
+    }
+
+    #[cfg(windows)]
     #[test]
     fn 写入删除失败时说本机路径和原因() {
         let message = "无法写入 /data/x/a.txt: Permission denied (os error 13)";
@@ -2065,12 +1704,13 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn 时间的换算() {
         // 2023-11-14 22:13:20 UTC
         assert_eq!(filetime(1_700_000_000_000), 133_444_736_000_000_000);
         assert_eq!(
-            (133_444_736_000_000_000 - EPOCH_GAP) / 10_000,
+            (133_444_736_000_000_000 - windows::EPOCH_GAP) / 10_000,
             1_700_000_000_000
         );
     }
@@ -2102,20 +1742,43 @@ mod tests {
         }
     }
 
-    unsafe extern "C" fn no_dir_info(_: *mut DirInfo, _: *mut c_void, _: u32, _: *mut u32) -> u8 {
+    #[cfg(windows)]
+    unsafe extern "C" fn no_dir_info(
+        _: *mut DirInfo,
+        _: *mut std::ffi::c_void,
+        _: u32,
+        _: *mut u32,
+    ) -> u8 {
         0
     }
 
-    /// 经本机通道映射这个目录：不经 WinFsp，直接调读写。
+    /// 不经 WinFsp、FUSE，直接调读写。
+    fn new_mount(channel: Channel, settings: Settings) -> Mount {
+        new_mount_with(channel, settings, Box::new(|_| {}))
+    }
+
+    fn new_mount_with(
+        channel: Channel,
+        settings: Settings,
+        sink: Box<dyn Fn(String) + Send + Sync>,
+    ) -> Mount {
+        #[cfg(windows)]
+        let mount = Mount::new(channel, settings, no_dir_info, sink);
+        #[cfg(not(windows))]
+        let mount = Mount::new(channel, settings, sink);
+        mount.unwrap()
+    }
+
+    /// 经本机通道映射这个目录。
     fn local_mount(dir: &TempDir) -> Mount {
         let settings = Settings {
             root: dir.0.to_string_lossy().into_owned(),
             place: "T:".into(),
             read_only: false,
-            windows: true,
+            windows: cfg!(windows),
             label: "test".into(),
         };
-        Mount::new(Channel::Local, settings, no_dir_info, Box::new(|_| {})).unwrap()
+        new_mount(Channel::Local, settings)
     }
 
     /// 一串看着随机、每次都一样的字节。
@@ -2138,6 +1801,15 @@ mod tests {
         buffer
     }
 
+    /// Linux 上 root 不受文件权限限制，只读的照样写得了：看权限的测试测不了。
+    fn ignores_permissions() -> bool {
+        #[cfg(target_os = "linux")]
+        // SAFETY：只读进程自己的有效用户
+        return unsafe { libc::geteuid() } == 0;
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
     /// 把文件或目录设成只读（或者去掉只读）。
     fn set_readonly(path: &std::path::Path, readonly: bool) {
         let mut permissions = std::fs::metadata(path).unwrap().permissions();
@@ -2147,30 +1819,41 @@ mod tests {
 
     #[test]
     fn 写不了的文件打开来写内容就拒绝_读和改属性不拦() {
+        if ignores_permissions() {
+            return;
+        }
         let dir = TempDir::new();
         dir.write("ro.txt", b"keep");
         set_readonly(&dir.0.join("ro.txt"), true);
         let mount = local_mount(&dir);
         let node = mount.open("ro.txt").unwrap();
-        for granted in [FILE_WRITE_DATA, FILE_APPEND_DATA, 0x1 | FILE_APPEND_DATA] {
-            assert_eq!(mount.check_write(&node, granted), Err(STATUS_ACCESS_DENIED));
-        }
-        // 读、改属性和时间（0x100）照样打得开
-        assert_eq!(mount.check_write(&node, 0x1 | 0x80 | 0x100), Ok(()));
+        assert_eq!(mount.check_write(&node, true), Err(STATUS_ACCESS_DENIED));
+        // 读、改属性和时间照样打得开
+        assert_eq!(mount.check_write(&node, false), Ok(()));
         dir.write("rw.txt", b"x");
         let writable = mount.open("rw.txt").unwrap();
-        assert_eq!(mount.check_write(&writable, FILE_WRITE_DATA), Ok(()));
+        assert_eq!(mount.check_write(&writable, true), Ok(()));
         set_readonly(&dir.0.join("ro.txt"), false);
     }
 
     #[test]
     fn 删之前看所在目录写不写得了_windows_上目录的只读属性不算() {
+        if ignores_permissions() {
+            return;
+        }
         let dir = TempDir::new();
         std::fs::create_dir(dir.0.join("locked")).unwrap();
         dir.write("locked/keep.txt", b"x");
         set_readonly(&dir.0.join("locked"), true);
         // Windows 主机：「文档」这些文件夹都带只读属性，里面的照样能删
-        let mount = local_mount(&dir);
+        let settings = Settings {
+            root: dir.0.to_string_lossy().into_owned(),
+            place: "T:".into(),
+            read_only: false,
+            windows: true,
+            label: "test".into(),
+        };
+        let mount = new_mount(Channel::Local, settings);
         let node = mount.open("locked/keep.txt").unwrap();
         assert_eq!(mount.can_delete(&node), Ok(()));
         // Linux 主机：只读是按这个用户的权限算的，写不了的目录里不让删（不然系统以为删掉了）
@@ -2181,7 +1864,7 @@ mod tests {
             windows: false,
             label: "test".into(),
         };
-        let linux = Mount::new(Channel::Local, settings, no_dir_info, Box::new(|_| {})).unwrap();
+        let linux = new_mount(Channel::Local, settings);
         let node = linux.open("locked/keep.txt").unwrap();
         assert_eq!(linux.can_delete(&node), Err(STATUS_ACCESS_DENIED));
         set_readonly(&dir.0.join("locked"), false);
@@ -2288,7 +1971,7 @@ mod tests {
         dir.write("w.bin", &model);
         let mount = local_mount(&dir);
         let node = mount.open("w.bin").unwrap();
-        let stop = AtomicBool::new(false);
+        let stop = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|scope| {
             for seed in 0..3u64 {
                 let (mount, node, stop) = (&mount, &node, &stop);
@@ -2429,7 +2112,8 @@ mod tests {
         dir.write("d/f.txt", b"hello");
         let mount = local_mount(&dir);
         let file = mount.open("d/f.txt").unwrap();
-        let folder = mount.open("D").unwrap();
+        // 主机是 Windows 时不分大小写
+        let folder = mount.open(if cfg!(windows) { "D" } else { "d" }).unwrap();
         mount.rename(&folder, "e", false).unwrap();
         assert_eq!(lock(&file.state).path, "e/f.txt");
         assert!(lock(&mount.nodes).contains_key("e/f.txt"));
@@ -2533,19 +2217,20 @@ mod tests {
     impl Daemon {
         fn new() -> Daemon {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
-            // kuaid.exe 在 target/<档> 下。测试程序原来在 target/<档>/deps 下，rustc 1.100 起在
+            // kuaid 在 target/<档> 下。测试程序原来在 target/<档>/deps 下，rustc 1.100 起在
             // target/<档>/build/<包>/<哈希>/ 下面，所以往上逐级找
+            let name = format!("kuaid{}", std::env::consts::EXE_SUFFIX);
             let test_exe = std::env::current_exe().unwrap();
             let profile = test_exe
                 .ancestors()
                 .skip(1)
-                .find(|dir| dir.join("kuaid.exe").is_file());
+                .find(|dir| dir.join(&name).is_file());
             let kuaid = std::env::var_os("KUAID_BIN")
                 .map(std::path::PathBuf::from)
-                .or_else(|| profile.map(|dir| dir.join("kuaid.exe")));
+                .or_else(|| profile.map(|dir| dir.join(&name)));
             let Some(kuaid) = kuaid.filter(|kuaid| kuaid.is_file()) else {
                 panic!(
-                    "{} 的上级目录里没有 kuaid.exe：先 cargo build -p kuaid",
+                    "{} 的上级目录里没有 {name}：先 cargo build -p kuaid",
                     test_exe.display()
                 );
             };
@@ -2563,16 +2248,21 @@ mod tests {
             let build = dir.join(".kuai").join("test");
             std::fs::create_dir_all(&build).unwrap();
             std::fs::create_dir_all(dir.join("files")).unwrap();
-            let exe = build.join("kuaid.exe");
+            let exe = build.join(&name);
             if std::fs::hard_link(&kuaid, &exe).is_err() {
                 std::fs::copy(&kuaid, &exe).unwrap();
             }
             Daemon { dir, exe }
         }
 
+        /// 跑这个测试自己的 kuaid。主目录换成测试的临时目录：Windows 上 kuaid 认 `FR_KUAID_HOME`，
+        /// Linux 上只认 `HOME`（运行目录、套接字在 `$HOME/.kuai/run`）。不换的话会连到这个用户
+        /// 真的常驻进程上，测完的 `--stop` 把它连同里面的终端一起结束（2026-11-23 在开发机上出过）。
         fn command(&self) -> std::process::Command {
             let mut cmd = std::process::Command::new(&self.exe);
             cmd.env("FR_KUAID_HOME", &self.dir)
+                .env("HOME", &self.dir)
+                .env_remove("XDG_CONFIG_HOME")
                 .env_remove("SSH_AUTH_SOCK")
                 .current_dir(&self.dir);
             cmd
@@ -2590,6 +2280,27 @@ mod tests {
         }
 
         /// 线路断了：强行结束转接程序，等于 ssh 没了（常驻进程不动）。
+        #[cfg(target_os = "linux")]
+        fn cut(&self) {
+            let mut killed = 0;
+            for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+                let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                    continue;
+                };
+                let exe = std::fs::read_link(entry.path().join("exe"));
+                let args = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+                let connect = args.split(|byte| *byte == 0).any(|arg| arg == b"--connect");
+                if connect && exe.is_ok_and(|exe| exe.starts_with(&self.dir)) {
+                    // SAFETY：结束这个测试自己拉起的转接程序
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    killed += 1;
+                }
+            }
+            assert!(killed > 0, "没找到转接程序");
+        }
+
+        /// 线路断了：强行结束转接程序，等于 ssh 没了（常驻进程不动）。
+        #[cfg(windows)]
         fn cut(&self) {
             let script = format!(
                 "Get-CimInstance Win32_Process -Filter \"Name='kuaid.exe'\" | Where-Object {{ $_.ExecutablePath -and $_.ExecutablePath.StartsWith('{}', 'OrdinalIgnoreCase') -and $_.CommandLine -like '*--connect*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }}",
@@ -2630,12 +2341,12 @@ mod tests {
             root: daemon.files().to_string_lossy().into_owned(),
             place: "T:".into(),
             read_only: false,
-            windows: true,
+            windows: cfg!(windows),
             label: "test".into(),
         };
         let errors = errors.clone();
         let sink = Box::new(move |text: String| errors.lock().unwrap().push(text));
-        Mount::new(daemon.connect(), settings, no_dir_info, sink).unwrap()
+        new_mount_with(daemon.connect(), settings, sink)
     }
 
     #[test]
@@ -2677,7 +2388,7 @@ mod tests {
         mount.rename(&made, "a.bin", true).unwrap();
         assert_eq!(std::fs::read(files.join("a.bin")).unwrap(), text);
         assert!(!files.join("sub").join("b.txt").exists());
-        mount.remove(&made);
+        mount.remove(&made, true).unwrap();
         mount.close(made);
         assert!(!files.join("a.bin").exists());
         assert!(
