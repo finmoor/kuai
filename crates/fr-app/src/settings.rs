@@ -708,10 +708,12 @@ impl Default for Settings {
 
 impl Settings {
     /// 读进来以后理一遍：旧版本的标签页挪进第一个工作区；保证至少有一个工作区、下标不越界。
+    /// 补上的那个工作区不起名字：这时界面语言还没定（语言也在设置里），交给本机的 kuaid 时
+    /// 再叫「默认」（[`crate::machines::migration_ops`]）。原来在这里起，英文界面也叫「默认」。
     pub fn normalize(&mut self) {
         if self.workspaces.is_empty() {
             self.workspaces.push(TabGroup {
-                name: tr("默认").to_string(),
+                name: String::new(),
                 tabs: std::mem::take(&mut self.open_tabs),
                 active: self.active_tab,
                 ..TabGroup::default()

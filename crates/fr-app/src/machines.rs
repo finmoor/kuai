@@ -390,9 +390,14 @@ pub(crate) fn migration_ops(settings: &mut Settings, local: &Store) -> Vec<Op> {
             id: id.clone(),
             ..Workspace::default()
         });
+        // 读设置时补上的那个没有名字（见 `Settings::normalize`），这时界面语言已经定了
+        let name = match group.name.is_empty() {
+            true => tr("默认").to_string(),
+            false => group.name.clone(),
+        };
         ops.push(Op::AddWorkspace {
             id: id.clone(),
-            name: group.name.clone(),
+            name: name.clone(),
         });
         for entry in group.repos.iter().chain(&group.tabs) {
             if let Some(repo) = member_ref(LOCAL, entry) {
@@ -404,7 +409,7 @@ pub(crate) fn migration_ops(settings: &mut Settings, local: &Store) -> Vec<Op> {
         }
         let key = WorkspaceKey::new(LOCAL, &id);
         let view = settings.view_mut(&key);
-        view.name = group.name.clone();
+        view.name = name;
         view.tabs = group.tabs.clone();
         view.active = group.active;
         view.closed = group.closed.clone();
@@ -1834,6 +1839,23 @@ mod tests {
             )
             .unwrap();
         assert_ne!(new_workspace_id(&store), first);
+    }
+
+    #[test]
+    fn 第一次启动补的工作区等界面语言定了再起名() {
+        use fr_core::i18n::tr;
+        // 读设置时（还不知道界面语言）补上的工作区没有名字
+        let mut settings = Settings::default();
+        assert_eq!(settings.workspaces.len(), 1);
+        assert!(settings.workspaces[0].name.is_empty());
+        // 交给本机的 kuaid 时（语言已经定了）才叫「默认」
+        let mut local = Store::default();
+        let ops = migration_ops(&mut settings, &local);
+        local.apply(&ops, false).unwrap();
+        assert_eq!(local.workspaces.len(), 1);
+        assert_eq!(local.workspaces[0].name, tr("默认"));
+        let key = WorkspaceKey::new(LOCAL, &local.workspaces[0].id);
+        assert_eq!(settings.view(&key).unwrap().name, tr("默认"));
     }
 
     #[test]
