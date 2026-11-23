@@ -937,6 +937,8 @@
   "正在启动 kuaid…": "Starting kuaid…",
   "正在经由 {name} 连接…": "Connecting via {name}…",
   "正在连接跳板机 {name}…": "Connecting to jump host {name}…",
+  "正在重试（{retry}/{total}）…": "Retrying ({retry}/{total})…",
+  "正在重试连接 {cx}（{retry}/{total}）…": "Retrying connection to {cx} ({retry}/{total})…",
   "{destination}\n{jump}{repos}主机上的内容不受影响。": "{destination}\n{jump}{repos}Nothing on the host is affected.",
   "{names} 经此主机连接，移除后改为直接连接，需重新选择跳板机。\n": "{names} connect via this host. After removal they connect directly; choose a jump host for them again.\n",
   "不使用": "None",

@@ -950,7 +950,7 @@ impl AppState {
     }
 
     /// 过一会儿重连，连不上隔得越来越久（2 秒起，最多 30 秒；窗口回到前台时马上试一次，见
-    /// [`Self::retry_now`]）。断开了的、连不上的服务器都在这里接着连，连上以后它上面的仓库标签页、
+    /// [`Self::retry_now`]）。每一轮里直接连的 ssh 连不上还先重试几次（`connect_with`）。断开了的、连不上的服务器都在这里接着连，连上以后它上面的仓库标签页、
     /// 终端跟着接上（[`HostConnected`]）。要密码的不弹窗：存着密码的照样连得上，没存的、登录被拒绝的
     /// 不再试，等用户点「重试」。不用了（删掉了、已经连上了）就不连了。
     pub(crate) fn schedule_reconnect(&mut self, key: &str, cx: &mut Context<Self>) {

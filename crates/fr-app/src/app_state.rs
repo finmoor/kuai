@@ -4,7 +4,7 @@ use fr_core::i18n::tr;
 use fr_core::tf;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fr_channel::{Channel, ConnectOptions, Connection, Jump};
 use futures::FutureExt as _;
@@ -31,6 +31,23 @@ pub fn save_failures() -> futures::channel::mpsc::UnboundedReceiver<String> {
 /// 一次连接在登录阶段失败的详情，见 [`AppState::last_login_failure`]。
 type FailureSlot = Arc<std::sync::Mutex<Option<fr_channel::LoginFailure>>>;
 
+/// 直接连的服务器 ssh 连不上（超时、连接被拒绝、对方断开，多半是网络抖了一下、电脑刚醒）时，同一次
+/// 连接里再试几次，都不行才算连不上。登录被拒绝、主机密钥不对的不再试（见 `connect_with`）。
+pub(crate) const CONNECT_RETRIES: u32 = 5;
+/// 每次重试前等多久
+const CONNECT_RETRY_GAP: Duration = Duration::from_secs(2);
+/// 一次就等了这么久才失败的不再试：多半是登录上以后主机那头卡住了（启动脚本卡在挂死的网络盘上，
+/// 等到握手期限 60 秒才结束），再试也一样，五次就是五六分钟。断网时 ssh 10 秒就超时
+const CONNECT_RETRY_SLOW: Duration = Duration::from_secs(50);
+
+/// 后台连接线程报给界面的进度
+enum Progress {
+    /// 经跳板机的：登录上几台了
+    Stage(usize),
+    /// 连不上，开始第几次重试（从 1 数）
+    Retry(u32),
+}
+
 /// 一台服务器的连接状态。
 pub enum ConnStatus {
     Idle,
@@ -50,6 +67,8 @@ pub struct AppState {
     conns: HashMap<String, Connecting>,
     /// 经跳板机连接、还在连的：已经登录上几台了（跳板机按顺序算）
     stages: HashMap<String, usize>,
+    /// 还在连的：连不上、在第几次重试了（见 [`CONNECT_RETRIES`]）
+    retrying: HashMap<String, u32>,
     /// 最近一次连接失败在登录阶段的哪一步（诊断用，见 `diagnose`）；登录上以后才失败的是空的。
     /// 开始连接时就放进来，后台线程在连接结果出来之前写好：等同一个结果的诊断框读到的一定是这一次的
     login_failures: HashMap<String, FailureSlot>,
@@ -90,6 +109,7 @@ impl AppState {
             settings,
             conns: HashMap::new(),
             stages: HashMap::new(),
+            retrying: HashMap::new(),
             login_failures: HashMap::new(),
             save_later: None,
             mounts: crate::mapping::Mounts::new(),
@@ -129,6 +149,17 @@ impl AppState {
         }
         let route = self.settings.route(id);
         let done = self.stages.get(id).copied().unwrap_or(0);
+        // 重试的这一次还没登录上第一台
+        if let Some(retry) = self.retrying(id)
+            && done == 0
+        {
+            return tf!(
+                "正在重试（{retry}/{total}）…",
+                retry,
+                total = CONNECT_RETRIES
+            )
+            .into();
+        }
         match (route.get(done), route.last()) {
             (Some(jump), _) => tf!("正在连接跳板机 {name}…", name = jump.name).into(),
             // 跳板机都登录上了：在连目标服务器；它也登录上以后是启动 kuaid
@@ -138,6 +169,12 @@ impl AppState {
             (None, Some(_)) => tr("正在启动 kuaid…").into(),
             (None, None) => tr("正在连接…").into(),
         }
+    }
+
+    /// 正在连的这一次连不上、在第几次重试了（见 [`CONNECT_RETRIES`]）；没在连、没重试的是 None。
+    pub fn retrying(&self, id: &str) -> Option<u32> {
+        let connecting = matches!(self.conns.get(id).map(|c| c.peek()), Some(None));
+        connecting.then(|| self.retrying.get(id).copied()).flatten()
     }
 
     pub fn status(&self, id: &str) -> ConnStatus {
@@ -225,20 +262,32 @@ impl AppState {
                 _ => {}
             }
         }
-        // 经跳板机的：后台线程每登录上一台报一次，这边记下来、刷新列表上的那句话
+        // 经跳板机的：后台线程每登录上一台报一次；连不上要重试时也报。这边记下来、刷新列表上的那句话
         self.stages.remove(id);
+        self.retrying.remove(id);
         let failure_slot = FailureSlot::default();
         self.login_failures
             .insert(id.to_string(), failure_slot.clone());
-        let (stage_tx, mut stage_rx) = futures::channel::mpsc::unbounded::<usize>();
-        let on_stage = Arc::new(move |done: usize| drop(stage_tx.unbounded_send(done)))
-            as fr_channel::StageHandler;
+        let (progress_tx, mut progress_rx) = futures::channel::mpsc::unbounded::<Progress>();
+        let retry_tx = progress_tx.clone();
+        let on_stage =
+            Arc::new(move |done: usize| drop(progress_tx.unbounded_send(Progress::Stage(done))))
+                as fr_channel::StageHandler;
         let stage_id = id.to_string();
         cx.spawn(async move |this, cx| {
             use futures::StreamExt as _;
-            while let Some(done) = stage_rx.next().await {
+            while let Some(progress) = progress_rx.next().await {
                 let updated = this.update(cx, |this, cx| {
-                    this.stages.insert(stage_id.clone(), done);
+                    match progress {
+                        Progress::Stage(done) => {
+                            this.stages.insert(stage_id.clone(), done);
+                        }
+                        // 重试从第一台跳板机连起
+                        Progress::Retry(retry) => {
+                            this.stages.remove(&stage_id);
+                            this.retrying.insert(stage_id.clone(), retry);
+                        }
+                    }
                     cx.notify();
                 });
                 if updated.is_err() {
@@ -280,6 +329,7 @@ impl AppState {
                 let server = self.server(id).cloned();
                 let route: Vec<Server> = self.settings.route(id).into_iter().cloned().collect();
                 let slot = failure_slot.clone();
+                let executor = cx.background_executor().clone();
                 cx.background_executor()
                     .spawn(async move {
                         let server =
@@ -288,13 +338,33 @@ impl AppState {
                         options.jumps = route.iter().map(jump_options).collect();
                         options.on_stage = (!route.is_empty()).then_some(on_stage);
                         options.no_prompt = no_prompt;
-                        Connection::connect(&server.destination, &options)
-                            .map(Arc::new)
-                            .map_err(|err| {
+                        let mut retry = 0;
+                        loop {
+                            let started = Instant::now();
+                            let err = match Connection::connect(&server.destination, &options) {
+                                Ok(conn) => return Ok(Arc::new(conn)),
+                                Err(err) => err,
+                            };
+                            let failure = fr_channel::login_failure(&err).cloned();
+                            // 登录阶段连不上（超时、连接被拒绝、对方断开）的等一下再试。登录被拒绝、
+                            // 主机密钥不对、取消了输入的再试也一样，还会再弹窗；登录上以后才出的错
+                            // （kuaid 起不来、git 太旧）、一次就卡了很久的也不试
+                            let again = retry < CONNECT_RETRIES
+                                && started.elapsed() < CONNECT_RETRY_SLOW
+                                && failure.as_ref().is_some_and(|f| !f.needs_user());
+                            if !again {
                                 // 登录阶段在哪一步失败的，留给诊断
-                                *slot.lock().unwrap() = fr_channel::login_failure(&err).cloned();
-                                SharedString::from(format!("{err:#}"))
-                            })
+                                *slot.lock().unwrap() = failure;
+                                return Err(SharedString::from(format!("{err:#}")));
+                            }
+                            retry += 1;
+                            log::info!(
+                                "连接 {} 失败，第 {retry} 次重试：{err:#}",
+                                server.destination
+                            );
+                            drop(retry_tx.unbounded_send(Progress::Retry(retry)));
+                            executor.timer(CONNECT_RETRY_GAP).await;
+                        }
                     })
                     .shared()
             }

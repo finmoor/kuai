@@ -228,6 +228,12 @@ impl RepoView {
         subscriptions.push(cx.subscribe(&app, |this, _, event: &HostConnected, cx| {
             this.host_connected(&event.0, cx)
         }));
+        // 还在连：连不上要重试时「正在连接」那句话跟着写第几次
+        subscriptions.push(cx.observe(&app, |this, _, cx| {
+            if this.channel.is_none() && this.error.is_none() {
+                cx.notify();
+            }
+        }));
         let (history, history_subscriptions) = history::History::new(window, cx);
         subscriptions.extend(history_subscriptions);
         let (sidebar, sidebar_subscription) = sidebar::Sidebar::new(window, cx);
@@ -1170,7 +1176,16 @@ impl RepoView {
             match self.error.clone() {
                 Some(err) => self.render_placeholder(err, true, cx),
                 None => {
-                    let text = tf!("正在连接 {cx}…", cx = self.place(cx));
+                    let machine = crate::machines::machine_of(&self.entry);
+                    let text = match self.app.read(cx).retrying(machine) {
+                        Some(retry) => tf!(
+                            "正在重试连接 {cx}（{retry}/{total}）…",
+                            cx = self.place(cx),
+                            retry,
+                            total = crate::app_state::CONNECT_RETRIES
+                        ),
+                        None => tf!("正在连接 {cx}…", cx = self.place(cx)),
+                    };
                     self.render_placeholder(text.into(), false, cx)
                 }
             }
