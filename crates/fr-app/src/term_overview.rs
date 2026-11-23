@@ -55,9 +55,12 @@ use crate::app_state::AppState;
 use crate::machines::{LOCAL, WorkspaceKey, machine_of, split_relay};
 use crate::repo::tool_button;
 use crate::settings::{RepoEntry, TermSlot};
-use crate::term_board::{Program, RepoGroup, Row, TermBoard, TermId, TermState, free_number};
+use crate::term_board::{
+    GroupKey, Program, RepoGroup, Row, TermBoard, TermId, TermState, free_number,
+};
 use crate::terminal::{self, LinkBase, TerminalEvent, TerminalView};
 use crate::ui;
+use crate::workspace::{PickFor, Picked, QuickOpen, show_picker};
 
 /// 侧栏、画面上面那一条的高度（和仓库页的工具栏一样）
 const HEAD_HEIGHT: f32 = 52.;
@@ -136,9 +139,9 @@ struct SideRepo {
     hue: Option<usize>,
 }
 
-/// 侧栏里一个工作区的那一组。
+/// 侧栏里的一节：一个工作区，或者一台主机上未加入工作区的仓库。
 struct SideGroup {
-    workspace: Option<WorkspaceKey>,
+    key: GroupKey,
     collapsed: bool,
     repos: Vec<SideRepo>,
     hue: Option<usize>,
@@ -329,42 +332,85 @@ fn term_menu(
     }
 }
 
-/// 仓库那一行的右键菜单。
+/// 仓库那一行的右键菜单。`homes` 是未加入工作区的仓库能放进去的工作区（名字是菜单里写的），
+/// 在工作区里的仓库是 None，菜单里没有「添加到工作区」。
 fn repo_menu(
     view: WeakEntity<TermOverview>,
     entry: RepoEntry,
     pinned: bool,
+    homes: Option<Vec<(WorkspaceKey, SharedString)>>,
 ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
-    move |menu, _, _| {
+    move |menu, window, cx| {
         let at = |view: &WeakEntity<TermOverview>| (view.clone(), entry.clone());
         let (pin, new, go) = (at(&view), at(&view), at(&view));
-        menu.item(
-            PopupMenuItem::new(if pinned {
-                tr("取消固定")
-            } else {
-                tr("固定到顶部")
+        let menu = menu
+            .item(
+                PopupMenuItem::new(if pinned {
+                    tr("取消固定")
+                } else {
+                    tr("固定到顶部")
+                })
+                .on_click(move |_, _, cx| {
+                    pin.0
+                        .update(cx, |this, cx| this.toggle_pin_repo(&pin.1, cx))
+                        .ok();
+                }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(tr("新建终端")).on_click(move |_, window, cx| {
+                    new.0
+                        .update(cx, |this, cx| this.new_terminal(new.1.clone(), window, cx))
+                        .ok();
+                }),
+            )
+            .item(
+                PopupMenuItem::new(tr("打开仓库")).on_click(move |_, _, cx| {
+                    go.0.update(cx, |_, cx| cx.emit(Go::Repo(go.1.clone())))
+                        .ok();
+                }),
+            );
+        let Some(homes) = homes.clone() else {
+            return menu;
+        };
+        let (view, entry) = (view.clone(), entry.clone());
+        menu.separator()
+            .submenu(tr("添加到工作区"), window, cx, move |sub, _, _| {
+                if homes.is_empty() {
+                    return sub.label(tr("没有可添加到的工作区"));
+                }
+                homes.iter().fold(sub, |sub, (key, name)| {
+                    let (view, entry, key) = (view.clone(), entry.clone(), key.clone());
+                    sub.item(PopupMenuItem::new(name.clone()).on_click(move |_, _, cx| {
+                        view.update(cx, |this, cx| {
+                            this.add_to_workspace(key.clone(), entry.clone(), cx)
+                        })
+                        .ok();
+                    }))
+                })
             })
-            .on_click(move |_, _, cx| {
-                pin.0
-                    .update(cx, |this, cx| this.toggle_pin_repo(&pin.1, cx))
-                    .ok();
-            }),
-        )
-        .separator()
-        .item(
-            PopupMenuItem::new(tr("新建终端")).on_click(move |_, window, cx| {
-                new.0
-                    .update(cx, |this, cx| this.new_terminal(new.1.clone(), window, cx))
-                    .ok();
-            }),
-        )
-        .item(
-            PopupMenuItem::new(tr("打开仓库")).on_click(move |_, _, cx| {
-                go.0.update(cx, |_, cx| cx.emit(Go::Repo(go.1.clone())))
-                    .ok();
-            }),
-        )
     }
+}
+
+/// 能把 `entry` 放进去的工作区：那台电脑连着、访问得到这个仓库（本机的工作区能放各台主机上的，
+/// 主机上的工作区能放它自己和它配置的主机上的）。按主机页的先后，本机的在前；不是本机的名字后面
+/// 带主机名。
+fn homes_for(app: &AppState, entry: &RepoEntry) -> Vec<(WorkspaceKey, SharedString)> {
+    let ids = app.ids();
+    let mut homes = Vec::new();
+    for machine in app.machine_keys() {
+        if !app.writable(&machine) || ids.member_ref(&machine, entry).is_none() {
+            continue;
+        }
+        for (key, name, _) in app.workspaces_on(&machine).unwrap_or_default() {
+            let label: SharedString = match machine == LOCAL {
+                true => name.into(),
+                false => format!("{name} · {}", app.machine_name(&machine)).into(),
+            };
+            homes.push((key, label));
+        }
+    }
+    homes
 }
 
 impl TermOverview {
@@ -397,19 +443,27 @@ impl TermOverview {
         }
     }
 
-    /// 全部工作区里的仓库和各自的终端。这一页说了要结束的不算。
+    /// 全部工作区里的仓库和各自的终端，后面是各台主机上未加入工作区的仓库。这一页说了要结束的
+    /// 不算。
     fn hub(&self, cx: &App) -> Vec<RepoGroup> {
         let mut groups = self.board.read(cx).repos(cx);
         if self.ending.is_empty() {
             return groups;
         }
+        let app = self.app.read(cx);
+        // 主机仓库列表里没有、因为开着终端才列着的（子仓库），终端都结束了就不列
+        let listed = |entry: &RepoEntry| {
+            app.repos_on(machine_of(entry))
+                .is_some_and(|repos| repos.contains(entry))
+        };
         for group in &mut groups {
             for (_, rows) in &mut group.repos {
                 rows.retain(|row| !self.ending.contains(&row.id));
             }
-            // 不在任何工作区里的仓库是因为有终端才列着的
-            if group.workspace.is_none() {
-                group.repos.retain(|(_, rows)| !rows.is_empty());
+            if let GroupKey::Unbound(_) = group.key {
+                group
+                    .repos
+                    .retain(|(entry, rows)| !rows.is_empty() || listed(entry));
             }
         }
         groups.retain(|group| !group.repos.is_empty());
@@ -447,6 +501,14 @@ impl TermOverview {
         hub.pinned_repos.contains(entry)
     }
 
+    fn collapsed_group(&self, key: &GroupKey, cx: &App) -> bool {
+        let hub = &self.app.read(cx).settings.term_hub;
+        match key {
+            GroupKey::Workspace(key) => hub.collapsed.contains(key),
+            GroupKey::Unbound(machine) => hub.collapsed_unbound.contains(machine),
+        }
+    }
+
     fn collapsed_repo(&self, entry: &RepoEntry, cx: &App) -> bool {
         let hub = &self.app.read(cx).settings.term_hub;
         hub.collapsed_repos.contains(entry)
@@ -461,7 +523,7 @@ impl TermOverview {
     }
 
     /// 只看一台电脑时树里列的：那台上的工作区（只在它们之间去重，见 [`TermBoard::repos_on`]），
-    /// 加上不在任何工作区里、仓库在那台上的终端。
+    /// 加上那台上未加入工作区的仓库（经它连的主机上的也算它的）。
     fn scoped(&self, machine: &str, hub: &[RepoGroup], cx: &App) -> Vec<RepoGroup> {
         let mut groups = self.board.read(cx).repos_on(machine, cx);
         for group in &mut groups {
@@ -469,17 +531,21 @@ impl TermOverview {
                 rows.retain(|row| !self.ending.contains(&row.id));
             }
         }
-        let others = hub.iter().filter(|group| group.workspace.is_none());
-        let repos: Vec<Repo> = others
-            .flat_map(|group| &group.repos)
-            .filter(|(entry, _)| on_machine(machine, entry))
-            .cloned()
-            .collect();
-        if !repos.is_empty() {
-            groups.push(RepoGroup {
-                workspace: None,
-                repos,
-            });
+        for group in hub {
+            if let GroupKey::Unbound(_) = group.key {
+                let repos: Vec<Repo> = group
+                    .repos
+                    .iter()
+                    .filter(|(entry, _)| on_machine(machine, entry))
+                    .cloned()
+                    .collect();
+                if !repos.is_empty() {
+                    groups.push(RepoGroup {
+                        key: group.key.clone(),
+                        repos,
+                    });
+                }
+            }
         }
         groups
     }
@@ -515,7 +581,7 @@ impl TermOverview {
         let tree: &[RepoGroup] = scoped.as_deref().unwrap_or(hub);
         let workspace_hues = app.workspace_hues();
         let group_hue = |group: &RepoGroup| {
-            let key = group.workspace.as_ref()?;
+            let key = group.key.workspace()?;
             Some(
                 workspace_hues
                     .get(key)
@@ -570,12 +636,12 @@ impl TermOverview {
                     .filter(|(entry, rows)| !pins.pinned_repos.contains(entry) && wanted(rows))
                     .map(repo)
                     .collect();
-                let collapsed = group
-                    .workspace
-                    .as_ref()
-                    .is_some_and(|key| pins.collapsed.contains(key));
+                let collapsed = match &group.key {
+                    GroupKey::Workspace(key) => pins.collapsed.contains(key),
+                    GroupKey::Unbound(machine) => pins.collapsed_unbound.contains(machine),
+                };
                 (!repos.is_empty()).then(|| SideGroup {
-                    workspace: group.workspace.clone(),
+                    key: group.key.clone(),
                     collapsed,
                     repos,
                     hue: group_hue(group),
@@ -797,6 +863,7 @@ impl TermOverview {
             root: entry.path.clone(),
             sub: String::new(),
             local,
+            server: entry.server.clone(),
             // 本机的直接看；服务器上的问那台的 kuaid（每次现拿连接：会断、会换）
             channel: Rc::new(move |cx: &App| match local {
                 true => Some(Channel::Local),
@@ -917,13 +984,36 @@ impl TermOverview {
         cx.notify();
     }
 
-    fn toggle_group(&mut self, key: WorkspaceKey, cx: &mut Context<Self>) {
+    fn toggle_group(&mut self, key: GroupKey, cx: &mut Context<Self>) {
         self.app.update(cx, |app, cx| {
-            app.edit_term_hub(cx, |hub| match hub.collapsed.contains(&key) {
-                true => hub.collapsed.retain(|other| *other != key),
-                false => hub.collapsed.push(key),
+            app.edit_term_hub(cx, |hub| match key {
+                GroupKey::Workspace(key) => match hub.collapsed.contains(&key) {
+                    true => hub.collapsed.retain(|other| *other != key),
+                    false => hub.collapsed.push(key),
+                },
+                GroupKey::Unbound(machine) => match hub.collapsed_unbound.contains(&machine) {
+                    true => hub.collapsed_unbound.retain(|other| *other != machine),
+                    false => hub.collapsed_unbound.push(machine),
+                },
             })
         });
+        cx.notify();
+    }
+
+    /// 把仓库放进工作区（右键菜单的「添加到工作区」）：它挪到那个工作区那一节里，那一节收着就
+    /// 展开，选中它。
+    fn add_to_workspace(&mut self, key: WorkspaceKey, entry: RepoEntry, cx: &mut Context<Self>) {
+        let added = self.app.update(cx, |app, cx| {
+            let added = app.add_to_workspace(&key, &entry, cx);
+            if added {
+                app.edit_term_hub(cx, |hub| hub.collapsed.retain(|other| *other != key));
+            }
+            added
+        });
+        if added {
+            self.repo = Some(entry);
+            self.cursor = Cursor::Repo;
+        }
         cx.notify();
     }
 
@@ -1045,6 +1135,19 @@ impl TermOverview {
         .detach();
     }
 
+    /// 选一个仓库，在里面新建终端（侧栏标题行的 +、Ctrl+Shift+N）。各台主机列表里的仓库都能选，
+    /// 不管在不在工作区里。
+    pub fn pick_new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let app = self.app.clone();
+        let picker = cx.new(|cx| QuickOpen::new(app, PickFor::Terminal, window, cx));
+        cx.subscribe_in(&picker, window, |this, _, event: &Picked, window, cx| {
+            window.close_dialog(cx);
+            this.new_terminal(event.0.clone(), window, cx);
+        })
+        .detach();
+        show_picker(picker, tr("新建终端").into(), window, cx);
+    }
+
     /// 在选中的仓库里新开一个终端（Ctrl+Shift+`）。
     pub fn new_terminal_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(entry) = self.repo.clone() {
@@ -1054,9 +1157,18 @@ impl TermOverview {
 
     /// 开（或者重新开）这个位置上的终端，显示它，焦点进去。
     fn open(&mut self, slot: TermSlot, window: &mut Window, cx: &mut Context<Self>) {
-        // 仓库收着的话展开：新开的终端要在侧栏里看得见
+        // 仓库、它所在的那一节收着的话展开：新开的终端要在侧栏里看得见
         if self.collapsed_repo(&slot.entry, cx) {
             self.toggle_repo(&slot.entry, cx);
+        }
+        let hub = self.hub(cx);
+        let home = hub
+            .iter()
+            .find(|group| group.repos.iter().any(|(entry, _)| *entry == slot.entry));
+        if let Some(group) = home
+            && self.collapsed_group(&group.key, cx)
+        {
+            self.toggle_group(group.key.clone(), cx);
         }
         self.repo = Some(slot.entry.clone());
         self.cursor = Cursor::Term;
@@ -1780,6 +1892,8 @@ impl TermOverview {
         let name = app.repo_name(entry);
         let pinned = self.pinned_repo(entry, cx);
         let empty = rows.is_empty();
+        // 不在工作区里的（没有工作区的颜色）右键可以放进工作区
+        let homes = repo.hue.is_none().then(|| homes_for(app, entry));
         let tip = match entry.server.is_some() {
             true => tf!(
                 "{path}（{place}）",
@@ -1896,12 +2010,17 @@ impl TermOverview {
                     )
                     .child(Self::row_actions().child(pin).child(new)),
             )
-            .context_menu(repo_menu(cx.entity().downgrade(), entry.clone(), pinned))
+            .context_menu(repo_menu(
+                cx.entity().downgrade(),
+                entry.clone(),
+                pinned,
+                homes,
+            ))
             .into_any_element()
     }
 
-    /// 一个工作区的分节标题：色块、名字（主机上的工作区在列着全部主机时带主机名）、一条细线、几个
-    /// 终端（收着时写几个停下、在跑、空着）、箭头。点一下收起、展开；「其他」那一组没有箭头，收不起。
+    /// 一节的标题：色块（未加入工作区的是空心的灰框）、名字（主机上的在列着全部主机时带主机名）、
+    /// 一条细线、几个终端（收着时写几个停下、在跑、空着）、箭头。点一下收起、展开。
     /// `sticky` 是吸在树顶上的那一份（滚动时盖在树上面，见 [`Self::sticky_group`]）。
     fn render_group_head(
         &self,
@@ -1919,15 +2038,14 @@ impl TermOverview {
         );
         let (chip_bg, hover, panel) = (theme.secondary, theme.list_hover, theme.sidebar);
         let app = self.app.read(cx);
-        let workspace = group.workspace.as_ref();
-        let name: SharedString = match workspace {
-            Some(key) => app.workspace_name(key),
-            None => tr("其他").into(),
+        // 未加入工作区的那一节名字淡一档，和工作区分开
+        let (name, soft): (SharedString, bool) = match &group.key {
+            GroupKey::Workspace(key) => (app.workspace_name(key), false),
+            GroupKey::Unbound(_) => (tr("未加入工作区").into(), true),
         };
-        // 主机上的工作区标出是哪台；只列着一台的时候不用标
-        let machine = workspace
-            .filter(|key| !key.is_local() && !scoped)
-            .map(|key| app.machine_name(&key.machine));
+        // 主机上的标出是哪台；只列着一台的时候不用标
+        let at = group.key.machine();
+        let machine = (at != LOCAL && !scoped).then(|| app.machine_name(at));
         let chip = |text: SharedString| {
             div()
                 .flex_none()
@@ -1965,7 +2083,16 @@ impl TermOverview {
             true => ("hub-group-sticky", "hub-group-sticky-name"),
             false => ("hub-group", "hub-group-name"),
         };
-        let key = workspace.cloned();
+        let key = group.key.clone();
+        let mark = match group.key {
+            GroupKey::Workspace(_) => ui::hue_mark(Self::hue_color(group.hue, cx), 8.),
+            GroupKey::Unbound(_) => div()
+                .flex_none()
+                .size(px(8.))
+                .rounded(px(2.))
+                .border(px(1.5))
+                .border_color(muted),
+        };
         let head = h_flex()
             .id((id, index))
             .h(px(26.))
@@ -1977,9 +2104,13 @@ impl TermOverview {
             .text_size(px(12.))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(fg)
-            .child(ui::hue_mark(Self::hue_color(group.hue, cx), 8.))
+            .child(mark)
             .child(Self::space(8.))
-            .child(ui::clipped((name_id, index), name).flex_shrink(1.))
+            .child(
+                ui::clipped((name_id, index), name)
+                    .flex_shrink(1.)
+                    .when(soft, |el| el.text_color(muted)),
+            )
             .children(machine.map(chip))
             .child(
                 div()
@@ -1990,23 +2121,21 @@ impl TermOverview {
                     .bg(border),
             )
             .child(count)
-            .when_some(key, |el, key| {
-                el.cursor_pointer()
-                    .hover(|s| s.bg(hover))
-                    .child(
-                        h_flex()
-                            .flex_none()
-                            .w(px(16.))
-                            .ml(px(4.))
-                            .justify_center()
-                            .text_color(muted)
-                            .child(Icon::new(arrow).size(px(12.))),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.focus.focus(window, cx);
-                        this.toggle_group(key.clone(), cx);
-                    }))
-            });
+            .cursor_pointer()
+            .hover(|s| s.bg(hover))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .w(px(16.))
+                    .ml(px(4.))
+                    .justify_center()
+                    .text_color(muted)
+                    .child(Icon::new(arrow).size(px(12.))),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.focus.focus(window, cx);
+                this.toggle_group(key.clone(), cx);
+            }));
         h_flex()
             .h(px(GROUP_HEAD))
             .px(px(6.))
@@ -2043,7 +2172,7 @@ impl TermOverview {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for group in &side.groups {
-            (&group.workspace, group.collapsed, group.repos.len()).hash(&mut hasher);
+            (&group.key, group.collapsed, group.repos.len()).hash(&mut hasher);
             for repo in &group.repos {
                 (repo.collapsed, repo.listed.len()).hash(&mut hasher);
             }
@@ -2326,6 +2455,7 @@ impl TermOverview {
             theme.muted_foreground,
             theme.primary,
         );
+        let (head_fg, head_hover) = (theme.sidebar_foreground, theme.secondary);
         let summary = match side.stopped {
             0 => tf!("{n} 个终端", n = side.total.to_string()),
             _ => tf!(
@@ -2458,12 +2588,13 @@ impl TermOverview {
             .bg(panel)
             .border_r_1()
             .border_color(border)
-            // 顶上那一条和仓库页侧栏的一样：图标、名字、一行小字
+            // 顶上那一条和仓库页侧栏的一样：图标、名字、一行小字；行尾是「新建终端…」
             .child(
                 h_flex()
                     .h(px(HEAD_HEIGHT))
                     .flex_none()
-                    .px(px(12.))
+                    .pl(px(12.))
+                    .pr(px(8.))
                     .gap(px(10.))
                     .border_b_1()
                     .border_color(border)
@@ -2483,7 +2614,7 @@ impl TermOverview {
                             .flex_1()
                             .min_w_0()
                             .child(
-                                ui::clipped("overview-title", trc("页面", "终端"))
+                                ui::clipped("overview-title", trc("页面", "会话"))
                                     .text_sm()
                                     .font_weight(FontWeight::SEMIBOLD),
                             )
@@ -2492,6 +2623,26 @@ impl TermOverview {
                                     .text_size(px(11.))
                                     .text_color(muted),
                             ),
+                    )
+                    .child(
+                        div()
+                            .id("overview-new")
+                            .flex_none()
+                            .size(px(26.))
+                            .rounded(px(6.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .text_color(muted)
+                            .hover(|s| s.bg(head_hover).text_color(head_fg))
+                            .child(ui::icon(IconName::Plus))
+                            .tooltip(|window, cx| {
+                                ui::tip(tr("新建终端…（Ctrl+Shift+N）"), window, cx)
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.pick_new_terminal(window, cx)
+                            })),
                     ),
             )
             .child(self.render_filter(side, width, window, cx))
@@ -2533,7 +2684,7 @@ impl TermOverview {
                                         .text_color(muted)
                                         .text_center()
                                         .child(match self.filter {
-                                            Filter::All => tr("工作区中没有仓库"),
+                                            Filter::All => tr("没有仓库"),
                                             Filter::Stopped => tr("没有已停下的终端"),
                                             Filter::Running => tr("没有运行中的终端"),
                                         }),

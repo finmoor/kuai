@@ -1543,6 +1543,14 @@ impl Workspace {
         }
     }
 
+    /// Ctrl+Shift+V：当前仓库文件页上的 Markdown 在预览和源文件之间切换。
+    pub fn preview_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_repo() {
+            tab.shown(cx)
+                .update(cx, |view, cx| view.toggle_markdown_preview(window, cx));
+        }
+    }
+
     /// Ctrl+Shift+T：重新打开最近关掉的标签页。
     pub fn reopen_closed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.app.read(cx).closed_tabs().into_iter().next() {
@@ -1631,30 +1639,20 @@ impl Workspace {
     /// Ctrl+P：快速打开仓库。输入几个字筛选，上下键选，回车打开选中的，也可以点。
     pub fn quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let app = self.app.clone();
-        let picker = cx.new(|cx| QuickOpen::new(app, window, cx));
+        let picker = cx.new(|cx| QuickOpen::new(app, PickFor::Open, window, cx));
         cx.subscribe_in(&picker, window, |this, _, event: &Picked, window, cx| {
             window.close_dialog(cx);
             this.open(event.0.clone(), window, cx);
         })
         .detach();
-        let first_build = Cell::new(true);
-        window.open_dialog(cx, move |dialog, window, cx| {
-            // 对话框打开的那一刻焦点会被它拿走，打开后再放到输入框
-            if first_build.replace(false) {
-                let input = picker.read(cx).input.clone();
-                input.focus_handle(cx).focus(window, cx);
-            }
-            let on_enter = picker.clone();
-            dialog
-                .title(tr("快速打开仓库"))
-                .w(px(620.))
-                // 回车打开选中的那个
-                .on_ok(move |_, _, cx| {
-                    on_enter.update(cx, |picker, cx| picker.pick_selected(cx));
-                    false
-                })
-                .child(picker.clone())
-        });
+        show_picker(picker, tr("快速打开仓库").into(), window, cx);
+    }
+
+    /// Ctrl+Shift+N：选一个仓库，在里面新建终端，到会话页显示它。
+    pub fn pick_new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_terms(window, cx);
+        self.overview
+            .update(cx, |overview, cx| overview.pick_new_terminal(window, cx));
     }
 
     /// 告诉各个标签页显不显示，把开着的标签页和显示着的那一页记进设置。
@@ -1982,7 +1980,7 @@ impl Workspace {
                 Page::Terms,
                 "page-terms",
                 IconName::SquareTerminal,
-                trc("页面", "终端"),
+                trc("页面", "会话"),
                 narrow,
                 cx,
             )
@@ -2648,13 +2646,23 @@ impl Render for Workspace {
     }
 }
 
-/// 快速打开里选中了一个仓库。
-struct Picked(RepoEntry);
+/// 选仓库的框里选中了一个仓库。
+pub(crate) struct Picked(pub RepoEntry);
 
-/// 快速打开：一个输入框加仓库列表，输入的字按名字和路径筛选。
-struct QuickOpen {
+/// 选仓库干什么。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PickFor {
+    /// 快速打开（Ctrl+P）：刚关掉的、开着的在前，行尾写着
+    Open,
+    /// 在里面新建终端（会话页的 +、Ctrl+Shift+N）：行尾写它在哪个工作区
+    Terminal,
+}
+
+/// 选仓库的框：一个输入框加仓库列表，输入的字按名字和路径筛选。快速打开和新建终端共用。
+pub(crate) struct QuickOpen {
     app: Entity<AppState>,
     input: Entity<InputState>,
+    purpose: PickFor,
     /// 上下键选中的是匹配结果里的第几个
     selected: usize,
     _subscription: Subscription,
@@ -2662,8 +2670,43 @@ struct QuickOpen {
 
 impl EventEmitter<Picked> for QuickOpen {}
 
+/// 把选仓库的框弹出来（选中以后的事由订阅 [`Picked`] 的那一方做，记得关掉对话框）。
+pub(crate) fn show_picker(
+    picker: Entity<QuickOpen>,
+    title: SharedString,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    // 点按钮（会话页标题行的 +、标题栏的 +）弹出来的：鼠标还停在按钮上，排着队的提示半秒后会盖在
+    // 对话框的标题上
+    ui::cancel_pending_tip(window, cx);
+    let first_build = Cell::new(true);
+    window.open_dialog(cx, move |dialog, window, cx| {
+        // 对话框打开的那一刻焦点会被它拿走，打开后再放到输入框
+        if first_build.replace(false) {
+            let input = picker.read(cx).input.clone();
+            input.focus_handle(cx).focus(window, cx);
+        }
+        let on_enter = picker.clone();
+        dialog
+            .title(title.clone())
+            .w(px(620.))
+            // 回车选中高亮的那个
+            .on_ok(move |_, _, cx| {
+                on_enter.update(cx, |picker, cx| picker.pick_selected(cx));
+                false
+            })
+            .child(picker.clone())
+    });
+}
+
 impl QuickOpen {
-    fn new(app: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(
+        app: Entity<AppState>,
+        purpose: PickFor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let input =
             cx.new(|cx| InputState::new(window, cx).placeholder(tr("仓库名称或路径中的关键字")));
         let subscription = cx.subscribe(&input, |this: &mut Self, _, event: &InputEvent, cx| {
@@ -2676,17 +2719,39 @@ impl QuickOpen {
         Self {
             app,
             input,
+            purpose,
             selected: 0,
             _subscription: subscription,
         }
     }
 
     /// 匹配输入内容的仓库：名字、路径、服务器名里有这几个字（不分大小写）。
-    /// 先是刚关掉的（最近关的在最上），再是开着的，最后是各台电脑列表里的其余仓库（本机的在前）。
-    /// 第三项是行尾标的小字：刚关掉、开着。
-    fn matches(&self, cx: &App) -> Vec<(RepoEntry, SharedString, Option<&'static str>)> {
+    /// 快速打开：先是刚关掉的（最近关的在最上），再是开着的，最后是各台电脑列表里的其余仓库（本机
+    /// 的在前）；第三项是行尾标的小字：刚关掉、开着。新建终端：各台电脑列表里的仓库，行尾写它在
+    /// 哪个工作区（不在的写「未加入工作区」）。
+    fn matches(&self, cx: &App) -> Vec<(RepoEntry, SharedString, Option<SharedString>)> {
         let needle = self.input.read(cx).value().trim().to_lowercase();
         let app = self.app.read(cx);
+        let wanted = |(entry, title, _): &(RepoEntry, SharedString, Option<SharedString>)| {
+            needle.is_empty()
+                || title.to_lowercase().contains(&needle)
+                || entry.path.to_lowercase().contains(&needle)
+        };
+        if self.purpose == PickFor::Terminal {
+            return app
+                .all_repos()
+                .into_iter()
+                .map(|entry| {
+                    let place = match app.workspace_of(&entry) {
+                        Some(key) => app.workspace_name(&key),
+                        None => tr("未加入工作区").into(),
+                    };
+                    let title = app.repo_title(&entry);
+                    (entry, title, Some(place))
+                })
+                .filter(wanted)
+                .collect();
+        }
         let open = app.tabs().repos.clone();
         let closed: Vec<RepoEntry> = app
             .closed_tabs()
@@ -2698,20 +2763,21 @@ impl QuickOpen {
             .into_iter()
             .filter(|entry| !open.contains(entry) && !closed.contains(entry))
             .collect();
+        let closed_mark: SharedString = tr("最近关闭").into();
+        let open_mark: SharedString = tr("已打开").into();
         closed
             .iter()
-            .map(|entry| (entry.clone(), Some(tr("最近关闭"))))
-            .chain(open.iter().map(|entry| (entry.clone(), Some(tr("已打开")))))
+            .map(|entry| (entry.clone(), Some(closed_mark.clone())))
+            .chain(
+                open.iter()
+                    .map(|entry| (entry.clone(), Some(open_mark.clone()))),
+            )
             .chain(rest.into_iter().map(|entry| (entry, None)))
             .map(|(entry, mark)| {
                 let title = app.repo_title(&entry);
                 (entry, title, mark)
             })
-            .filter(|(entry, title, _)| {
-                needle.is_empty()
-                    || title.to_lowercase().contains(&needle)
-                    || entry.path.to_lowercase().contains(&needle)
-            })
+            .filter(wanted)
             .collect()
     }
 

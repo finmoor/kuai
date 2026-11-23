@@ -1,6 +1,10 @@
 //! 终端里的链接：按住 Ctrl，鼠标底下的网址、文件路径画上下划线、鼠标变成手形，单击打开（和
 //! Windows 终端、VS Code 的终端一样）。程序要了鼠标的（opencode、Codex）也是按住 Ctrl 单击。
 //!
+//! 不按 Ctrl 看不出哪里能点：鼠标在网址、路径上停 [`REST`]，画一条灰的虚线，下面提示「Ctrl+单击…
+//! · 右键更多」。右键点在网址、路径上弹它的菜单（在文件页中打开、在浏览器中打开、用默认程序打开、
+//! 复制路径……，见 [`fill_menu`]），别处右键照旧。
+//!
 //! - 网址（http、https）：在默认浏览器里打开。程序用 OSC 8 写的超链接也认。
 //! - 仓库里的文件、目录：到这个仓库的文件页打开（带行号的跳到那一行），服务器上的仓库也一样，见
 //!   [`TerminalEvent::OpenFile`]。相对路径按那一段输出当时所在的目录算：往上找最近一行写着目录的
@@ -20,14 +24,25 @@ use alacritty_terminal::index::{Column as GridColumn, Line as GridLine, Point as
 use alacritty_terminal::term::Term;
 use alacritty_terminal::term::cell::Flags;
 use fr_channel::Channel;
+use fr_core::i18n::tr;
 use fr_core::term_link::{self, Place, Target};
 use fr_core::term_text;
+use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{ActiveTheme as _, h_flex};
+use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::{Proxy, TerminalEvent, TerminalView};
+use crate::open_with;
+use crate::settings::RepoEntry;
 
 /// 问过的路径在不在，记这么久
 const CHECKED_FOR: Duration = Duration::from_secs(5);
+/// 没按 Ctrl 时鼠标在网址、路径上停这么久，画虚线、出提示。扫过去不出（停下来才问主机路径在不在）
+pub(super) const REST: Duration = Duration::from_millis(500);
+/// 菜单顶上那一行的路径最多显示这么多个字，长的把中间省掉
+const SHOWN_MAX: usize = 60;
 /// 找提示符时往上最多看这么多行
 const PROMPT_SCAN: i32 = 5000;
 
@@ -40,6 +55,8 @@ pub struct LinkBase {
     pub sub: String,
     /// 仓库在这台电脑上：仓库外的文件也能打开
     pub local: bool,
+    /// 仓库所在的主机（本机是 None）：在浏览器中打开时按它记网页服务的口令、换连接
+    pub server: Option<String>,
     /// 现在的仓库通道（连接断了、换了时跟着换；没有就问不了）
     pub channel: ChannelNow,
 }
@@ -52,7 +69,54 @@ pub type ChannelNow = Rc<dyn Fn(&App) -> Option<Channel>>;
 pub(super) struct Hover {
     pub start: GridPoint,
     pub end: GridPoint,
+    /// 没按 Ctrl、停够了显示的：画虚线、出提示，单击不打开
+    pub soft: bool,
     open: Open,
+}
+
+/// 网格上的一段：从哪一格到哪一格（含）。
+pub(super) type Span = (GridPoint, GridPoint);
+
+/// 右键点在网址、路径上：菜单列它的几项（见 [`fill_menu`]）。
+pub(super) struct LinkMenu {
+    pub start: GridPoint,
+    pub end: GridPoint,
+    /// 菜单顶上那一行：认出来的写法（路径带着行号）
+    shown: String,
+    state: MenuState,
+}
+
+#[derive(Clone)]
+enum MenuState {
+    Ready(Open),
+    /// 还在问主机这个路径在不在：问的是哪个（见 [`ask_key`]）、行列
+    Asking(String, Option<(u32, u32)>),
+    /// 问过了，没有这个路径
+    Missing,
+}
+
+/// 链接菜单里点了哪一项。
+#[derive(Clone)]
+enum MenuAction {
+    /// 在文件页中打开、显示仓库里的路径
+    Files {
+        path: String,
+        at: Option<(u32, u32)>,
+        dir: bool,
+    },
+    /// 仓库里的网页在浏览器中打开
+    Browser(String),
+    /// 仓库里的文件用默认程序打开
+    Default(String),
+    Url(String),
+    /// 仓库外的本机文件用默认程序打开、目录在资源管理器里打开
+    OutsideFile(String),
+    OutsideDir(String),
+    /// 在资源管理器中显示（本机的完整路径）
+    Reveal(String),
+    CopyText(String),
+    Copy,
+    Paste,
 }
 
 #[derive(Clone, PartialEq)]
@@ -91,7 +155,7 @@ struct Pending {
 pub(super) struct LinkUi {
     /// 终端开在哪个仓库：认路径用；没有就只认网址
     base: Option<LinkBase>,
-    /// 按住 Ctrl 时鼠标底下的链接：画下划线，单击打开
+    /// 鼠标底下的链接：按着 Ctrl 的画下划线，单击打开；没按 Ctrl、停够了的画虚线、出提示
     pub hover: Option<Hover>,
     /// 鼠标最后在终端里的哪里（离开了是 None）、那时按着 Ctrl 没有：按下、松开 Ctrl 时重新看
     pub mouse_at: Option<Point<Pixels>>,
@@ -103,6 +167,33 @@ pub(super) struct LinkUi {
     /// 鼠标底下的路径正在问（还不知道算不算链接）：问的是哪个、行列
     waiting: Option<(String, Option<(u32, u32)>)>,
     pending: Option<Pending>,
+    /// 鼠标停在哪一格、停够 [`REST`] 了没有；计时的任务
+    rest_at: Option<GridPoint>,
+    rested: bool,
+    rest_task: Option<Task<()>>,
+    /// 右键点在了网址、路径上（菜单开着时也在）
+    pub menu: Option<LinkMenu>,
+    /// 开着的链接菜单：路径问到了以后重画它
+    menu_view: Option<(WeakEntity<PopupMenu>, AnyWindowHandle)>,
+    /// 提示：文字、做好的提示框（文字变了才重做）
+    tip: Option<(SharedString, AnyView)>,
+}
+
+impl LinkUi {
+    /// 画实线、画虚线的各是哪一段：按着 Ctrl 指着的、右键菜单说的画实线，没按 Ctrl 停着的画虚线。
+    pub(super) fn lines(&self) -> (Option<Span>, Option<Span>) {
+        let menu = self.menu.as_ref().map(|menu| (menu.start, menu.end));
+        match &self.hover {
+            Some(hover) if hover.soft => (menu, Some((hover.start, hover.end))),
+            Some(hover) => (Some((hover.start, hover.end)), None),
+            None => (menu, None),
+        }
+    }
+
+    /// 鼠标变成手形：按着 Ctrl 指着链接。
+    pub(super) fn pointer(&self) -> bool {
+        self.hover.as_ref().is_some_and(|hover| !hover.soft)
+    }
 }
 
 /// 网格上 `point` 所在的那一行，连同写满折下去的前后几行：每个字，和它在网格上的哪一格。宽字的后半格、
@@ -238,8 +329,9 @@ impl TerminalView {
         self.links.checked.clear();
     }
 
-    /// 鼠标挪到 `position`、按着 Ctrl（`ctrl`）没有：重新看底下的链接。没按 Ctrl、正在选字、按着
-    /// 报给程序的鼠标键时没有链接。
+    /// 鼠标挪到 `position`、按着 Ctrl（`ctrl`）没有：重新看底下的链接。按着 Ctrl 的马上看；没按的
+    /// 停够 [`REST`] 才看（见 [`Self::rest_at`]）。正在选字、按着报给程序的鼠标键、右键菜单开着时
+    /// 没有链接。
     pub(super) fn hover_link(
         &mut self,
         position: Point<Pixels>,
@@ -249,8 +341,13 @@ impl TerminalView {
         self.links.mouse_at = Some(position);
         self.links.ctrl = ctrl;
         self.links.waiting = None;
-        let found = match ctrl && !self.selecting && self.mouse_held.is_none() {
-            true => self.link_under(position, cx),
+        self.rest_at(position, cx);
+        let usable = !self.selecting && self.mouse_held.is_none() && self.links.menu.is_none();
+        let found = match (ctrl || self.links.rested) && usable {
+            true => self.link_under(position, cx).map(|hover| Hover {
+                soft: !ctrl,
+                ..hover
+            }),
             false => None,
         };
         if found != self.links.hover {
@@ -259,10 +356,54 @@ impl TerminalView {
         }
     }
 
+    /// 鼠标在 `position`：换了一格、又不在提示着的链接上，就重新计时，停够 [`REST`] 再看底下的链接。
+    fn rest_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some((cell, _)) = self.grid_point(position) else {
+            return;
+        };
+        if self.links.rest_at == Some(cell) {
+            return;
+        }
+        self.links.rest_at = Some(cell);
+        let on_hint = self
+            .links
+            .hover
+            .as_ref()
+            .is_some_and(|hover| hover.soft && hover.start <= cell && cell <= hover.end);
+        if on_hint {
+            return;
+        }
+        self.links.rested = false;
+        self.links.rest_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(REST).await;
+            this.update(cx, |this, cx| {
+                this.links.rested = true;
+                if let Some(position) = this.links.mouse_at {
+                    let ctrl = this.links.ctrl;
+                    this.hover_link(position, ctrl, cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// 打字、按下鼠标：停着的提示收起来（鼠标再挪动、停够了再出）。
+    pub(super) fn hide_link_tip(&mut self, cx: &mut Context<Self>) {
+        self.links.rested = false;
+        self.links.rest_task = None;
+        if self.links.hover.as_ref().is_some_and(|hover| hover.soft) {
+            self.links.hover = None;
+            cx.notify();
+        }
+    }
+
     /// 鼠标离开了终端：不再有链接。
     pub(super) fn leave_link(&mut self, cx: &mut Context<Self>) {
         self.links.mouse_at = None;
         self.links.waiting = None;
+        self.links.rest_at = None;
+        self.links.rested = false;
+        self.links.rest_task = None;
         if self.links.hover.take().is_some() {
             cx.notify();
         }
@@ -277,18 +418,24 @@ impl TerminalView {
         }
     }
 
-    fn link_under(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> Option<Hover> {
+    /// 网格上 `position` 那里的链接：从哪一格到哪一格、指向哪，路径的话还有提示符里的目录。
+    fn target_at(
+        &self,
+        position: Point<Pixels>,
+    ) -> Option<(GridPoint, GridPoint, Target, Option<String>)> {
         let (point, _) = self.grid_point(position)?;
-        let (start, end, target, dir) = {
-            let session = self.session.as_ref()?;
-            let term = session.term.lock();
-            let (start, end, target) = find(&term, point)?;
-            let dir = match target {
-                Target::Path { .. } => prompt_dir_above(&term, start),
-                Target::Url(_) => None,
-            };
-            (start, end, target, dir)
+        let session = self.session.as_ref()?;
+        let term = session.term.lock();
+        let (start, end, target) = find(&term, point)?;
+        let dir = match target {
+            Target::Path { .. } => prompt_dir_above(&term, start),
+            Target::Url(_) => None,
         };
+        Some((start, end, target, dir))
+    }
+
+    fn link_under(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> Option<Hover> {
+        let (start, end, target, dir) = self.target_at(position)?;
         let open = match target {
             Target::Url(url) => Open::Url(url),
             Target::Path { path, line, col } => {
@@ -311,33 +458,34 @@ impl TerminalView {
                 }
             }
         };
-        Some(Hover { start, end, open })
+        Some(Hover {
+            start,
+            end,
+            soft: false,
+            open,
+        })
     }
 
-    /// 问一下路径 `raw` 在不在，问到了重新看鼠标底下；单击时还在问的，问到了打开它。`dir` 是提示符
-    /// 里写的目录（见 [`prompt_dir_above`]），`key` 是记结果用的名字。不知道开在哪个仓库、没有可问的
-    /// 写法时返回 false。
+    /// 路径 `raw` 可能指的几处，挨个问；还有问的时候用的通道。`dir` 是提示符里写的目录（见
+    /// [`prompt_dir_above`]）。不知道开在哪个仓库、没有可问的写法时没有。
     ///
     /// 几种写法（git 改动里的 `a/`、`b/` 去掉）挨个按这些目录试：提示符里的目录；它在仓库里或者没有时，
     /// 再试终端开在的目录、仓库根。提示符里的目录在仓库外时只按它算：说的是那里的文件，仓库里同名的
     /// 不是它。
-    fn check_path(
-        &mut self,
-        raw: String,
-        dir: Option<String>,
-        key: String,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(base) = self.links.base.clone() else {
-            return false;
-        };
+    fn places(
+        &self,
+        raw: &str,
+        dir: Option<&str>,
+        cx: &App,
+    ) -> Option<(LinkBase, Option<Channel>, Vec<Place>)> {
+        let base = self.links.base.clone()?;
         let channel = (base.channel)(cx);
         // 服务器上的 `~`：那台的主目录
         let home = match &channel {
             Some(Channel::Remote(conn)) => Some(conn.hello.home.clone()),
             _ => None,
         };
-        let here = dir.as_deref().and_then(|dir| {
+        let here = dir.and_then(|dir| {
             term_link::resolve_at(&base.root, dir, home.as_deref(), ".").map(|place| (dir, place))
         });
         let mut tries: Vec<Place> = Vec::new();
@@ -348,7 +496,7 @@ impl TerminalView {
                 tries.push(place);
             }
         };
-        for path in term_link::alternatives(&raw) {
+        for path in term_link::alternatives(raw) {
             if let Some((dir, _)) = &here {
                 add(term_link::resolve_at(
                     &base.root,
@@ -368,9 +516,41 @@ impl TerminalView {
                 add(term_link::resolve(&base.root, sub, path));
             }
         }
-        if tries.is_empty() {
+        (!tries.is_empty()).then_some((base, channel, tries))
+    }
+
+    /// 记下问到的结果（`key` 见 [`ask_key`]）。
+    fn remember(&mut self, raw: &str, dir: Option<&str>, key: &str, found: &Option<(Place, bool)>) {
+        log::info!(
+            "终端里的路径 {raw}（提示符里的目录 {}）：{}",
+            dir.unwrap_or("没有"),
+            match found {
+                Some((Place::Repo(path), _)) => format!("仓库里的 {path}"),
+                Some((Place::Outside(path), _)) => format!("仓库外的 {path}"),
+                None => "不在".to_string(),
+            }
+        );
+        self.links.checked.insert(
+            key.to_string(),
+            Checked {
+                found: found.clone(),
+                at: Instant::now(),
+            },
+        );
+    }
+
+    /// 问一下路径 `raw` 在不在，问到了重新看鼠标底下；单击时还在问的，问到了打开它；右键菜单等着的，
+    /// 问到了重画菜单。`dir` 是提示符里的目录，`key` 是记结果用的名字。问不了时返回 false。
+    fn check_path(
+        &mut self,
+        raw: String,
+        dir: Option<String>,
+        key: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((base, channel, tries)) = self.places(&raw, dir.as_deref(), cx) else {
             return false;
-        }
+        };
         self.links.asking.insert(key.clone());
         cx.spawn(async move |this, cx| {
             let mut found = None;
@@ -398,43 +578,89 @@ impl TerminalView {
                     break;
                 }
             }
-            let clicked = this
+            let (clicked, menu) = this
                 .update(cx, |this, cx| {
-                    log::info!(
-                        "终端里的路径 {raw}（提示符里的目录 {}）：{}",
-                        dir.as_deref().unwrap_or("没有"),
-                        match &found {
-                            Some((Place::Repo(path), _)) => format!("仓库里的 {path}"),
-                            Some((Place::Outside(path), _)) => format!("仓库外的 {path}"),
-                            None => "不在".to_string(),
-                        }
-                    );
+                    this.remember(&raw, dir.as_deref(), &key, &found);
                     this.links.asking.remove(&key);
-                    this.links.checked.insert(
-                        key.clone(),
-                        Checked {
-                            found: found.clone(),
-                            at: Instant::now(),
-                        },
-                    );
                     if let Some(position) = this.links.mouse_at {
                         let ctrl = this.links.ctrl;
                         this.hover_link(position, ctrl, cx);
                     }
-                    let pending = this.links.pending.take_if(|pending| pending.key == key)?;
-                    Some((opening(found?, pending.at), pending.window))
+                    let menu = this.menu_answered(&key, &found, cx);
+                    let clicked = this
+                        .links
+                        .pending
+                        .take_if(|pending| pending.key == key)
+                        .and_then(|pending| {
+                            Some((opening(found.clone()?, pending.at), pending.window))
+                        });
+                    (clicked, menu)
                 })
-                .ok()
-                .flatten();
+                .unwrap_or_default();
             if let Some((open, window)) = clicked {
                 cx.update_window(window, |_, window, cx| {
                     this.update(cx, |this, cx| this.open_target(open, window, cx))
                 })
                 .ok();
             }
+            if let Some((menu, window)) = menu {
+                let view = this.clone();
+                cx.update_window(window, |_, window, cx| {
+                    menu.update(cx, |menu, cx| {
+                        menu.rebuild(window, cx, |menu, window, cx| {
+                            fill_menu(&view, menu, window, cx)
+                        })
+                    })
+                })
+                .ok();
+            }
         })
         .detach();
         true
+    }
+
+    /// 本机的仓库：当场看路径 `raw` 在不在（右键菜单要马上列出来），结果记下。看不了（不是本机的
+    /// 仓库、没有可问的写法）时是 None。
+    fn check_now(&mut self, raw: &str, dir: Option<&str>, key: &str, cx: &App) -> Option<()> {
+        let (base, _, tries) = self.places(raw, dir, cx)?;
+        if !base.local {
+            return None;
+        }
+        let found = tries.into_iter().find_map(|place| {
+            let dir = match &place {
+                Place::Repo(path) => fr_core::files::stat(&base.root, path)
+                    .ok()
+                    .filter(|stat| stat.exists)
+                    .map(|stat| stat.dir),
+                Place::Outside(path) => std::fs::metadata(path).ok().map(|meta| meta.is_dir()),
+            };
+            Some((place, dir?))
+        });
+        self.remember(raw, dir, key, &found);
+        Some(())
+    }
+
+    /// 问到了 `key`：右键菜单正等着它的话换成问到的，返回要重画的菜单。
+    fn menu_answered(
+        &mut self,
+        key: &str,
+        found: &Option<(Place, bool)>,
+        cx: &mut Context<Self>,
+    ) -> Option<(Entity<PopupMenu>, AnyWindowHandle)> {
+        let menu = self.links.menu.as_mut()?;
+        let MenuState::Asking(asked, at) = &menu.state else {
+            return None;
+        };
+        if asked != key {
+            return None;
+        }
+        menu.state = match found {
+            Some(found) => MenuState::Ready(opening(found.clone(), *at)),
+            None => MenuState::Missing,
+        };
+        cx.notify();
+        let (view, window) = self.links.menu_view.clone()?;
+        Some((view.upgrade()?, window))
     }
 
     /// 鼠标在终端里按下：按着 Ctrl 单击的是链接就打开，返回 true（不再选字、不报给程序）。
@@ -444,8 +670,9 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        // 又按了一下：前面那一下还在等的不开了
+        // 又按了一下：前面那一下还在等的不开了；停着的提示收起来
         self.links.pending = None;
+        self.hide_link_tip(cx);
         if !event.modifiers.control || event.click_count > 1 {
             return false;
         }
@@ -481,9 +708,323 @@ impl TerminalView {
             Open::Outside { path, dir: false } => crate::shell::open_file(&path, window, cx),
         }
     }
+
+    /// 右键点在 `position`：那里是认得出的网址、路径就记下来，返回 true，外面那一层的右键菜单列它的
+    /// 几项（见 [`fill_menu`]）。路径还没问过的：本机的当场看，主机上的先列「正在查找…」，问到了重画
+    /// 菜单。问过了、不在的路径不算。
+    pub(super) fn menu_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        self.links.menu = None;
+        self.links.menu_view = None;
+        self.hide_link_tip(cx);
+        let Some((start, end, target, dir)) = self.target_at(position) else {
+            return false;
+        };
+        let (shown, state) = match target {
+            Target::Url(url) => (url.clone(), MenuState::Ready(Open::Url(url))),
+            Target::Path { path, line, col } => {
+                let at = line.map(|line| (line, col.unwrap_or(1)));
+                let shown = match line {
+                    Some(line) => format!("{path}:{line}"),
+                    None => path.clone(),
+                };
+                let key = ask_key(dir.as_deref(), &path);
+                let fresh = self
+                    .links
+                    .checked
+                    .get(&key)
+                    .is_some_and(|checked| checked.at.elapsed() < CHECKED_FOR);
+                // 没问过的：本机的当场看；主机上的去问，菜单先列「正在查找…」
+                if !fresh
+                    && !self.links.asking.contains(&key)
+                    && self.check_now(&path, dir.as_deref(), &key, cx).is_none()
+                    && !self.check_path(path.clone(), dir.clone(), key.clone(), cx)
+                {
+                    return false;
+                }
+                let state = match self.links.checked.get(&key) {
+                    _ if self.links.asking.contains(&key) => MenuState::Asking(key, at),
+                    Some(Checked {
+                        found: Some(found), ..
+                    }) => MenuState::Ready(opening(found.clone(), at)),
+                    _ => return false,
+                };
+                (shown, state)
+            }
+        };
+        log::info!("右键点在终端里的链接上：{}", middle_cut(&shown, SHOWN_MAX));
+        self.links.menu = Some(LinkMenu {
+            start,
+            end,
+            shown,
+            state,
+        });
+        cx.notify();
+        true
+    }
+
+    /// 链接菜单里点了一项。
+    fn menu_action(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
+        let base = self.links.base.clone();
+        match action {
+            MenuAction::Files { path, at, dir } => {
+                cx.emit(TerminalEvent::OpenFile { path, at, dir })
+            }
+            MenuAction::Browser(path) => {
+                if let Some(base) = &base {
+                    let entry = RepoEntry {
+                        server: base.server.clone(),
+                        path: base.root.clone(),
+                    };
+                    let channel = (base.channel)(cx);
+                    open_with::open_in_browser(&entry, channel, &path, window, cx);
+                }
+            }
+            MenuAction::Default(path) => match &base {
+                Some(base) if base.local => {
+                    let full = open_with::full_path(&base.root, false, &path);
+                    crate::shell::open_file(&full, window, cx);
+                }
+                Some(base) => match (base.channel)(cx) {
+                    Some(channel) => open_with::open_copy(channel, &base.root, &path, window, cx),
+                    None => {
+                        let text = tr("主机未连接，无法读取此文件。");
+                        crate::shell::report(Err(text.into()), window, cx);
+                    }
+                },
+                None => {}
+            },
+            MenuAction::Url(url) => crate::shell::report(crate::shell::open_link(&url), window, cx),
+            MenuAction::OutsideFile(path) => crate::shell::open_file(&path, window, cx),
+            MenuAction::OutsideDir(path) => {
+                crate::shell::report(crate::shell::open_folder(&path), window, cx)
+            }
+            MenuAction::Reveal(path) => {
+                crate::shell::report(crate::shell::reveal_in_explorer(&path), window, cx)
+            }
+            MenuAction::CopyText(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+            MenuAction::Copy => self.copy(cx),
+            MenuAction::Paste => self.paste(cx),
+        }
+    }
+
+    /// 停着的链接下面那个提示：「Ctrl+单击在文件页中打开 · 右键更多」，放在鼠标那一行下面。
+    pub(super) fn link_tip(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let hover = self.links.hover.as_ref().filter(|hover| hover.soft)?;
+        let mouse = self.links.mouse_at?;
+        let what = match &hover.open {
+            Open::Url(_) => tr("Ctrl+单击在浏览器中打开"),
+            Open::Repo { dir: true, .. } => tr("Ctrl+单击在文件页中显示"),
+            Open::Repo { dir: false, .. } => tr("Ctrl+单击在文件页中打开"),
+            Open::Outside { dir: true, .. } if cfg!(windows) => tr("Ctrl+单击在资源管理器中打开"),
+            Open::Outside { dir: true, .. } => tr("Ctrl+单击在文件管理器中打开"),
+            Open::Outside { dir: false, .. } => tr("Ctrl+单击用默认程序打开"),
+        };
+        // 程序要了鼠标（opencode）：右键归程序，按着 Shift 才是 Kuai 的
+        let more = match self.mouse_mode(false) {
+            Some(_) => tr("Shift+右键更多"),
+            None => tr("右键更多"),
+        };
+        let text: SharedString = format!("{what} · {more}").into();
+        let tip = match &self.links.tip {
+            Some((shown, tip)) if *shown == text => tip.clone(),
+            _ => {
+                let tip = Tooltip::new(text.clone()).build(window, cx);
+                self.links.tip = Some((text, tip.clone()));
+                tip
+            }
+        };
+        let geometry = self.geometry.get();
+        let cell = geometry.cell.height.max(px(1.));
+        let row = ((mouse.y - geometry.origin.y) / cell).floor();
+        // 界面库的提示框四周带 12px 的外边距（`m_3`），框本身要落在这一行下面 2px、鼠标左边 10px
+        const MARGIN: Pixels = px(12.);
+        let below = geometry.origin.y + cell * (row + 1.) + px(2.) - MARGIN;
+        Some(
+            deferred(
+                anchored()
+                    .position(point(mouse.x - px(10.) - MARGIN, below))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(tip),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
 }
 
-/// 问到的路径（在哪、是不是目录）、要跳到的行列：单击时打开什么。
+/// 外面那一层的右键菜单打开时：记下这个菜单（路径问到了重画它），关了的时候忘掉右键点的链接；
+/// 再按 [`fill_menu`] 列出各项。
+pub(super) fn open_menu(
+    view: &WeakEntity<TerminalView>,
+    menu: PopupMenu,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let opened = (cx.entity().downgrade(), window.window_handle());
+    let closing = view.clone();
+    cx.subscribe_self(move |_, _: &DismissEvent, cx| {
+        closing
+            .update(cx, |this, cx| {
+                this.links.menu = None;
+                this.links.menu_view = None;
+                cx.notify();
+            })
+            .ok();
+    })
+    .detach();
+    view.update(cx, |this, _| this.links.menu_view = Some(opened))
+        .ok();
+    fill_menu(view, menu, window, cx)
+}
+
+/// 终端的右键菜单：右键点在网址、路径上时，顶上一行是认出来的写法，下面是它能做的事（目录：在文件页
+/// 中显示、在资源管理器中显示、复制路径；文件：在文件页中打开、在浏览器中打开（网页、SVG）、用默认程序
+/// 打开、复制路径；网址：在浏览器中打开、复制链接）；最后都有复制、粘贴。别处（设置里选了菜单时）只有
+/// 复制、粘贴。
+pub(super) fn fill_menu(
+    view: &WeakEntity<TerminalView>,
+    menu: PopupMenu,
+    _: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let Some(this) = view.upgrade() else {
+        return menu;
+    };
+    let (link, base, has_selection, alive) = {
+        let this = this.read(cx);
+        (
+            this.links
+                .menu
+                .as_ref()
+                .map(|menu| (menu.shown.clone(), menu.state.clone())),
+            this.links.base.clone(),
+            this.selected_text().is_some(),
+            this.is_alive(),
+        )
+    };
+    let muted = cx.theme().muted_foreground;
+    let act = |label: &'static str, action: MenuAction| {
+        let view = view.clone();
+        PopupMenuItem::new(label).on_click(move |_, window, cx| {
+            view.update(cx, |this, cx| this.menu_action(action.clone(), window, cx))
+                .ok();
+        })
+    };
+    // 第一项（和按住 Ctrl 单击一样）：右边写着「Ctrl+单击」
+    let first = |label: &'static str, action: MenuAction| {
+        let view = view.clone();
+        PopupMenuItem::element(move |_, _| {
+            h_flex().w_full().gap(px(24.)).child(label).child(
+                div()
+                    .ml_auto()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(tr("Ctrl+单击")),
+            )
+        })
+        .on_click(move |_, window, cx| {
+            view.update(cx, |this, cx| this.menu_action(action.clone(), window, cx))
+                .ok();
+        })
+    };
+    let mut menu = menu;
+    if let Some((shown, state)) = link {
+        menu = menu.label(middle_cut(&shown, SHOWN_MAX)).separator();
+        let local = base.as_ref().is_some_and(|base| base.local);
+        let full = |path: &str| match &base {
+            Some(base) => open_with::full_path(&base.root, !base.local, path),
+            None => path.to_string(),
+        };
+        menu = match state {
+            MenuState::Asking(..) => menu.item(PopupMenuItem::new(tr("正在查找…")).disabled(true)),
+            MenuState::Missing => {
+                menu.item(PopupMenuItem::new(tr("找不到这个路径")).disabled(true))
+            }
+            MenuState::Ready(Open::Url(url)) => menu
+                .item(first(tr("在浏览器中打开"), MenuAction::Url(url.clone())))
+                .item(act(tr("复制链接"), MenuAction::CopyText(url))),
+            MenuState::Ready(Open::Repo {
+                path,
+                at,
+                dir: true,
+            }) => {
+                let shown = MenuAction::Files {
+                    path: path.clone(),
+                    at,
+                    dir: true,
+                };
+                let mut menu = menu.item(first(tr("在文件页中显示"), shown));
+                if local {
+                    let reveal = MenuAction::Reveal(full(&path));
+                    menu = menu.item(act(crate::shell::reveal_label(), reveal));
+                }
+                menu.separator()
+                    .item(act(tr("复制路径"), MenuAction::CopyText(full(&path))))
+                    .item(act(tr("复制相对路径"), MenuAction::CopyText(path)))
+            }
+            MenuState::Ready(Open::Repo {
+                path,
+                at,
+                dir: false,
+            }) => {
+                let opened = MenuAction::Files {
+                    path: path.clone(),
+                    at,
+                    dir: false,
+                };
+                let mut menu = menu.item(first(tr("在文件页中打开"), opened));
+                if open_with::is_web(&path) {
+                    let browser = MenuAction::Browser(path.clone());
+                    menu = menu.item(act(tr("在浏览器中打开"), browser));
+                }
+                menu.item(act(tr("用默认程序打开"), MenuAction::Default(path.clone())))
+                    .separator()
+                    .item(act(tr("复制路径"), MenuAction::CopyText(full(&path))))
+                    .item(act(tr("复制相对路径"), MenuAction::CopyText(path)))
+            }
+            MenuState::Ready(Open::Outside { path, dir: true }) => menu
+                .item(first(
+                    crate::shell::open_folder_label(),
+                    MenuAction::OutsideDir(path.clone()),
+                ))
+                .separator()
+                .item(act(tr("复制路径"), MenuAction::CopyText(path))),
+            MenuState::Ready(Open::Outside { path, dir: false }) => menu
+                .item(first(
+                    tr("用默认程序打开"),
+                    MenuAction::OutsideFile(path.clone()),
+                ))
+                .item(act(
+                    crate::shell::reveal_label(),
+                    MenuAction::Reveal(path.clone()),
+                ))
+                .separator()
+                .item(act(tr("复制路径"), MenuAction::CopyText(path))),
+        };
+        menu = menu.separator();
+    }
+    menu.item(act(tr("复制"), MenuAction::Copy).disabled(!has_selection))
+        .item(act(tr("粘贴"), MenuAction::Paste).disabled(!alive))
+}
+
+/// 太长的写法把中间换成「…」，留下开头和结尾（文件名在结尾）。
+fn middle_cut(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_string();
+    }
+    let head = max / 3;
+    let tail = max - head - 1;
+    let start: String = text.chars().take(head).collect();
+    let end: String = text.chars().skip(count - tail).collect();
+    format!("{start}…{end}")
+}
+
+// 问到的路径（在哪、是不是目录）、要跳到的行列：单击时打开什么。
 fn opening((place, dir): (Place, bool), at: Option<(u32, u32)>) -> Open {
     match place {
         Place::Repo(path) => Open::Repo { path, at, dir },

@@ -158,6 +158,7 @@ fn frame(bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) -> Frame {
         rects: Vec::new(),
         shapes,
         runs,
+        dashes: Vec::new(),
         cursor: Some(CursorDraw {
             row: end.0,
             col: end.1,

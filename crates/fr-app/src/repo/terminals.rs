@@ -504,6 +504,7 @@ impl RepoView {
             root: self.entry.path.clone(),
             sub,
             local: self.entry.server.is_none(),
+            server: self.entry.server.clone(),
             channel: Rc::new(move |cx: &App| repo.upgrade()?.read(cx).channel.clone()),
         };
         view.update(cx, |view, _| view.set_link_base(base));

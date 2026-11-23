@@ -1289,7 +1289,8 @@ impl AppState {
 
 /// 一个服务器上的路径在菜单里和映射有关的几项，接在 `menu` 后面。
 ///
-/// - 有映射着的映射包含它：「复制本机路径」「在资源管理器中显示」，文件另有「用默认程序打开」；
+/// - 有映射着的映射包含它：「复制本机路径」「在资源管理器中显示」（「用默认程序打开」由文件页的菜单
+///   自己给，映射着的开映射盘上的，见 `RepoView::open_with_default`）；
 /// - 配了映射、现在没映射着：「立即映射」；
 /// - 都没有：「将此目录映射到本机…」（文件的话映射的是 `root`，一般是仓库的根目录）。
 pub fn menu_items(
@@ -1307,7 +1308,7 @@ pub fn menu_items(
     }
     let state = app.read(cx);
     if let Some(local) = state.local_path(server, path) {
-        let (copy, reveal, open) = (local.clone(), local.clone(), local.clone());
+        let (copy, reveal) = (local.clone(), local.clone());
         menu = menu
             .item(
                 PopupMenuItem::new(tr("复制本机路径")).on_click(move |_, _, cx| {
@@ -1320,13 +1321,6 @@ pub fn menu_items(
                     crate::shell::report(result, window, cx);
                 },
             ));
-        if !dir {
-            menu = menu.item(PopupMenuItem::new(tr("用默认程序打开")).on_click(
-                move |_, window, cx| {
-                    crate::shell::open_file(&open, window, cx);
-                },
-            ));
-        }
         return menu;
     }
     menu_map_item(menu, app, server, path, dir, root, cx)

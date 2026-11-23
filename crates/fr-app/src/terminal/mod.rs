@@ -72,7 +72,7 @@ use futures::channel::mpsc;
 use futures::future::LocalBoxFuture;
 use futures::{FutureExt as _, StreamExt as _};
 use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
@@ -1604,6 +1604,8 @@ impl TerminalView {
         if self.flash.take().is_some() {
             cx.notify();
         }
+        // 鼠标停着的链接提示：打字时收起来
+        self.hide_link_tip(cx);
         // 正打着字的时候光标不闪
         self.typed_at = Instant::now();
         if std::mem::take(&mut self.blink_hidden) {
@@ -1920,20 +1922,25 @@ impl TerminalView {
         self.press_mouse(1, event, window, cx);
     }
 
-    /// 右键：程序要了鼠标就报给它；不然选着字就复制，没选就粘贴（和 Windows 终端一样），设置里
-    /// 选了菜单时弹菜单（菜单挂在外面那一层）。
+    /// 右键：程序要了鼠标就报给它（按着 Shift 的除外）。点在网址、路径上弹它的菜单（见
+    /// [`links::fill_menu`]）；别处选着字就复制，没选就粘贴（和 Windows 终端一样），设置里选了菜单时
+    /// 弹复制、粘贴的菜单。菜单挂在外面那一层，这里不让它弹时拦下。
     fn on_right_click(
         &mut self,
         event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.press_mouse(2, event, window, cx)
+        if self.press_mouse(2, event, window, cx) {
+            return;
+        }
+        self.click_focus(window, cx);
+        if self.menu_at(event.position, cx)
             || prefs::get(cx).right_click == crate::settings::RightClick::Menu
         {
             return;
         }
-        self.click_focus(window, cx);
+        cx.stop_propagation();
         if self.selected_text().is_some() {
             self.copy(cx);
         } else if self.is_alive() {
@@ -2164,15 +2171,14 @@ impl EntityInputHandler for TerminalView {
 }
 
 impl Render for TerminalView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (background, muted, bar) = (theme.background, theme.muted_foreground, theme.secondary);
         let (for_prepaint, for_paint) = (cx.entity(), cx.entity());
-        // 右键：默认是「选着字就复制，否则粘贴」；设置里改成菜单的，弹出复制、粘贴
-        let menu = prefs::get(cx).right_click == crate::settings::RightClick::Menu;
-        let (has_selection, alive) = (self.selected_text().is_some(), self.is_alive());
         let view = cx.entity().downgrade();
         let overlays = self.scroll_overlays(cx);
+        // 鼠标在网址、路径上停着：下面一个提示
+        let tip = self.link_tip(window, cx);
         let panel = div()
             .id("terminal")
             .relative()
@@ -2182,8 +2188,8 @@ impl Render for TerminalView {
             .pt(px(scroll::TOP))
             .bg(background)
             // 按住 Ctrl 指着链接时是手形（见 [`links`]）
-            .when(self.links.hover.is_some(), |panel| panel.cursor_pointer())
-            .when(self.links.hover.is_none(), |panel| panel.cursor_text())
+            .when(self.links.pointer(), |panel| panel.cursor_pointer())
+            .when(!self.links.pointer(), |panel| panel.cursor_text())
             // 打字时鼠标没离开：界面库默认打过字就当鼠标不在上面（离开了），鼠标没动、接着按 Ctrl
             // 就认不出底下的链接
             .hover_listener_mode(HoverListenerMode::InputModalityIndependent)
@@ -2231,28 +2237,15 @@ impl Render for TerminalView {
                         .child(notice),
                 )
             });
-        if !menu {
-            return panel.into_any_element();
-        }
+        // 右键菜单：点在网址、路径上，或者设置里选了菜单时才弹（不弹的在 `on_right_click` 里拦下）
         div()
             .size_full()
-            .child(panel.context_menu(move |menu, _, _| {
-                let (copy, paste) = (view.clone(), view.clone());
-                menu.item(
-                    PopupMenuItem::new(tr("复制"))
-                        .disabled(!has_selection)
-                        .on_click(move |_, _, cx| {
-                            copy.update(cx, |this, cx| this.copy(cx)).ok();
-                        }),
-                )
-                .item(
-                    PopupMenuItem::new(tr("粘贴"))
-                        .disabled(!alive)
-                        .on_click(move |_, _, cx| {
-                            paste.update(cx, |this, cx| this.paste(cx)).ok();
-                        }),
-                )
-            }))
+            .child(
+                panel.context_menu(move |menu, window, cx| {
+                    links::open_menu(&view, menu, window, cx)
+                }),
+            )
+            .children(tip)
             .into_any_element()
     }
 }
@@ -2342,6 +2335,8 @@ struct Frame {
     /// 自己画的字（方块、制表线，见 [`glyphs`]）：第几行、第几列、哪个字、什么颜色
     shapes: Vec<(usize, usize, char, Hsla)>,
     runs: Vec<Run>,
+    /// 画虚线的格子（没按 Ctrl、鼠标停着的链接）：第几行、从第几列起、几列
+    dashes: Vec<(usize, usize, usize)>,
     cursor: Option<CursorDraw>,
     foreground: Hsla,
     background: Hsla,
@@ -2415,7 +2410,7 @@ fn prepaint(
     let this = view.read(cx);
     let session = this.session.as_ref()?;
     let focused = this.focus.is_focused(window);
-    let (rects, shapes, runs, cursor, fixed, flash) = {
+    let (rects, shapes, runs, cursor, dashes, fixed, flash) = {
         let term = session.term.lock();
         this.blinking.set(focused && term.cursor_style().blinking);
         // 往回翻着时最下面的输入区固定住（见 [`scroll`]）
@@ -2432,14 +2427,12 @@ fn prepaint(
         let rows = term.grid().screen_lines();
         let split = fixed.split(rows);
         let flash = scroll::flash_row(this.scroll.flash, offset, split);
-        let link = this
-            .links
-            .hover
-            .as_ref()
-            .map(|hover| (hover.start, hover.end));
-        let (rects, shapes, runs, cursor) = snapshot(&term, &palette, selection, fixed, link);
+        // 按住 Ctrl 指着的链接、右键菜单说的那一段画实线；没按 Ctrl 停着的画虚线（见 [`links`]）
+        let (link, dashed) = this.links.lines();
+        let (rects, shapes, runs, cursor, dashes) =
+            snapshot(&term, &palette, selection, fixed, link, dashed);
         let fixed_top = (fixed.len > 0).then_some(split);
-        (rects, shapes, runs, cursor, fixed_top, flash)
+        (rects, shapes, runs, cursor, dashes, fixed_top, flash)
     };
     let mut frame = Frame {
         origin: bounds.origin,
@@ -2447,6 +2440,7 @@ fn prepaint(
         rects,
         shapes,
         runs,
+        dashes,
         // 进程结束了、够不着了就不画光标
         cursor: cursor.filter(|_| this.is_alive()),
         foreground: palette.foreground,
@@ -2499,17 +2493,19 @@ type Snapshot = (
     Vec<(usize, usize, char, Hsla)>,
     Vec<Run>,
     Option<CursorDraw>,
+    Vec<(usize, usize, usize)>,
 );
 
 /// 把现在看得见的格子拍成要画的背景块、自己画的字、文字段和光标。往回翻着、输入区固定在最下面时
 /// （见 [`scroll::Fixed`]），那几行画的是现在的屏幕，不是往回翻到的内容。`link`：按住 Ctrl 指着
-/// 的链接从哪一格到哪一格，画下划线（见 [`links`]）。
+/// 的链接从哪一格到哪一格，画下划线；`dashed`：没按 Ctrl、鼠标停着的链接，画虚线（见 [`links`]）。
 fn snapshot(
     term: &Term<Proxy>,
     palette: &Palette,
     selection_color: Hsla,
     fixed: scroll::Fixed,
     link: Option<(GridPoint, GridPoint)>,
+    dashed: Option<(GridPoint, GridPoint)>,
 ) -> Snapshot {
     let content = term.renderable_content();
     let offset = content.display_offset as i32;
@@ -2536,6 +2532,7 @@ fn snapshot(
     let mut runs: Vec<Run> = Vec::new();
     let mut current: Option<Run> = None;
     let mut cursor = None;
+    let mut dashes: Vec<(usize, usize, usize)> = Vec::new();
     let flush = |current: &mut Option<Run>, runs: &mut Vec<Run>| {
         if let Some(mut run) = current.take() {
             let kept = run.text.trim_end_matches(' ').len();
@@ -2592,6 +2589,12 @@ fn snapshot(
         }
         let underline = flags.intersects(Flags::ALL_UNDERLINES)
             || link.is_some_and(|(start, end)| start <= point && point <= end);
+        if dashed.is_some_and(|(start, end)| start <= point && point <= end) {
+            match dashes.last_mut() {
+                Some((r, c, n)) if *r == row && *c + *n == col => *n += width,
+                _ => dashes.push((row, col, width)),
+            }
+        }
         let strike = flags.contains(Flags::STRIKEOUT);
         let hidden = flags.contains(Flags::HIDDEN);
         // 方块、制表线不交给字体：按格子画，一格接一格没有缝。在文字段里它算一个空格
@@ -2658,7 +2661,7 @@ fn snapshot(
         }
     }
     flush(&mut current, &mut runs);
-    (rects, shapes, runs, cursor)
+    (rects, shapes, runs, cursor, dashes)
 }
 
 impl Frame {
@@ -2823,6 +2826,18 @@ fn paint_frame(frame: &Frame, bounds: Bounds<Pixels>, window: &mut Window, cx: &
             let _ = line.paint(origin, frame.cell.height, TextAlign::Left, None, window, cx);
             let cells = frame.cell_bounds(run.row, run.col, run.next - run.col);
             paint_decorations(cells, run.style, window);
+        }
+        // 鼠标停着的链接：字下面一条灰的虚线
+        let dash = frame.foreground.opacity(0.55);
+        for &(row, col, cols) in &frame.dashes {
+            let cells = frame.cell_bounds(row, col, cols);
+            let y = cells.bottom() - px(2.);
+            let mut x = cells.origin.x;
+            while x < cells.right() {
+                let len = px(3.).min(cells.right() - x);
+                window.paint_quad(fill(Bounds::new(point(x, y), size(len, px(1.))), dash));
+                x += px(5.);
+            }
         }
         if let Some(cursor) = &frame.cursor {
             let cols = if cursor.wide { 2 } else { 1 };
@@ -3060,11 +3075,12 @@ mod tests {
         let white = gpui_kit::rgb(0xeeeeee).into();
         let black = gpui_kit::rgb(0x111111).into();
         let palette = Palette::new(white, black, true);
-        let (_, _, _, cursor) = snapshot(
+        let (_, _, _, cursor, _) = snapshot(
             &term,
             &palette,
             white,
             super::scroll::Fixed::default(),
+            None,
             None,
         );
         cursor.map(|cursor| (cursor.row, cursor.col, cursor.shape))
@@ -3094,11 +3110,12 @@ mod tests {
         let white = gpui_kit::rgb(0xeeeeee).into();
         let black = gpui_kit::rgb(0x111111).into();
         let palette = Palette::new(white, black, true);
-        let (_, _, runs, _) = snapshot(
+        let (_, _, runs, _, _) = snapshot(
             &term,
             &palette,
             white,
             super::scroll::Fixed::default(),
+            None,
             None,
         );
         runs.into_iter().map(|run| (run.col, run.text)).collect()

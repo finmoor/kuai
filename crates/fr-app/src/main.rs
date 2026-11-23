@@ -15,6 +15,7 @@ mod machines;
 mod manager;
 mod mapping;
 mod open_dir;
+mod open_with;
 mod packaging;
 mod palette;
 mod prompt;
@@ -40,6 +41,7 @@ mod tray;
 mod ui;
 mod update;
 mod update_view;
+mod web_serve;
 mod win;
 mod workspace;
 mod workspace_page;
@@ -72,8 +74,10 @@ gpui_kit::actions!(
         ToggleSidebar,
         ShowFiles,
         SaveFile,
+        TogglePreview,
         BackToRoot,
         ShowTerminals,
+        PickNewTerminal,
         GoToHead
     ]
 );
@@ -83,7 +87,7 @@ gpui_kit::actions!(
 /// 留下的都是终端里的程序本来就收不到、或者收到了也和不按 Shift 时没有区别的组合键。
 /// F5、Ctrl+W、Ctrl+F、Ctrl+P、Ctrl+S 不在里面：它们是 shell 和程序要用的
 /// （删一个词、往前搜、上一条命令……）。新加的全局快捷键要在终端里也生效，得加到这里。
-const TERMINAL_KEEPS: [&str; 14] = [
+const TERMINAL_KEEPS: [&str; 15] = [
     // 切仓库标签页、重新打开刚关的
     "ctrl-tab",
     "ctrl-shift-tab",
@@ -100,8 +104,9 @@ const TERMINAL_KEEPS: [&str; 14] = [
     "ctrl-,",
     "ctrl-shift-b",
     "ctrl-shift-f",
-    // 终端总览页：在终端里看着一个，要去看别的
+    // 会话页：在终端里看着一个，要去看别的、在别的仓库里新开一个
     "ctrl-shift-a",
+    "ctrl-shift-n",
 ];
 
 /// 焦点在终端里时，键位表里出现过的键除了 [`TERMINAL_KEEPS`] 一律不当快捷键。
@@ -475,6 +480,8 @@ fn main() {
                 // 和 VS Code 的资源管理器一样
                 KeyBinding::new("ctrl-shift-e", ShowFiles, None),
                 KeyBinding::new("ctrl-s", SaveFile, None),
+                // 文件页的 Markdown 在预览和源文件之间切换（和 VS Code 一样）。焦点在终端里时归终端（粘贴）
+                KeyBinding::new("ctrl-shift-v", TogglePreview, None),
                 // 从子仓库回到根仓库。焦点在终端、输入框里时归它们（往回一个词）
                 KeyBinding::new("alt-left", BackToRoot, None),
                 // 上面那句对输入框要靠这一条才成立：没有上下文的绑定和输入框自己的一样深，后登记的
@@ -483,12 +490,17 @@ fn main() {
                 // 编辑器的查找，见 `RepoView::find`）、Ctrl+Shift+A 和 Ctrl+Shift+E（界面库拿来选到
                 // 行首、行尾，Windows 上没人这么按，留给切页面）。界面库升级后重新对一遍。
                 KeyBinding::new("alt-left", MoveToPreviousWord, Some("Input")),
-                // 所有工作区里的终端（All terminals）。终端里的程序分不出它和 Ctrl+A，留给 Kuai
+                // 会话页：所有主机上各个仓库的终端。终端里的程序分不出它和 Ctrl+A，留给 Kuai
                 KeyBinding::new("ctrl-shift-a", ShowTerminals, None),
+                // 选一个仓库新建终端（New）。同上，程序分不出它和 Ctrl+N
+                KeyBinding::new("ctrl-shift-n", PickNewTerminal, None),
             ]);
             release_keys_to_terminal(cx);
             workspace_action::<OpenSettings>(cx, |ws, window, cx| ws.toggle_settings(window, cx));
             workspace_action::<ShowTerminals>(cx, |ws, window, cx| ws.toggle_terms(window, cx));
+            workspace_action::<PickNewTerminal>(cx, |ws, window, cx| {
+                ws.pick_new_terminal(window, cx)
+            });
             workspace_action::<Refresh>(cx, |ws, _, cx| ws.refresh_active(cx));
             workspace_action::<CloseTab>(cx, |ws, window, cx| ws.close_active(window, cx));
             workspace_action::<ShowChanges>(cx, |ws, window, cx| {
@@ -514,6 +526,9 @@ fn main() {
             });
             workspace_action::<ShowFiles>(cx, |ws, window, cx| ws.files_in_active(window, cx));
             workspace_action::<SaveFile>(cx, |ws, window, cx| ws.save_in_active(window, cx));
+            workspace_action::<TogglePreview>(cx, |ws, window, cx| {
+                ws.preview_in_active(window, cx)
+            });
             workspace_action::<BackToRoot>(cx, |ws, window, cx| {
                 ws.back_to_root_in_active(window, cx)
             });

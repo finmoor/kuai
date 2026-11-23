@@ -210,7 +210,7 @@ pub(crate) fn render_block<T: 'static>(
                 let entry = entry.clone();
                 chip.cursor_pointer()
                     .hover(move |s| s.bg(list_hover))
-                    .tooltip(|window, cx| ui::tip(tr("在终端页中查看"), window, cx))
+                    .tooltip(|window, cx| ui::tip(tr("在会话页中查看"), window, cx))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         go(this, entry.clone(), window, cx)

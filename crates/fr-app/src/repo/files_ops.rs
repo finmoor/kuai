@@ -118,6 +118,31 @@ pub(super) fn view_item(
     })
 }
 
+/// 文件交给别处看的几项：网页、SVG「在浏览器中打开」，Markdown「打开预览」，都有「用默认程序打开」。
+pub(super) fn open_items(menu: PopupMenu, view: &WeakEntity<RepoView>, path: &str) -> PopupMenu {
+    let item = |label, run| view_item(view, label, run);
+    let mut menu = menu;
+    if crate::open_with::is_web(path) {
+        let path = path.to_string();
+        menu = menu.item(item(
+            tr("在浏览器中打开"),
+            Box::new(move |this, window, cx| this.open_in_browser(path.clone(), window, cx)),
+        ));
+    }
+    if crate::open_with::is_markdown(path) {
+        let path = path.to_string();
+        menu = menu.item(item(
+            tr("打开预览"),
+            Box::new(move |this, window, cx| this.preview_markdown(path.clone(), window, cx)),
+        ));
+    }
+    let path = path.to_string();
+    menu.item(item(
+        tr("用默认程序打开"),
+        Box::new(move |this, window, cx| this.open_with_default(path.clone(), window, cx)),
+    ))
+}
+
 /// 树里一行（或者空白处，`row` 为 None）的右键菜单。
 pub(super) fn tree_menu(
     view: WeakEntity<RepoView>,
@@ -148,6 +173,7 @@ pub(super) fn tree_menu(
                 tr("打开"),
                 Box::new(move |this, window, cx| this.open_file(open.clone(), false, window, cx)),
             ));
+            menu = open_items(menu, &view, &row.path);
             menu = menu.separator();
             if changed {
                 menu = menu.item(item(
@@ -786,6 +812,57 @@ impl RepoView {
         cx.notify();
     }
 
+    // ---------- 交给浏览器、默认程序 ----------
+
+    /// 在浏览器中打开仓库里的 `path`（网页、SVG），经本机网页服务（见 [`crate::web_serve`]）。编辑器
+    /// 里有没保存的修改时提示一下：浏览器里是磁盘上的那一版。
+    pub(super) fn open_in_browser(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .files
+            .tabs
+            .iter()
+            .any(|tab| tab.path == path && tab.dirty())
+        {
+            let text = tr("此文件有未保存的修改，浏览器中显示的是已保存的内容。");
+            window.push_notification(Notification::info(text), cx);
+        }
+        crate::open_with::open_in_browser(&self.entry, self.channel.clone(), &path, window, cx);
+    }
+
+    /// 用默认程序打开仓库里的 `path`。本机的直接打开；远程主机上的：映射着的开映射盘上的，文件页里
+    /// 显示成卡片的用卡片那一份（本机改过可以传回去），其余的下载一份到本机再开。
+    pub(super) fn open_with_default(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let full = self.full_path(&path);
+        let Some(server) = self.entry.server.clone() else {
+            return crate::shell::open_file(&full, window, cx);
+        };
+        if let Some(local) = self.app.read(cx).local_path(&server, &full) {
+            return crate::shell::open_file(&local, window, cx);
+        }
+        let card = self
+            .files
+            .tabs
+            .iter()
+            .find(|tab| tab.path == path && matches!(tab.body, Body::Opaque(_)))
+            .map(|tab| tab.id);
+        if let Some(id) = card {
+            return self.open_externally(id, window, cx);
+        }
+        if let Some((channel, repo)) = self.files_channel() {
+            crate::open_with::open_copy(channel, &repo, &path, window, cx);
+        }
+    }
+
     // ---------- 用默认程序打开 ----------
 
     /// 用系统给这种文件设的默认程序打开。本机仓库直接打开；服务器上的先下载一份到本机的
@@ -838,12 +915,7 @@ impl RepoView {
         let Some(doc) = tab.opaque_mut() else {
             return;
         };
-        sweep_old_copies();
-        // 每次下载放进自己的目录：文件名和服务器上的一样（换掉本机不能用的字符），默认程序的
-        // 标题栏里看得出是哪个文件
-        let number = NEXT_COPY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = copies_dir().join(format!("{}-{number}", std::process::id()));
-        let dest = dir.join(local_file_name(&name));
+        let dest = new_copy_dir().join(local_file_name(&name));
         let mut stream = channel.fs_download(&repo, &path, dest.clone());
         let label: SharedString = tr("正在下载…").into();
         doc.busy = Some((label.clone(), 0, 0));
@@ -1105,6 +1177,14 @@ fn downloads_dir() -> Option<PathBuf> {
 /// 下载副本的子目录编号：整个进程一个计数。不用标签的编号，那是每个仓库页各自从头数的，两个
 /// 仓库页会撞上，关一个标签就删了另一个仓库的副本。
 static NEXT_COPY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// 新下载的一份副本放进哪个目录：[`copies_dir`] 下每次一个。文件名和主机上的一样（换掉本机不能用
+/// 的字符，见 [`local_file_name`]），默认程序的标题栏里看得出是哪个文件。
+pub(crate) fn new_copy_dir() -> PathBuf {
+    sweep_old_copies();
+    let number = NEXT_COPY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    copies_dir().join(format!("{}-{number}", std::process::id()))
+}
 
 /// 清掉以前留下的副本：Kuai 没关标签页就退出时，副本留在临时目录里。别的进程的、七天没动过的删掉
 /// （本进程的还开着）。每个进程只清一次。

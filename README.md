@@ -73,9 +73,9 @@ Kuai 在服务器上安装一个常驻的小程序 `kuaid`（约 3 MB，无需 r
 
 每个仓库都有自己的终端，运行在仓库所在的主机上。关闭标签页、退出 Kuai、网络断开、合上电脑，其中的 Claude Code 照常运行；再次打开即可接回，屏幕内容保持不变。不需要 tmux。
 
-![「终端」页：左侧按工作区列出各仓库的终端，右侧是 Claude Code 的画面](assets/screenshots/zh-CN/terminals.png)
+![「会话」页：左侧按工作区列出各仓库的终端，右侧是 Claude Code 的画面](assets/screenshots/zh-CN/terminals.png)
 
-- **停下来就提醒**：「终端」页汇总所有工作区中各仓库的终端，图标区分 AI 助手、其他命令和空闲的 shell；终端停止输出时提醒，Kuai 不在前台时发送系统通知
+- **停下来就提醒**：「会话」页汇总所有主机上各仓库的终端（未加入工作区的仓库也在），图标区分 AI 助手、其他命令和空闲的 shell；终端停止输出时提醒，Kuai 不在前台时发送系统通知
 - **截图直接发给它**：复制截图后粘贴，或将图片、文件拖进终端；文件自动上传到主机，终端中得到的是它在主机上的路径
 - **同时运行多个任务**：一个仓库可以打开多个终端
 - 本机仓库的终端同样在退出 Kuai 后继续运行
@@ -108,7 +108,7 @@ Kuai 在服务器上安装一个常驻的小程序 `kuaid`（约 3 MB，无需 r
 
 终端、Git、文件是同一个仓库的三页，可以直接从一页跳到另一页：
 
-- **终端 → 文件**：按住 <kbd>Ctrl</kbd> 单击终端中的文件路径，在文件页中打开并跳到对应的行
+- **终端 → 文件**：按住 <kbd>Ctrl</kbd> 单击终端中的文件路径，在文件页中打开并跳到对应的行；右键点在路径上，可在浏览器中打开网页、用默认程序打开、复制路径
 - **文件 → Git**：查看正在编辑的文件的改动，以及改过它的提交
 - **Git → 文件**：在改动的文件上点击右键，在文件页中打开
 - **文件 → 终端**：在文件所在的目录中新建终端
@@ -233,7 +233,7 @@ Kuai 不自建连接和认证，全部交给 SSH。思路与 VS Code 的 Remote 
 
 ## 快捷键
 
-常用的几个：<kbd>Ctrl</kbd>+<kbd>P</kbd> 快速打开仓库，<kbd>Ctrl</kbd>+<kbd>&#96;</kbd> 在终端页和之前的页面之间切换，<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> 打开「终端」页，<kbd>Ctrl</kbd>+<kbd>Enter</kbd> 提交，在改动行上按空格键暂存。
+常用的几个：<kbd>Ctrl</kbd>+<kbd>P</kbd> 快速打开仓库，<kbd>Ctrl</kbd>+<kbd>&#96;</kbd> 在终端页和之前的页面之间切换，<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> 打开「会话」页，<kbd>Ctrl</kbd>+<kbd>Enter</kbd> 提交，在改动行上按空格键暂存。
 
 <details>
 <summary><b>全部快捷键</b></summary>
@@ -253,10 +253,12 @@ Kuai 不自建连接和认证，全部交给 SSH。思路与 VS Code 的 Remote 
 | Ctrl+Shift+` | 为当前仓库新建终端，并切换到终端页 |
 | Ctrl+Shift+B | 收起或展开左侧栏（收起后显示为一列图标，所有标签页共用此状态） |
 | Ctrl+Shift+E | 切换到当前仓库的文件页 |
-| Ctrl+Shift+A | 切换到「终端」页（所有工作区中各仓库的终端） |
-| Ctrl+Shift+↑、Ctrl+Shift+↓ | 在「终端」页往终端中输入时，切换到侧栏中的上一个、下一个终端（输入时终端画面顶上有一条细线） |
+| Ctrl+Shift+A | 切换到「会话」页（所有主机上各仓库的终端） |
+| Ctrl+Shift+N | 选择一个仓库新建终端，在「会话」页中显示 |
+| Ctrl+Shift+↑、Ctrl+Shift+↓ | 在「会话」页往终端中输入时，切换到侧栏中的上一个、下一个终端（输入时终端画面顶上有一条细线） |
 | Alt+← | 在子仓库或工作树中时，返回根仓库的子仓库总览或工作树总览（焦点在终端、输入框中时不生效） |
 | Ctrl+S | 保存文件页中当前打开的文件 |
+| Ctrl+Shift+V | 文件页中的 Markdown 在预览和源文件之间切换 |
 
 列表中的按键（先点击列表，或用 Ctrl+1、Ctrl+2 将焦点移到列表）：
 
@@ -269,7 +271,7 @@ Kuai 不自建连接和认证，全部交给 SSH。思路与 VS Code 的 Remote 
 | 逐行追溯 | 上下方向键、PageUp、PageDown、Home、End 选择行，Enter 跳转到修改该行的提交，Esc 关闭 |
 | 文件页的目录树 | 上下方向键切换，左右方向键折叠、展开目录，Enter 打开文件并保留，空格键预览；F2 重命名，Delete 删除（会先确认） |
 
-焦点位于终端中时，只有以下快捷键仍由 Kuai 处理：Ctrl+Tab、Ctrl+Shift+Tab、Ctrl+Shift+T、Ctrl+1、Ctrl+2、Ctrl+Shift+E、Ctrl+\`、Ctrl+Shift+\`、Ctrl+,、Ctrl+Shift+B、Ctrl+Shift+A，以及「终端」页中的 Ctrl+Shift+↑、Ctrl+Shift+↓。其余按键（Tab、Shift+Tab、Esc、F5、Ctrl+W、Ctrl+F、Ctrl+P、Ctrl+S、功能键、Alt 组合键等）交给终端中的程序（Alt+V 见下文）。终端中：Ctrl+C 中断（选中文字时为复制），Ctrl+Shift+C 复制（在 opencode 这类使用鼠标的程序中拖选后，由程序复制），Ctrl+V、Shift+Insert 粘贴（剪贴板中为图片或文件时，粘贴的是其路径）；远程主机上的终端中，剪贴板中有图片或文件时 Alt+V（Claude Code 在 Windows 上粘贴图片的按键）也由 Kuai 发送，与 Ctrl+V 相同，否则交给程序；右键在有选中文字时复制，否则粘贴；Shift+PageUp、Shift+PageDown、鼠标滚轮和右侧的滚动条可查看之前的输出，往回翻时输入区固定在底部，打字时画面不动，按 Enter 回到底部；左侧的刻度是发出过的消息，鼠标停留可预览，单击跳转；按住 Ctrl 单击网址、文件路径即可打开：网址在浏览器中打开，仓库中的文件在文件页中打开并跳到对应的行，本机上仓库外的文件用默认程序打开。终端中的程序使用鼠标时（例如 opencode、全屏模式的 Claude Code），点击、拖动、右键和滚轮都交给程序；按住 Shift 时仍由 Kuai 处理：拖动选中文字，右键复制或粘贴，滚动查看终端的记录。
+焦点位于终端中时，只有以下快捷键仍由 Kuai 处理：Ctrl+Tab、Ctrl+Shift+Tab、Ctrl+Shift+T、Ctrl+1、Ctrl+2、Ctrl+Shift+E、Ctrl+\`、Ctrl+Shift+\`、Ctrl+,、Ctrl+Shift+B、Ctrl+Shift+A、Ctrl+Shift+N，以及「会话」页中的 Ctrl+Shift+↑、Ctrl+Shift+↓。其余按键（Tab、Shift+Tab、Esc、F5、Ctrl+W、Ctrl+F、Ctrl+P、Ctrl+S、功能键、Alt 组合键等）交给终端中的程序（Alt+V 见下文）。终端中：Ctrl+C 中断（选中文字时为复制），Ctrl+Shift+C 复制（在 opencode 这类使用鼠标的程序中拖选后，由程序复制），Ctrl+V、Shift+Insert 粘贴（剪贴板中为图片或文件时，粘贴的是其路径）；远程主机上的终端中，剪贴板中有图片或文件时 Alt+V（Claude Code 在 Windows 上粘贴图片的按键）也由 Kuai 发送，与 Ctrl+V 相同，否则交给程序；右键点在网址、文件路径上时弹出菜单（在文件页中打开、在浏览器中打开、用默认程序打开、复制路径等），在别处有选中文字时复制，否则粘贴；Shift+PageUp、Shift+PageDown、鼠标滚轮和右侧的滚动条可查看之前的输出，往回翻时输入区固定在底部，打字时画面不动，按 Enter 回到底部；左侧的刻度是发出过的消息，鼠标停留可预览，单击跳转；按住 Ctrl 单击网址、文件路径即可打开（鼠标在上面停留片刻会出现虚线和提示）：网址在浏览器中打开，仓库中的文件在文件页中打开并跳到对应的行，本机上仓库外的文件用默认程序打开。终端中的程序使用鼠标时（例如 opencode、全屏模式的 Claude Code），点击、拖动、右键和滚轮都交给程序；按住 Shift 时仍由 Kuai 处理：拖动选中文字，右键弹出菜单或复制、粘贴，滚动查看终端的记录。
 
 </details>
 

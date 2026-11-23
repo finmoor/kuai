@@ -14,12 +14,14 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, Input};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _};
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::files::{Body, ImageDoc, Opaque, OpaqueDoc, OpenFile, TextDoc};
-use super::files_ops::{tree_menu, view_item};
+use super::files_ops::{open_items, tree_menu, view_item};
 use super::rail::rail_button;
 use super::{Page, RepoView, TOOLBAR_HEIGHT, tool_button};
 use crate::text::human_size;
@@ -557,6 +559,7 @@ impl RepoView {
             Some(tab) => match &tab.body {
                 Body::Loading => self.render_file_note(tr("正在读取文件…").into(), false, cx),
                 Body::Failed(error) => self.render_file_note(error.clone(), true, cx),
+                Body::Text(doc) if tab.rendered => self.render_markdown(tab, doc, cx),
                 Body::Text(doc) => self.render_editor(doc),
                 Body::Image(doc) => self.render_image(tab, doc, cx),
                 Body::Opaque(doc) => self.render_opaque(tab, doc, cx),
@@ -687,6 +690,13 @@ impl RepoView {
         let tracked_or_changed = on_file;
         let changed = mark.is_some();
         let (changes_path, history_path, term_path) = (path.clone(), path.clone(), path.clone());
+        // 网页、SVG 多一个「浏览器」，Markdown 多一个「预览」
+        let web = path
+            .as_deref()
+            .filter(|path| crate::open_with::is_web(path));
+        let web = web.map(str::to_string);
+        let markdown = path.as_deref().is_some_and(crate::open_with::is_markdown) && text.is_some();
+        let rendered = tab.is_some_and(|tab| tab.rendered);
         h_flex()
             .h(px(TOOLBAR_HEIGHT))
             .px(px(10.))
@@ -787,6 +797,45 @@ impl RepoView {
                     this.new_terminal_in(dir, window, cx);
                 })),
             )
+            .when_some(web, |bar, web| {
+                bar.child(
+                    tool_button(
+                        "file-browser",
+                        IconName::Globe,
+                        tr("浏览器"),
+                        tr("在浏览器中打开（同目录的样式、脚本、图片都能加载）"),
+                        false,
+                        true,
+                        0,
+                        cx,
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_in_browser(web.clone(), window, cx)
+                    })),
+                )
+            })
+            .when(markdown, |bar| {
+                bar.child(
+                    tool_button(
+                        "file-preview",
+                        IconName::Eye,
+                        tr("预览"),
+                        if rendered {
+                            tr("回到源文件（Ctrl+Shift+V）")
+                        } else {
+                            tr("预览 Markdown（Ctrl+Shift+V）")
+                        },
+                        false,
+                        true,
+                        0,
+                        cx,
+                    )
+                    .selected(rendered)
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.toggle_markdown_preview(window, cx)),
+                    ),
+                )
+            })
             .child(self.render_file_more(id, path, cx))
             .into_any_element()
     }
@@ -814,7 +863,7 @@ impl RepoView {
         super::tool_button_bare("file-more", IconName::Ellipsis, tr("更多"), false, 0, cx)
             .disabled(path.is_none())
             .dropdown_menu(move |menu, _, cx| {
-                let (Some(id), Some(path)) = (id, path.clone()) else {
+                let (Some(_), Some(path)) = (id, path.clone()) else {
                     return menu;
                 };
                 let full_remote = format!("{}/{path}", root.trim_end_matches('/'));
@@ -848,6 +897,7 @@ impl RepoView {
                         Box::new(move |this, _, cx| this.copy_path(&relative, true, cx)),
                     ))
                     .separator();
+                menu = open_items(menu, &view, &path);
                 menu = match remote {
                     true => {
                         let menu = match &server_id {
@@ -869,19 +919,14 @@ impl RepoView {
                             }),
                         ))
                     }
-                    false => menu
-                        .item(item(
-                            tr("用默认程序打开"),
-                            Box::new(move |this, window, cx| this.open_externally(id, window, cx)),
-                        ))
-                        .item(item(
-                            crate::shell::reveal_label(),
-                            Box::new(move |this, window, cx| {
-                                let path = this.full_path(&reveal);
-                                let result = crate::shell::reveal_in_explorer(&path);
-                                crate::shell::report(result, window, cx);
-                            }),
-                        )),
+                    false => menu.item(item(
+                        crate::shell::reveal_label(),
+                        Box::new(move |this, window, cx| {
+                            let path = this.full_path(&reveal);
+                            let result = crate::shell::reveal_in_explorer(&path);
+                            crate::shell::report(result, window, cx);
+                        }),
+                    )),
                 };
                 // 经别的服务器连的（A>B）：本机连不到它，VS Code 打不开
                 let relayed = remote && server.is_none();

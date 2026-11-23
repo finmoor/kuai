@@ -469,7 +469,7 @@ pub struct TermSlot {
     pub number: u32,
 }
 
-/// 终端页（标题栏上的「终端」）在这台电脑上记的东西，不同步到别的电脑。
+/// 会话页（标题栏上的「会话」）在这台电脑上记的东西，不同步到别的电脑。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TermHub {
     /// 固定的终端，按固定的先后
@@ -484,6 +484,9 @@ pub struct TermHub {
     /// 收起的仓库：下面不列它的终端
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collapsed_repos: Vec<RepoEntry>,
+    /// 收起的「未加入工作区」（哪台主机的那一节：本机是空串）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collapsed_unbound: Vec<String>,
     /// 侧栏只列哪台电脑上的工作区：没有是全部，空的是本机，别的是服务器的 id。固定的不受它影响
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
@@ -495,6 +498,7 @@ impl TermHub {
             && self.pinned_repos.is_empty()
             && self.collapsed.is_empty()
             && self.collapsed_repos.is_empty()
+            && self.collapsed_unbound.is_empty()
             && self.scope.is_none()
     }
 }

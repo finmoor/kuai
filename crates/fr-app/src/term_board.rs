@@ -175,11 +175,37 @@ pub fn free_number(used: &[u32]) -> u32 {
     (1..).find(|n| !used.contains(n)).unwrap_or(1)
 }
 
-/// 一个工作区里的仓库和各自的终端（终端页的侧栏按它画）。
+/// 会话页侧栏里一节是什么。
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum GroupKey {
+    /// 一个工作区
+    Workspace(WorkspaceKey),
+    /// 一台主机上不在任何工作区里的仓库（主机的键，经别的主机连的是 `那台>它`）
+    Unbound(String),
+}
+
+impl GroupKey {
+    pub fn workspace(&self) -> Option<&WorkspaceKey> {
+        match self {
+            GroupKey::Workspace(key) => Some(key),
+            GroupKey::Unbound(_) => None,
+        }
+    }
+
+    /// 这一节在哪台主机上
+    pub fn machine(&self) -> &str {
+        match self {
+            GroupKey::Workspace(key) => &key.machine,
+            GroupKey::Unbound(machine) => machine,
+        }
+    }
+}
+
+/// 一节里的仓库和各自的终端（会话页的侧栏按它画）。
 pub struct RepoGroup {
-    /// 不在任何工作区里的仓库归到最后一组，这里是 None
-    pub workspace: Option<WorkspaceKey>,
-    /// 按工作区里的先后；没有终端的仓库也在
+    pub key: GroupKey,
+    /// 工作区的按工作区里的先后；未加入工作区的按主机仓库列表的先后，列表里没有、却开着终端的
+    /// （子仓库）排在后面。没有终端的仓库也在
     pub repos: Vec<(RepoEntry, Vec<Row>)>,
 }
 
@@ -580,34 +606,29 @@ impl TermBoard {
         Some(rows)
     }
 
-    /// 全部工作区里的仓库和各自的终端：现在用的工作区在最前，不在任何工作区里、却有终端的仓库在
-    /// 最后。一个仓库在几个工作区里时只列在第一个里。没连着的服务器上的仓库不列：上面的终端不知道，
-    /// 也开不了。
+    /// 全部工作区里的仓库和各自的终端，后面是各台主机上未加入工作区的仓库（主机仓库列表里不在
+    /// 任何工作区中的，没有终端的也列；列表里没有、却开着终端的也归在这里）。一个仓库在几个工作区
+    /// 里时只列在第一个里。没连着的主机上的仓库不列：上面的终端不知道，也开不了。
     pub fn repos(&self, cx: &App) -> Vec<RepoGroup> {
         let app = self.app.read(cx);
-        let workspaces = self.reachable_members(workspace_order(app), app);
+        let order = workspace_order(app);
+        let grouped: Vec<RepoEntry> = order.iter().flat_map(|key| app.members(key)).collect();
+        let workspaces = self.reachable_members(order, app);
         let (mut groups, rows) = group_by_workspace(workspaces, self.all_rows());
-        let mut repos: Vec<(RepoEntry, Vec<Row>)> = Vec::new();
-        for row in rows {
-            match repos.iter_mut().find(|(entry, _)| *entry == row.entry) {
-                Some((_, list)) => list.push(row),
-                None => repos.push((row.entry.clone(), vec![row])),
-            }
-        }
-        if !repos.is_empty() {
-            groups.push(RepoGroup {
-                workspace: None,
-                repos,
-            });
-        }
+        let listed: Vec<RepoEntry> = app
+            .all_repos()
+            .into_iter()
+            .filter(|entry| self.reachable(entry) && !grouped.contains(entry))
+            .collect();
+        groups.extend(group_unbound(listed, rows));
         groups
     }
 
-    /// 电脑 `machine` 上的工作区里的仓库和各自的终端（终端页只看一台服务器时用）。和 [`Self::repos`]
+    /// 电脑 `machine` 上的工作区里的仓库和各自的终端（会话页只看一台主机时用）。和 [`Self::repos`]
     /// 不一样的地方：只在这台电脑的工作区之间去重。同一个仓库也在别的电脑的工作区里时，[`Self::repos`]
     /// 把它归到排在前面的那个工作区（比如本机现在用的），这里照样列在这台电脑的工作区里；不然
-    /// 这台电脑的工作区会因为仓库都被别处占了而整个不见。不在任何工作区里的
-    /// 终端这里不管。
+    /// 这台电脑的工作区会因为仓库都被别处占了而整个不见。未加入工作区的那几节这里不管（从
+    /// [`Self::repos`] 里挑）。
     pub fn repos_on(&self, machine: &str, cx: &App) -> Vec<RepoGroup> {
         let app = self.app.read(cx);
         let mut keys = workspace_order(app);
@@ -616,22 +637,56 @@ impl TermBoard {
         group_by_workspace(workspaces, self.all_rows()).0
     }
 
+    /// 这次连着、开得了终端：本机的总是，主机上的要那台连着。
+    fn reachable(&self, entry: &RepoEntry) -> bool {
+        entry.server.is_none() || self.watching(machine_of(entry))
+    }
+
     /// 各个工作区里的仓库，去掉这次还没连上的服务器上的。
     fn reachable_members(
         &self,
         keys: Vec<WorkspaceKey>,
         app: &AppState,
     ) -> Vec<(WorkspaceKey, Vec<RepoEntry>)> {
-        let reachable =
-            |entry: &RepoEntry| entry.server.is_none() || self.watching(machine_of(entry));
         keys.into_iter()
             .map(|key| {
                 let mut members = app.members(&key);
-                members.retain(reachable);
+                members.retain(|entry| self.reachable(entry));
                 (key, members)
             })
             .collect()
     }
+}
+
+/// 未加入工作区的仓库按主机分节：`listed` 是主机仓库列表里的（已经按主机排好），`rows` 是没归到
+/// 哪个工作区的终端。列表里的仓库按列表的先后，终端归到各自的仓库；剩下的终端（子仓库这类列表里
+/// 没有的）按仓库接在它所在主机那一节的后面，那台没有这一节就新起一节。
+fn group_unbound(listed: Vec<RepoEntry>, mut rows: Vec<Row>) -> Vec<RepoGroup> {
+    let mut groups: Vec<RepoGroup> = Vec::new();
+    let add = |groups: &mut Vec<RepoGroup>, entry: RepoEntry, mine: Vec<Row>| {
+        let key = GroupKey::Unbound(machine_of(&entry).to_string());
+        match groups.iter_mut().find(|group| group.key == key) {
+            Some(group) => group.repos.push((entry, mine)),
+            None => groups.push(RepoGroup {
+                key,
+                repos: vec![(entry, mine)],
+            }),
+        }
+    };
+    for entry in listed {
+        let (mine, rest): (Vec<Row>, Vec<Row>) =
+            rows.into_iter().partition(|row| row.entry == entry);
+        rows = rest;
+        add(&mut groups, entry, mine);
+    }
+    while let Some(first) = rows.first() {
+        let entry = first.entry.clone();
+        let (mine, rest): (Vec<Row>, Vec<Row>) =
+            rows.into_iter().partition(|row| row.entry == entry);
+        rows = rest;
+        add(&mut groups, entry, mine);
+    }
+    groups
 }
 
 /// 把终端按工作区、仓库分组。同一个仓库在几个工作区里时只列在最前面的那个里；没有仓库可列的
@@ -656,7 +711,7 @@ fn group_by_workspace(
         }
         if !repos.is_empty() {
             groups.push(RepoGroup {
-                workspace: Some(key),
+                key: GroupKey::Workspace(key),
                 repos,
             });
         }
@@ -704,8 +759,78 @@ fn owner(app: &AppState, machine: &str, key: &str) -> (RepoEntry, u32) {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{Program, RepoEntry, Row, TermId, WorkspaceKey, group_by_workspace};
-    use super::{TermState, free_number, state_of};
+    use super::{GroupKey, Program, RepoEntry, Row, TermId, WorkspaceKey, group_by_workspace};
+    use super::{TermState, free_number, group_unbound, state_of};
+
+    #[test]
+    fn 未加入工作区的仓库按主机分节_没有终端的也列() {
+        let entry = |server: Option<&str>, path: &str| RepoEntry {
+            server: server.map(str::to_string),
+            path: path.into(),
+        };
+        let row = |entry: RepoEntry, number: u32| Row {
+            id: TermId {
+                machine: entry.server.clone().unwrap_or_default(),
+                term: format!("{}-{number}", entry.path),
+            },
+            entry,
+            number,
+            title: None,
+            last: String::new(),
+            cols: 80,
+            rows: 24,
+            alive: true,
+            state: TermState::Idle,
+            last_output: None,
+            programs: None,
+        };
+        // 主机仓库列表里的：本机两个、s1 一个（按主机排好）；终端开在本机的 b、本机列表里没有的
+        // 子仓库 a/sub、s1 列表里没有的 /x
+        let listed = vec![
+            entry(None, "C:/a"),
+            entry(None, "C:/b"),
+            entry(Some("s1"), "/c"),
+        ];
+        let rows = vec![
+            row(entry(Some("s1"), "/x"), 1),
+            row(entry(None, "C:/b"), 2),
+            row(entry(None, "C:/a/sub"), 1),
+            row(entry(None, "C:/b"), 1),
+        ];
+        let groups = group_unbound(listed, rows);
+        let keys: Vec<&GroupKey> = groups.iter().map(|group| &group.key).collect();
+        assert_eq!(
+            keys,
+            [
+                &GroupKey::Unbound(String::new()),
+                &GroupKey::Unbound("s1".into())
+            ]
+        );
+        let view = |group: &super::RepoGroup| -> Vec<(String, Vec<u32>)> {
+            group
+                .repos
+                .iter()
+                .map(|(entry, rows)| {
+                    let numbers = rows.iter().map(|row| row.number).collect();
+                    (entry.path.clone(), numbers)
+                })
+                .collect()
+        };
+        assert_eq!(
+            view(&groups[0]),
+            [
+                ("C:/a".to_string(), vec![]),
+                ("C:/b".to_string(), vec![2, 1]),
+                ("C:/a/sub".to_string(), vec![1]),
+            ]
+        );
+        assert_eq!(
+            view(&groups[1]),
+            [("/c".to_string(), vec![]), ("/x".to_string(), vec![1])]
+        );
+        // 没有未加入工作区的仓库、也没有剩下的终端：一节都没有
+        assert!(group_unbound(Vec::new(), Vec::new()).is_empty());
+    }
 
     #[test]
     fn 终端里跑的是哪一类程序() {

@@ -404,6 +404,8 @@ impl AppState {
                 if let Some(Ok(conn)) = this.conns.get(&id).and_then(|c| c.peek()) {
                     let conn = conn.clone();
                     this.learn_machine(&id, &conn.hello.machine, cx);
+                    // 浏览器里开着的这台主机上的网页：之后的请求经新连接读
+                    crate::web_serve::connected(&id, &Channel::Remote(conn.clone()));
                     // 经别的电脑连的这台认出来就是本机或者已有的一台：不单独列，也不订阅
                     if this.ids().duplicate(&id) {
                         this.note_duplicate(&id, cx);

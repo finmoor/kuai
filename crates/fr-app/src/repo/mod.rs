@@ -37,6 +37,7 @@ mod image_diff;
 mod impact;
 mod inline_diff;
 mod layout;
+mod markdown;
 mod menus;
 mod merge;
 mod ops;
@@ -50,6 +51,8 @@ mod sweep;
 mod terminals;
 mod worktrees;
 
+pub(crate) use files::local_file_name;
+pub(crate) use files_ops::new_copy_dir;
 pub(crate) use layout::sidebar_open;
 pub(crate) use ops::explain;
 pub(crate) use subs::{PARALLEL, Summary, summarize};

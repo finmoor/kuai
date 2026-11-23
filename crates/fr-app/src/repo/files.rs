@@ -364,7 +364,7 @@ pub(super) fn remove_copy(copy: &LocalCopy) {
 /// 主机上的文件名变成本机能用的文件名。主机多半是 Linux，文件名里可以有 `\`、`:`、`*` 这些，
 /// 原样拼到本机路径上会落到下载目录外面（`..\`、`C:\…`），或者建不出来；保留的设备名（CON、
 /// NUL、COM1……）前面加 `_`，结尾的点和空格去掉（Windows 会自己去掉，那就不是同一个文件了）。
-pub(super) fn local_file_name(name: &str) -> String {
+pub(crate) fn local_file_name(name: &str) -> String {
     let mut out: String = name
         .chars()
         .map(|c| match c {
@@ -459,6 +459,8 @@ pub(super) struct OpenFile {
     stat_task: Option<Task<()>>,
     /// 读回来以后光标跳到这里（终端里按住 Ctrl 单击了带行号的路径，见 [`RepoView::show_path`]）
     jump: Option<Position>,
+    /// Markdown 显示成排好的样子（预览），不是源文件（见 [`RepoView::toggle_markdown_preview`]）
+    pub rendered: bool,
 }
 
 impl OpenFile {
@@ -565,6 +567,8 @@ pub(super) struct Files {
     pub drop_target: Option<String>,
     /// 终端里单击了仓库里的路径时还没连上仓库（刚打开）：连上后再打开（见 `RepoView::show_path`）
     shown: Option<Shown>,
+    /// Markdown 预览里远程主机上的图片（见 [`super::markdown`]）
+    pub md_images: super::markdown::MdImages,
 }
 
 /// 等着打开的仓库里的路径（见 [`Files::shown`]）：路径、行列、是不是目录。
@@ -612,6 +616,7 @@ impl Files {
             loaded: false,
             drop_target: None,
             shown: None,
+            md_images: Default::default(),
         };
         (files, subscription)
     }
@@ -847,19 +852,7 @@ fn sort_entries(entries: &mut [FsEntry]) {
 impl RepoView {
     /// 仓库根在磁盘上的完整路径加上相对路径（状态栏、复制路径用）。服务器上的用 `/`，本机用 `\`。
     pub(super) fn full_path(&self, path: &str) -> String {
-        let root = self.entry.path.trim_end_matches(['/', '\\']);
-        // 服务器上的、Windows 以外的本机：正斜杠
-        if self.entry.server.is_some() || !cfg!(windows) {
-            return match path.is_empty() {
-                true => root.to_string(),
-                false => format!("{root}/{path}"),
-            };
-        }
-        let root = root.replace('/', "\\");
-        match path.is_empty() {
-            true => root,
-            false => format!("{root}\\{}", path.replace('/', "\\")),
-        }
+        crate::open_with::full_path(&self.entry.path, self.entry.server.is_some(), path)
     }
 
     /// 没保存的文件有几个（关标签页、退出前要问）。
@@ -1329,6 +1322,7 @@ impl RepoView {
             load_task: None,
             stat_task: None,
             jump: None,
+            rendered: false,
         };
         // 预览的那个标签（没改过的）换成这个文件，位置不变
         let reuse = self
@@ -1348,6 +1342,53 @@ impl RepoView {
             }
         }
         self.load_file(id, window, cx);
+        cx.notify();
+    }
+
+    /// 打开 Markdown 的预览（树里右键「打开预览」）：切到文件页，打开它，显示成排好的样子。
+    pub(super) fn preview_markdown(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_page(Page::Files, window, cx);
+        self.open_file(path.clone(), false, window, cx);
+        if let Some(tab) = self.files.tabs.iter_mut().find(|tab| tab.path == path) {
+            tab.rendered = true;
+        }
+        self.reveal_in_tree(&path, cx);
+        self.files.md_images.clear();
+        self.start_md_images(cx);
+        cx.notify();
+    }
+
+    /// 当前的 Markdown 在预览和源文件之间切换（工具栏的「预览」、Ctrl+Shift+V）。不是 Markdown、
+    /// 不在文件页上时不做什么。
+    pub fn toggle_markdown_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page != Page::Files {
+            return;
+        }
+        let Some(tab) = self.files.tabs.get_mut(self.files.active) else {
+            return;
+        };
+        if !crate::open_with::is_markdown(&tab.path) || tab.text().is_none() {
+            return;
+        }
+        tab.rendered = !tab.rendered;
+        // 回到源文件：焦点放回编辑器，接着就能打字
+        if !tab.rendered
+            && let Some(doc) = tab.text()
+        {
+            doc.editor.focus_handle(cx).focus(window, cx);
+        }
+        // 打开预览时图片重新读（主机上可能换过）
+        let rendered = tab.rendered;
+        if rendered {
+            self.files.md_images.clear();
+            self.start_md_images(cx);
+        }
+        log::info!("Markdown 换成{}", if rendered { "预览" } else { "源文件" });
         cx.notify();
     }
 
@@ -1647,10 +1688,24 @@ impl RepoView {
     }
 
     /// Ctrl+F 在文件页上：在显示着的文件里查找；没有打开文本文件（一个都没开、开的是图片）时
-    /// 把焦点放到按名称过滤文件的框里。
+    /// 把焦点放到按名称过滤文件的框里。Markdown 正预览着的先回到源文件（查找条在编辑器上）。
     pub(super) fn find_in_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 预览着：先回到源文件。编辑器这时还不在画面上，查找条要等它画出来再开（同 `jump_to`）
+        let active = self.files.active;
+        let was_rendered = self
+            .files
+            .tabs
+            .get_mut(active)
+            .map(|tab| std::mem::replace(&mut tab.rendered, false))
+            .unwrap_or(false);
         let doc = self.files.active_tab().and_then(OpenFile::text);
         match doc.map(|doc| doc.editor.clone()) {
+            Some(editor) if was_rendered => {
+                cx.notify();
+                window.on_next_frame(move |window, _| {
+                    window.on_next_frame(move |window, cx| open_editor_search(&editor, window, cx));
+                });
+            }
             Some(editor) => open_editor_search(&editor, window, cx),
             None => self.files.filter.focus_handle(cx).focus(window, cx),
         }

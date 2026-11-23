@@ -73,9 +73,9 @@ Kuai installs a small resident program, `kuaid` (about 3 MB, no root, no open po
 
 Every repository has its own terminals, running on the host the repository lives on. Close the tab, quit Kuai, lose the network or close the laptop: Claude Code inside keeps running. Open the repository again and you are back where you left, screen contents intact. No tmux needed.
 
-![The Terminals page: terminals of each repository grouped by workspace on the left, a Claude Code session on the right](assets/screenshots/en/terminals.png)
+![The Sessions page: terminals of each repository grouped by workspace on the left, a Claude Code session on the right](assets/screenshots/en/terminals.png)
 
-- **Told when it stops**: the Terminals page gathers the terminals of every repository in every workspace; icons tell AI assistants from other commands and idle shells. You are notified when a terminal stops producing output, with a system notification when Kuai is in the background
+- **Told when it stops**: the Sessions page gathers the terminals of every repository on every host, including repositories not in a workspace; icons tell AI assistants from other commands and idle shells. You are notified when a terminal stops producing output, with a system notification when Kuai is in the background
 - **Hand it a screenshot**: copy a screenshot and paste, or drop images and files on the terminal. The file is uploaded to the host, and the terminal receives its path there
 - **Several tasks at once**: a repository can have several terminals
 - Terminals of local repositories also keep running after Kuai quits
@@ -108,7 +108,7 @@ A full graphical Git client, modelled on Fork. When Claude Code is done, switch 
 
 Terminal, Git and Files are three pages of the same repository, and you can go straight from one to another:
 
-- **Terminal → Files**: hold <kbd>Ctrl</kbd> and click a file path in the terminal to open it on the Files page at that line
+- **Terminal → Files**: hold <kbd>Ctrl</kbd> and click a file path in the terminal to open it on the Files page at that line; right-click a path to open a web page in the browser, open the file in its default program or copy the path
 - **Files → Git**: see the changes to the file you are editing, and the commits that touched it
 - **Git → Files**: right-click a changed file and open it on the Files page
 - **Files → Terminal**: open a new terminal in the file's directory
@@ -233,7 +233,7 @@ Found a bug or have a suggestion? Please open an [issue](https://github.com/finm
 
 ## Keyboard shortcuts
 
-The ones you will use most: <kbd>Ctrl</kbd>+<kbd>P</kbd> quick open repository, <kbd>Ctrl</kbd>+<kbd>&#96;</kbd> switch between the Terminal page and the previous page, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> the Terminals page, <kbd>Ctrl</kbd>+<kbd>Enter</kbd> commit, and Space on a changed line to stage it.
+The ones you will use most: <kbd>Ctrl</kbd>+<kbd>P</kbd> quick open repository, <kbd>Ctrl</kbd>+<kbd>&#96;</kbd> switch between the Terminal page and the previous page, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> the Sessions page, <kbd>Ctrl</kbd>+<kbd>Enter</kbd> commit, and Space on a changed line to stage it.
 
 <details>
 <summary><b>All shortcuts</b></summary>
@@ -253,10 +253,12 @@ The ones you will use most: <kbd>Ctrl</kbd>+<kbd>P</kbd> quick open repository, 
 | Ctrl+Shift+` | Open a new terminal for the current repository and switch to the Terminal page |
 | Ctrl+Shift+B | Collapse or expand the sidebar (collapsed, it becomes a strip of icons; shared by all tabs) |
 | Ctrl+Shift+E | Switch to the repository's Files page |
-| Ctrl+Shift+A | Open the Terminals page (terminals of every repository in every workspace) |
-| Ctrl+Shift+↑, Ctrl+Shift+↓ | While typing into a terminal on the Terminals page, switch to the previous / next terminal in the sidebar (a thin line along the top of the terminal shows that it has the input) |
+| Ctrl+Shift+A | Open the Sessions page (terminals of every repository on every host) |
+| Ctrl+Shift+N | Pick a repository and open a new terminal in it on the Sessions page |
+| Ctrl+Shift+↑, Ctrl+Shift+↓ | While typing into a terminal on the Sessions page, switch to the previous / next terminal in the sidebar (a thin line along the top of the terminal shows that it has the input) |
 | Alt+← | Inside a sub-repository or a worktree, return to the root repository's overview (not while focus is in a terminal or a text field) |
 | Ctrl+S | Save the open file on the Files page |
+| Ctrl+Shift+V | Switch a Markdown file on the Files page between preview and source |
 
 Keys in lists (click the list first, or move focus there with Ctrl+1 / Ctrl+2):
 
@@ -269,7 +271,7 @@ Keys in lists (click the list first, or move focus there with Ctrl+1 / Ctrl+2):
 | Blame | Up, Down, PageUp, PageDown, Home, End to select a line; Enter jumps to the commit that changed it; Esc closes |
 | File tree on the Files page | Up/Down to move, Left/Right to collapse or expand a folder, Enter to open and keep the file, Space to preview; F2 to rename, Delete to delete (asks first) |
 
-While focus is in a terminal, Kuai handles only these shortcuts: Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+Shift+T, Ctrl+1, Ctrl+2, Ctrl+Shift+E, Ctrl+\`, Ctrl+Shift+\`, Ctrl+,, Ctrl+Shift+B, Ctrl+Shift+A, and Ctrl+Shift+↑ / Ctrl+Shift+↓ on the Terminals page. Every other key (Tab, Shift+Tab, Esc, F5, Ctrl+W, Ctrl+F, Ctrl+P, Ctrl+S, function keys, Alt combinations and so on) goes to the program in the terminal (see below for Alt+V). In a terminal: Ctrl+C interrupts (copies when text is selected), Ctrl+Shift+C copies (after you drag to select inside a program that uses the mouse, such as opencode, the program does the copying), Ctrl+V and Shift+Insert paste (an image or a file on the clipboard is pasted as its path); in a terminal on a remote host, Alt+V (the key Claude Code uses on Windows to paste an image) is also sent by Kuai when the clipboard holds an image or a file, exactly like Ctrl+V, and goes to the program otherwise; right-click copies when text is selected and pastes otherwise; Shift+PageUp, Shift+PageDown, the mouse wheel and the scrollbar on the right show earlier output. While you are scrolled back, the input area stays pinned at the bottom, typing does not move the view, and Enter returns to the bottom; the marks on the left are the messages you sent: hover to preview, click to jump. Ctrl+click a URL or a file path to open it: URLs open in the browser, files in the repository open on the Files page at that line, and other files on this computer open in their default program. When the program in the terminal uses the mouse (opencode, or Claude Code in fullscreen mode), clicks, drags, right-clicks and the wheel go to the program; hold Shift to let Kuai handle them instead: drag to select text, right-click to copy or paste, scroll through the terminal's history.
+While focus is in a terminal, Kuai handles only these shortcuts: Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+Shift+T, Ctrl+1, Ctrl+2, Ctrl+Shift+E, Ctrl+\`, Ctrl+Shift+\`, Ctrl+,, Ctrl+Shift+B, Ctrl+Shift+A, Ctrl+Shift+N, and Ctrl+Shift+↑ / Ctrl+Shift+↓ on the Sessions page. Every other key (Tab, Shift+Tab, Esc, F5, Ctrl+W, Ctrl+F, Ctrl+P, Ctrl+S, function keys, Alt combinations and so on) goes to the program in the terminal (see below for Alt+V). In a terminal: Ctrl+C interrupts (copies when text is selected), Ctrl+Shift+C copies (after you drag to select inside a program that uses the mouse, such as opencode, the program does the copying), Ctrl+V and Shift+Insert paste (an image or a file on the clipboard is pasted as its path); in a terminal on a remote host, Alt+V (the key Claude Code uses on Windows to paste an image) is also sent by Kuai when the clipboard holds an image or a file, exactly like Ctrl+V, and goes to the program otherwise; right-click on a URL or a file path opens a menu (open on the Files page, open in the browser, open in the default program, copy the path and so on), and elsewhere copies when text is selected and pastes otherwise; Shift+PageUp, Shift+PageDown, the mouse wheel and the scrollbar on the right show earlier output. While you are scrolled back, the input area stays pinned at the bottom, typing does not move the view, and Enter returns to the bottom; the marks on the left are the messages you sent: hover to preview, click to jump. Ctrl+click a URL or a file path to open it (rest the mouse on one for a moment to see a dashed underline and a hint): URLs open in the browser, files in the repository open on the Files page at that line, and other files on this computer open in their default program. When the program in the terminal uses the mouse (opencode, or Claude Code in fullscreen mode), clicks, drags, right-clicks and the wheel go to the program; hold Shift to let Kuai handle them instead: drag to select text, right-click for the menu or to copy and paste, scroll through the terminal's history.
 
 </details>
 
