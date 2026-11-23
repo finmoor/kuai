@@ -679,6 +679,10 @@ pub struct TerminalView {
     mouse_held: Option<u8>,
     /// 上一次报给程序的鼠标在第几列、第几行：在同一格里挪不重复报
     mouse_cell: Option<(usize, usize)>,
+    /// 在要了鼠标的程序里按着左键：拖到别的格了没有（拖了就是在程序里选字，见 `program_selected`）
+    program_drag: Option<bool>,
+    /// 刚在要了鼠标的程序里拖选过，之后没按键、没点：松开时剪贴板里的字（见 `copy_in_program`）
+    program_selected: Option<Option<String>>,
     /// 滚轮滚了不到一行的零头
     scroll_rest: f32,
     /// 程序自己设的标题（OSC 0、2）
@@ -859,6 +863,8 @@ impl TerminalView {
             selecting: false,
             mouse_held: None,
             mouse_cell: None,
+            program_drag: None,
+            program_selected: None,
             scroll_rest: 0.,
             title: None,
             blinking: Rc::default(),
@@ -1263,6 +1269,8 @@ impl TerminalView {
     fn type_bytes(&mut self, bytes: Vec<u8>, enter: bool, cx: &mut Context<Self>) {
         // 这边在往里输入：「只看」的画面把大小要过来（见 `wants_size`）
         self.size_wanted = true;
+        // 按了键：程序里选的字多半没了（见 `copy_in_program`）
+        self.program_selected = None;
         if let Some(session) = &self.session {
             let mut term = session.term.lock();
             if enter || self.scroll.fixed.get().len == 0 {
@@ -1340,6 +1348,27 @@ impl TerminalView {
         let session = self.session.as_ref()?;
         let text = session.term.lock().selection_to_string()?;
         (!text.is_empty()).then_some(text)
+    }
+
+    /// Ctrl+Shift+C 时 Kuai 自己没选字，但刚在要了鼠标的程序里拖选过（opencode 这类自己画选区的）：
+    /// 当 Ctrl+C 转给程序，它用 Ctrl+C 复制自己选的字（Windows 终端没选字时也是把这个键交给程序）。
+    /// 拖完以后按过键、点过，或者剪贴板已经变了（程序松开时自己复制了，比如 tmux、opencode 设成
+    /// 选中即复制）不转：程序那边多半已经没有选区，Ctrl+C 会清空输入框、退出程序或者打断命令。
+    /// 返回转了没有。
+    fn copy_in_program(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(before) = self.program_selected.take() else {
+            return false;
+        };
+        if self.selected_text().is_some() || self.mouse_mode(false).is_none() {
+            return false;
+        }
+        if cx.read_from_clipboard().and_then(|item| item.text()) != before {
+            log::info!("Ctrl+Shift+C：程序拖选后已经自己复制了，不再转 Ctrl+C");
+            return false;
+        }
+        log::info!("Ctrl+Shift+C：Kuai 没选字，刚在程序里拖选过，当 Ctrl+C 转给程序");
+        self.type_bytes(vec![0x03], false, cx);
+        true
     }
 
     fn copy(&mut self, cx: &mut Context<Self>) {
@@ -1611,9 +1640,12 @@ impl TerminalView {
             return;
         }
         let only_ctrl = mods.control && !mods.alt && !mods.platform;
-        // 复制：Ctrl+Shift+C；选着字的时候 Ctrl+C 也是复制（没选字时是中断程序）
+        // 复制：Ctrl+Shift+C；选着字的时候 Ctrl+C 也是复制（没选字时是中断程序）。Kuai 没选字、刚在
+        // 要了鼠标的程序里拖选过时 Ctrl+Shift+C 交给程序复制（见 `copy_in_program`）
         if only_ctrl && key == "c" && (mods.shift || self.selected_text().is_some()) {
-            self.copy(cx);
+            if !(mods.shift && self.copy_in_program(cx)) {
+                self.copy(cx);
+            }
             cx.stop_propagation();
             return;
         }
@@ -1747,6 +1779,9 @@ impl TerminalView {
         self.click_focus(window, cx);
         self.report_mouse(mode, button, false, event.position, event.modifiers);
         self.mouse_held = Some(button);
+        // 又点了：程序里原来选的字多半没了；左键拖开就是重新选
+        self.program_selected = None;
+        self.program_drag = (button == 0).then_some(false);
         // 右键：设置里选了菜单时，外面那一层的菜单不弹
         if button == 2 {
             cx.stop_propagation();
@@ -1766,6 +1801,9 @@ impl TerminalView {
         }
         if self.screen_cell(event.position) != self.mouse_cell {
             self.report_mouse(mode, button + 32, false, event.position, event.modifiers);
+            if let Some(moved) = &mut self.program_drag {
+                *moved = true;
+            }
         }
     }
 
@@ -1774,6 +1812,11 @@ impl TerminalView {
         let Some(button) = self.mouse_held.take() else {
             return;
         };
+        // 在程序里拖选完了：记下这时剪贴板里的字。程序松开时自己复制了的（tmux、opencode 设成选中
+        // 即复制），之后剪贴板会变，Ctrl+Shift+C 就不再转给它（见 `copy_in_program`）
+        if self.program_drag.take() == Some(true) {
+            self.program_selected = Some(cx.read_from_clipboard().and_then(|item| item.text()));
+        }
         let mode = self.mode();
         if mode.intersects(TermMode::MOUSE_MODE) {
             self.report_mouse(mode, button, true, event.position, event.modifiers);
@@ -1843,7 +1886,15 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    /// 松开右键、中键：按下时报给了程序的，松开也报。
+    fn on_other_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.release_mouse(event, cx);
+    }
+
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // 按下时报给了程序的：松开也报。窗口上那个监听要等按下以后画一次才挂上，按下、松开挨得很近
+        // （触摸板轻点、模拟的点击）时松开先到，原来就丢了，Kuai 当键一直按着，之后一挪就报成拖动
+        self.release_mouse(event, cx);
         let was_selecting = std::mem::take(&mut self.selecting);
         // 只点了一下没拖：不算选了东西
         if let Some(session) = &self.session {
@@ -2149,6 +2200,8 @@ impl Render for TerminalView {
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_click))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::on_other_mouse_up))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_other_mouse_up))
             .on_scroll(cx.listener(Self::on_scroll))
             // 从资源管理器拖文件进来：拖到上面时底色变一下（不能加边框，会挤得行列数变）
             .drag_over::<ExternalPaths>(|style, _, _, cx| {
