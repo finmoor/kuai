@@ -209,6 +209,10 @@ struct NodeState {
     gone: bool,
     /// 删掉时还开着，主机上改成了藏起来的名字：最后一个句柄关掉时删（[`Mount::hide`]）
     orphan: bool,
+    /// 开着的句柄数：[`Mount::open`]、[`Mount::create`] 各加一，[`Mount::close`] 减一。不看 `Arc` 的
+    /// 引用数：收读写回音的线程、查属性的地方也临时拿着，原来数到它们，最后一个句柄关了也当没关完，
+    /// 藏起来的文件留在主机上
+    handles: usize,
     /// 这次列目录用的那一份，按名字排好；翻页时要前后一致
     #[cfg(windows)]
     listing: Option<Arc<Vec<Row>>>,
@@ -935,6 +939,7 @@ impl Mount {
                             checked: Instant::now(),
                             gone: false,
                             orphan: false,
+                            handles: 0,
                             #[cfg(windows)]
                             listing: None,
                         }),
@@ -946,17 +951,18 @@ impl Mount {
                 }
             }
         };
+        let mut state = lock(&node.state);
+        state.handles += 1;
         if reused {
-            let mut state = lock(&node.state);
             let changed = state.stat.mtime != stat.mtime || state.stat.size != stat.size;
             // 自己正在写的不算别人改的
             if changed && state.flying.is_empty() && !state.dirty {
                 state.stat = stat;
                 state.cache.renew();
-                drop(state);
                 node.arrived.notify_all();
             }
         }
+        drop(state);
         node
     }
 
@@ -1743,14 +1749,15 @@ impl Mount {
         if writer {
             let _ = self.commit(&node);
         }
-        let (key, orphan) = {
-            let state = lock(&node.state);
+        let (key, orphan, last) = {
+            let mut state = lock(&node.state);
+            state.handles = state.handles.saturating_sub(1);
             (
                 self.key(&state.path),
                 state.orphan.then(|| state.path.clone()),
+                state.handles == 0,
             )
         };
-        let last = Arc::strong_count(&node) == 1;
         if last && orphan.is_some() {
             drop(self.drain(&node, lock(&node.state)));
         }
@@ -2453,7 +2460,10 @@ mod tests {
         assert_eq!(std::fs::read(dir.0.join("open.txt")).unwrap(), b"new");
         assert_eq!(std::fs::read(dir.0.join(&hidden)).unwrap(), b"OLD");
         // 最后一个句柄关了：藏起来的删掉
-        let other = node.clone();
+        // 另一个句柄：经藏起来的名字拿到的是同一个
+        let stat = lock(&node.state).stat;
+        let other = mount.node(&hidden, stat);
+        assert!(Arc::ptr_eq(&other, &node));
         mount.close(other, false);
         assert!(dir.0.join(&hidden).exists());
         mount.close(node, true);
