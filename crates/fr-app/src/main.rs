@@ -10,6 +10,7 @@ mod desktop;
 mod diagnose;
 mod fonts;
 mod graph_paint;
+mod history;
 mod instance;
 mod machines;
 mod manager;
@@ -18,6 +19,7 @@ mod open_dir;
 mod open_with;
 mod packaging;
 mod palette;
+mod presets;
 mod prompt;
 mod redirect_guard;
 mod repo;
@@ -45,11 +47,12 @@ mod web_serve;
 mod win;
 mod workspace;
 mod workspace_page;
+mod ws_links;
 
 use std::path::PathBuf;
 
 use futures::StreamExt as _;
-use gpui_kit::component::input::MoveToPreviousWord;
+use gpui_kit::component::input::{MoveToNextWord, MoveToPreviousWord};
 use gpui_kit::*;
 
 use crate::app_state::AppState;
@@ -75,10 +78,13 @@ gpui_kit::actions!(
         ShowFiles,
         SaveFile,
         TogglePreview,
-        BackToRoot,
+        GoBack,
+        GoForward,
         ShowTerminals,
         PickNewTerminal,
-        GoToHead
+        GoToHead,
+        NextProgram,
+        PrevProgram
     ]
 );
 
@@ -241,6 +247,24 @@ pub(crate) fn with_main_window(cx: &mut App, f: impl FnOnce(&mut Window, &mut Ap
         };
         let handle = *handle;
         handle.update(cx, |_, window, cx| f(window, cx)).ok();
+    });
+}
+
+/// 在主窗口的工作区上做一件事（菜单里点了「管理预设…」要打开设置页之类）。推迟到这一轮处理完再做。
+pub(crate) fn with_main_workspace(
+    cx: &mut App,
+    f: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+) {
+    cx.defer(move |cx| {
+        let Some(MainWorkspace(workspace, handle)) = cx.try_global::<MainWorkspace>() else {
+            return;
+        };
+        let (workspace, handle) = (workspace.clone(), *handle);
+        handle
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |ws, cx| f(ws, window, cx)).ok();
+            })
+            .ok();
     });
 }
 
@@ -449,9 +473,10 @@ fn main() {
     // git、ssh 要密码时交给界面弹窗
     let prompts = prompt::init();
 
-    // 图标要注册了资源才显示。用整套 Lucide 图标（程序大 1 MB 左右），界面上用到哪个不用再登记
+    // 图标要注册了资源才显示。用整套 Lucide 图标（程序大 1 MB 左右），界面上用到哪个不用再登记；
+    // 再加上新建终端的预设里各家的图标
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::AllAssets)
+        .with_assets(presets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
             // Linux 上挑等宽字体（没有 Consolas）
@@ -482,14 +507,25 @@ fn main() {
                 KeyBinding::new("ctrl-s", SaveFile, None),
                 // 文件页的 Markdown 在预览和源文件之间切换（和 VS Code 一样）。焦点在终端里时归终端（粘贴）
                 KeyBinding::new("ctrl-shift-v", TogglePreview, None),
-                // 从子仓库回到根仓库。焦点在终端、输入框里时归它们（往回一个词）
-                KeyBinding::new("alt-left", BackToRoot, None),
-                // 上面那句对输入框要靠这一条才成立：没有上下文的绑定和输入框自己的一样深，后登记的
-                // 在前，不补这一条的话输入框里按 Alt+← 也是回根仓库。界面库的输入框和我们的全局键
-                // 撞的一共四个：Alt+←（让给输入框）、Ctrl+F（全局的接住以后按页面分派，文件页交给
+                // 后退、前进（标题栏最左边的两个按钮）；在子仓库、工作树里时后退先回到上一层。
+                // 焦点在终端、输入框里时归它们（往回、往后一个词）
+                KeyBinding::new("alt-left", GoBack, None),
+                KeyBinding::new("alt-right", GoForward, None),
+                // 上面两句对输入框要靠这两条才成立：没有上下文的绑定和输入框自己的一样深，后登记的
+                // 在前，不补的话输入框里按 Alt+← 也是后退。界面库的输入框和我们的全局键撞的一共
+                // 五个：Alt+←、Alt+→（让给输入框）、Ctrl+F（全局的接住以后按页面分派，文件页交给
                 // 编辑器的查找，见 `RepoView::find`）、Ctrl+Shift+A 和 Ctrl+Shift+E（界面库拿来选到
                 // 行首、行尾，Windows 上没人这么按，留给切页面）。界面库升级后重新对一遍。
                 KeyBinding::new("alt-left", MoveToPreviousWord, Some("Input")),
+                KeyBinding::new("alt-right", MoveToNextWord, Some("Input")),
+                // 新建终端的选仓库框里换要运行的程序。快捷键表先于按键监听，界面库在最外层把 Tab 绑成了
+                // 切焦点，所以要在框自己的上下文里绑
+                KeyBinding::new("tab", NextProgram, Some(workspace::QUICK_OPEN_CONTEXT)),
+                KeyBinding::new(
+                    "shift-tab",
+                    PrevProgram,
+                    Some(workspace::QUICK_OPEN_CONTEXT),
+                ),
                 // 会话页：所有主机上各个仓库的终端。终端里的程序分不出它和 Ctrl+A，留给 Kuai
                 KeyBinding::new("ctrl-shift-a", ShowTerminals, None),
                 // 选一个仓库新建终端（New）。同上，程序分不出它和 Ctrl+N
@@ -529,9 +565,8 @@ fn main() {
             workspace_action::<TogglePreview>(cx, |ws, window, cx| {
                 ws.preview_in_active(window, cx)
             });
-            workspace_action::<BackToRoot>(cx, |ws, window, cx| {
-                ws.back_to_root_in_active(window, cx)
-            });
+            workspace_action::<GoBack>(cx, |ws, window, cx| ws.go_back(window, cx));
+            workspace_action::<GoForward>(cx, |ws, window, cx| ws.go_forward(window, cx));
             cx.on_action(|_: &ToggleFrameOverlay, cx: &mut App| {
                 for handle in cx.windows() {
                     handle
@@ -542,7 +577,9 @@ fn main() {
 
             let saved_window = settings.window;
             terminal::set_prefs(&settings.terminal, cx);
+            presets::sync(&settings, cx);
             let app = cx.new(|cx| AppState::new(settings, load_issue.clone(), cx));
+            presets::init(&app, cx);
             // 在终端里按 Ctrl+加号、减号调了字号：存进设置
             terminal::set_prefs_writer(cx, {
                 let app = app.clone();

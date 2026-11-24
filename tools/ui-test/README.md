@@ -7,7 +7,7 @@
 | `make-ui-repo.sh <目录>` | 建测试仓库：有改动、删除、未跟踪、已暂存的文件，分支、标签、贮藏，远程是同目录下的裸仓库 |
 | `make-ops-repo.sh <目录>` | 建测合并、变基、挑拣、冲突用的仓库：两条分支改了同一行，合并必然冲突 |
 | `capture-window.ps1 -ProcessId <pid> -Out <png>` | 用 PrintWindow 截窗口，窗口被挡住也能截 |
-| `post-input.ps1 -ProcessId <pid> -Action <动作> ...` | 投递输入：`click`、`dblclick`、`move`（`-X -Y`），`drag`（再加 `-X2 -Y2`），`wheel`（滚轮，`-Text` 给格数，负数往下滚），`rclick`（右键），`type`（`-Text`，中文也行），`key`（`-Text` 给按键名：enter、esc、f1 到 f12、up、down、left、right、tab、backspace、insert、delete、space、pageup、pagedown、home、end，还有 comma、backtick、equal、minus 和单个字母、数字），`activate`（模拟切走再切回窗口，触发自动刷新），`mclick`（中键），`syscommand`（`-Text minimize`、`restore`、`maximize`、`close`），`hittest`（问标题栏上这一点是能点的客户区还是拖窗口的地方）。`click`、`key` 加 `-Mods ctrl`、`shift`、`alt`（可以用加号连起来，如 `ctrl+shift`）就是带修饰键的 |
+| `post-input.ps1 -ProcessId <pid> -Action <动作> ...` | 投递输入：`click`、`dblclick`、`move`（`-X -Y`），`drag`（再加 `-X2 -Y2`），`wheel`（滚轮，`-Text` 给格数，负数往下滚），`rclick`（右键），`type`（`-Text`，中文也行），`key`（`-Text` 给按键名：enter、esc、f1 到 f12、up、down、left、right、tab、backspace、insert、delete、space、pageup、pagedown、home、end，还有 comma、backtick、equal、minus 和单个字母、数字），`activate`（模拟切走再切回窗口，触发自动刷新），`mclick`（中键），`xclick`（鼠标侧键，`-Text back` 后退、`forward` 前进），`syscommand`（`-Text minimize`、`restore`、`maximize`、`close`），`hittest`（问标题栏上这一点是能点的客户区还是拖窗口的地方）。`click`、`key` 加 `-Mods ctrl`、`shift`、`alt`（可以用加号连起来，如 `ctrl+shift`）就是带修饰键的 |
 | `crop.ps1` | 从截图里裁一块放大看 |
 | `fake-sshd.py <主目录> <kuaid 程序> <端口> [选项]` | 测试用的 SSH 服务：只听 127.0.0.1，把客户端接到 `<kuaid 程序> --stdio` 上，客户端看到的主机就是 <主目录>。不带选项时登录一律放行；`--password-env` 要密码（加 `--kbd` 改用 keyboard-interactive），`--pubkey` 只认一把密钥，`--forward` 当跳板机。要装 paramiko |
 | `throttle-proxy.py <听的端口> <目标端口> <每秒字节数> [开头不发的秒数]` | 测试用的限速转发：接在 fake-sshd 前面，主机到客户端的方向限速，模拟慢线路；第四个参数让每条连接开头几秒不发，模拟握手很慢 |

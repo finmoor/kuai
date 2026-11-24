@@ -592,6 +592,7 @@ impl AppState {
         self.settings.normalize();
         // 终端的设置：开着的终端马上跟着变
         crate::terminal::set_prefs(&self.settings.terminal, cx);
+        crate::presets::sync(&self.settings, cx);
         self.save();
         cx.notify();
     }
@@ -606,7 +607,7 @@ impl AppState {
         }
     }
 
-    /// 改终端页记的东西（固定的终端和仓库、收起的工作区），稍后存盘。
+    /// 改会话页记的东西（固定的终端和仓库、收起的工作区），稍后存盘。
     pub fn edit_term_hub(
         &mut self,
         cx: &mut Context<Self>,

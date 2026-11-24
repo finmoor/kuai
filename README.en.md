@@ -78,6 +78,7 @@ Every repository has its own terminals, running on the host the repository lives
 - **Told when it stops**: the Sessions page gathers the terminals of every repository on every host, including repositories not in a workspace; icons tell AI assistants from other commands and idle shells. You are notified when a terminal stops producing output, with a system notification when Kuai is in the background
 - **Hand it a screenshot**: copy a screenshot and paste, or drop images and files on the terminal. The file is uploaded to the host, and the terminal receives its path there
 - **Several tasks at once**: a repository can have several terminals
+- **Claude Code in one click**: the ⌄ next to New terminal runs Claude Code, Codex, OpenCode, Antigravity CLI or a command of your own, or continues the last session; choose in Settings what the button itself opens
 - Terminals of local repositories also keep running after Kuai quits
 - Font, size, line height, cursor and scrollback are configurable
 
@@ -256,7 +257,7 @@ The ones you will use most: <kbd>Ctrl</kbd>+<kbd>P</kbd> quick open repository, 
 | Ctrl+Shift+A | Open the Sessions page (terminals of every repository on every host) |
 | Ctrl+Shift+N | Pick a repository and open a new terminal in it on the Sessions page |
 | Ctrl+Shift+↑, Ctrl+Shift+↓ | While typing into a terminal on the Sessions page, switch to the previous / next terminal in the sidebar (a thin line along the top of the terminal shows that it has the input) |
-| Alt+← | Inside a sub-repository or a worktree, return to the root repository's overview (not while focus is in a terminal or a text field) |
+| Alt+←, Alt+→ | Go back / forward (same as the two buttons at the far left of the title bar; the mouse side buttons work too); inside a sub-repository or a worktree, Back first returns to the root repository's overview. Not while focus is in a terminal or a text field |
 | Ctrl+S | Save the open file on the Files page |
 | Ctrl+Shift+V | Switch a Markdown file on the Files page between preview and source |
 

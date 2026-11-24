@@ -37,7 +37,7 @@ use crate::settings::{Auth, RepoEntry, Server, Target};
 use crate::term_board::TermBoard;
 use crate::ui;
 
-/// 左边顶上那一条的高度（和工作区页、终端页一样）
+/// 左边顶上那一条的高度（和工作区页、会话页一样）
 const HEAD_HEIGHT: f32 = 52.;
 
 pub enum ManagerEvent {
@@ -47,7 +47,7 @@ pub enum ManagerEvent {
     Rename(RepoEntry),
     /// 到工作区页看这台电脑上的工作区（服务器上的「3 个工作区」）
     ShowWorkspaces(String),
-    /// 到终端页看这个仓库的终端（点了仓库那一行的终端个数）
+    /// 到会话页看这个仓库的终端（点了仓库那一行的终端个数）
     Terminals(RepoEntry),
 }
 
@@ -1645,7 +1645,7 @@ impl ManagerView {
                         .bg(secondary)
                         .text_size(px(11.))
                         .text_color(colors.muted)
-                        // 工作区的色块：和工作区页、终端页同一个颜色
+                        // 工作区的色块：和工作区页、会话页同一个颜色
                         .child(ui::hue_mark(hue, 6.))
                         .child(div().min_w_0().truncate().child(name))
                         .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
@@ -1801,58 +1801,67 @@ impl ManagerView {
         };
         let this = cx.entity().downgrade();
         let menu_app = self.app.clone();
-        let menu: MenuFor = Rc::new(move |menu: PopupMenu, entry: RepoEntry, sub: bool, _, cx| {
-            let at = |this: &WeakEntity<ManagerView>| (this.clone(), entry.clone());
-            let (open, rename, remove) = (at(&this), at(&this), at(&this));
-            let path = entry.path.clone();
-            let menu = menu
-                .item(
-                    PopupMenuItem::new(tr("在标签页中打开")).on_click(move |_, _, cx| {
+        let menu: MenuFor = Rc::new(
+            move |menu: PopupMenu, entry: RepoEntry, sub: bool, window, cx| {
+                let at = |this: &WeakEntity<ManagerView>| (this.clone(), entry.clone());
+                let (open, rename, remove) = (at(&this), at(&this), at(&this));
+                let path = entry.path.clone();
+                let menu = menu.item(PopupMenuItem::new(tr("在标签页中打开")).on_click(
+                    move |_, _, cx| {
                         open.0
                             .update(cx, |_, cx| cx.emit(ManagerEvent::Open(open.1.clone())))
                             .ok();
-                    }),
-                )
-                .separator()
-                .item(
-                    PopupMenuItem::new(tr("重命名…"))
+                    },
+                ));
+                // 不在任何工作区里是「添加到工作区 ▸」；在的话是「打开工作区」，后面跟「添加到其他工作区 ▸」
+                let add = crate::ws_links::plain_add(&menu_app);
+                let menu = crate::ws_links::context_items(
+                    menu, &menu_app, &entry, None, true, &add, window, cx,
+                );
+                let menu = menu
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(tr("重命名…"))
+                            .disabled(!writable)
+                            .on_click(move |_, _, cx| {
+                                rename
+                                    .0
+                                    .update(cx, |_, cx| {
+                                        cx.emit(ManagerEvent::Rename(rename.1.clone()))
+                                    })
+                                    .ok();
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new(tr("复制仓库路径")).on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                        }),
+                    );
+                if sub {
+                    return menu;
+                }
+                // 映射到本机只对直接连的服务器
+                let menu = match &entry.server {
+                    Some(server) if crate::machines::split_relay(server).is_none() => {
+                        let path = entry.path.clone();
+                        crate::mapping::menu_items(menu, &menu_app, server, &path, true, &path, cx)
+                    }
+                    _ => menu,
+                };
+                menu.separator().item(
+                    PopupMenuItem::new(tr("从列表中移除…"))
                         .disabled(!writable)
-                        .on_click(move |_, _, cx| {
-                            rename
+                        .on_click(move |_, window, cx| {
+                            remove
                                 .0
-                                .update(cx, |_, cx| cx.emit(ManagerEvent::Rename(rename.1.clone())))
+                                .update(cx, |this, cx| {
+                                    this.confirm_remove(remove.1.clone(), window, cx)
+                                })
                                 .ok();
                         }),
                 )
-                .item(
-                    PopupMenuItem::new(tr("复制仓库路径")).on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
-                    }),
-                );
-            if sub {
-                return menu;
-            }
-            // 映射到本机只对直接连的服务器
-            let menu = match &entry.server {
-                Some(server) if crate::machines::split_relay(server).is_none() => {
-                    let path = entry.path.clone();
-                    crate::mapping::menu_items(menu, &menu_app, server, &path, true, &path, cx)
-                }
-                _ => menu,
-            };
-            menu.separator().item(
-                PopupMenuItem::new(tr("从列表中移除…"))
-                    .disabled(!writable)
-                    .on_click(move |_, window, cx| {
-                        remove
-                            .0
-                            .update(cx, |this, cx| {
-                                this.confirm_remove(remove.1.clone(), window, cx)
-                            })
-                            .ok();
-                    }),
-            )
-        });
+            },
+        );
         let handlers: Handlers<Self> = Handlers {
             open: Rc::new(|_, entry, _, cx| cx.emit(ManagerEvent::Open(entry))),
             fold: Rc::new(|this, entry, _, cx| this.toggle_subs(entry, cx)),
@@ -1879,6 +1888,7 @@ impl ManagerView {
                     open: open.clone(),
                     terms: crate::workspace_page::terminal_summary(board, entry),
                     chips: self.repo_chips(entry, colors, cx),
+                    hit: None,
                 }
             };
             let (rename, remove) = (entry.clone(), entry.clone());

@@ -53,7 +53,7 @@ const COMMIT_LIST_MIN: f32 = 78.;
 
 /// 侧栏展开着时多宽（窗口宽 `vw`）：右边至少留 560 给提交列表或文件列表加改动。
 ///
-/// 终端总览页左边的列表也用它，右边的画面才和仓库的终端页一样大。
+/// 会话页左边的列表也用它，右边的画面才和仓库的终端页一样大。
 pub(crate) fn sidebar_open(layout: &Layout, vw: f32) -> f32 {
     let max = (vw - 560.).min(480.);
     layout

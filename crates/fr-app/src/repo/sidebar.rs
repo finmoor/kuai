@@ -478,6 +478,91 @@ impl RepoView {
         rows
     }
 
+    /// 记下这个标签页是从哪个工作区打开的（见 `home_hint`）。
+    pub fn set_home_hint(
+        &mut self,
+        home: Option<crate::machines::WorkspaceKey>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.home_hint != home {
+            self.home_hint = home;
+            cx.notify();
+        }
+    }
+
+    pub fn home_hint(&self) -> Option<crate::machines::WorkspaceKey> {
+        self.home_hint.clone()
+    }
+
+    /// 侧栏顶上第二行开头的工作区按钮：色块和名字（在几个工作区里后面带「+N」），点了到工作区页
+    /// 选中它；没加入工作区的写「未加入工作区」，点了可以添加。设计见
+    /// `docs/design/back-and-workspace/`，做法见 `ws_links`。
+    pub(super) fn render_home_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (muted, fg) = (theme.muted_foreground, theme.foreground);
+        let app = self.app.read(cx);
+        let hint = self.home_hint.as_ref();
+        let homes = crate::ws_links::homes(app, &self.entry, hint);
+        let tip = crate::ws_links::tip(app, &self.entry, hint);
+        let content = match homes.first() {
+            Some(key) => h_flex()
+                .gap(px(4.))
+                .child(ui::hue_mark(ui::hue(app.workspace_hue(key), cx), 7.))
+                .child(
+                    div()
+                        .max_w(px(110.))
+                        .truncate()
+                        .text_color(fg.opacity(0.85))
+                        .child(app.workspace_name(key)),
+                )
+                .when(homes.len() > 1, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_color(muted)
+                            .child(format!("+{}", homes.len() - 1)),
+                    )
+                    .child(
+                        gpui_kit::component::Icon::new(IconName::ChevronDown)
+                            .size(px(10.))
+                            .text_color(muted),
+                    )
+                }),
+            None => h_flex()
+                .gap(px(4.))
+                .text_color(muted)
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(7.))
+                        .rounded(px(2.))
+                        .border(px(1.5))
+                        .border_color(muted),
+                )
+                .child(tr("未加入工作区")),
+        };
+        let button = Button::new("side-home")
+            .ghost()
+            .xsmall()
+            .compact()
+            .flex_none()
+            .h(px(18.))
+            .ml(px(-4.))
+            .px(px(4.))
+            .child(content.text_size(px(11.)))
+            .tooltip(tip);
+        crate::ws_links::button(
+            button,
+            &self.app,
+            &self.entry,
+            self.home_hint.clone(),
+            crate::ws_links::plain_add(&self.app),
+            Anchor::TopLeft,
+            false,
+            cx,
+        )
+    }
+
     /// 侧栏顶上：仓库的名字、在哪，和右边的工具栏一样高。
     fn render_side_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
@@ -523,14 +608,30 @@ impl RepoView {
                                 .font_weight(FontWeight::SEMIBOLD),
                         )
                         .child(
-                            // 提示里位置和路径各一行：路径很长，接在一行里会从盘符后面断开
-                            ui::clipped_with_tip(
-                                "repo-place",
-                                format!("{place} · {}", self.entry.path),
-                                format!("{place}\n{}", self.entry.path),
-                            )
-                            .text_size(px(11.))
-                            .text_color(muted),
+                            // 开头是所在的工作区（点了到工作区页），后面是在哪台、路径
+                            h_flex()
+                                .min_w_0()
+                                .gap(px(3.))
+                                .child(self.render_home_button(cx))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(11.))
+                                        .text_color(muted)
+                                        .child("·"),
+                                )
+                                .child(
+                                    // 提示里位置和路径各一行：路径很长，接在一行里会从盘符后面断开
+                                    ui::clipped_with_tip(
+                                        "repo-place",
+                                        format!("{place} · {}", self.entry.path),
+                                        format!("{place}\n{}", self.entry.path),
+                                    )
+                                    .flex_shrink(1.)
+                                    .min_w_0()
+                                    .text_size(px(11.))
+                                    .text_color(muted),
+                                ),
                         ),
                 )
                 .child(

@@ -76,6 +76,7 @@ use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+use crate::presets::Start;
 use crate::win;
 use colors::Palette;
 use keys::WheelTarget;
@@ -86,6 +87,11 @@ const PADDING: f32 = 8.;
 /// 显示左上角那一块
 const MIN_WATCH_FONT: f32 = 8.;
 
+/// 新终端等提示符：输出停了这么久再看光标（见 [`TerminalView::run_output`]）
+const RUN_QUIET: Duration = Duration::from_millis(300);
+/// 新终端等提示符最多等这么久，看不出来也照样输入预设的命令
+const RUN_GIVE_UP: Duration = Duration::from_secs(8);
+
 /// 服务器上终端会话的名字里，仓库路径和序号之间的分隔符（路径里不会有的一个控制字符）
 const KEY_SEPARATOR: char = '\u{1f}';
 
@@ -94,7 +100,7 @@ pub type Closing = futures::future::BoxFuture<'static, anyhow::Result<()>>;
 
 /// 显示终端的标题：Windows 上 shell 刚启动时标题是它自己的完整路径
 /// （`C:\Program Files\PowerShell\7\pwsh.exe`），只留程序名（`pwsh`，不带 `.exe`），别的照原样。
-/// 仓库的终端页、终端页、停下的提醒都这样写。
+/// 仓库的终端页、会话页、停下的提醒都这样写。
 pub fn short_title(title: &str) -> SharedString {
     let is_program_path = title.to_lowercase().ends_with(".exe") && title.contains(['\\', '/']);
     match title.rsplit(['\\', '/']).next() {
@@ -131,7 +137,7 @@ pub fn session_number(repo: &str, key: &str) -> Option<u32> {
     (number >= 2).then_some(number)
 }
 
-/// 不知道是哪个仓库的终端时，把会话的名字拆成路径和序号（终端总览页列别处的终端用）。
+/// 不知道是哪个仓库的终端时，把会话的名字拆成路径和序号（会话页列别处的终端用）。
 pub fn split_session_key(key: &str) -> (&str, u32) {
     match key.rsplit_once(KEY_SEPARATOR) {
         Some((path, number)) => match number.parse() {
@@ -172,8 +178,8 @@ pub struct Launch {
 enum Feed {
     /// 仿真器的事件（有新内容、标题变了、程序问颜色……）
     Term(TermEvent),
-    /// 服务器上的终端接上了：会话的编号
-    Opened(String),
+    /// 服务器上的终端接上了：会话的编号，是不是新开的（为假是接上了已有的会话）
+    Opened(String, bool),
     /// 服务器上的终端里的程序结束了：退出码
     Exited(Option<i32>),
     /// 和服务器的连接断了（终端里的程序还在跑）
@@ -579,11 +585,11 @@ async fn pump(
         let alive = match item {
             Some(Ok(TermItem::Opened {
                 term: id,
+                created,
                 restore: parts,
-                ..
             })) => {
                 restore.start(parts);
-                send(Feed::Opened(id))
+                send(Feed::Opened(id, created))
             }
             Some(Ok(TermItem::Marks(marks))) => send(Feed::Marks(marks)),
             Some(Ok(TermItem::Output(bytes))) => {
@@ -700,7 +706,7 @@ pub struct TerminalView {
     /// 「只看」接着的终端，这边要把大小要过来（见 [`Self::wants_size`]）：往里打了字、点了画面、
     /// 焦点由人放进来、这边的面板改了大小。下一帧看过就放下
     size_wanted: bool,
-    /// 下一次焦点进来不算要大小：终端页跟着别处改的大小换上新建的画面时（见 [`Self::follow_size`]）
+    /// 下一次焦点进来不算要大小：会话页跟着别处改的大小换上新建的画面时（见 [`Self::follow_size`]）
     follow: bool,
     /// 上一帧这块面板按设置里的字号放得下几行几列
     roomy: Option<Grid>,
@@ -710,6 +716,18 @@ pub struct TerminalView {
     scroll: scroll::ScrollUi,
     /// 按住 Ctrl 指着的链接、认路径要的东西（见 [`links`]）
     links: links::LinkUi,
+    /// 新开的 shell 里要替用户输入的命令（新建终端时选的预设，见 `presets.rs`）
+    run: Option<Start>,
+    /// 下一次开出来的是新的会话就输入 `run`：刚建好、重启以后。接上的是已有的会话（重开 Kuai、
+    /// 别处开着的）就不输入；断线重连后 kuaid 里那个会话没了、开了个新的也不输入（`npm run deploy`
+    /// 这种命令不能自己再跑一遍）
+    run_armed: bool,
+    /// 会话是新开的，`run` 还没输入：等 shell 的提示符出来（见 [`Self::run_output`]）
+    run_due: bool,
+    /// 有新输出以后等它停下来，再看提示符出来没有
+    run_quiet: Option<Task<()>>,
+    /// 一直看不出提示符（没有输出、光标停在行首）：到时间照样输入
+    run_give_up: Option<Task<()>>,
     _blink: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -742,7 +760,7 @@ impl TerminalView {
         Self::build(Some(Box::new(launcher)), window, cx)
     }
 
-    /// 接上 `conn` 那台电脑上编号是 `term` 的终端，它现在是 `cols` 列 `rows` 行（终端总览页右边的
+    /// 接上 `conn` 那台电脑上编号是 `term` 的终端，它现在是 `cols` 列 `rows` 行（会话页右边的
     /// 画面）。和 [`Self::new`] 的区别：
     ///
     /// - 用「只看」的接法，不改那个终端的大小：按它自己的行列数画，地方不够就把字缩小。它改了大小
@@ -784,8 +802,8 @@ impl TerminalView {
     /// 设置里的字号放得下的行列数 `roomy` 和它现在的不一样，而且是这边有了动静（[`Self::size_wanted`]，
     /// 或者窗口在前台时这块面板改了大小）。每帧画之前问一次。
     ///
-    /// 只看焦点在不在不行：两台电脑的终端页焦点都停在同一个终端里时（一台的窗口在后面没人用也算），
-    /// 一边要过去，另一边的终端页跟着换上新建的画面，焦点在就又要回来，画面一直在两个大小之间跳。
+    /// 只看焦点在不在不行：两台电脑的会话页焦点都停在同一个终端里时（一台的窗口在后面没人用也算），
+    /// 一边要过去，另一边的会话页跟着换上新建的画面，焦点在就又要回来，画面一直在两个大小之间跳。
     fn wants_size(&mut self, roomy: Grid, window: &Window) -> bool {
         let resized = self.roomy.replace(roomy).is_some_and(|old| old != roomy);
         let wanted =
@@ -796,7 +814,7 @@ impl TerminalView {
             && self.focus.is_focused(window)
     }
 
-    /// 终端页跟着别处改的大小换上了这个新建的画面，焦点随后挪进来：这一下不算这边要大小，往里打字、
+    /// 会话页跟着别处改的大小换上了这个新建的画面，焦点随后挪进来：这一下不算这边要大小，往里打字、
     /// 点画面时再要（见 [`Self::wants_size`]）。
     pub fn follow_size(&mut self) {
         self.follow = true;
@@ -804,7 +822,7 @@ impl TerminalView {
 
     /// 把「只看」接着的终端改成 `grid` 这么大：这里的仿真器跟着改，再告诉 kuaid，里面的程序按新的
     /// 大小重画。之后还是只看的接法（不回答程序的话），只是大小由这边定了：终端列表报上来的大小和
-    /// 它一样，终端页不会再重建这个画面。别处的画面（仓库的终端页、别的电脑上的 Kuai）焦点进去时再
+    /// 它一样，会话页不会再重建这个画面。别处的画面（仓库的终端页、别的电脑上的 Kuai）焦点进去时再
     /// 把大小要回去（见 [`Self::focus_changed`]），谁在输入就按谁的大小。
     fn claim(&mut self, grid: Grid, cx: &mut Context<Self>) {
         let Some(session) = &mut self.session else {
@@ -878,6 +896,11 @@ impl TerminalView {
             marks: Vec::new(),
             scroll: scroll::ScrollUi::default(),
             links: links::LinkUi::default(),
+            run: None,
+            run_armed: false,
+            run_due: false,
+            run_quiet: None,
+            run_give_up: None,
             _blink: blink,
             _subscriptions: subscriptions,
         }
@@ -921,7 +944,7 @@ impl TerminalView {
     }
 
     /// 所在的那台电脑（重新）连上了：断开时停下（程序还在 kuaid 里跑）、启动时连不上的，自己接上、
-    /// 开起来，和按 Enter 一样（看不见的等画出来时再开）。只看的不管，它的画面由终端页换。
+    /// 开起来，和按 Enter 一样（看不见的等画出来时再开）。只看的不管，它的画面由会话页换。
     pub fn host_back(&mut self, cx: &mut Context<Self>) {
         let stopped = (self.lost && self.exited.is_none()) || self.unreachable;
         if stopped && self.connecting.is_none() && self.watch.is_none() && self.launcher.is_some() {
@@ -961,9 +984,17 @@ impl TerminalView {
         self.session.as_ref().is_some_and(Session::in_process)
     }
 
-    /// 程序自己设的标题（见 [`short_title`]）。
-    pub fn title(&self) -> Option<SharedString> {
-        self.title.as_deref().map(short_title)
+    /// 终端叫什么：程序自己设的标题；从预设开的、标题还是 shell 的，叫预设的名字（见
+    /// [`crate::presets::display_name`]）。
+    pub fn label(&self) -> Option<SharedString> {
+        crate::presets::display_name(self.title.as_deref(), self.run.as_ref())
+    }
+
+    /// 开出来的 shell 里替用户输入这条命令、回车（新建终端时选的预设）。接上的是已有的会话就不输入。
+    /// 要在第一次画出来（开始连接）之前调用。
+    pub fn run_on_start(&mut self, start: Option<Start>) {
+        self.run_armed = start.is_some();
+        self.run = start;
     }
 
     /// kuaid 给这个终端的编号：开在 Kuai 进程里的、还没接上的是 None。
@@ -1002,6 +1033,8 @@ impl TerminalView {
     pub fn restart(&mut self, closing: Option<Closing>, cx: &mut Context<Self>) {
         let closing = self.kill().or(closing);
         self.reopen(cx);
+        // 从预设开的：新开的 shell 里再输入一遍
+        self.run_armed = self.run.is_some();
         let Some(closing) = closing else {
             return;
         };
@@ -1077,6 +1110,9 @@ impl TerminalView {
         };
         self.exited = None;
         self.lost = false;
+        self.run_due = false;
+        self.run_quiet = None;
+        self.run_give_up = None;
         // 换了一个会话：接上 kuaid 里留着的会话时它再把记着的消息发过来
         self.marks.clear();
         self.scroll.reset();
@@ -1122,7 +1158,10 @@ impl TerminalView {
                     (Err(err), Some(fallback)) if !this.hosted => {
                         log::warn!("本机的 kuaid 用不了，终端开在 Kuai 进程里：{err}");
                         match Session::spawn(fallback, grid, cell, cx) {
-                            Ok(session) => this.session = Some(session),
+                            Ok(session) => {
+                                this.session = Some(session);
+                                this.run_opened(true, cx);
+                            }
                             Err(err) => {
                                 this.error = Some(tf!("终端启动失败：{err}", err).into());
                             }
@@ -1147,8 +1186,9 @@ impl TerminalView {
         match feed {
             Feed::Term(event) => return self.on_event(event, cx),
             // 只看的不改那个终端的大小，编号也早就知道
-            Feed::Opened(_) if self.watch.is_some() => {}
-            Feed::Opened(id) => {
+            Feed::Opened(..) if self.watch.is_some() => {}
+            Feed::Opened(id, created) => {
+                self.run_opened(created, cx);
                 if let Some(Session {
                     link: Link::Remote { conn, term, .. },
                     grid,
@@ -1231,10 +1271,69 @@ impl TerminalView {
             TermEvent::ClipboardLoad(..) => {}
             // 往回翻着时来了新输出：回到底部的按钮上一个蓝点。只是输入区里的字变了（往回翻着打字的
             // 回显）不算，见 `scroll::outside_digest`、`settle_outside`
-            TermEvent::Wakeup => self.watch_outside(cx),
+            TermEvent::Wakeup => {
+                self.watch_outside(cx);
+                self.run_output(cx);
+            }
             TermEvent::Bell | TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => {}
         }
         cx.notify();
+    }
+
+    /// 会话开好了：是新开的、要输入预设的命令，就开始等提示符。
+    fn run_opened(&mut self, created: bool, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.run_armed) || !created || self.run.is_none() {
+            return;
+        }
+        self.run_due = true;
+        self.run_give_up = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RUN_GIVE_UP).await;
+            this.update(cx, |this, _| this.type_run()).ok();
+        }));
+    }
+
+    /// 有新输出：等它停下来，光标不在行首（提示符画出来了）就输入预设的命令。shell 起来以后一般先
+    /// 清屏、设标题、读配置，最后画提示符等输入；PowerShell 的提示符画完还会问一次光标在哪。
+    fn run_output(&mut self, cx: &mut Context<Self>) {
+        if !self.run_due {
+            return;
+        }
+        self.run_quiet = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RUN_QUIET).await;
+            this.update(cx, |this, _| {
+                if this.at_prompt() {
+                    this.type_run();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// 光标不在行首：shell 画了提示符在等输入。
+    fn at_prompt(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.term.lock().grid().cursor.point.column.0 > 0)
+    }
+
+    /// 输入预设的命令、回车。
+    fn type_run(&mut self) {
+        if !std::mem::take(&mut self.run_due) {
+            return;
+        }
+        self.run_quiet = None;
+        self.run_give_up = None;
+        if let Some(start) = &self.run {
+            log::info!("新终端里输入预设的命令：{}", start.command);
+            self.write(format!("{}\r", start.command).into_bytes());
+        }
+    }
+
+    /// 不再替用户输入预设的命令（他已经开始敲了）。
+    fn cancel_run(&mut self) {
+        self.run_due = false;
+        self.run_quiet = None;
+        self.run_give_up = None;
     }
 
     /// 往程序的输入里写。
@@ -1269,6 +1368,8 @@ impl TerminalView {
     fn type_bytes(&mut self, bytes: Vec<u8>, enter: bool, cx: &mut Context<Self>) {
         // 这边在往里输入：「只看」的画面把大小要过来（见 `wants_size`）
         self.size_wanted = true;
+        // 用户抢先敲了：预设的命令不替他输入了
+        self.cancel_run();
         // 按了键：程序里选的字多半没了（见 `copy_in_program`）
         self.program_selected = None;
         if let Some(session) = &self.session {
@@ -1301,7 +1402,7 @@ impl TerminalView {
         if !focused {
             self.marked = None;
         }
-        // 焦点进来时把大小要回来：终端页、别的电脑上的 Kuai 往里输入时可能按它们的画面改过（见
+        // 焦点进来时把大小要回来：会话页、别的电脑上的 Kuai 往里输入时可能按它们的画面改过（见
         // `claim`）。只发给 kuaid，大小没变它不动；开在 Kuai 进程里的终端没有别人改大小
         if focused
             && self.watch.is_none()

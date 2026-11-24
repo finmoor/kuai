@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory)] [int]$ProcessId,
-    # click | dblclick | rclick | mclick | drag | move | wheel | type | key | activate | hittest | syscommand
+    # click | dblclick | rclick | mclick | xclick | drag | move | wheel | type | key | activate | hittest | syscommand
     [Parameter(Mandatory)] [string]$Action,
     # 截图里的坐标（窗口矩形左上角为原点的物理像素，和 capture-printwindow.ps1 的图一致）
     [int]$X, [int]$Y, [int]$X2, [int]$Y2,
@@ -160,6 +160,15 @@ switch ($Action) {
         Post $WM_MOUSEMOVE ([IntPtr]0) (LParam $X $Y)
         Post 0x0207 ([IntPtr]0x10) (LParam $X $Y)
         Post 0x0208 ([IntPtr]0) (LParam $X $Y)
+    }
+    'xclick' {
+        # 鼠标侧键：-Text back（XBUTTON1，后退）| forward（XBUTTON2，前进）。wParam 高字是哪个键，低字是按着的键
+        $which = @{ back = 1; forward = 2 }[$Text.ToLower()]
+        if (-not $which) { throw "侧键只有 back、forward：$Text" }
+        $held = @{ 1 = 0x20; 2 = 0x40 }[$which]
+        Post $WM_MOUSEMOVE ([IntPtr]0) (LParam $X $Y)
+        Post 0x020B ([IntPtr](($which -shl 16) -bor $held)) (LParam $X $Y)
+        Post 0x020C ([IntPtr]($which -shl 16)) (LParam $X $Y)
     }
     'syscommand' {
         # 系统命令：-Text minimize | restore | close（等于点标题栏上的按钮、Alt+F4）

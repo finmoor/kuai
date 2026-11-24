@@ -336,7 +336,7 @@ pub fn hue(slot: usize, cx: &App) -> Hsla {
     }
 }
 
-/// 工作区的色块：终端页侧栏的分节标题、工作区页的列表、「已固定」的行尾都用它标是哪个工作区。
+/// 工作区的色块：会话页侧栏的分节标题、工作区页的列表、「已固定」的行尾都用它标是哪个工作区。
 pub fn hue_mark(color: Hsla, size: f32) -> Div {
     div()
         .flex_none()

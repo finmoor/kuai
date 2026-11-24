@@ -121,7 +121,7 @@ use serde_json::Value;
 /// 11：`term_watch` 订阅终端列表；`term_attach` 可以只看（`watch`）；[`TermInfo`] 多了 `idle_ms`、`last`。
 /// 12：[`Hello`] 多了 `machine`（这台电脑的标识，见 [`crate::store::machine_id`]）。
 /// 13：`term_programs`，终端里除了 shell 还有哪些程序在跑。
-/// 14：[`TermInfo`] 多了 `programs`，终端列表里就带着各个终端在跑的程序（终端页侧栏的图标用）。
+/// 14：[`TermInfo`] 多了 `programs`，终端列表里就带着各个终端在跑的程序（会话页、仓库终端页侧栏的图标用）。
 /// 15：`fs_read` 可以带 `whole`：文件比它大时不读内容，只回文件的情况（文件页打开太大的文件时
 /// 不白传一块）；`fs_sync`，把文件刷到主机的磁盘上（映射盘上的程序要求刷盘时）。
 /// 16：终端流里带上发出去的消息（[`TermMarks`]）；[`TermOpened`] 多了 `restore`（还原屏幕的输出分几段、

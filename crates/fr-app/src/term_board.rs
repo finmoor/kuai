@@ -1,4 +1,4 @@
-//! 所有工作区里的终端现在怎么样了（终端总览页、标题栏上的个数、「已停下」的提醒都从这里读）。
+//! 所有工作区里的终端现在怎么样了（会话页、标题栏上的个数、「已停下」的提醒都从这里读）。
 //!
 //! 终端开在各台电脑的 kuaid 里。连着哪台就订阅哪台的终端列表（`term_watch`，协议 11）：开了、结束了、
 //! 有输出变成没输出时 kuaid 推一份过来，每个终端带着「多久没有输出了」和屏幕上最后一行字。
@@ -11,8 +11,8 @@
 //! - 空闲：停下以后看过了，或者不知道它什么时候输出过。
 //!
 //! 「看过」：它正显示在窗口里（仓库标签页的终端页上选中的那个，见 [`TermBoard::set_shown`]），
-//! 在总览页里选中过，或者从总览页前往过。总览页里正选中的那个不提醒、不计入标题栏上的个数，
-//! 但在列表里仍写着「已停下」，选到别的、离开那一页以后才变成空闲：不然一打开总览页，自动选中的
+//! 在会话页里选中过，或者从会话页前往过。会话页里正选中的那个不提醒、不计入标题栏上的个数，
+//! 但在列表里仍写着「已停下」，选到别的、离开那一页以后才变成空闲：不然一打开会话页，自动选中的
 //! 那个马上变成空闲，就看不出是哪个停下了。启动 Kuai、刚连上一台电脑时已经停着的终端都算看过：
 //! 只提醒这次运行期间停下来的。记在内存里，不同步。
 //!
@@ -69,9 +69,9 @@ pub struct TermId {
 pub enum Shown {
     /// 仓库标签页的终端页上：哪个仓库的第几个终端
     Repo(RepoEntry, u32),
-    /// 总览页里选中的
+    /// 会话页里选中的
     Term(TermId),
-    /// 总览页里正往里输入的：和终端页上显示着的一样，一直算看过
+    /// 会话页里正往里输入的：和仓库终端页上显示着的一样，一直算看过
     Typing(TermId),
 }
 
@@ -107,7 +107,7 @@ pub struct Row {
     pub programs: Option<Vec<String>>,
 }
 
-/// 终端里跑的是哪一类程序：终端页侧栏按它挑图标。
+/// 终端里跑的是哪一类程序：会话页侧栏按它挑图标。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Program {
     /// AI 助手（Claude Code、Codex 这些）
@@ -424,7 +424,7 @@ impl TermBoard {
     fn recompute(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
         let shown = self.shown_id();
-        // 终端页上正显示着的、总览页里正往里输入的一直算看过。总览页里只是选中的那个先不记：它在
+        // 仓库终端页上正显示着的、会话页里正往里输入的一直算看过。会话页里只是选中的那个先不记：它在
         // 列表里还得写着「已停下」，选到别的、离开这一页时才记（见 `set_shown`）
         if let (Some(id), Some(Shown::Repo(..) | Shown::Typing(_))) = (&shown, &self.shown) {
             self.seen.insert(id.clone(), now);
@@ -472,7 +472,7 @@ impl TermBoard {
     /// 正显示在窗口里的是哪个终端（窗口不在前台、显示的不是终端时是 None）。
     pub fn set_shown(&mut self, shown: Option<Shown>, cx: &mut Context<Self>) {
         if self.shown != shown {
-            // 总览页里刚才选中的那个：看过了
+            // 会话页里刚才选中的那个：看过了
             if let Some(Shown::Term(id) | Shown::Typing(id)) = &self.shown {
                 self.seen.insert(id.clone(), Instant::now());
             }
@@ -482,9 +482,9 @@ impl TermBoard {
                 Some(Shown::Repo(entry, number)) => {
                     log::info!("正显示的终端：{} 的第 {number} 个", entry.path)
                 }
-                Some(Shown::Term(id)) => log::info!("正显示的终端：总览页里选中的 {}", id.term),
+                Some(Shown::Term(id)) => log::info!("正显示的终端：会话页里选中的 {}", id.term),
                 Some(Shown::Typing(id)) => {
-                    log::info!("正显示的终端：总览页里正在输入的 {}", id.term)
+                    log::info!("正显示的终端：会话页里正在输入的 {}", id.term)
                 }
             }
             self.recompute(cx);
@@ -509,7 +509,7 @@ impl TermBoard {
         }
     }
 
-    /// 看过了（从总览页前往它）。
+    /// 看过了（从会话页前往它）。
     pub fn mark_seen(&mut self, id: &TermId, cx: &mut Context<Self>) {
         self.seen.insert(id.clone(), Instant::now());
         self.recompute(cx);
@@ -525,7 +525,7 @@ impl TermBoard {
         self.watches.get(machine).map(|(conn, _)| conn.clone())
     }
 
-    /// 已停下、还没看过的有几个（总览页里正选中的那个不算：正看着它）。
+    /// 已停下、还没看过的有几个（会话页里正选中的那个不算：正看着它）。
     pub fn attention(&self) -> usize {
         let shown = self.shown_id();
         self.states

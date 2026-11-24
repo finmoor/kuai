@@ -171,6 +171,9 @@ pub struct RepoView {
     /// 文件监听；流结束（装不上监听、仓库目录没了或换了、连接断了）后任务也结束
     watch_task: Option<Task<()>>,
     watch_retry: WatchRetry,
+    /// 从哪个工作区打开的（工作区页上打开的、会话页里列在哪个工作区下面）：侧栏顶上的工作区按钮
+    /// 先写它，在几个工作区里时菜单里它排第一
+    home_hint: Option<crate::machines::WorkspaceKey>,
     history: history::History,
     changes: changes::Changes,
     sidebar: sidebar::Sidebar,
@@ -273,6 +276,7 @@ impl RepoView {
             refresh_again: false,
             watch_task: None,
             watch_retry: WatchRetry::default(),
+            home_hint: None,
             history,
             changes,
             sidebar,

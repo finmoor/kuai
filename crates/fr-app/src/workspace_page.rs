@@ -6,7 +6,7 @@
 //! 选了哪台服务器、哪个工作区都无关）。右上角「全部打开」把它的仓库连同子仓库一次开成标签页；
 //! 子仓库还没找完的，找完了接着开。
 //!
-//! 仓库那一行写分支、改动数、已打开、终端个数（点了到终端页），鼠标移上去出「新建终端」「移出工作区」；
+//! 仓库那一行写分支、改动数、已打开、终端个数（点了到会话页），鼠标移上去出「新建终端」「移出工作区」；
 //! 子仓库默认展开，左边的小箭头收起（记在设置里，只在这台电脑上）。行的样子见 `repo_rows`。
 //! 1.16.1 左上角的工作区菜单（带「切换服务器」的那一套）由这一页代替。
 
@@ -36,7 +36,7 @@ use crate::settings::RepoEntry;
 use crate::term_board::{TermBoard, TermState};
 use crate::ui;
 
-/// 侧栏顶上那一条的高度（和终端页、仓库页一样）
+/// 侧栏顶上那一条的高度（和会话页、仓库页一样）
 const HEAD_HEIGHT: f32 = 52.;
 
 pub enum PageEvent {
@@ -46,10 +46,12 @@ pub enum PageEvent {
     OpenAll { entries: Vec<RepoEntry>, show: bool },
     /// 给仓库改显示的名字（对话框由主窗口开）
     Rename(RepoEntry),
-    /// 到终端页看这个仓库的终端
+    /// 到会话页看这个仓库的终端
     Terminals(RepoEntry),
-    /// 在这个仓库里新开一个终端
+    /// 在这个仓库里新开一个终端，运行「默认运行」的那个预设
     NewTerminal(RepoEntry),
+    /// 在这个仓库里新开一个终端，运行选的这个（None 是只开 shell）
+    RunInTerminal(RepoEntry, Option<crate::presets::Start>),
 }
 
 pub struct WorkspacePage {
@@ -60,6 +62,15 @@ pub struct WorkspacePage {
     open_later: Vec<RepoEntry>,
     /// 这一页显示着
     visible: bool,
+    /// 「打开工作区」过来时要标出来的那个仓库（或子仓库）：那一行带选中的底色，滚到看得见。离开这一页、
+    /// 换了工作区就不标了
+    hit: Option<RepoEntry>,
+    /// 标出来的那一行还没滚到看得见
+    scroll_to_hit: bool,
+    /// 右边那一栏的滚动
+    scroll: ScrollHandle,
+    /// 标出来的那个仓库上一帧画在哪（滚到它用）
+    hit_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -106,7 +117,54 @@ impl WorkspacePage {
             scan,
             open_later: Vec::new(),
             visible: false,
+            hit: None,
+            scroll_to_hit: false,
+            scroll: ScrollHandle::new(),
+            hit_bounds: Rc::new(Cell::new(None)),
             _subscriptions: subscriptions,
+        }
+    }
+
+    /// 选中的工作区（后退时回到它、从这一页打开的仓库记着它）。
+    pub fn selected(&self, cx: &App) -> Option<WorkspaceKey> {
+        self.selection(cx).1
+    }
+
+    /// 「打开工作区」：选中工作区 `key`（列它所在的那台电脑），`entry` 那一行标出来、滚到看得见。
+    pub fn reveal(&mut self, key: WorkspaceKey, entry: Option<RepoEntry>, cx: &mut Context<Self>) {
+        self.app.update(cx, |app, cx| app.set_current(key, cx));
+        self.scroll_to_hit = entry.is_some();
+        self.hit = entry;
+        self.hit_bounds.set(None);
+        if self.visible {
+            self.want_scan(cx);
+        }
+        cx.notify();
+    }
+
+    /// 标出来的那一行不在看得见的地方：滚过去（按上一帧画的位置算）。
+    fn scroll_hit_into_view(&mut self, cx: &mut Context<Self>) {
+        let Some(hit) = self.hit_bounds.get() else {
+            return;
+        };
+        self.scroll_to_hit = false;
+        let view = self.scroll.bounds();
+        let margin = px(12.);
+        let was = self.scroll.offset();
+        let mut y = was.y;
+        // 在下面看不见：往上滚到底边露出来
+        if hit.bottom() + margin > view.bottom() {
+            y -= hit.bottom() + margin - view.bottom();
+        }
+        // 在上面看不见（或者比看得见的地方还高）：顶边对齐
+        let top = hit.top() + (y - was.y);
+        if top - margin < view.top() {
+            y += view.top() - (top - margin);
+        }
+        let y = y.min(px(0.));
+        if y != was.y {
+            self.scroll.set_offset(point(was.x, y));
+            cx.notify();
         }
     }
 
@@ -120,6 +178,8 @@ impl WorkspacePage {
     /// 这一页不显示了。
     pub fn hidden(&mut self) {
         self.visible = false;
+        self.hit = None;
+        self.scroll_to_hit = false;
     }
 
     /// 列的是哪台电脑，选中的是哪个工作区（那台上的工作区还没读到、一个都没有时是 None）。
@@ -168,6 +228,7 @@ impl WorkspacePage {
 
     /// 工作区页的下拉里换一台电脑看。
     fn pick_machine(&mut self, machine: String, cx: &mut Context<Self>) {
+        self.hit = None;
         self.app
             .update(cx, |app, _| app.menu_machine = Some(machine));
         self.want_scan(cx);
@@ -176,6 +237,7 @@ impl WorkspacePage {
 
     /// 选中一个工作区：只是在这一页上看它，标签页不动。
     fn pick(&mut self, key: WorkspaceKey, cx: &mut Context<Self>) {
+        self.hit = None;
         self.app.update(cx, |app, cx| app.set_current(key, cx));
         self.want_scan(cx);
         cx.notify();
@@ -488,7 +550,7 @@ impl WorkspacePage {
                     .when(on, |row| row.bg(selected_bg))
                     .when(!on, |row| row.hover(|s| s.bg(hover)))
                     .on_click(cx.listener(move |this, _, _, cx| this.pick(pick.clone(), cx)))
-                    // 工作区的色块：和终端页侧栏的分节标题同一个颜色
+                    // 工作区的色块：和会话页侧栏的分节标题同一个颜色
                     .child(
                         h_flex()
                             .flex_none()
@@ -795,7 +857,7 @@ impl WorkspacePage {
         });
         let writable = app.writable(&key.machine);
         let name = app.workspace_name(&key);
-        // 工作区的颜色（和侧栏、终端页的一样）
+        // 工作区的颜色（和侧栏、会话页的一样）
         let hue = ui::hue(app.workspace_hue(&key), cx);
         // 断开着：只能看、能打开，不能改
         let banner = (!writable).then(|| {
@@ -949,6 +1011,7 @@ impl WorkspacePage {
             .min_w_0()
             .h_full()
             .overflow_y_scroll()
+            .track_scroll(&self.scroll)
             .child(
                 v_flex()
                     .w_full()
@@ -976,57 +1039,74 @@ impl WorkspacePage {
     ) -> Vec<AnyElement> {
         let menu_key = key.clone();
         let this = cx.entity().downgrade();
-        let menu: MenuFor = Rc::new(move |menu: PopupMenu, entry: RepoEntry, sub: bool, _, _| {
-            let at = |this: &WeakEntity<WorkspacePage>| (this.clone(), entry.clone());
-            let (open, term, leave, rename) = (at(&this), at(&this), at(&this), at(&this));
-            let path = entry.path.clone();
-            let menu = menu.item(PopupMenuItem::new(tr("在标签页中打开")).on_click(
-                move |_, _, cx| {
-                    open.0
-                        .update(cx, |_, cx| cx.emit(PageEvent::Open(open.1.clone())))
-                        .ok();
-                },
-            ));
-            let menu = match sub {
-                true => menu,
-                false => {
-                    let leave_key = menu_key.clone();
-                    menu.item(
-                        PopupMenuItem::new(tr("新建终端")).on_click(move |_, _, cx| {
+        let menu: MenuFor = Rc::new(
+            move |menu: PopupMenu, entry: RepoEntry, sub: bool, window, cx| {
+                let at = |this: &WeakEntity<WorkspacePage>| (this.clone(), entry.clone());
+                let (open, term, leave, rename) = (at(&this), at(&this), at(&this), at(&this));
+                let path = entry.path.clone();
+                let menu = menu.item(PopupMenuItem::new(tr("在标签页中打开")).on_click(
+                    move |_, _, cx| {
+                        open.0
+                            .update(cx, |_, cx| cx.emit(PageEvent::Open(open.1.clone())))
+                            .ok();
+                    },
+                ));
+                let menu = match sub {
+                    true => menu,
+                    false => {
+                        let leave_key = menu_key.clone();
+                        let place = term
+                            .0
+                            .upgrade()
+                            .map(|page| page.read(cx).app.read(cx).repo_name(&term.1))
+                            .unwrap_or_default();
+                        let on_start: crate::presets::OnStart = Rc::new(move |start, _, cx| {
+                            let (entry, start) = (term.1.clone(), start);
                             term.0
-                                .update(cx, |_, cx| cx.emit(PageEvent::NewTerminal(term.1.clone())))
+                                .update(cx, |_, cx| cx.emit(PageEvent::RunInTerminal(entry, start)))
                                 .ok();
+                        });
+                        menu.submenu(
+                            tr("新建终端"),
+                            window,
+                            cx,
+                            crate::presets::menu_builder(place, on_start),
+                        )
+                        .separator()
+                        .item(
+                            PopupMenuItem::new(tr("移出工作区"))
+                                .disabled(!writable)
+                                .on_click(move |_, window, cx| {
+                                    let key = leave_key.clone();
+                                    leave
+                                        .0
+                                        .update(cx, |this, cx| {
+                                            this.remove_from_workspace(
+                                                key,
+                                                leave.1.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                        })
+                                        .ok();
+                                }),
+                        )
+                    }
+                };
+                menu.separator()
+                    .item(PopupMenuItem::new(tr("重命名…")).on_click(move |_, _, cx| {
+                        rename
+                            .0
+                            .update(cx, |_, cx| cx.emit(PageEvent::Rename(rename.1.clone())))
+                            .ok();
+                    }))
+                    .item(
+                        PopupMenuItem::new(tr("复制仓库路径")).on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
                         }),
                     )
-                    .separator()
-                    .item(
-                        PopupMenuItem::new(tr("移出工作区"))
-                            .disabled(!writable)
-                            .on_click(move |_, window, cx| {
-                                let key = leave_key.clone();
-                                leave
-                                    .0
-                                    .update(cx, |this, cx| {
-                                        this.remove_from_workspace(key, leave.1.clone(), window, cx)
-                                    })
-                                    .ok();
-                            }),
-                    )
-                }
-            };
-            menu.separator()
-                .item(PopupMenuItem::new(tr("重命名…")).on_click(move |_, _, cx| {
-                    rename
-                        .0
-                        .update(cx, |_, cx| cx.emit(PageEvent::Rename(rename.1.clone())))
-                        .ok();
-                }))
-                .item(
-                    PopupMenuItem::new(tr("复制仓库路径")).on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
-                    }),
-                )
-        });
+            },
+        );
         let handlers: Handlers<Self> = Handlers {
             open: Rc::new(|_, entry, _, cx| cx.emit(PageEvent::Open(entry))),
             fold: Rc::new(|this, entry, _, cx| this.toggle_fold(entry, cx)),
@@ -1056,6 +1136,10 @@ impl WorkspacePage {
                     open: open.clone(),
                     terms: terminal_summary(board, entry),
                     chips: Vec::new(),
+                    hit: self
+                        .hit
+                        .clone()
+                        .filter(|hit| entry.same_repo(hit) || entry.contains(hit)),
                 }
             };
             let (term_entry, leave_entry, leave_key) = (entry.clone(), entry.clone(), key.clone());
@@ -1093,7 +1177,24 @@ impl WorkspacePage {
         blocks
             .into_iter()
             .enumerate()
-            .map(|(ix, (block, actions))| render_block(ix, block, actions, columns, &handlers, cx))
+            .map(|(ix, (block, actions))| {
+                let hit = block.hit.is_some();
+                let element = render_block(ix, block, actions, columns, &handlers, cx);
+                if !hit {
+                    return element;
+                }
+                // 标出来的那个仓库画在哪：下一帧按它滚到看得见
+                let cell = self.hit_bounds.clone();
+                div()
+                    .relative()
+                    .child(element)
+                    .child(
+                        canvas(move |bounds, _, _| cell.set(Some(bounds)), |_, _, _, _| {})
+                            .absolute()
+                            .inset_0(),
+                    )
+                    .into_any_element()
+            })
             .collect()
     }
 }
@@ -1123,6 +1224,10 @@ impl Render for WorkspacePage {
         let width = crate::repo::sidebar_open(&self.app.read(cx).settings.layout, viewport);
         let (machine, key) = self.selection(cx);
         let background = cx.theme().background;
+        // 「打开工作区」过来的：这一帧画完知道那一行在哪，下一帧滚过去
+        if self.scroll_to_hit {
+            cx.on_next_frame(window, |this, _, cx| this.scroll_hit_into_view(cx));
+        }
         h_flex()
             .size_full()
             .bg(background)

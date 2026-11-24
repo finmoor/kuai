@@ -1,5 +1,5 @@
-//! 设置页：常规（语言、开机自启、托盘）、外观（深色浅色、配色）、终端（字体、光标、滚动和复制）、
-//! 关于（版本、检查更新、源代码）。
+//! 设置页：常规（语言、开机自启、托盘）、外观（深色浅色、配色）、终端（新建终端的预设、字体、光标、
+//! 滚动和复制）、关于（版本、检查更新、源代码）。
 //!
 //! 每一项改了马上生效、马上存盘，没有「确定」「应用」。这里只改 [`AppState`] 里的设置；
 //! 换主题、换语言、建托盘图标这些要动窗口的事，由主窗口（`workspace.rs`）看到设置变了再去做。
@@ -13,7 +13,7 @@ use gpui_kit::component::group_box::GroupBoxVariant;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::setting::{
-    NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage, Settings,
+    NumberFieldOptions, SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage, Settings,
 };
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Selectable as _, Sizable as _, Size as ControlSize, WindowExt as _,
@@ -32,6 +32,10 @@ use crate::update::{self, Updater};
 pub struct SettingsPage {
     app: Entity<AppState>,
     updater: Entity<Updater>,
+    /// 换一个数，设置页就从头画（选中的页、滚到哪都重来），从 [`Self::start_page`] 那一页开始：
+    /// 别处要打开设置的某一页时用（界面库的设置页只认第一次画时给的页）
+    generation: usize,
+    start_page: usize,
     _observe: [Subscription; 2],
 }
 
@@ -45,8 +49,17 @@ impl SettingsPage {
         Self {
             app,
             updater,
+            generation: 0,
+            start_page: 0,
             _observe: observe,
         }
+    }
+
+    /// 打开时显示终端那一页（新建终端的预设在最上面）。
+    pub fn show_terminal(&mut self, cx: &mut Context<Self>) {
+        self.generation += 1;
+        self.start_page = 2;
+        cx.notify();
     }
 
     fn general(&self) -> SettingPage {
@@ -205,7 +218,7 @@ impl SettingsPage {
 
     /// 终端：最上面是预览，下面是字体、光标、滚动和复制、本机仓库用哪个 shell。
     /// 每一项改了马上作用在所有开着的终端上（见 `terminal::prefs`）。
-    fn terminal(&self) -> SettingPage {
+    fn terminal(&self, cx: &App) -> SettingPage {
         let app = self.app.clone();
         let defaults = TerminalSettings::default();
         // 读终端设置里的一项、改一项
@@ -558,6 +571,7 @@ impl SettingsPage {
         SettingPage::new(tr("终端"))
             .icon(Icon::new(IconName::SquareTerminal))
             .default_open(true)
+            .group(crate::presets::settings_group(&self.app, cx))
             .group(SettingGroup::new().item(preview))
             .group(
                 SettingGroup::new()
@@ -1007,16 +1021,24 @@ fn report(text: String, cx: &mut App) {
 impl Render for SettingsPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let bg = cx.theme().background;
-        div().size_full().bg(bg).child(
-            Settings::new("settings")
-                .with_group_variant(GroupBoxVariant::Outline)
-                .sidebar_width(px(200.))
-                .pages([
-                    self.general(),
-                    self.appearance(),
-                    self.terminal(),
-                    self.about(),
-                ]),
-        )
+        div()
+            .id(("settings-page", self.generation))
+            .size_full()
+            .bg(bg)
+            .child(
+                Settings::new("settings")
+                    .with_group_variant(GroupBoxVariant::Outline)
+                    .sidebar_width(px(200.))
+                    .default_selected_index(SelectIndex {
+                        page_ix: self.start_page,
+                        group_ix: None,
+                    })
+                    .pages([
+                        self.general(),
+                        self.appearance(),
+                        self.terminal(cx),
+                        self.about(),
+                    ]),
+            )
     }
 }

@@ -3,10 +3,10 @@
 //! 标题栏是自己画的，标签页直接放在里面，不另占一行。最左边是三个页面：服务器、终端、工作区，
 //! 长得一样，名字固定不变；后面是标签页：仓库（和子仓库）一个一个排（设计见
 //! `design/server-workspace/`，第二版）。设置页打开时也是一个标签页。1.17 右边还有一段终端的标签页
-//! （T3），2026-11-20 去掉了：终端在终端页里看，那里的「打开仓库」打开它所在的仓库。
+//! （T3），2026-11-20 去掉了：终端在会话页里看，那里的「打开仓库」打开它所在的仓库。
 //!
 //! 标签页全局一份，像 VS Code 的编辑器标签：打开哪个就是哪个，和选了哪台服务器、哪个工作区都
-//! 无关。从哪里打开（工作区页、服务器页、终端页、快速打开）都是往这一排里加，
+//! 无关。从哪里打开（工作区页、服务器页、会话页、快速打开）都是往这一排里加，
 //! 已经开着的切过去。工作区只是「一组常一起看的仓库」，在工作区页里一次全部打开。开着哪些标签页
 //! 只记在这台电脑上。
 //!
@@ -39,13 +39,14 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _, TitleBar, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Sizable as _, TitleBar, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::app_state::AppState;
-use crate::machines::LOCAL;
+use crate::history::History;
+use crate::machines::{LOCAL, WorkspaceKey};
 use crate::manager::{ManagerEvent, ManagerView};
 use crate::prompt::{self, Prompts};
 use crate::repo::{RepoEvent, RepoView};
@@ -102,6 +103,46 @@ enum Page {
     Repo(usize),
 }
 
+/// 后退、前进记下的一步：在哪一页。仓库按它本身记（标签页的位置会变），工作区页记着选中的是
+/// 哪个工作区。设计见 `docs/design/back-and-workspace/`（方向 B）。
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Nav {
+    Servers,
+    Terms,
+    Workspaces(Option<WorkspaceKey>),
+    Repo(RepoEntry),
+}
+
+/// 还回得去：仓库的标签页关了就回不去，后退、前进时跳过。
+fn reachable(tabs: &[RepoTab], nav: &Nav) -> bool {
+    match nav {
+        Nav::Repo(entry) => tabs.iter().any(|tab| tab.entry.same_repo(entry)),
+        _ => true,
+    }
+}
+
+/// 主窗口的工作区：别的页面要换页（打开工作区）时经它找过来。
+pub(crate) struct Navigator(WeakEntity<Workspace>);
+
+impl Global for Navigator {}
+
+/// 到工作区页，选中工作区 `key`，`entry` 那一行标出来（会话页、仓库页、标签页右键的「打开工作区」，
+/// 见 `ws_links`）。推迟到这一轮事件处理完再做：点的那个页面这时正被占用，换页要告诉它不显示了。
+pub(crate) fn go_to_workspace(
+    key: WorkspaceKey,
+    entry: Option<RepoEntry>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(this) = cx.try_global::<Navigator>().map(|nav| nav.0.clone()) else {
+        return;
+    };
+    window.defer(cx, move |window, cx| {
+        this.update(cx, |this, cx| this.open_workspace(key, entry, window, cx))
+            .ok();
+    });
+}
+
 /// 上一次应用到窗口上的外观设置；变了才重新应用。
 #[derive(PartialEq, Clone)]
 struct Applied {
@@ -122,18 +163,24 @@ pub struct Workspace {
     tabs: Vec<RepoTab>,
     /// 显示着的那一页
     page: Page,
-    /// 按 Ctrl+Shift+A 打开终端页之前在哪一页：再按一次回去
+    /// 按 Ctrl+Shift+A 打开会话页之前在哪一页：再按一次回去
     before_terms: Page,
-    /// 那一页是仓库标签页时是哪个仓库：回去时按它找。下标靠不住，在终端页上关了、固定了别的标签页
+    /// 那一页是仓库标签页时是哪个仓库：回去时按它找。下标靠不住，在会话页上关了、固定了别的标签页
     /// 位置就变了，原来会回到别的仓库，或者一个没有标签页的空页
     before_terms_repo: Option<RepoEntry>,
+    /// 后退、前进（标题栏最左边的两个按钮、Alt+←、Alt+→、鼠标侧键）：去过的页面
+    history: History<Nav>,
+    /// 正在后退、前进：这次换页不记
+    traveling: bool,
+    /// 上次离开会话页时焦点在终端里：退回去时放回去，接着打字
+    terms_typing: bool,
     /// 主机移除了、因为有没保存的文件或正在做操作而暂时没关的标签页（已经说过一次，不再说）
     kept_on_removal: Vec<RepoEntry>,
     /// 设置页开着；它盖在当前标签页上面，关掉回到原来那一页
     showing_settings: bool,
     /// 所有工作区里的终端现在怎么样（见 `term_board`）
     board: Entity<TermBoard>,
-    /// 终端页（标题栏上的「终端」，Ctrl+Shift+A）
+    /// 会话页（标题栏上的「会话」，Ctrl+Shift+A）
     overview: Entity<TermOverview>,
     /// 上一次告诉 `board` 的「正显示着哪个终端」
     told_shown: Option<Shown>,
@@ -189,14 +236,23 @@ impl Workspace {
                 &workspaces,
                 window,
                 |this, _, event, window, cx| match event {
-                    PageEvent::Open(entry) => this.open(entry.clone(), window, cx),
+                    // 从哪个工作区打开的：仓库页的工作区按钮先写它
+                    PageEvent::Open(entry) => {
+                        let home = this.workspaces.read(cx).selected(cx);
+                        this.open(entry.clone(), window, cx);
+                        this.hint_home(home, cx);
+                    }
                     PageEvent::OpenAll { entries, show } => {
                         this.open_all(entries.clone(), *show, window, cx)
                     }
                     PageEvent::Rename(entry) => this.rename_repo(entry.clone(), window, cx),
                     PageEvent::Terminals(entry) => this.show_terminals_of(entry, window, cx),
                     PageEvent::NewTerminal(entry) => {
-                        this.new_terminal_for(entry.clone(), window, cx)
+                        let start = crate::presets::default_start(cx);
+                        this.new_terminal_for(entry.clone(), start, window, cx)
+                    }
+                    PageEvent::RunInTerminal(entry, start) => {
+                        this.new_terminal_for(entry.clone(), start.clone(), window, cx)
                     }
                 },
             ),
@@ -232,7 +288,7 @@ impl Workspace {
                 }
                 cx.notify();
             }),
-            // 标题栏上「终端」那一项的个数跟着变；总览页里换了选中的，也要重新告诉 `board`
+            // 标题栏上「会话」那一项的个数跟着变；会话页里换了选中的，也要重新告诉 `board`
             cx.observe(&board, |_, _, cx| cx.notify()),
             cx.observe(&overview, |_, _, cx| cx.notify()),
             cx.subscribe_in(
@@ -408,6 +464,9 @@ impl Workspace {
             page: Page::Workspaces,
             before_terms: Page::Workspaces,
             before_terms_repo: None,
+            history: History::default(),
+            traveling: false,
+            terms_typing: false,
             kept_on_removal: Vec::new(),
             showing_settings: false,
             board,
@@ -425,6 +484,7 @@ impl Workspace {
             _subscriptions: subscriptions,
             _prompts: prompt::show_in(prompts, window, cx),
         };
+        cx.set_global(Navigator(cx.weak_entity()));
         // 恢复上次开着的标签页和显示着的那一页
         let saved = app.read(cx).tabs().clone();
         for entry in saved.repos {
@@ -941,11 +1001,18 @@ impl Workspace {
         }
     }
 
-    /// 工作区页上点了一个仓库的「新建终端」：到终端页，在这个仓库里新开一个。
-    fn new_terminal_for(&mut self, entry: RepoEntry, window: &mut Window, cx: &mut Context<Self>) {
+    /// 工作区页上点了一个仓库的「新建终端」：到会话页，在这个仓库里新开一个，输入 `start`。
+    fn new_terminal_for(
+        &mut self,
+        entry: RepoEntry,
+        start: Option<crate::presets::Start>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.show_terms(window, cx);
-        self.overview
-            .update(cx, |overview, cx| overview.new_terminal(entry, window, cx));
+        self.overview.update(cx, |overview, cx| {
+            overview.new_terminal_with(entry, start, window, cx)
+        });
     }
 
     /// 这个仓库的标签页在第几个；没开着就建一个加在最后。
@@ -955,7 +1022,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
-        // Windows 上同一个仓库的几种写法算一个（见 [`RepoEntry::same_repo`]），不然从终端页打开没登记
+        // Windows 上同一个仓库的几种写法算一个（见 [`RepoEntry::same_repo`]），不然从会话页打开没登记
         // 过的子仓库会再开一个标签页
         if let Some(ix) = self.tabs.iter().position(|t| t.entry.same_repo(&entry)) {
             return ix;
@@ -965,18 +1032,168 @@ impl Workspace {
         self.tabs.len() - 1
     }
 
-    /// 换到一页（标题栏上的三个页面、某个标签页）。设置页开着就关掉。
+    /// 换到一页（标题栏上的三个页面、某个标签页）。设置页开着就关掉。换了就记一步，后退能回来。
     fn show_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.here(cx);
+        self.show_page_from(from, page, window, cx);
+    }
+
+    /// 同 [`Self::show_page`]。`from` 是换页之前在哪：换页前已经改了要去的那一页的样子（选中了别的
+    /// 工作区）时，调用的地方要在改之前记下。
+    fn show_page_from(
+        &mut self,
+        from: Nav,
+        page: Page,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 离开会话页时焦点在不在终端里：退回来时照样放回去
+        if self.page == Page::Terms && page != Page::Terms && !self.showing_settings {
+            self.terms_typing = self.overview.read(cx).typing(window, cx);
+        }
         // 设置页盖着时，下面那一页不算显示着
         let was = (!self.showing_settings).then_some(self.page);
         self.showing_settings = false;
         self.page = page;
         self.page_changed(was, window, cx);
         self.persist(cx);
+        if !self.traveling && self.here(cx) != from {
+            self.history.remember(from);
+        }
         cx.notify();
     }
 
-    /// 显示着的那一页换了（`was` 是原来显示着的，设置页盖着时是 None）：终端页、工作区页要知道
+    // ---- 后退、前进 ----
+
+    /// 现在在哪一页（设置页盖着时是下面那一页）。
+    fn here(&self, cx: &App) -> Nav {
+        match self.page {
+            Page::Servers => Nav::Servers,
+            Page::Terms => Nav::Terms,
+            Page::Workspaces => Nav::Workspaces(self.workspaces.read(cx).selected(cx)),
+            Page::Repo(ix) => match self.tabs.get(ix) {
+                Some(tab) => Nav::Repo(tab.entry.clone()),
+                None => Nav::Workspaces(None),
+            },
+        }
+    }
+
+    /// 按钮的提示里写的名字。
+    fn nav_label(&self, nav: &Nav, cx: &App) -> SharedString {
+        let app = self.app.read(cx);
+        match nav {
+            Nav::Servers => trc("页面", "主机").into(),
+            Nav::Terms => trc("页面", "会话").into(),
+            Nav::Workspaces(Some(key)) => {
+                tf!("工作区「{name}」", name = app.workspace_name(key)).into()
+            }
+            Nav::Workspaces(None) => trc("页面", "工作区").into(),
+            Nav::Repo(entry) => app.repo_name(entry),
+        }
+    }
+
+    /// 后退、前进会到哪（按钮的提示用）；没有是 None。后退时设置页开着是关掉它，在子仓库、工作树
+    /// 里是回到上一层。
+    fn travel_target(&self, back: bool, cx: &App) -> Option<SharedString> {
+        let here = self.here(cx);
+        if back {
+            if self.showing_settings {
+                return Some(self.nav_label(&here, cx));
+            }
+            if let Some(tab) = self.active_repo()
+                && tab.view.read(cx).active_sub().is_some()
+            {
+                return Some(self.app.read(cx).repo_name(&tab.entry));
+            }
+        }
+        self.history
+            .peek(back, &here, |nav| reachable(&self.tabs, nav))
+            .map(|nav| self.nav_label(nav, cx))
+    }
+
+    /// 后退（标题栏的 ←、Alt+←、鼠标侧键）：设置页开着就关掉它；在子仓库、工作树里先回到上一层；
+    /// 不然回到上一页。
+    pub fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.showing_settings {
+            self.toggle_settings(window, cx);
+            return;
+        }
+        if let Some(tab) = self.active_repo() {
+            let view = tab.view.clone();
+            if view.update(cx, |view, cx| view.back_to_root(window, cx)) {
+                cx.notify();
+                return;
+            }
+        }
+        self.travel(true, window, cx);
+    }
+
+    /// 前进（标题栏的 →、Alt+→、鼠标侧键）。
+    pub fn go_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.travel(false, window, cx);
+    }
+
+    fn travel(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let here = self.here(cx);
+        let tabs = &self.tabs;
+        let Some(nav) = self.history.step(back, here, |nav| reachable(tabs, nav)) else {
+            return;
+        };
+        self.traveling = true;
+        self.visit(nav, window, cx);
+        self.traveling = false;
+    }
+
+    /// 回到记下的那一页。
+    fn visit(&mut self, nav: Nav, window: &mut Window, cx: &mut Context<Self>) {
+        match nav {
+            Nav::Servers => self.show_page(Page::Servers, window, cx),
+            Nav::Terms => {
+                self.show_terms(window, cx);
+                if self.terms_typing {
+                    self.overview
+                        .update(cx, |overview, cx| overview.type_in(window, cx));
+                }
+            }
+            Nav::Workspaces(key) => {
+                let known = |key: &WorkspaceKey| self.app.read(cx).workspace(key).is_some();
+                if let Some(key) = key.filter(known) {
+                    self.app.update(cx, |app, cx| app.set_current(key, cx));
+                }
+                self.show_page(Page::Workspaces, window, cx);
+            }
+            Nav::Repo(entry) => {
+                let at = self.tabs.iter().position(|tab| tab.entry.same_repo(&entry));
+                if let Some(ix) = at {
+                    self.show_page(Page::Repo(ix), window, cx);
+                }
+            }
+        }
+    }
+
+    /// 到工作区页，选中工作区 `key`，`entry` 那一行标出来（「打开工作区」，见 [`go_to_workspace`]）。
+    fn open_workspace(
+        &mut self,
+        key: WorkspaceKey,
+        entry: Option<RepoEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let from = self.here(cx);
+        self.workspaces
+            .update(cx, |page, cx| page.reveal(key, entry, cx));
+        self.show_page_from(from, Page::Workspaces, window, cx);
+    }
+
+    /// 刚打开的仓库标签页是从哪个工作区来的（工作区页上打开的、会话页里列在哪个工作区下面）：它的
+    /// 工作区按钮先写这个。
+    fn hint_home(&mut self, home: Option<WorkspaceKey>, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_repo() {
+            tab.view.update(cx, |view, cx| view.set_home_hint(home, cx));
+        }
+    }
+
+    /// 显示着的那一页换了（`was` 是原来显示着的，设置页盖着时是 None）：会话页、工作区页要知道
     /// 自己显示了、不显示了。
     fn page_changed(&mut self, was: Option<Page>, window: &mut Window, cx: &mut Context<Self>) {
         let now = (!self.showing_settings).then_some(self.page);
@@ -1246,20 +1463,6 @@ impl Workspace {
         self.close_many(|at, _| at > ix, window, cx);
     }
 
-    /// 标签页右键的「在工作区页中显示」：到工作区页，选中包含它的那个工作区。
-    fn reveal_in_workspaces(
-        &mut self,
-        entry: &RepoEntry,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(key) = self.app.read(cx).workspace_of(entry) else {
-            return;
-        };
-        self.app.update(cx, |app, cx| app.set_current(key, cx));
-        self.show_page(Page::Workspaces, window, cx);
-    }
-
     /// 服务器页上点了一台服务器的「N 个工作区」：到工作区页看那台的。
     fn show_workspaces_of(&mut self, machine: String, window: &mut Window, cx: &mut Context<Self>) {
         self.app
@@ -1267,7 +1470,7 @@ impl Workspace {
         self.show_page(Page::Workspaces, window, cx);
     }
 
-    /// 工作区页上点了一个仓库的终端个数：到终端页，选中它。
+    /// 工作区页上点了一个仓库的终端个数：到会话页，选中它。
     fn show_terminals_of(
         &mut self,
         entry: &RepoEntry,
@@ -1288,7 +1491,16 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Ctrl+Shift+A：打开终端页；已经在上面就回到原来那一页。
+    /// 打开设置的终端那一页（新建终端菜单里的「管理预设…」）。
+    pub fn open_terminal_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_page
+            .update(cx, |page, cx| page.show_terminal(cx));
+        if !self.showing_settings {
+            self.toggle_settings(window, cx);
+        }
+    }
+
+    /// Ctrl+Shift+A：打开会话页；已经在上面就回到原来那一页。
     pub fn toggle_terms(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.page == Page::Terms && !self.showing_settings {
             let back = match self.before_terms {
@@ -1300,7 +1512,7 @@ impl Workspace {
                 page => page,
             };
             self.show_page(back, window, cx);
-            // 焦点还在看不见的终端页上：放回显示出来的终端里
+            // 焦点还在看不见的会话页上：放回显示出来的终端里
             if let Some(tab) = self.active_repo() {
                 tab.shown(cx)
                     .update(cx, |view, cx| view.focus_shown_terminal(window, cx));
@@ -1310,7 +1522,7 @@ impl Workspace {
         }
     }
 
-    /// 到终端页（标题栏上的「终端」）。
+    /// 到会话页（标题栏上的「会话」）。
     fn show_terms(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.page != Page::Terms {
             self.before_terms = self.page;
@@ -1319,7 +1531,7 @@ impl Workspace {
         self.show_page(Page::Terms, window, cx);
     }
 
-    /// 提醒里的「前往」、点了系统通知：到终端页选中这个终端。
+    /// 提醒里的「前往」、点了系统通知：到会话页选中这个终端。
     fn go_to_terminal(&mut self, row: &TermRow, window: &mut Window, cx: &mut Context<Self>) {
         log::info!("前往终端：{} 的第 {} 个", row.entry.path, row.number);
         self.show_terms(window, cx);
@@ -1338,17 +1550,19 @@ impl Workspace {
         window.remove_notification1::<TerminalStopped>(key, cx);
     }
 
-    /// 从终端页打开一个仓库（工具栏的「打开仓库」、右键菜单、Enter、双击）：打开它的标签页，显示
+    /// 从会话页打开一个仓库（工具栏的「打开仓库」、右键菜单、Enter、双击）：打开它的标签页，显示
     /// Git 页。
     fn open_repo_git(&mut self, entry: &RepoEntry, window: &mut Window, cx: &mut Context<Self>) {
+        let home = self.overview.read(cx).listed_under(entry, cx);
         self.open(entry.clone(), window, cx);
+        self.hint_home(home, cx);
         if let Some(tab) = self.active_repo() {
             tab.shown(cx)
                 .update(cx, |view, cx| view.show_git_page(window, cx));
         }
     }
 
-    /// 终端页里按住 Ctrl 单击了仓库里的文件、目录：打开这个仓库的标签页（进了子仓库的退回这个仓库），
+    /// 会话页里按住 Ctrl 单击了仓库里的文件、目录：打开这个仓库的标签页（进了子仓库的退回这个仓库），
     /// 在文件页打开它（见 [`RepoView::show_path`]）。
     fn open_repo_path(
         &mut self,
@@ -1469,7 +1683,7 @@ impl Workspace {
         self.toast_jobs.unbounded_send(job).ok();
     }
 
-    /// 现在正显示着哪个终端：窗口在前台时，终端总览页里选中的（正往里输入的另算），或者当前标签页的
+    /// 现在正显示着哪个终端：窗口在前台时，会话页里选中的（正往里输入的另算），或者当前标签页的
     /// 终端页上那个。
     fn shown_terminal(&self, window: &Window, cx: &App) -> Option<Shown> {
         if !window.is_window_active() || self.showing_settings {
@@ -1519,14 +1733,6 @@ impl Workspace {
         }
     }
 
-    /// Alt+←：在子仓库、别的工作树里时回到上一层的总览表。
-    pub fn back_to_root_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.active_repo() {
-            tab.view
-                .update(cx, |view, cx| view.back_to_root(window, cx));
-        }
-    }
-
     /// Ctrl+Shift+E：当前仓库切到文件页。
     pub fn files_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_repo() {
@@ -1562,9 +1768,9 @@ impl Workspace {
         }
     }
 
-    /// Ctrl+Shift+`：当前仓库再开一个终端，切到终端页显示它。
+    /// Ctrl+Shift+`：当前仓库再开一个终端，切到它的终端页显示它（在会话页上时开在那里）。
     pub fn new_terminal_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // 终端页上：开在那里选中的仓库里
+        // 会话页上：开在那里选中的仓库里
         if self.page == Page::Terms && !self.showing_settings {
             self.overview
                 .update(cx, |overview, cx| overview.new_terminal_here(window, cx));
@@ -1753,7 +1959,6 @@ impl Workspace {
         let (accent, muted) = (cx.theme().primary, cx.theme().muted_foreground);
         let app = self.app.read(cx);
         let can_reopen = !app.closed_tabs().is_empty();
-        let in_workspace = app.workspace_of(&tab.entry).is_some();
         let close = tab_close(("close-tab", ix), look.selected, cx).on_click(cx.listener(
             move |this, _, window, cx| {
                 cx.stop_propagation();
@@ -1815,15 +2020,15 @@ impl Workspace {
                 )
             })
             .when(look.show_close, |tab| tab.child(close))
-            .context_menu(move |menu, _, cx| {
+            .context_menu(move |menu, window, cx| {
                 tab_menu(
                     menu,
                     ix,
                     entry.clone(),
                     can_reopen,
-                    in_workspace,
                     &menu_app,
                     &menu_this,
+                    window,
                     cx,
                 )
             })
@@ -2003,9 +2208,9 @@ impl Workspace {
             })
             .tooltip(move |window, cx| {
                 let text = match waiting {
-                    0 => tr("所有终端（Ctrl+Shift+A）").to_string(),
+                    0 => tr("会话（Ctrl+Shift+A）").to_string(),
                     n => tf!(
-                        "所有终端（Ctrl+Shift+A）：{n} 个已停下，尚未查看",
+                        "会话（Ctrl+Shift+A）：{n} 个终端已停下，尚未查看",
                         n = n.to_string()
                     ),
                 };
@@ -2024,6 +2229,34 @@ impl Workspace {
             .when(narrow, |tab| {
                 tab.tooltip(move |window, cx| ui::tip(workspaces_label, window, cx))
             });
+        // 最左边的后退、前进：提示里写会回到哪
+        let travel = |back: bool, cx: &mut Context<Self>| {
+            let target = self.travel_target(back, cx);
+            let tip: SharedString = match (&target, back) {
+                (Some(to), true) => tf!("返回：{to}（Alt+←）", to = to.clone()).into(),
+                (Some(to), false) => tf!("前进：{to}（Alt+→）", to = to.clone()).into(),
+                (None, true) => tr("没有可返回的页面").into(),
+                (None, false) => tr("没有可前进的页面").into(),
+            };
+            let (id, icon) = match back {
+                true => ("nav-back", IconName::ArrowLeft),
+                false => ("nav-forward", IconName::ArrowRight),
+            };
+            div().occlude().flex_none().child(
+                Button::new(id)
+                    .ghost()
+                    .small()
+                    .icon(ui::icon(icon))
+                    .disabled(target.is_none())
+                    .tooltip(tip)
+                    .on_click(cx.listener(move |this, _, window, cx| match back {
+                        true => this.go_back(window, cx),
+                        false => this.go_forward(window, cx),
+                    })),
+            )
+        };
+        let back = travel(true, cx);
+        let forward = travel(false, cx);
         // 先量出每个标签不挤时多宽，再决定怎么缩、哪些收进「⌄」（见 `tab_fit`）
         let hints = self.tab_hints(cx);
         let looks: Vec<RepoTabLook> = hints
@@ -2130,7 +2363,10 @@ impl Workspace {
                     .flex_1()
                     .min_w_0()
                     .gap(px(4.))
-                    // 三个页面在最前，后面是标签页
+                    // 最前面是后退、前进，然后是三个页面，后面是标签页
+                    .child(back)
+                    .child(forward)
+                    .child(div().flex_none().w(px(1.)).h(px(16.)).mx(px(2.)).bg(border))
                     .child(servers)
                     .child(terms)
                     .child(workspaces)
@@ -2287,95 +2523,91 @@ pub(crate) fn machine_status(state: &AppState, machine: &str, cx: &App) -> (Shar
     }
 }
 
-/// 仓库标签页的右键菜单。`in_workspace`：有工作区包含它（「在工作区页中显示」才有用）。
+/// 仓库标签页的右键菜单。
 #[allow(clippy::too_many_arguments)]
 fn tab_menu(
     menu: PopupMenu,
     ix: usize,
     entry: RepoEntry,
     can_reopen: bool,
-    in_workspace: bool,
     app: &Entity<AppState>,
     this: &WeakEntity<Workspace>,
-    cx: &App,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     let (close, others, right, all) = (this.clone(), this.clone(), this.clone(), this.clone());
-    let (reopen, pin, reveal, rename) = (this.clone(), this.clone(), this.clone(), this.clone());
-    let reveal_entry = entry.clone();
+    let (reopen, pin, rename) = (this.clone(), this.clone(), this.clone());
     let path = entry.path.clone();
     let pinned = app.read(cx).tabs().is_pinned(&entry);
-    menu.item(
-        PopupMenuItem::new(if pinned {
-            tr("取消固定")
-        } else {
-            tr("固定标签页")
-        })
-        .on_click(move |_, _, cx| {
-            pin.update(cx, |this, cx| this.toggle_pin(ix, cx)).ok();
-        }),
-    )
-    .separator()
-    .item(
-        PopupMenuItem::new(tr("关闭"))
-            .disabled(pinned)
-            .on_click(move |_, window, cx| {
-                close.update(cx, |this, cx| this.close(ix, window, cx)).ok();
+    // 这个标签页的工作区按钮先写哪个（从哪个工作区打开的）
+    let home = this
+        .upgrade()
+        .and_then(|this| this.read(cx).tabs.get(ix).map(|tab| tab.view.clone()))
+        .and_then(|view| view.read(cx).home_hint());
+    let menu = menu
+        .item(
+            PopupMenuItem::new(if pinned {
+                tr("取消固定")
+            } else {
+                tr("固定标签页")
+            })
+            .on_click(move |_, _, cx| {
+                pin.update(cx, |this, cx| this.toggle_pin(ix, cx)).ok();
             }),
-    )
-    .item(
-        PopupMenuItem::new(tr("关闭其他标签页")).on_click(move |_, window, cx| {
-            others
-                .update(cx, |this, cx| this.close_others(Some(ix), window, cx))
-                .ok();
-        }),
-    )
-    .item(
-        PopupMenuItem::new(tr("关闭右侧标签页")).on_click(move |_, window, cx| {
-            right
-                .update(cx, |this, cx| this.close_right(ix, window, cx))
-                .ok();
-        }),
-    )
-    .item(
-        PopupMenuItem::new(tr("全部关闭")).on_click(move |_, window, cx| {
-            all.update(cx, |this, cx| this.close_others(None, window, cx))
-                .ok();
-        }),
-    )
-    .item(
-        PopupMenuItem::new(tr("重新打开已关闭的标签页（Ctrl+Shift+T）"))
-            .disabled(!can_reopen)
-            .on_click(move |_, window, cx| {
-                reopen
-                    .update(cx, |this, cx| this.reopen_closed(window, cx))
+        )
+        .separator()
+        .item(
+            PopupMenuItem::new(tr("关闭"))
+                .disabled(pinned)
+                .on_click(move |_, window, cx| {
+                    close.update(cx, |this, cx| this.close(ix, window, cx)).ok();
+                }),
+        )
+        .item(
+            PopupMenuItem::new(tr("关闭其他标签页")).on_click(move |_, window, cx| {
+                others
+                    .update(cx, |this, cx| this.close_others(Some(ix), window, cx))
                     .ok();
             }),
-    )
-    .separator()
-    .item(
-        PopupMenuItem::new(tr("在工作区页中显示"))
-            .disabled(!in_workspace)
-            .on_click(move |_, window, cx| {
-                reveal
-                    .update(cx, |this, cx| {
-                        this.reveal_in_workspaces(&reveal_entry, window, cx)
-                    })
+        )
+        .item(
+            PopupMenuItem::new(tr("关闭右侧标签页")).on_click(move |_, window, cx| {
+                right
+                    .update(cx, |this, cx| this.close_right(ix, window, cx))
                     .ok();
             }),
-    )
-    .separator()
-    .item(
-        PopupMenuItem::new(tr("重命名…")).on_click(move |_, window, cx| {
-            rename
-                .update(cx, |this, cx| this.rename_repo(entry.clone(), window, cx))
-                .ok();
-        }),
-    )
-    .item(
-        PopupMenuItem::new(tr("复制仓库路径")).on_click(move |_, _, cx| {
-            cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
-        }),
-    )
+        )
+        .item(
+            PopupMenuItem::new(tr("全部关闭")).on_click(move |_, window, cx| {
+                all.update(cx, |this, cx| this.close_others(None, window, cx))
+                    .ok();
+            }),
+        )
+        .item(
+            PopupMenuItem::new(tr("重新打开已关闭的标签页（Ctrl+Shift+T）"))
+                .disabled(!can_reopen)
+                .on_click(move |_, window, cx| {
+                    reopen
+                        .update(cx, |this, cx| this.reopen_closed(window, cx))
+                        .ok();
+                }),
+        )
+        .separator();
+    let add = crate::ws_links::plain_add(app);
+    crate::ws_links::context_items(menu, app, &entry, home.as_ref(), true, &add, window, cx)
+        .separator()
+        .item(
+            PopupMenuItem::new(tr("重命名…")).on_click(move |_, window, cx| {
+                rename
+                    .update(cx, |this, cx| this.rename_repo(entry.clone(), window, cx))
+                    .ok();
+            }),
+        )
+        .item(
+            PopupMenuItem::new(tr("复制仓库路径")).on_click(move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+            }),
+        )
 }
 
 /// 对话框里「确定」要做的事：回车和点按钮共用。
@@ -2640,6 +2872,15 @@ impl Render for Workspace {
             .size_full()
             .bg(bg)
             .text_color(fg)
+            // 鼠标侧键：后退、前进
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|this, _, window, cx| this.go_back(window, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|this, _, window, cx| this.go_forward(window, cx)),
+            )
             .child(ui::tooltip_guard())
             .child(title_bar)
             .child(div().flex_1().min_h_0().child(content))
@@ -2658,6 +2899,9 @@ pub(crate) enum PickFor {
     Terminal,
 }
 
+/// 选仓库的框的按键上下文：新建终端时 Tab、Shift+Tab 换要运行的程序（见 `main.rs`）。
+pub(crate) const QUICK_OPEN_CONTEXT: &str = "QuickOpen";
+
 /// 选仓库的框：一个输入框加仓库列表，输入的字按名字和路径筛选。快速打开和新建终端共用。
 pub(crate) struct QuickOpen {
     app: Entity<AppState>,
@@ -2665,6 +2909,9 @@ pub(crate) struct QuickOpen {
     purpose: PickFor,
     /// 上下键选中的是匹配结果里的第几个
     selected: usize,
+    /// 新建终端：框上面那一排要运行的程序选的是第几个（0 是只开 shell，往后是菜单里列的预设，见
+    /// [`Self::programs`]）。开始时是「默认运行」的那个，Tab、Shift+Tab 换
+    program: usize,
     _subscription: Subscription,
 }
 
@@ -2716,13 +2963,40 @@ impl QuickOpen {
                 cx.notify();
             }
         });
+        let default = crate::presets::default_preset(cx).map(|preset| preset.id);
+        let program = Self::programs(cx)
+            .iter()
+            .position(|start| start.as_ref().map(|(id, _)| id) == default.as_ref())
+            .unwrap_or(0);
         Self {
             app,
             input,
             purpose,
             selected: 0,
+            program,
             _subscription: subscription,
         }
+    }
+
+    /// 新建终端时可以选的程序：只开 shell（None），再是菜单里列的预设（id 和要输入的）。
+    fn programs(cx: &App) -> Vec<Option<(String, crate::presets::Start)>> {
+        std::iter::once(None)
+            .chain(
+                crate::presets::all(cx)
+                    .iter()
+                    .filter(|preset| preset.shown)
+                    .map(|preset| Some((preset.id.clone(), crate::presets::Start::of(preset)))),
+            )
+            .collect()
+    }
+
+    /// 新建终端：上面那一排选的程序（None 是只开 shell）。
+    pub(crate) fn chosen_start(&self, cx: &App) -> Option<crate::presets::Start> {
+        Self::programs(cx)
+            .into_iter()
+            .nth(self.program)
+            .flatten()
+            .map(|(_, start)| start)
     }
 
     /// 匹配输入内容的仓库：名字、路径、服务器名里有这几个字（不分大小写）。
@@ -2787,6 +3061,20 @@ impl QuickOpen {
         }
     }
 
+    /// 新建终端时 Tab、Shift+Tab：换要运行的程序，到头绕回去。快速打开时照旧切焦点。
+    fn next_program(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.purpose != PickFor::Terminal {
+            cx.propagate();
+            return;
+        }
+        let count = Self::programs(cx).len().max(1);
+        self.program = match forward {
+            true => (self.program + 1) % count,
+            false => (self.program + count - 1) % count,
+        };
+        cx.notify();
+    }
+
     /// 上下键：在匹配结果里移动，到头绕回去。
     fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let count = self.matches(cx).len();
@@ -2800,6 +3088,87 @@ impl QuickOpen {
         }
         cx.stop_propagation();
         cx.notify();
+    }
+}
+
+impl QuickOpen {
+    /// 新建终端的框上面那一排：要运行的程序（只开 shell、各个预设），选中的那个描边；行尾写怎么换、
+    /// 「管理预设…」。
+    fn render_programs(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (muted, border, primary, hover, active) = (
+            theme.muted_foreground,
+            theme.border,
+            theme.primary,
+            theme.list_hover,
+            theme.list_active,
+        );
+        let programs: Vec<(gpui_kit::component::Icon, SharedString)> = Self::programs(cx)
+            .iter()
+            .map(|program| match program {
+                Some((_, start)) => (
+                    crate::presets::icon(&start.icon)
+                        .size_3p5()
+                        .text_color(crate::presets::color(&start.icon, start.hue, cx)),
+                    SharedString::from(start.name.clone()),
+                ),
+                None => (
+                    ui::icon(IconName::SquareTerminal).text_color(muted),
+                    SharedString::from(tr("终端")),
+                ),
+            })
+            .collect();
+        let chosen = self.program.min(programs.len().saturating_sub(1));
+        let chips: Vec<AnyElement> = programs
+            .into_iter()
+            .enumerate()
+            .map(|(ix, (icon, name))| {
+                h_flex()
+                    .id(("pick-program", ix))
+                    .h(px(26.))
+                    .px_2()
+                    .gap_1p5()
+                    .rounded(px(ui::RADIUS))
+                    .border_1()
+                    .border_color(if ix == chosen { primary } else { border })
+                    .when(ix == chosen, |chip| chip.bg(active))
+                    .when(ix != chosen, |chip| chip.hover(|s| s.bg(hover)))
+                    .cursor_pointer()
+                    .text_sm()
+                    .child(icon)
+                    .child(name)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.program = ix;
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        v_flex()
+            .gap_1()
+            .child(h_flex().flex_wrap().gap_1().children(chips))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(div().child(tr("Tab 切换要运行的程序")))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("pick-manage")
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(primary))
+                            .child(tr("管理预设…"))
+                            .on_click(|_, window, cx| {
+                                window.close_dialog(cx);
+                                crate::with_main_workspace(cx, |workspace, window, cx| {
+                                    workspace.open_terminal_settings(window, cx)
+                                });
+                            }),
+                    ),
+            )
+            .into_any_element()
     }
 }
 
@@ -2850,9 +3219,18 @@ impl Render for QuickOpen {
             })
             .collect();
         let empty = rows.is_empty();
+        let programs = (self.purpose == PickFor::Terminal).then(|| self.render_programs(cx));
         v_flex()
             .gap_2()
+            .key_context(QUICK_OPEN_CONTEXT)
             .capture_key_down(cx.listener(Self::on_key))
+            .on_action(
+                cx.listener(|this, _: &crate::NextProgram, _, cx| this.next_program(true, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::PrevProgram, _, cx| this.next_program(false, cx)),
+            )
+            .children(programs)
             .child(Input::new(&self.input))
             .child(
                 div()

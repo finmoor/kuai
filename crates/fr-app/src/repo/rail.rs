@@ -192,11 +192,14 @@ impl RepoView {
                     .children(items),
             )
             .child(
-                h_flex()
+                v_flex()
                     .flex_none()
                     .w_full()
                     .py(px(8.))
-                    .justify_center()
+                    .gap(px(4.))
+                    .items_center()
+                    // 所在的工作区（侧栏展开时写在顶上第二行），点了到工作区页
+                    .child(self.render_rail_home(cx))
                     .child(
                         rail_button("rail-expand", IconName::PanelLeftOpen, false)
                             .tooltip(tr("展开侧栏（Ctrl+Shift+B）"))
@@ -207,6 +210,43 @@ impl RepoView {
             )
             .child(self.split_handle(Split::Sidebar, cx))
             .into_any_element()
+    }
+
+    /// 侧栏收起时的工作区按钮（展开时在侧栏顶上第二行，见 `render_home_button`）。
+    /// 画的是所在工作区的色块（没加入的是空心灰框），不用图标：工作区的图标和侧栏里「工作树」的一样。
+    fn render_rail_home(&self, cx: &mut Context<Self>) -> AnyElement {
+        let hint = self.home_hint();
+        let app = self.app.read(cx);
+        let tip = crate::ws_links::tip(app, &self.entry, hint.as_ref());
+        let first = crate::ws_links::homes(app, &self.entry, hint.as_ref())
+            .into_iter()
+            .next();
+        let muted = cx.theme().muted_foreground;
+        let mark = match first {
+            Some(key) => ui::hue_mark(ui::hue(app.workspace_hue(&key), cx), 10.),
+            None => div()
+                .flex_none()
+                .size(px(10.))
+                .rounded(px(2.5))
+                .border(px(1.5))
+                .border_color(muted),
+        };
+        let button = Button::new("rail-home")
+            .ghost()
+            .w(px(BUTTON))
+            .h(px(BUTTON))
+            .child(mark)
+            .tooltip(tip);
+        crate::ws_links::button(
+            button,
+            &self.app,
+            &self.entry,
+            hint,
+            crate::ws_links::plain_add(&self.app),
+            Anchor::BottomLeft,
+            false,
+            cx,
+        )
     }
 
     /// 最上面的仓库图标，和侧栏顶上的一样；停上去看名字和位置，右键和侧栏顶上一样。

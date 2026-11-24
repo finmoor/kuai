@@ -96,6 +96,8 @@ pub(crate) struct Block {
     pub terms: Option<(usize, TermState)>,
     /// 名字和已打开之间的小标签（服务器页：它在哪些工作区里）
     pub chips: Vec<AnyElement>,
+    /// 要标出来的这个仓库或它的某个子仓库（工作区页上「打开工作区」过来的）：那一行带选中的底色
+    pub hit: Option<RepoEntry>,
 }
 
 /// 一行里能点的几样。
@@ -220,7 +222,17 @@ pub(crate) fn render_block<T: 'static>(
             None => chip.into_any_element(),
         }
     });
+    // 标出来的是子仓库、子仓库又收着时，标在仓库那一行上。底色和侧栏里选中的一行一样
+    let selection = cx.theme().sidebar_accent;
+    let hit_head = block.hit.as_ref().is_some_and(|hit| {
+        hit.same_repo(&block.entry)
+            || !subs
+                .iter()
+                .any(|sub| sub_entry(&block.entry, sub).same_repo(hit))
+            || !unfolded
+    });
     let head = row_shell(("block-row", key), &block.entry, handlers, false, cx)
+        .when(hit_head, |row| row.bg(selection))
         .min_h(px(46.))
         .pl(px(6.))
         .child(caret)
@@ -299,8 +311,10 @@ pub(crate) fn render_block<T: 'static>(
                     .cloned();
                 let is_open = block.open.contains(&sub);
                 let id = key * 10_000 + at;
+                let hit = unfolded && block.hit.as_ref().is_some_and(|hit| hit.same_repo(&sub));
                 let row =
                     row_shell(("sub-row", id), &sub, handlers, true, cx)
+                        .when(hit, |row| row.bg(selection))
                         .min_h(px(38.))
                         .pl(px(8.))
                         .child(

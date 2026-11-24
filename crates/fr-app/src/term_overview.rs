@@ -1,4 +1,4 @@
-//! 终端页（标题栏上的「终端」，Ctrl+Shift+A）：所有工作区里各个仓库的终端合在一起管。
+//! 会话页（标题栏上的「会话」，Ctrl+Shift+A）：所有工作区里各个仓库的终端合在一起管。
 //!
 //! 仓库标签页里的终端页是它只看一个仓库的样子：两边是同一批终端（都在各台电脑的 kuaid 里，数据
 //! 在 [`TermBoard`]）。设计见 `docs/design/terminal-hub/`（方向 C，带固定）。
@@ -30,7 +30,7 @@
 //! 点标签、新开一个终端时进到终端里，之后的键都归里面的程序，只留 Ctrl+Shift+↑、↓ 沿着侧栏换终端。
 //! 输入时画面带一圈主色的边框：Enter 在侧栏上是打开仓库、在终端里是回车，得一眼看得出焦点在哪。
 //!
-//! 侧栏和仓库页的侧栏一样宽、一样的底色和字号，右边上面一条和终端页的工具栏一样高，下面全是画面：
+//! 侧栏和仓库页的侧栏一样宽、一样的底色和字号，右边上面一条和仓库终端页的工具栏一样高，下面全是画面：
 //! 这样画面和仓库的终端页一样大，终端是几行几列就正好放得下，字不用缩小。侧栏右边有分隔条，拖它改的
 //! 就是仓库页侧栏的那个宽度（见 [`crate::side_split`]）。
 
@@ -53,6 +53,7 @@ use gpui_kit::*;
 
 use crate::app_state::AppState;
 use crate::machines::{LOCAL, WorkspaceKey, machine_of, split_relay};
+use crate::presets;
 use crate::repo::tool_button;
 use crate::settings::{RepoEntry, TermSlot};
 use crate::term_board::{
@@ -80,7 +81,7 @@ enum Filter {
     Running,
 }
 
-/// 要离开终端页去的地方。
+/// 要离开会话页去的地方。
 pub enum Go {
     /// 打开这个仓库的标签页，显示 Git 页
     Repo(RepoEntry),
@@ -190,6 +191,8 @@ pub struct TermOverview {
     peek: Option<Peek>,
     /// 这一页正在开（新建、重启）的终端：等它出现在列表里
     opening: Option<TermSlot>,
+    /// 仓库行上「新建终端」的 ⌄ 正开着菜单：那一行的按钮一直显示（鼠标挪进菜单时离开了那一行）
+    menu_open: Option<RepoEntry>,
     /// 这一页说了要结束的终端：列表里还有它的那一小会儿当它不在了
     ending: Vec<TermId>,
     /// 这一页显示着
@@ -265,7 +268,7 @@ fn term_menu(
     pinned: bool,
     repo: SharedString,
 ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
-    move |menu, _, _| {
+    move |menu, window, cx| {
         let at = |view: &WeakEntity<TermOverview>| (view.clone(), slot.clone());
         let (go, pin, new, attach, restart, end) = (
             at(&view),
@@ -275,74 +278,83 @@ fn term_menu(
             at(&view),
             at(&view),
         );
-        menu.item(
+        let menu = menu.item(
             PopupMenuItem::new(tr("打开仓库")).on_click(move |_, _, cx| {
                 go.0.update(cx, |_, cx| cx.emit(Go::Repo(go.1.entry.clone())))
                     .ok();
             }),
-        )
-        .item(
-            PopupMenuItem::new(if pinned {
-                tr("取消固定")
-            } else {
-                tr("固定")
-            })
-            .on_click(move |_, _, cx| {
-                pin.0
-                    .update(cx, |this, cx| this.toggle_pin_term(&pin.1, cx))
-                    .ok();
-            }),
-        )
-        .separator()
-        .item(
-            PopupMenuItem::new(tf!("在 {repo} 中新建终端", repo = repo.clone())).on_click(
-                move |_, window, cx| {
-                    new.0
-                        .update(cx, |this, cx| {
-                            this.new_terminal(new.1.entry.clone(), window, cx)
-                        })
+        );
+        workspace_items(menu, &view, &slot.entry, false, window, cx)
+            .item(
+                PopupMenuItem::new(if pinned {
+                    tr("取消固定")
+                } else {
+                    tr("固定")
+                })
+                .on_click(move |_, _, cx| {
+                    pin.0
+                        .update(cx, |this, cx| this.toggle_pin_term(&pin.1, cx))
                         .ok();
-                },
-            ),
-        )
-        .item(
-            PopupMenuItem::new(tr("发送图片或文件…")).on_click(move |_, window, cx| {
-                attach
-                    .0
-                    .update(cx, |this, cx| this.attach(&attach.1, window, cx))
-                    .ok();
-            }),
-        )
-        .item(
-            PopupMenuItem::new(tr("重启")).on_click(move |_, window, cx| {
-                restart
-                    .0
-                    .update(cx, |this, cx| this.restart(&restart.1, window, cx))
-                    .ok();
-            }),
-        )
-        .separator()
-        .item(
-            PopupMenuItem::new(tr("结束")).on_click(move |_, window, cx| {
-                end.0
-                    .update(cx, |this, cx| this.end(&end.1, window, cx))
-                    .ok();
-            }),
-        )
+                }),
+            )
+            .separator()
+            .submenu(
+                tf!("在 {repo} 中新建终端", repo = repo.clone()),
+                window,
+                cx,
+                presets::menu_builder(repo.clone(), on_start_in(&new.0, new.1.entry.clone())),
+            )
+            .item(
+                PopupMenuItem::new(tr("发送图片或文件…")).on_click(move |_, window, cx| {
+                    attach
+                        .0
+                        .update(cx, |this, cx| this.attach(&attach.1, window, cx))
+                        .ok();
+                }),
+            )
+            .item(
+                PopupMenuItem::new(tr("重启")).on_click(move |_, window, cx| {
+                    restart
+                        .0
+                        .update(cx, |this, cx| this.restart(&restart.1, window, cx))
+                        .ok();
+                }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(tr("结束")).on_click(move |_, window, cx| {
+                    end.0
+                        .update(cx, |this, cx| this.end(&end.1, window, cx))
+                        .ok();
+                }),
+            )
     }
 }
 
-/// 仓库那一行的右键菜单。`homes` 是未加入工作区的仓库能放进去的工作区（名字是菜单里写的），
-/// 在工作区里的仓库是 None，菜单里没有「添加到工作区」。
+/// 菜单里选了要运行的程序：在这个仓库里新建终端。
+fn on_start_in(view: &WeakEntity<TermOverview>, entry: RepoEntry) -> presets::OnStart {
+    let view = view.clone();
+    Rc::new(move |start, window, cx| {
+        view.update(cx, |this, cx| {
+            this.new_terminal_with(entry.clone(), start, window, cx)
+        })
+        .ok();
+    })
+}
+
+/// 仓库那一行的右键菜单。
 fn repo_menu(
     view: WeakEntity<TermOverview>,
     entry: RepoEntry,
     pinned: bool,
-    homes: Option<Vec<(WorkspaceKey, SharedString)>>,
 ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
     move |menu, window, cx| {
         let at = |view: &WeakEntity<TermOverview>| (view.clone(), entry.clone());
         let (pin, new, go) = (at(&view), at(&view), at(&view));
+        let place = view
+            .upgrade()
+            .map(|view| view.read(cx).app.read(cx).repo_name(&entry))
+            .unwrap_or_default();
         let menu = menu
             .item(
                 PopupMenuItem::new(if pinned {
@@ -357,12 +369,11 @@ fn repo_menu(
                 }),
             )
             .separator()
-            .item(
-                PopupMenuItem::new(tr("新建终端")).on_click(move |_, window, cx| {
-                    new.0
-                        .update(cx, |this, cx| this.new_terminal(new.1.clone(), window, cx))
-                        .ok();
-                }),
+            .submenu(
+                tr("新建终端"),
+                window,
+                cx,
+                presets::menu_builder(place, on_start_in(&new.0, new.1.clone())),
             )
             .item(
                 PopupMenuItem::new(tr("打开仓库")).on_click(move |_, _, cx| {
@@ -370,47 +381,69 @@ fn repo_menu(
                         .ok();
                 }),
             );
-        let Some(homes) = homes.clone() else {
-            return menu;
-        };
-        let (view, entry) = (view.clone(), entry.clone());
-        menu.separator()
-            .submenu(tr("添加到工作区"), window, cx, move |sub, _, _| {
-                if homes.is_empty() {
-                    return sub.label(tr("没有可添加到的工作区"));
-                }
-                homes.iter().fold(sub, |sub, (key, name)| {
-                    let (view, entry, key) = (view.clone(), entry.clone(), key.clone());
-                    sub.item(PopupMenuItem::new(name.clone()).on_click(move |_, _, cx| {
-                        view.update(cx, |this, cx| {
-                            this.add_to_workspace(key.clone(), entry.clone(), cx)
-                        })
-                        .ok();
-                    }))
-                })
-            })
+        workspace_items(menu, &view, &entry, true, window, cx)
     }
 }
 
-/// 能把 `entry` 放进去的工作区：那台电脑连着、访问得到这个仓库（本机的工作区能放各台主机上的，
-/// 主机上的工作区能放它自己和它配置的主机上的）。按主机页的先后，本机的在前；不是本机的名字后面
-/// 带主机名。
-fn homes_for(app: &AppState, entry: &RepoEntry) -> Vec<(WorkspaceKey, SharedString)> {
-    let ids = app.ids();
-    let mut homes = Vec::new();
-    for machine in app.machine_keys() {
-        if !app.writable(&machine) || ids.member_ref(&machine, entry).is_none() {
-            continue;
-        }
-        for (key, name, _) in app.workspaces_on(&machine).unwrap_or_default() {
-            let label: SharedString = match machine == LOCAL {
-                true => name.into(),
-                false => format!("{name} · {}", app.machine_name(&machine)).into(),
-            };
-            homes.push((key, label));
-        }
+/// 一节的标题（工作区名、未加入工作区）的右键菜单：打开工作区（到工作区页选中它）、收起或展开。
+fn group_menu(
+    view: WeakEntity<TermOverview>,
+    key: GroupKey,
+    collapsed: bool,
+) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+    move |menu, _, _| {
+        let menu = match &key {
+            GroupKey::Workspace(workspace) => {
+                let workspace = workspace.clone();
+                menu.item(
+                    PopupMenuItem::new(tr("打开工作区")).on_click(move |_, window, cx| {
+                        crate::workspace::go_to_workspace(workspace.clone(), None, window, cx)
+                    }),
+                )
+            }
+            GroupKey::Unbound(_) => menu,
+        };
+        let (view, key) = (view.clone(), key.clone());
+        menu.item(
+            PopupMenuItem::new(if collapsed {
+                tr("展开")
+            } else {
+                tr("收起")
+            })
+            .on_click(move |_, _, cx| {
+                view.update(cx, |this, cx| this.toggle_group(key.clone(), cx))
+                    .ok();
+            }),
+        )
     }
-    homes
+}
+
+/// 右键菜单里的「打开工作区」（在几个工作区里是子菜单）；`more` 时后面跟「添加到其他工作区 ▸」，
+/// 一个都不在时是「添加到工作区 ▸」（见 `ws_links`）。放进去以后挪到那个工作区那一节、选中它。
+fn workspace_items(
+    menu: PopupMenu,
+    view: &WeakEntity<TermOverview>,
+    entry: &RepoEntry,
+    more: bool,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let Some(this) = view.upgrade() else {
+        return menu;
+    };
+    let app = this.read(cx).app.clone();
+    let first = this.read(cx).listed_under(entry, cx);
+    let add = add_here(view);
+    crate::ws_links::context_items(menu, &app, entry, first.as_ref(), more, &add, window, cx)
+}
+
+/// 在这一页放进工作区：挪到那一节、选中它（[`TermOverview::add_to_workspace`]）。
+fn add_here(view: &WeakEntity<TermOverview>) -> crate::ws_links::AddTo {
+    let view = view.clone();
+    Rc::new(move |key, entry, window, cx| {
+        view.update(cx, |this, cx| this.add_to_workspace(key, entry, window, cx))
+            .ok();
+    })
 }
 
 impl TermOverview {
@@ -433,6 +466,7 @@ impl TermOverview {
             filter: Filter::All,
             peek: None,
             opening: None,
+            menu_open: None,
             ending: Vec::new(),
             visible: false,
             unpin: None,
@@ -948,8 +982,24 @@ impl TermOverview {
         }
     }
 
-    /// 焦点放到右边的终端里，开始输入。
-    fn type_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 这个仓库在侧栏里列在哪个工作区下面（「打开工作区」在几个工作区里时它排第一）；在「未加入
+    /// 工作区」里、不在侧栏里是 None。
+    pub fn listed_under(&self, entry: &RepoEntry, cx: &App) -> Option<WorkspaceKey> {
+        self.hub(cx).into_iter().find_map(|group| match group.key {
+            GroupKey::Workspace(key)
+                if group
+                    .repos
+                    .iter()
+                    .any(|(listed, _)| listed.same_repo(entry)) =>
+            {
+                Some(key)
+            }
+            _ => None,
+        })
+    }
+
+    /// 焦点放到右边的终端里，开始输入（后退回到这一页时，离开前就在输入的也放回去）。
+    pub fn type_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(peek) = &self.peek {
             peek.view.focus_handle(cx).focus(window, cx);
             cx.notify();
@@ -1001,8 +1051,14 @@ impl TermOverview {
     }
 
     /// 把仓库放进工作区（右键菜单的「添加到工作区」）：它挪到那个工作区那一节里，那一节收着就
-    /// 展开，选中它。
-    fn add_to_workspace(&mut self, key: WorkspaceKey, entry: RepoEntry, cx: &mut Context<Self>) {
+    /// 展开，选中它（右边换成它的终端；原来只改了选中的，右边还显示着别的仓库的终端）。
+    fn add_to_workspace(
+        &mut self,
+        key: WorkspaceKey,
+        entry: RepoEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let added = self.app.update(cx, |app, cx| {
             let added = app.add_to_workspace(&key, &entry, cx);
             if added {
@@ -1011,8 +1067,7 @@ impl TermOverview {
             added
         });
         if added {
-            self.repo = Some(entry);
-            self.cursor = Cursor::Repo;
+            self.select_repo(entry, window, cx);
         }
         cx.notify();
     }
@@ -1088,9 +1143,22 @@ impl TermOverview {
         }));
     }
 
-    /// 在一个仓库里新开一个终端，显示它，焦点进去。序号用这个仓库里最小的空号：先问一遍那台电脑的
-    /// kuaid 现在有哪几个（它可能刚被拉起来，列表还没推过来）。
+    /// 在一个仓库里新开一个终端，运行「默认运行」的那个预设。
     pub fn new_terminal(&mut self, entry: RepoEntry, window: &mut Window, cx: &mut Context<Self>) {
+        let start = presets::default_start(cx);
+        self.new_terminal_with(entry, start, window, cx);
+    }
+
+    /// 在一个仓库里新开一个终端，显示它，焦点进去；新开的 shell 里输入 `start`（None 是只开 shell）。
+    /// 序号用这个仓库里最小的空号：先问一遍那台电脑的 kuaid 现在有哪几个（它可能刚被拉起来，列表
+    /// 还没推过来）。
+    pub fn new_terminal_with(
+        &mut self,
+        entry: RepoEntry,
+        start: Option<presets::Start>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let connecting = self.app.update(cx, |app, cx| match &entry.server {
             Some(server) if !app.knows_server(server) => None,
             Some(server) => Some(app.connect(server, cx)),
@@ -1123,6 +1191,7 @@ impl TermOverview {
                         entry,
                         number: free_number(&used),
                     };
+                    presets::remember(slot.clone(), start, cx);
                     this.open(slot, window, cx);
                 }
                 Err(err) => {
@@ -1140,10 +1209,16 @@ impl TermOverview {
     pub fn pick_new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let app = self.app.clone();
         let picker = cx.new(|cx| QuickOpen::new(app, PickFor::Terminal, window, cx));
-        cx.subscribe_in(&picker, window, |this, _, event: &Picked, window, cx| {
-            window.close_dialog(cx);
-            this.new_terminal(event.0.clone(), window, cx);
-        })
+        cx.subscribe_in(
+            &picker,
+            window,
+            |this, picker, event: &Picked, window, cx| {
+                // 框上面那一排选的要运行的程序
+                let start = picker.read(cx).chosen_start(cx);
+                window.close_dialog(cx);
+                this.new_terminal_with(event.0.clone(), start, window, cx);
+            },
+        )
         .detach();
         show_picker(picker, tr("新建终端").into(), window, cx);
     }
@@ -1183,8 +1258,10 @@ impl TermOverview {
     /// 建一个正经接着的画面：kuaid 里没有这个名字的终端就开一个。
     fn open_view(&mut self, slot: TermSlot, window: &mut Window, cx: &mut Context<Self>) {
         let (entry, app, number) = (slot.entry.clone(), self.app.clone(), slot.number);
+        // 从预设开的（新建、重启）：新开出来的 shell 里替用户输入命令
+        let start = presets::started(&slot, cx);
         let view = cx.new(|cx| {
-            TerminalView::new(
+            let mut view = TerminalView::new(
                 move |cx| {
                     let mut launch = crate::shell::terminal_launch(&entry, &app, number, "", cx)?;
                     // 退回到开在 Kuai 进程里的终端跟着画面走，这一页换一个终端它就结束了：不退
@@ -1193,7 +1270,9 @@ impl TermOverview {
                 },
                 window,
                 cx,
-            )
+            );
+            view.run_on_start(start);
+            view
         });
         view.focus_handle(cx).focus(window, cx);
         let events = self.link_view(&view, &slot.entry, cx);
@@ -1207,12 +1286,12 @@ impl TermOverview {
     }
 
     /// 列表、标签上写的终端名字：程序设的标题（完整路径只留程序名，见
-    /// [`crate::terminal::short_title`]），没有标题的写「终端 N」。
-    pub(crate) fn term_name(row: &Row) -> SharedString {
-        match &row.title {
-            Some(title) => crate::terminal::short_title(title),
-            None => tf!("终端 {n}", n = row.number.to_string()).into(),
-        }
+    /// [`crate::terminal::short_title`]）；从预设开的、标题还是 shell 的写预设的名字（见
+    /// [`presets::display_name`]）；都没有的写「终端 N」。
+    pub(crate) fn term_name(row: &Row, cx: &App) -> SharedString {
+        let start = presets::started(&row.slot(), cx);
+        presets::display_name(row.title.as_deref(), start.as_ref())
+            .unwrap_or_else(|| tf!("终端 {n}", n = row.number.to_string()).into())
     }
 
     /// 结束、重启前先问一句：里面还在输出、或者除了 shell 还有程序在跑的（见 [`crate::term_end`]）。
@@ -1231,7 +1310,7 @@ impl TermOverview {
         let ending = crate::term_end::Ending {
             conn: self.board.read(cx).conn(&row.id.machine),
             repo: self.app.read(cx).repo_name(&row.entry),
-            name: Self::term_name(&row),
+            name: Self::term_name(&row, cx),
             row: Some(row),
             term: None,
             exited: false,
@@ -1541,7 +1620,7 @@ impl TermOverview {
         // 括号、逗号要翻译：英文界面里是半角的
         let head = tf!(
             "{name}（{repo}，{state}{since}）",
-            name = Self::term_name(row),
+            name = Self::term_name(row, cx),
             repo,
             state = Self::state_text(row),
             since
@@ -1676,6 +1755,19 @@ impl TermOverview {
         };
         let slot = h_flex().flex_none().size(px(14.)).justify_center();
         let glyph = |name: IconName, size: f32| Icon::new(name).size(px(size)).text_color(color);
+        // 认得出的程序（内置预设的那几家、自己加的预设）画它的图标。进程名认不出（npm 装的程序在
+        // Windows 上叫 node）、这个终端又是从预设开的，画那个预设的
+        let known = match row.program() {
+            Program::Agent | Program::Command => row
+                .programs
+                .as_deref()
+                .and_then(|programs| presets::program_icon(programs, cx))
+                .or_else(|| presets::started(&row.slot(), cx).map(|start| start.icon)),
+            Program::Shell | Program::Unknown => None,
+        };
+        if let Some(icon) = known {
+            return slot.child(presets::icon(&icon).size(px(13.)).text_color(color));
+        }
         match row.program() {
             Program::Unknown => slot.child(Self::dot(row.state, 8., cx)),
             Program::Agent => slot.child(glyph(IconName::Sparkles, 14.)),
@@ -1730,7 +1822,7 @@ impl TermOverview {
                             .truncate()
                             .text_color(if row.alive { fg } else { muted })
                             .when(unseen, |el| el.font_weight(FontWeight::SEMIBOLD))
-                            .child(Self::term_name(row)),
+                            .child(Self::term_name(row, cx)),
                     )
                     .child(
                         h_flex()
@@ -1856,7 +1948,7 @@ impl TermOverview {
                             .truncate()
                             .text_color(if row.alive { fg } else { muted })
                             .when(unseen, |el| el.font_weight(FontWeight::SEMIBOLD))
-                            .child(Self::term_name(row)),
+                            .child(Self::term_name(row, cx)),
                     )
                     .child(tail)
                     .child(Self::row_actions().child(pin).child(end)),
@@ -1892,8 +1984,6 @@ impl TermOverview {
         let name = app.repo_name(entry);
         let pinned = self.pinned_repo(entry, cx);
         let empty = rows.is_empty();
-        // 不在工作区里的（没有工作区的颜色）右键可以放进工作区
-        let homes = repo.hue.is_none().then(|| homes_for(app, entry));
         let tip = match entry.server.is_some() {
             true => tf!(
                 "{path}（{place}）",
@@ -1963,10 +2053,38 @@ impl TermOverview {
         }));
         let new = Self::row_button(("hub-new", index), IconName::Plus, cx)
             .tooltip(move |window, cx| ui::tip(new_tip.clone(), window, cx))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                cx.stop_propagation();
-                this.new_terminal(for_new.clone(), window, cx);
+            .on_click(cx.listener({
+                let entry = for_new.clone();
+                move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.new_terminal(entry.clone(), window, cx);
+                }
             }));
+        // ⌄：选要运行的程序。菜单开着时这一行的按钮一直显示
+        let menu_open = self.menu_open.as_ref() == Some(&for_new);
+        let view = cx.entity().downgrade();
+        let pick = Button::new(("hub-new-menu", index))
+            .ghost()
+            .xsmall()
+            .icon(ui::icon_small(IconName::ChevronDown))
+            .tooltip(tr("选择要运行的程序"))
+            // 不当作点了这一行（选中它会把焦点拿走，菜单就关了）
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .dropdown_menu(presets::menu_builder(
+                name.clone(),
+                on_start_in(&view, for_new.clone()),
+            ))
+            .on_open_change({
+                let (view, entry) = (view.clone(), for_new.clone());
+                move |open, _, cx| {
+                    let (open, entry) = (*open, entry.clone());
+                    view.update(cx, |this, cx| {
+                        this.menu_open = open.then_some(entry);
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            });
         let icon = match entry.server.is_some() {
             true => IconName::Server,
             false => IconName::FolderGit2,
@@ -2008,14 +2126,15 @@ impl TermOverview {
                             .pr(px(4.))
                             .group_hover("hub-row", |s| s.invisible()),
                     )
-                    .child(Self::row_actions().child(pin).child(new)),
+                    .child(
+                        Self::row_actions()
+                            .when(menu_open, |actions| actions.visible())
+                            .child(pin)
+                            .child(new)
+                            .child(pick),
+                    ),
             )
-            .context_menu(repo_menu(
-                cx.entity().downgrade(),
-                entry.clone(),
-                pinned,
-                homes,
-            ))
+            .context_menu(repo_menu(cx.entity().downgrade(), entry.clone(), pinned))
             .into_any_element()
     }
 
@@ -2135,7 +2254,12 @@ impl TermOverview {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.focus.focus(window, cx);
                 this.toggle_group(key.clone(), cx);
-            }));
+            }))
+            .context_menu(group_menu(
+                cx.entity().downgrade(),
+                group.key.clone(),
+                group.collapsed,
+            ));
         h_flex()
             .h(px(GROUP_HEAD))
             .px(px(6.))
@@ -2789,7 +2913,7 @@ impl TermOverview {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .child(Self::term_name(row)),
+                    .child(Self::term_name(row, cx)),
             )
             .child(close)
             .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
@@ -2863,8 +2987,9 @@ impl TermOverview {
                 .hover(|s| s.bg(hover).text_color(fg))
                 .child(ui::icon(IconName::Plus))
                 .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.new_terminal(entry.clone(), window, cx)
+                .on_click(cx.listener({
+                    let entry = entry.clone();
+                    move |this, _, window, cx| this.new_terminal(entry.clone(), window, cx)
                 }))
         });
         // 怎么开始往终端里输入；正在输入时不写，画面顶上那条细线就是
@@ -2874,6 +2999,12 @@ impl TermOverview {
             .map(|_| tr("点击画面或按 → 输入"));
         let slot = shown.as_ref().map(Row::slot);
         let (for_attach, for_restart) = (slot.clone(), slot);
+        // 两个按钮对着哪个仓库（和 `go` 一样）、它在侧栏里列在哪个工作区下面
+        let go_to = shown.as_ref().map(|row| row.entry.clone()).or(repo.clone());
+        let target = go_to.clone().map(|entry| {
+            let home = self.listed_under(&entry, cx);
+            (entry, home)
+        });
         h_flex()
             .h(px(HEAD_HEIGHT))
             .flex_none()
@@ -2890,6 +3021,18 @@ impl TermOverview {
                     .children(tabs),
             )
             .children(plus)
+            .children(self.repo.clone().map(|entry| {
+                let name = self.app.read(cx).repo_name(&entry);
+                Button::new("hub-new-tab-menu")
+                    .ghost()
+                    .xsmall()
+                    .icon(ui::icon_small(IconName::ChevronDown))
+                    .tooltip(tr("选择要运行的程序"))
+                    .dropdown_menu(presets::menu_builder(
+                        name,
+                        on_start_in(&cx.entity().downgrade(), entry),
+                    ))
+            }))
             .child(div().flex_1().min_w(px(4.)))
             .children(place.map(|place| {
                 ui::clipped("hub-place", place)
@@ -2940,14 +3083,47 @@ impl TermOverview {
                         }
                     })),
                 )
-                .child(
+            })
+            // 打开工作区、打开仓库：显示着的终端所在的仓库，没有显示着的终端时是选中的仓库
+            .children(target.map(|(entry, home)| {
+                let app = self.app.read(cx);
+                let homes = crate::ws_links::homes(app, &entry, home.as_ref()).len();
+                let tip = crate::ws_links::tip(app, &entry, home.as_ref());
+                let label = match homes {
+                    0 => tr("添加到工作区"),
+                    _ => tr("打开工作区"),
+                };
+                let button = Button::new("overview-workspace")
+                    .small()
+                    .flex_none()
+                    .ml(px(6.))
+                    .icon(ui::icon(IconName::Layers))
+                    .label(label)
+                    .tooltip(tip);
+                let add = add_here(&cx.entity().downgrade());
+                crate::ws_links::button(
+                    button,
+                    &self.app,
+                    &entry,
+                    home,
+                    add,
+                    Anchor::TopRight,
+                    true,
+                    cx,
+                )
+            }))
+            .when(go_to.is_some(), |bar| {
+                bar.child(
                     Button::new("overview-go")
                         .primary()
                         .small()
                         .flex_none()
                         .ml(px(6.))
                         .label(tr("打开仓库"))
-                        .tooltip(tr("打开此终端所在的仓库（Enter）"))
+                        .tooltip(match shown.is_some() {
+                            true => tr("打开此终端所在的仓库（Enter）"),
+                            false => tr("打开此仓库（Enter）"),
+                        })
                         .on_click(cx.listener(|this, _, _, cx| this.go(cx))),
                 )
             })
@@ -3013,22 +3189,11 @@ impl TermOverview {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(tr("此仓库没有打开的终端")),
                     )
-                    .child(
-                        Button::new("hub-first")
-                            .primary()
-                            .small()
-                            .icon(ui::icon(IconName::Plus))
-                            .label(tr("打开终端"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.new_terminal(entry.clone(), window, cx)
-                            })),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(tr("或按 Ctrl+Shift+`")),
-                    )
+                    .child(presets::first_buttons(
+                        self.app.read(cx).repo_name(&entry),
+                        on_start_in(&cx.entity().downgrade(), entry),
+                        cx,
+                    ))
                     .into_any_element()
             }
             (None, None, None) => centered()

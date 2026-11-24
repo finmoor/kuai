@@ -207,7 +207,7 @@ impl View {
 pub enum Front {
     /// 服务器页
     Servers,
-    /// 终端页
+    /// 会话页
     Terms,
     /// 工作区页
     #[default]
@@ -434,6 +434,12 @@ pub struct Settings {
     /// 终端的字体、光标、滚动和复制（所有终端共用）
     #[serde(default, skip_serializing_if = "TerminalSettings::is_default")]
     pub terminal: TerminalSettings,
+    /// 新建终端的预设（见 `presets.rs`）；没改过是 None，用内置的那几个
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_presets: Option<Vec<crate::presets::Preset>>,
+    /// 「新终端」按钮、Ctrl+Shift+` 开哪个预设（它的 id）；空着是只开 shell
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub terminal_default: String,
     #[serde(default)]
     pub layout: Layout,
     // 1.16 以前仓库页「全部仓库」里卡片的收起、展开记在 collapsed_cards、expanded_cards 里；
@@ -447,7 +453,7 @@ pub struct Settings {
     /// 各个仓库自己记的东西
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repo_memos: Vec<RepoMemo>,
-    /// 终端页（标题栏上的「终端」）里固定到顶上的终端和仓库、收起的工作区
+    /// 会话页（标题栏上的「会话」）里固定到顶上的终端和仓库、收起的工作区
     #[serde(default, skip_serializing_if = "TermHub::is_empty")]
     pub term_hub: TermHub,
     /// 上次关闭时窗口的位置和大小
@@ -461,7 +467,7 @@ pub struct Settings {
     pub skipped_version: Option<String>,
 }
 
-/// 一个仓库的第几个终端（终端页里固定的终端按它认：终端重启以后编号换了，位置还是这个）。
+/// 一个仓库的第几个终端（会话页里固定的终端按它认：终端重启以后编号换了，位置还是这个）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TermSlot {
     #[serde(flatten)]
@@ -696,6 +702,8 @@ impl Default for Settings {
             notify_terminal_system: true,
             terminal_shell: String::new(),
             terminal: TerminalSettings::default(),
+            terminal_presets: None,
+            terminal_default: String::new(),
             layout: Layout::default(),
             folded_subs: Vec::new(),
             unfolded_subs: Vec::new(),
@@ -1262,7 +1270,7 @@ impl RepoEntry {
 
     /// 是不是同一个仓库。Windows 上的路径不分大小写、正反斜杠：同一个目录有几种写法，kuaid 报上来的
     /// 终端名字是小写、正斜杠的（见 [`fr_core::dir::windows_key`]），没登记过的子仓库的终端就按那种
-    /// 写法列着，从终端页打开它时要认得出它就是开着的那个标签页。
+    /// 写法列着，从会话页打开它时要认得出它就是开着的那个标签页。
     pub fn same_repo(&self, other: &RepoEntry) -> bool {
         let windows = |path: &str| path.as_bytes().get(1) == Some(&b':');
         self.server == other.server
@@ -2158,7 +2166,7 @@ mod tests {
     }
 
     #[test]
-    fn 终端页的固定_没有就不写_终端的位置和仓库写在一层() {
+    fn 会话页的固定_没有就不写_终端的位置和仓库写在一层() {
         // 什么都没固定、没收起：设置文件里没有这一项，旧的设置文件也读得进来
         let text = serde_json::to_string(&Settings::default()).unwrap();
         assert!(!text.contains("term_hub"));
