@@ -860,6 +860,13 @@ impl RepoView {
         self.files.tabs.iter().filter(|tab| tab.dirty()).count()
     }
 
+    /// 换了界面语言：按名称过滤的框里的提示文字是建的时候定的，要重新设一遍。
+    pub(super) fn retranslate_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.files.filter.update(cx, |state, cx| {
+            state.set_placeholder(tr("按名称或路径过滤文件…"), window, cx)
+        });
+    }
+
     /// 画之前调用：在文件页上、根目录还没列过就列；等着重新载入的文件载入。
     pub(super) fn sync_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.page != Page::Files {

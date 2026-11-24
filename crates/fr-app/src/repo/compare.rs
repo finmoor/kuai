@@ -302,10 +302,13 @@ impl Compare {
     }
 }
 
-/// 一段界面文字大概多宽：汉字、全角标点按字号算，字母、数字、间隔号这些按一半多一点
+/// 一段界面文字大概多宽：汉字、全角标点、箭头按字号算，字母、数字、间隔号这些按一半多一点
 /// （估得偏宽）。只用来定顶上一条放不放得下。
 fn text_width(text: &str, size: f32) -> f32 {
-    let wide = text.chars().filter(|c| *c >= '\u{2e80}').count() as f32;
+    let wide = text
+        .chars()
+        .filter(|c| *c >= '\u{2e80}' || ('\u{2190}'..='\u{21ff}').contains(c))
+        .count() as f32;
     let narrow = text.chars().count() as f32 - wide;
     wide * size + narrow * size * 0.48
 }
@@ -327,10 +330,20 @@ const END_MAX: f32 = 260.;
 const END_MIN: f32 = 96.;
 
 /// 顶上一条里放不放右边那句话。`room` 是去掉固定的东西以后剩下的宽度，`summary` 是那句话要的
-/// 宽度，`needs` 是两个下拉把名字写全各要多宽。放不下就不放（左边两栏的标题上有文件数、
-/// 提交数），地方留给两个下拉。
+/// 宽度，`needs` 是两个下拉把名字写全各要多宽。地方先留给两个下拉。
 fn summary_fits(room: f32, summary: f32, needs: (f32, f32)) -> bool {
     needs.0.min(END_MAX) + needs.1.min(END_MAX) + summary <= room
+}
+
+/// 那句话的一种写法：字，后面带不带增删的行数。
+type SummaryForm = (SharedString, bool);
+
+/// 那句话用哪种写法：`widths` 是从全到短各种写法要的宽度，挑第一种放得下的。都放不下就不放
+/// （左边两栏的标题上有文件数、提交数）。1.23 以前只有全的那种，英文界面侧栏一拖宽就没了。
+fn pick_summary(room: f32, widths: &[f32], needs: (f32, f32)) -> Option<usize> {
+    widths
+        .iter()
+        .position(|width| summary_fits(room, *width, needs))
 }
 
 fn short(id: &str) -> &str {
@@ -1010,23 +1023,35 @@ impl RepoView {
                 .into_any_element()
         };
         let both_worktree = matches!((base, other), (End::Worktree, End::Worktree));
-        // 右边那句话：差几个提交、几个文件、增删多少行
-        let (text, totals): (SharedString, Option<(usize, usize)>) = match &self.compare.load {
-            Load::Loading => (tr("正在读取…").into(), None),
-            Load::Failed(_) => (SharedString::default(), None),
-            Load::Ready if both_worktree => (SharedString::default(), None),
+        // 右边那句话：差几个提交、几个文件、增删多少行。地方不够时依次换短的写法（见
+        // [`pick_summary`]）：「↑5 ↓6 · 15 个文件」、「↑5 ↓6」、不写增删行数；第一种是全的。
+        let (forms, totals): (Vec<SummaryForm>, Option<(usize, usize)>) = match &self.compare.load {
+            Load::Loading => (vec![(tr("正在读取…").into(), false)], None),
+            Load::Failed(_) => (Vec::new(), None),
+            Load::Ready if both_worktree => (Vec::new(), None),
             Load::Ready => {
                 let files = tf!("{n} 个文件", n = self.compare.files.len());
-                let text = match self.compare.counts {
-                    Some((behind, ahead)) => tf!(
-                        "领先 {ahead} · 落后 {behind} · {files}",
-                        ahead,
-                        behind,
-                        files
-                    ),
-                    None => files,
+                let forms = match self.compare.counts {
+                    Some((behind, ahead)) => {
+                        let arrows = format!("↑{ahead} ↓{behind}");
+                        let short = format!("{arrows} · {files}");
+                        let full = tf!(
+                            "领先 {ahead} · 落后 {behind} · {files}",
+                            ahead,
+                            behind,
+                            files
+                        );
+                        vec![
+                            (full.into(), true),
+                            (short.into(), true),
+                            (arrows.clone().into(), true),
+                            (arrows.into(), false),
+                        ]
+                    }
+                    // 只有文件数（一端是本地修改）：再短就只写增删的行数
+                    None => vec![(files.into(), true), (SharedString::default(), true)],
                 };
-                (text.into(), Some(self.compare.totals()))
+                (forms, Some(self.compare.totals()))
             }
         };
         let numbers = totals.map(|(added, removed)| (format!("+{added}"), format!("−{removed}")));
@@ -1041,10 +1066,15 @@ impl RepoView {
             + 24.
             + (30. + text_width(close, 14.))
             + 8. * 9.;
-        let summary_width = text_width(&text, 12.)
-            + numbers.as_ref().map_or(0., |(added, removed)| {
-                text_width(added, 12.) + text_width(removed, 12.) + 16.
-            });
+        let numbers_width = numbers.as_ref().map_or(0., |(added, removed)| {
+            text_width(added, 12.) + text_width(removed, 12.) + 16.
+        });
+        let widths: Vec<f32> = forms
+            .iter()
+            .map(|(text, with_numbers)| {
+                text_width(text, 12.) + if *with_numbers { numbers_width } else { 0. }
+            })
+            .collect();
         let room = f32::from(self.viewport.width) - self.sizes(cx).sidebar - fixed;
         // 下拉里：图标、名字、哈希、箭头，加两边的内边距
         let need = |end: &End| {
@@ -1054,40 +1084,48 @@ impl RepoView {
             };
             26. + 14. + 6. + text_width(&self.end_name(end), 15.) + sha + 6. + 16.
         };
-        let show_summary = summary_fits(room, summary_width, (need(base), need(other)));
-        let summary: AnyElement = match &self.compare.load {
+        let chosen = pick_summary(room, &widths, (need(base), need(other)));
+        let summary: AnyElement = match (&self.compare.load, chosen) {
             // 读取失败的原因总要写出来，占剩下的地方
-            Load::Failed(err) => ui::clipped("compare-error", err.clone())
+            (Load::Failed(err), _) => ui::clipped("compare-error", err.clone())
                 .flex_1()
                 .text_xs()
                 .text_color(danger)
                 .into_any_element(),
-            _ if !show_summary || text.is_empty() => div().into_any_element(),
-            _ => {
-                let tip = tf!(
-                    "{other} 相对 {base}：领先、落后的是提交数",
-                    other = self.end_commit_name(other),
-                    base = self.end_commit_name(base)
-                );
+            (_, None) => div().into_any_element(),
+            (_, Some(i)) => {
+                let (text, with_numbers) = forms[i].clone();
+                let full = forms[0].0.clone();
+                // 鼠标停上去：领先、落后说的是什么；写的是短的时，先写全的那句
+                let tip = totals.map(|_| {
+                    SharedString::from(tf!(
+                        "{other} 相对 {base}：领先、落后的是提交数",
+                        other = self.end_commit_name(other),
+                        base = self.end_commit_name(base)
+                    ))
+                });
                 h_flex()
+                    .id("compare-summary")
                     .flex_none()
                     .gap(px(8.))
                     .text_xs()
-                    .child(
-                        div()
-                            .id("compare-summary")
-                            .text_color(muted)
-                            .child(text.clone())
-                            .when(totals.is_some(), |summary| {
-                                summary.tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
-                            }),
-                    )
-                    .children(numbers.map(|(added, removed)| {
-                        h_flex()
-                            .gap(px(8.))
-                            .child(div().text_color(added_color).child(added))
-                            .child(div().text_color(removed_color).child(removed))
-                    }))
+                    .when(!text.is_empty(), |summary| {
+                        summary.child(div().text_color(muted).child(text))
+                    })
+                    .when(with_numbers, |summary| {
+                        summary.children(numbers.map(|(added, removed)| {
+                            h_flex()
+                                .gap(px(8.))
+                                .child(div().text_color(added_color).child(added))
+                                .child(div().text_color(removed_color).child(removed))
+                        }))
+                    })
+                    .when_some(tip, |summary, tip| {
+                        summary.tooltip(move |window, cx| match i {
+                            0 => ui::tip(tip.clone(), window, cx),
+                            _ => ui::two_line_tip(full.clone(), tip.clone(), window, cx),
+                        })
+                    })
                     .into_any_element()
             }
         };
@@ -1927,7 +1965,7 @@ impl RepoView {
 
 #[cfg(test)]
 mod tests {
-    use super::{END_MAX, END_MIN, menu_name, summary_fits, text_width};
+    use super::{END_MAX, END_MIN, menu_name, pick_summary, summary_fits, text_width};
 
     #[test]
     fn 顶上一条放不放那句话() {
@@ -1939,10 +1977,24 @@ mod tests {
     }
 
     #[test]
+    fn 那句话放不下换短的写法() {
+        // 两个下拉一共 300；四种写法依次变短
+        let widths = [200., 150., 90., 40.];
+        assert_eq!(pick_summary(700., &widths, (120., 180.)), Some(0));
+        assert_eq!(pick_summary(460., &widths, (120., 180.)), Some(1));
+        assert_eq!(pick_summary(400., &widths, (120., 180.)), Some(2));
+        assert_eq!(pick_summary(350., &widths, (120., 180.)), Some(3));
+        assert_eq!(pick_summary(320., &widths, (120., 180.)), None);
+        // 没有可写的（两端都是本地修改、读取失败）
+        assert_eq!(pick_summary(700., &[], (120., 180.)), None);
+    }
+
+    #[test]
     fn 估文字的宽度() {
         assert_eq!(text_width("比较", 14.), 28.);
-        // 间隔号、减号是窄的
+        // 间隔号、减号是窄的，箭头按宽的算
         assert_eq!(text_width("·−", 10.), text_width("ab", 10.));
+        assert_eq!(text_width("↑↓", 10.), 20.);
         assert!((text_width("main", 10.) - 19.2).abs() < 0.01);
         assert_eq!(text_width("", 14.), 0.);
     }

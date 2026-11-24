@@ -135,6 +135,15 @@ impl DiffSearches {
     fn at_mut(&mut self, at: Where) -> &mut DiffSearch {
         &mut self.0[at as usize]
     }
+
+    /// 换了界面语言：三个搜索框里的提示文字是建的时候定的，要重新设一遍。
+    pub(super) fn retranslate(&self, window: &mut Window, cx: &mut App) {
+        for search in &self.0 {
+            search.input.update(cx, |state, cx| {
+                state.set_placeholder(tr("在改动中搜索…"), window, cx)
+            });
+        }
+    }
 }
 
 /// 一行里的匹配（字节范围，不重叠），最多 `limit` 个。不区分大小写时两边都按小写比。

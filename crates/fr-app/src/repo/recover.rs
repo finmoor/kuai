@@ -437,6 +437,13 @@ impl Recover {
 }
 
 impl RepoView {
+    /// 换了界面语言：搜索框里的提示文字是建的时候定的，要重新设一遍。
+    pub(super) fn retranslate_recover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.recover.search.update(cx, |state, cx| {
+            state.set_placeholder(tr("搜索说明、哈希、分支…"), window, cx)
+        });
+    }
+
     /// 侧栏点了「找回提交」。
     pub(super) fn show_recover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.leave_file_views(window, cx);

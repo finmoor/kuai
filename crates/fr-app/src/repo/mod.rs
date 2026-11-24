@@ -593,6 +593,9 @@ impl RepoView {
         self.retranslate_changes(window, cx);
         self.retranslate_subs(window, cx);
         self.retranslate_compare(window, cx);
+        self.retranslate_files(window, cx);
+        self.retranslate_recover(window, cx);
+        self.diff_search.retranslate(window, cx);
         cx.notify();
     }
 
@@ -1307,7 +1310,7 @@ impl Render for RepoView {
                     this.drag_split(event, cx)
                 }),
             )
-            .child(self.render_sidebar(cx))
+            .child(self.render_sidebar(window, cx))
             .child(right)
             .into_any_element()
     }

@@ -680,46 +680,130 @@ impl RepoView {
     }
 
     /// Git、终端、文件三页的切换：仓库名下面、过滤框上面，三页里都在这个位置。终端那一格标出
-    /// 有几个终端在跑（服务器上留着、还没接上的也算）。
-    fn render_page_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// 有几个终端在跑（服务器上留着、还没接上的也算），文件那一格有没保存的文件时带个圆点。
+    ///
+    /// 三格一样宽放得下就一样宽；放不下（英文的「Terminal 2」，原来被右边一格盖住半截）就按
+    /// 各格要的宽度分，多出来的平分；还放不下去掉图标；再放不下才一样宽、省略字，鼠标停上去
+    /// 看名字。见 [`page_switch_fit`]。
+    fn render_page_switch(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        /// 名字后面跟的：在跑的终端个数，或者有没保存的文件的圆点
+        enum Mark {
+            None,
+            Count(usize),
+            Dot,
+        }
         let theme = cx.theme();
         let (track, fg, muted) = (theme.secondary, theme.foreground, theme.muted_foreground);
         let dark = theme.is_dark();
-        // 选中的那一半：浅色主题是白底加一点影子，深色主题比底下亮一档
+        // 选中的那一格：浅色主题是白底加一点影子，深色主题比底下亮一档
         let on_bg = if dark {
             track.blend(fg.opacity(0.12))
         } else {
             theme.background
         };
+        let accent = theme.primary;
         let running = self.terminals_running(cx);
-        let (unsaved, accent) = (self.unsaved_files(), theme.primary);
-        let half = |id: &'static str,
-                    page: Page,
-                    icon: IconName,
-                    label: &'static str,
-                    tip: &'static str| {
+        let unsaved = self.unsaved_files();
+        let cells = [
+            (
+                Page::Git,
+                "page-git",
+                IconName::GitBranch,
+                "Git",
+                tr("提交历史和本地修改（Ctrl+1、Ctrl+2）"),
+                Mark::None,
+            ),
+            (
+                Page::Terminal,
+                "page-terminal",
+                IconName::SquareTerminal,
+                tr("终端"),
+                tr("此仓库的终端（Ctrl+`）"),
+                if running > 0 {
+                    Mark::Count(running)
+                } else {
+                    Mark::None
+                },
+            ),
+            (
+                Page::Files,
+                "page-files",
+                IconName::Files,
+                tr("文件"),
+                tr("浏览和编辑仓库中的文件（Ctrl+Shift+E）"),
+                if unsaved > 0 { Mark::Dot } else { Mark::None },
+            ),
+        ];
+        // 一格要多宽（带图标、不带图标）：名字都按选中时的粗细量，换一格选中，宽度不跟着变
+        let needs = cells.each_ref().map(|(_, _, _, label, _, mark)| {
+            let label = ui::text_width(window, label, 13., None, FontWeight::SEMIBOLD);
+            let mark = match mark {
+                Mark::None => 0.,
+                Mark::Count(n) => {
+                    PAGE_GAP + ui::text_width(window, &n.to_string(), 11., None, FontWeight::NORMAL)
+                }
+                Mark::Dot => PAGE_GAP + 6.,
+            };
+            let bare = 2. * PAGE_PAD + label + mark;
+            (bare + PAGE_ICON + PAGE_GAP, bare)
+        });
+        // 三格能用的宽度：侧栏减去底板两边的外边距（10）、内边距（2）和格子之间的空（2）
+        let inner = self.sizes(cx).sidebar - 2. * 10. - 2. * 2. - 2. * 2.;
+        let fit = page_switch_fit(inner, needs.map(|n| n.0), needs.map(|n| n.1));
+        let cell = |(page, id, icon, label, tip, mark): (
+            Page,
+            &'static str,
+            IconName,
+            &'static str,
+            &'static str,
+            Mark,
+        ),
+                    (with_icon, bare): (f32, f32)| {
             let on = self.page == page;
+            let need = if fit.icons { with_icon } else { bare };
+            // 一样宽又放不下：名字会被省略，提示里先写名字
+            let cut = !fit.natural && need > inner / 3.;
             h_flex()
                 .id(id)
-                .flex_1()
                 .min_w_0()
+                .map(|cell| match fit.natural {
+                    true => cell.flex_grow(1.).flex_shrink_0().flex_basis(px(need)),
+                    false => cell.flex_1().px(px(PAGE_PAD)),
+                })
                 .h(px(26.))
-                .gap(px(5.))
+                .gap(px(PAGE_GAP))
                 .justify_center()
                 .rounded(px(5.))
                 .text_size(px(13.))
                 .text_color(if on { fg } else { muted })
-                .when(on, |half| {
-                    half.bg(on_bg)
+                .when(on, |cell| {
+                    cell.bg(on_bg)
                         .font_weight(FontWeight::SEMIBOLD)
-                        .when(!dark, |half| half.shadow_xs())
+                        .when(!dark, |cell| cell.shadow_xs())
                 })
-                .when(!on, |half| {
-                    half.cursor_pointer().hover(|s| s.text_color(fg))
+                .when(!on, |cell| {
+                    cell.cursor_pointer().hover(|s| s.text_color(fg))
                 })
-                .child(ui::icon(icon).flex_none())
-                .child(label)
-                .tooltip(move |window, cx| ui::tip(tip, window, cx))
+                .when(fit.icons, |cell| cell.child(ui::icon(icon).flex_none()))
+                .child(div().min_w_0().truncate().child(label))
+                .map(|cell| match mark {
+                    Mark::None => cell,
+                    Mark::Count(n) => cell.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(muted)
+                            .child(n.to_string()),
+                    ),
+                    Mark::Dot => {
+                        cell.child(div().flex_none().size(px(6.)).rounded_full().bg(accent))
+                    }
+                })
+                .tooltip(move |window, cx| match cut {
+                    true => ui::two_line_tip(label.into(), tip.into(), window, cx),
+                    false => ui::tip(tip, window, cx),
+                })
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if this.page != page {
                         this.show_page(page, window, cx);
@@ -734,47 +818,10 @@ impl RepoView {
             .gap(px(2.))
             .rounded(px(7.))
             .bg(track)
-            .child(half(
-                "page-git",
-                Page::Git,
-                IconName::GitBranch,
-                "Git",
-                tr("提交历史和本地修改（Ctrl+1、Ctrl+2）"),
-            ))
-            .child(
-                half(
-                    "page-terminal",
-                    Page::Terminal,
-                    IconName::SquareTerminal,
-                    tr("终端"),
-                    tr("此仓库的终端（Ctrl+`）"),
-                )
-                .when(running > 0, |half| {
-                    half.child(
-                        div()
-                            .flex_none()
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::NORMAL)
-                            .text_color(muted)
-                            .child(running.to_string()),
-                    )
-                }),
-            )
-            .child(
-                half(
-                    "page-files",
-                    Page::Files,
-                    IconName::Files,
-                    tr("文件"),
-                    tr("浏览和编辑仓库中的文件（Ctrl+Shift+E）"),
-                )
-                .when(unsaved > 0, |half| {
-                    half.child(div().flex_none().size(px(6.)).rounded_full().bg(accent))
-                }),
-            )
+            .children(cells.into_iter().zip(needs).map(|(c, need)| cell(c, need)))
     }
 
-    pub(super) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_sidebar(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         if self.sidebar_collapsed(cx) {
             return self.render_rail(cx);
         }
@@ -790,7 +837,7 @@ impl RepoView {
             .child(self.render_side_header(cx))
             // 子仓库的页面：仓库名下面一个整行的「返回 <根仓库>」
             .children(self.render_back(cx))
-            .child(self.render_page_switch(cx));
+            .child(self.render_page_switch(window, cx));
         let side = match self.page {
             Page::Terminal => side.child(self.render_terminal_side(cx)),
             Page::Files => side.child(self.render_files_side(cx)),
@@ -1524,9 +1571,77 @@ pub(super) fn stash_label(message: &str) -> String {
     }
 }
 
+/// 切页面那一条：格子里图标的大小、图标和字之间的空、字离格子两边至少留的空。
+const PAGE_ICON: f32 = 14.;
+const PAGE_GAP: f32 = 5.;
+const PAGE_PAD: f32 = 4.;
+
+/// 切页面那一条的三格怎么排。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PageFit {
+    /// 带不带图标
+    icons: bool,
+    /// 按各格要的宽度分，多的平分（否则三格一样宽）
+    natural: bool,
+}
+
+/// `inner` 是三格加起来能用的宽度，`with`、`without` 是各格带图标、不带图标要的宽度（含两边
+/// 留的空）。先试一样宽，再试按各格要的分，都带图标；还不行就去掉图标再试一遍；都不行就一样
+/// 宽、不带图标，放不下的名字省略。
+fn page_switch_fit(inner: f32, with: [f32; 3], without: [f32; 3]) -> PageFit {
+    for (icons, need) in [(true, with), (false, without)] {
+        if need.iter().all(|w| *w <= inner / 3.) {
+            return PageFit {
+                icons,
+                natural: false,
+            };
+        }
+        if need.iter().sum::<f32>() <= inner {
+            return PageFit {
+                icons,
+                natural: true,
+            };
+        }
+    }
+    PageFit {
+        icons: false,
+        natural: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{TreeRow, stash_label, tree_rows};
+    use super::{PageFit, TreeRow, page_switch_fit, stash_label, tree_rows};
+
+    #[test]
+    fn 切页面的三格怎么排() {
+        let fit = |icons, natural| PageFit { icons, natural };
+        // 中文：三格都放得下，一样宽
+        assert_eq!(
+            page_switch_fit(212., [48., 64., 53.], [29., 45., 34.]),
+            fit(true, false)
+        );
+        // 英文的「Terminal 2」一样宽放不下，按各格要的分
+        assert_eq!(
+            page_switch_fit(212., [48., 94., 57.], [29., 75., 38.]),
+            fit(true, true)
+        );
+        // 侧栏再窄：去掉图标
+        assert_eq!(
+            page_switch_fit(150., [48., 94., 57.], [29., 75., 38.]),
+            fit(false, true)
+        );
+        // 怎么都放不下：一样宽，省略名字
+        assert_eq!(
+            page_switch_fit(120., [48., 94., 57.], [29., 75., 38.]),
+            fit(false, false)
+        );
+        // 刚好放下也算放得下
+        assert_eq!(
+            page_switch_fit(150., [50., 50., 50.], [31., 31., 31.]),
+            fit(true, false)
+        );
+    }
 
     #[test]
     fn 贮藏说明去掉前缀() {
