@@ -399,6 +399,11 @@ fn find(term: &Term<Proxy>, point: GridPoint) -> Option<(GridPoint, GridPoint, T
     ))
 }
 
+/// 网络路径（`\\主机\共享\…`、`//主机/共享/…`）：看它在不在要连那台主机。
+fn network_path(path: &str) -> bool {
+    path.starts_with(r"\\") || path.starts_with("//")
+}
+
 impl TerminalView {
     /// 告诉终端它开在哪个仓库（认链接里的路径用，见 [`LinkBase`]）。
     pub fn set_link_base(&mut self, base: LinkBase) {
@@ -527,7 +532,8 @@ impl TerminalView {
                         opening(checked.found.clone()?, at)
                     }
                     _ => {
-                        if self.check_path(path, dir, key.clone(), cx) {
+                        let passive = !self.links.ctrl;
+                        if self.check_path(path, dir, key.clone(), passive, cx) {
                             self.links.waiting = Some((key, at));
                         }
                         return None;
@@ -618,16 +624,29 @@ impl TerminalView {
 
     /// 问一下路径 `raw` 在不在，问到了重新看鼠标底下；单击时还在问的，问到了打开它；右键菜单等着的，
     /// 问到了重画菜单。`dir` 是提示符里的目录，`key` 是记结果用的名字。问不了时返回 false。
+    ///
+    /// `passive`：鼠标停着看的（没按 Ctrl）。这时不碰网络路径（`\\主机\共享`）：Windows 上看它在不在
+    /// 会去连那台主机，可能把登录凭据发过去，终端里的输出又是谁都能写的。按着 Ctrl、右键菜单时才问。
     fn check_path(
         &mut self,
         raw: String,
         dir: Option<String>,
         key: String,
+        passive: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some((base, channel, tries)) = self.places(&raw, dir.as_deref(), cx) else {
+        let Some((base, channel, mut tries)) = self.places(&raw, dir.as_deref(), cx) else {
             return false;
         };
+        let before = tries.len();
+        if passive {
+            tries.retain(|place| !matches!(place, Place::Outside(path) if network_path(path)));
+        }
+        // 跳过了的没问：没问到不记成「不在」，按着 Ctrl 再看时照样去问
+        let skipped = tries.len() != before;
+        if tries.is_empty() {
+            return false;
+        }
         self.links.asking.insert(key.clone());
         cx.spawn(async move |this, cx| {
             let mut found = None;
@@ -657,7 +676,9 @@ impl TerminalView {
             }
             let (clicked, menu) = this
                 .update(cx, |this, cx| {
-                    this.remember(&raw, dir.as_deref(), &key, &found);
+                    if found.is_some() || !skipped {
+                        this.remember(&raw, dir.as_deref(), &key, &found);
+                    }
                     this.links.asking.remove(&key);
                     if let Some(position) = this.links.mouse_at {
                         let ctrl = this.links.ctrl;
@@ -814,7 +835,7 @@ impl TerminalView {
                 if !fresh
                     && !self.links.asking.contains(&key)
                     && self.check_now(&path, dir.as_deref(), &key, cx).is_none()
-                    && !self.check_path(path.clone(), dir.clone(), key.clone(), cx)
+                    && !self.check_path(path.clone(), dir.clone(), key.clone(), false, cx)
                 {
                     return false;
                 }

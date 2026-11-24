@@ -324,21 +324,18 @@ impl Drop for PartFile {
     }
 }
 
-/// 把仓库里的 `path` 移到回收站（Windows）；别的系统上直接删除。
+/// 把仓库里的 `path` 移到回收站：Windows 上交给系统；Linux 上照 freedesktop 的规范
+/// （`fr_core::files::move_to_trash`），文件管理器的回收站里能还原。放不进回收站就报错，不改成直接删。
 pub(crate) fn trash(repo: &str, path: &str) -> Result<()> {
     let full = fr_core::files::resolve_inside(repo, path)?;
+    if std::fs::symlink_metadata(&full).is_err() {
+        bail!("{}", tf!("无法删除 {path}", path = full.display()));
+    }
     #[cfg(windows)]
-    {
-        if std::fs::symlink_metadata(&full).is_err() {
-            bail!("{}", tf!("无法删除 {path}", path = full.display()));
-        }
-        recycle(&full).with_context(|| tf!("无法删除 {path}", path = full.display()))
-    }
+    let moved = recycle(&full);
     #[cfg(not(windows))]
-    {
-        let _ = full;
-        fr_core::files::remove(repo, path)
-    }
+    let moved = fr_core::files::move_to_trash(&full);
+    moved.with_context(|| tf!("无法移到回收站：{path}", path = full.display()))
 }
 
 /// 交给系统的回收站。不弹确认框、不弹进度、不弹报错（结果由我们自己显示）。

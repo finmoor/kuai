@@ -453,35 +453,37 @@ impl RepoView {
         cx.notify();
     }
 
-    /// 加一个终端，返回它在第几个。`restored`：它是 kuaid 里留着的、里面的程序还在跑。
+    /// 加一个接 kuaid 里留着的会话 `term` 的终端，返回它在第几个。`restored`：里面的程序还在跑。
     fn add_terminal(
         &mut self,
         number: u32,
         restored: bool,
+        term: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
-        self.add_terminal_in(number, restored, String::new(), window, cx)
+        self.add_terminal_in(number, restored, String::new(), Some(term), window, cx)
     }
 
-    /// 同 [`Self::add_terminal`]，开在仓库里的 `dir` 目录（相对仓库根）。
+    /// 加一个终端，开在仓库里的 `dir` 目录（相对仓库根），返回它在第几个。`term`：要接的是 kuaid 里的
+    /// 哪个会话；新开的是 None。
     fn add_terminal_in(
         &mut self,
         number: u32,
         restored: bool,
         dir: String,
+        term: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
         let (entry, app, sub) = (self.entry.clone(), self.app.clone(), dir.clone());
-        // 从预设开的（见 [`Self::open_new_terminal`]）：新开出来的 shell 里替用户输入命令
-        let start = presets::started(
-            &TermSlot {
-                entry: entry.clone(),
-                number,
-            },
-            cx,
-        );
+        // 从预设开的（见 [`Self::open_new_terminal`]）：新开出来的 shell 里替用户输入命令。接的是别处
+        // 开的会话（这个序号原来那个结束了，别处又用它开了一个）就不算，不叫预设的名字，重启也不输入
+        let slot = TermSlot {
+            entry: entry.clone(),
+            number,
+        };
+        let start = presets::started(&slot, term, cx);
         let view = cx.new(|cx| {
             let mut view = TerminalView::new(
                 move |cx| crate::shell::terminal_launch(&entry, &app, number, &dir, cx),
@@ -491,7 +493,7 @@ impl RepoView {
             if restored {
                 view.mark_restored();
             }
-            view.run_on_start(start);
+            view.run_on_start(start, Some(slot));
             view
         });
         self.insert_terminal(number, view, sub, window, cx)
@@ -556,7 +558,7 @@ impl RepoView {
         let before = self.terminals.tabs.len();
         self.adopt_parked(window, cx);
         for waiting in std::mem::take(&mut self.terminals.waiting) {
-            let at = self.add_terminal(waiting.number, waiting.alive, window, cx);
+            let at = self.add_terminal(waiting.number, waiting.alive, &waiting.term, window, cx);
             let tab = &mut self.terminals.tabs[at];
             tab.adopted = true;
             // 列表里它是这个编号：列表里没有它了就是结束了（接上以前也算）
@@ -737,7 +739,7 @@ impl RepoView {
             number,
         };
         presets::remember(slot, start, cx);
-        self.terminals.active = self.add_terminal_in(number, false, dir, window, cx);
+        self.terminals.active = self.add_terminal_in(number, false, dir, None, window, cx);
         self.show_page(Page::Terminal, window, cx);
     }
 
@@ -826,11 +828,20 @@ impl RepoView {
         if view.in_process() || view.term_id().is_some() {
             return None;
         }
-        let term = match view.pending() {
-            Some(term) => term,
-            None => self.board_row(index, cx)?.id.term,
-        };
+        let term = self.tab_term(index, cx)?;
         Some(self.board_conn(cx)?.term_close(&term))
+    }
+
+    /// 第 `index` 个终端是 kuaid 里的哪个会话：接上的是它接着的；还没接上的是它等着接的，没有就照实时
+    /// 列表里这个位置上的那一行。开在 Kuai 进程里的、都不知道的是 None。
+    fn tab_term(&self, index: usize, cx: &App) -> Option<String> {
+        let view = self.terminals.tabs.get(index)?.view.read(cx);
+        if view.in_process() {
+            return None;
+        }
+        view.term_id()
+            .or_else(|| view.pending())
+            .or_else(|| Some(self.board_row(index, cx)?.id.term))
     }
 
     /// 结束、重启第 `index` 个终端。里面还在输出、或者除了 shell 还有程序在跑的先问一句，
@@ -897,6 +908,13 @@ impl RepoView {
         // 留着、还没接上的（没选中过）`kill` 说不了：照编号去结束
         let unattached = self.close_unattached(index, cx);
         let tab = self.terminals.tabs.remove(index);
+        if let Some(term) = tab.view.read(cx).term_id() {
+            let slot = TermSlot {
+                entry: self.entry.clone(),
+                number,
+            };
+            presets::ended(&slot, &term, cx);
+        }
         // 服务器上的终端不说一声的话会接着跑
         let closing = tab.view.update(cx, |view, _| view.kill()).or(unattached);
         if let Some(closing) = closing {
@@ -950,12 +968,22 @@ impl RepoView {
         // 还没接上的：先照编号关掉 kuaid 里的那个会话，关掉了再开（`restart` 自己关不了，原来重启
         // 只是接回了原来那个）
         let closing = self.close_unattached(index, cx);
+        // 从预设开的：记着的是这个会话的，重启以后新开的再输入一遍；是别的会话的去掉。还没接上的按它
+        // 等着接的那个会话认（关的也是它）：原来这时不说，新开的会话就认不出是这个预设的了
+        let term = self.tab_term(index, cx);
         let Some(tab) = self.terminals.tabs.get_mut(index) else {
             return;
         };
         // 重开以后是新的终端，不再是「留着、接回来的」
         tab.adopted = false;
         let view = tab.view.clone();
+        let slot = TermSlot {
+            entry: self.entry.clone(),
+            number: tab.number,
+        };
+        if let Some(term) = term {
+            presets::restarting(&slot, &term, cx);
+        }
         self.select_terminal(index, window, cx);
         view.update(cx, |view, cx| view.restart(closing, cx));
     }

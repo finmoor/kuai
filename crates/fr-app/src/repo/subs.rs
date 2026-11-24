@@ -531,6 +531,14 @@ impl RepoView {
         self.subs.filter.focus_handle(cx).focus(window, cx);
     }
 
+    /// 后退（[`Self::back_to_root`]）回到哪个仓库：进了两层（子仓库的工作树）时是外面那个子仓库，
+    /// 一层时是这个仓库自己；没进到里面是 None。
+    pub fn back_target(&self, cx: &App) -> Option<RepoEntry> {
+        let inner = self.active_sub()?;
+        let inner = inner.read(cx);
+        Some(inner.back_target(cx).unwrap_or_else(|| self.entry.clone()))
+    }
+
     pub fn back_to_root(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         // 里面还进了一层（子仓库的工作树）：先退那一层
         if let Some(inner) = self.active_sub()

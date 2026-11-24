@@ -350,7 +350,7 @@ cargo build --release -p kuaid
 pwsh tools/package.ps1
 ```
 
-发版：改 `Cargo.toml` 的版本号，在 `CHANGELOG.md` 加上这个版本的一节（每条一句话，会显示在 Kuai 的更新提示中），提交后打标签 `v<版本>` 推上去，`release.yml` 测试、打包、建 GitHub Release。Kuai 检查更新时只认 `kuai-*-windows-x64-setup.exe`（安装版用）和 `kuai-*-windows-x64.zip`（解压版用）这两个附件。
+发版：改 `Cargo.toml` 的版本号，在 `CHANGELOG.md` 加上这个版本的一节（每条一句话，会显示在 Kuai 的更新提示中），提交后打标签 `v<版本>` 推上去，`release.yml` 测试、打包、建 GitHub Release。Kuai 检查更新时按装法认附件：Windows 安装版 `kuai-*-windows-x64-setup.exe`、Windows 解压版 `kuai-*-windows-x64.zip`、Linux 解压版 `kuai-*-linux-x64.tar.gz`、.deb `kuai_*_amd64.deb`、AppImage `kuai-*-linux-x64.AppImage`（见 `crates/fr-app/src/update.rs` 的 `parse_release`），附件改名要两边一起改。
 
 设置存在 `%APPDATA%\kuai\settings.json`；环境变量 `FR_SETTINGS` 可以换成别的文件，测试时不碰自己的设置（开机自启写的是注册表，测试时用 `FR_AUTOSTART_KEY` 换一个键，任务管理器里的「禁用」记在它后面加 `-approved` 的键里）。
 

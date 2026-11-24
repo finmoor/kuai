@@ -482,11 +482,14 @@ impl Session {
         matches!(self.link, Link::Local { .. })
     }
 
-    /// 里面的 shell 是 Windows 上的（路径加引号的规则不一样）。
+    /// 里面的 shell 是 Windows 上的（路径加引号的规则不一样）。开在本机的（Kuai 进程里的、本机 kuaid
+    /// 的）看本机是什么系统，主机上的看那台：原来本机的一律当 Windows，Linux 上贴进去的路径也按
+    /// Windows 的规则加引号，带 `$`、反斜杠的名字 shell 认错。
     fn on_windows(&self) -> bool {
         match &self.link {
-            Link::Local { .. } => true,
-            Link::Remote { conn, local, .. } => *local || conn.hello.os == "windows",
+            Link::Local { .. } => cfg!(windows),
+            Link::Remote { local: true, .. } => cfg!(windows),
+            Link::Remote { conn, .. } => conn.hello.os == "windows",
         }
     }
 }
@@ -718,6 +721,8 @@ pub struct TerminalView {
     links: links::LinkUi,
     /// 新开的 shell 里要替用户输入的命令（新建终端时选的预设，见 `presets.rs`）
     run: Option<Start>,
+    /// 这是哪个仓库的第几个终端：开好了告诉 `presets` 是 kuaid 里的哪个会话（见 [`crate::presets::opened`]）
+    run_slot: Option<crate::settings::TermSlot>,
     /// 下一次开出来的是新的会话就输入 `run`：刚建好、重启以后。接上的是已有的会话（重开 Kuai、
     /// 别处开着的）就不输入；断线重连后 kuaid 里那个会话没了、开了个新的也不输入（`npm run deploy`
     /// 这种命令不能自己再跑一遍）
@@ -899,6 +904,7 @@ impl TerminalView {
             run: None,
             run_armed: false,
             run_due: false,
+            run_slot: None,
             run_quiet: None,
             run_give_up: None,
             _blink: blink,
@@ -991,10 +997,16 @@ impl TerminalView {
     }
 
     /// 开出来的 shell 里替用户输入这条命令、回车（新建终端时选的预设）。接上的是已有的会话就不输入。
-    /// 要在第一次画出来（开始连接）之前调用。
-    pub fn run_on_start(&mut self, start: Option<Start>) {
+    /// 要在第一次画出来（开始连接）之前调用。`slot`：这是哪个仓库的第几个终端。
+    pub fn run_on_start(&mut self, start: Option<Start>, slot: Option<crate::settings::TermSlot>) {
         self.run_armed = start.is_some();
         self.run = start;
+        self.run_slot = slot;
+    }
+
+    /// 已经开始开了（在连、开好了），预设的命令还没输入：这时放掉画面，kuaid 里开好的 shell 就等不到它。
+    pub fn run_pending(&self) -> bool {
+        self.run_due || (self.run_armed && (self.connecting.is_some() || self.session.is_some()))
     }
 
     /// kuaid 给这个终端的编号：开在 Kuai 进程里的、还没接上的是 None。
@@ -1188,6 +1200,15 @@ impl TerminalView {
             // 只看的不改那个终端的大小，编号也早就知道
             Feed::Opened(..) if self.watch.is_some() => {}
             Feed::Opened(id, created) => {
+                if self.run.is_some()
+                    && let Some(slot) = &self.run_slot
+                {
+                    crate::presets::opened(slot, &id, created, cx);
+                    // 照接上的会话再认一遍：记着的是别的会话的（序号被别处重用了，接上的是别处开的；
+                    // 断线后那个会话没了、开了个新的），这个终端就不算从预设开的，不叫预设的名字，
+                    // 重启时也不再输入它的命令。和会话页的认法一样（见 `presets::started`）
+                    self.run = crate::presets::started(slot, Some(&id), cx);
+                }
                 self.run_opened(created, cx);
                 if let Some(Session {
                     link: Link::Remote { conn, term, .. },
@@ -1237,6 +1258,9 @@ impl TerminalView {
             TermEvent::ResetTitle => self.title = None,
             TermEvent::ClipboardStore(_, text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
+                // 程序自己复制了（OSC 52）：拖选过的不用再转 Ctrl+C。只看剪贴板变没变的话，复制的
+                // 和原来的一样时认不出来
+                self.program_selected = None;
             }
             // 程序问某个颜色是什么（常用来判断终端是深色还是浅色）
             TermEvent::ColorRequest(index, format) => {
@@ -1272,6 +1296,7 @@ impl TerminalView {
             // 往回翻着时来了新输出：回到底部的按钮上一个蓝点。只是输入区里的字变了（往回翻着打字的
             // 回显）不算，见 `scroll::outside_digest`、`settle_outside`
             TermEvent::Wakeup => {
+                self.scroll.saw_output();
                 self.watch_outside(cx);
                 self.run_output(cx);
             }
@@ -1324,13 +1349,15 @@ impl TerminalView {
         self.run_quiet = None;
         self.run_give_up = None;
         if let Some(start) = &self.run {
-            log::info!("新终端里输入预设的命令：{}", start.command);
+            // 只记是哪个预设，不记命令：命令里可能带着密码、令牌（日志会转给别人看）
+            log::info!("新终端里输入预设「{}」的命令", start.name);
             self.write(format!("{}\r", start.command).into_bytes());
         }
     }
 
-    /// 不再替用户输入预设的命令（他已经开始敲了）。
+    /// 不再替用户输入预设的命令（他已经开始敲了）。还没开好的也不输入了。
     fn cancel_run(&mut self) {
+        self.run_armed = false;
         self.run_due = false;
         self.run_quiet = None;
         self.run_give_up = None;
@@ -1401,6 +1428,9 @@ impl TerminalView {
         self.tell_focus();
         if !focused {
             self.marked = None;
+            // 焦点走了：之后按 Ctrl+Shift+C 不再当成刚在程序里拖选过（程序里那块选区多半没了，转过去的
+            // Ctrl+C 会清掉输入、打断程序）
+            self.program_selected = None;
         }
         // 焦点进来时把大小要回来：会话页、别的电脑上的 Kuai 往里输入时可能按它们的画面改过（见
         // `claim`）。只发给 kuaid，大小没变它不动；开在 Kuai 进程里的终端没有别人改大小
@@ -1672,8 +1702,18 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// 把几个路径贴给程序。
+    /// 把几个路径贴给程序。名字里有控制字符（换行这些）的不贴：怎么加引号都可能被 shell 当成别的。
     fn paste_paths(&mut self, paths: &[String], cx: &mut Context<Self>) {
+        let usable: Vec<String> = paths
+            .iter()
+            .filter(|path| !path.chars().any(char::is_control))
+            .cloned()
+            .collect();
+        if usable.len() != paths.len() {
+            self.flash = Some(tr("已跳过名称中含有控制字符的文件。").into());
+            cx.notify();
+        }
+        let paths = usable.as_slice();
         if paths.is_empty() {
             return;
         }
@@ -1737,8 +1777,25 @@ impl TerminalView {
         if !self.is_alive() {
             // 正在连的时候按回车不管；连接断了是重新接上，别的是重新开
             if key == "enter" && self.connecting.is_none() && self.watch.is_none() {
+                // 进程结束了按 Enter 是重新启动：从预设开的再输入一遍（和「重启」一样，先告诉
+                // `presets` 要重启的是哪个会话，新开的会话才认得出是这个预设的）；连接断了只是重新
+                // 接上，不再输入
+                if self.exited.is_some() {
+                    if self.run.is_some()
+                        && let (Some(slot), Some(term)) = (&self.run_slot, self.term_id())
+                    {
+                        crate::presets::restarting(slot, &term, cx);
+                    }
+                    self.run_armed = self.run.is_some();
+                }
                 self.reopen(cx);
                 cx.stop_propagation();
+            } else if self.exited.is_none()
+                && !self.lost
+                && (keystroke.key_char.is_some() || matches!(key, "enter" | "backspace"))
+            {
+                // 还在开：用户先打了字（这时打的进不去），预设的命令也不替他输入了。快捷键不算
+                self.cancel_run();
             }
             return;
         }

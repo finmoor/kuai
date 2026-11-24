@@ -510,7 +510,13 @@ fn expand_home(path: &str, home: &str) -> String {
 fn join(parent: &str, name: &str, local: bool) -> String {
     // Windows 本机用反斜杠，别的（服务器上的、Linux 本机）用正斜杠
     let separator = if local && cfg!(windows) { '\\' } else { '/' };
-    let trimmed = parent.trim_end_matches(['/', '\\']);
+    // 反斜杠只在 Windows 的路径里是分隔符（本机是 Windows，或者写着盘符的 Windows 主机）；Linux 上
+    // 它是名字里的一个字，裁掉的话拼出来的和交给 git 的不是同一个目录，中止时会清理错地方
+    let windows = (local && cfg!(windows)) || parent.as_bytes().get(1) == Some(&b':');
+    let trimmed = match windows {
+        true => parent.trim_end_matches(['/', '\\']),
+        false => parent.trim_end_matches('/'),
+    };
     // 根目录（`/`、`C:\`）去掉尾巴后会变空或只剩盘符，补回分隔符
     format!("{trimmed}{separator}{name}")
 }
@@ -758,6 +764,9 @@ mod tests {
         assert_eq!(join("/home/me/", "app", true), "/home/me/app");
         assert_eq!(join("/home/me", "app", false), "/home/me/app");
         assert_eq!(join("/", "app", false), "/app");
+        // Linux 上名字里的反斜杠不是分隔符；Windows 主机上的照样裁
+        assert_eq!(join(r"/data/a\", "app", false), r"/data/a\/app");
+        assert_eq!(join(r"D:\work\", "app", false), "D:\\work/app");
     }
 
     #[test]

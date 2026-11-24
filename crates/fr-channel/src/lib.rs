@@ -309,7 +309,7 @@ pub fn init_prompts(
     if PROMPT_HANDLER.set(handler.clone()).is_err() {
         bail!(tr("init_prompts 只能调用一次"));
     }
-    let exe = std::env::current_exe()?;
+    let exe = fr_core::exe::path()?;
     // Unix 上的套接字放运行目录（Windows 上听本机端口，用不到目录）
     #[cfg(unix)]
     let dir = local_run_dir();
@@ -536,8 +536,57 @@ impl Channel {
                 let (repo, dir) = (repo.to_string(), dir.to_string());
                 local::blocking(move || fr_core::files::list(&repo, &dir))
             }
-            Channel::Remote(conn) => conn.fs_list(repo, dir),
+            Channel::Remote(conn) => conn.fs_list(repo, dir, false),
         }
+    }
+
+    /// 同 [`Self::fs_list`]，但只认仓库里的：本机网页服务、Markdown 预览读的是仓库的内容，不能
+    /// 借仓库里的符号链接读到仓库外、`.git` 里去（见 [`fr_core::files::confined`]）。
+    pub fn fs_list_confined(
+        &self,
+        repo: &str,
+        dir: &str,
+    ) -> BoxFuture<'static, Result<Vec<FsEntry>>> {
+        match self {
+            Channel::Local => {
+                let (repo, dir) = (repo.to_string(), dir.to_string());
+                local::blocking(move || fr_core::files::list_confined(&repo, &dir))
+            }
+            Channel::Remote(conn) => conn.fs_list(repo, dir, true),
+        }
+    }
+
+    /// 同 [`Self::fs_stat`]，但只认仓库里的（见 [`Self::fs_list_confined`]）。
+    pub fn fs_stat_confined(&self, repo: &str, path: &str) -> BoxFuture<'static, Result<FsStat>> {
+        match self {
+            Channel::Local => {
+                let (repo, path) = (repo.to_string(), path.to_string());
+                local::blocking(move || fr_core::files::stat_confined(&repo, &path))
+            }
+            Channel::Remote(conn) => conn.fs_stat(repo, path, true),
+        }
+    }
+
+    /// 同 [`Self::fs_read`]，但只读仓库里的普通文件（见 [`Self::fs_list_confined`]）。
+    pub fn fs_read_confined(
+        &self,
+        repo: &str,
+        path: &str,
+        offset: u64,
+        len: u64,
+        whole: Option<u64>,
+    ) -> BoxFuture<'static, Result<(FsStat, Vec<u8>)>> {
+        self.read_some(repo, path, (offset, len), whole, true)
+    }
+
+    /// 同 [`Self::fs_open`]，但只读仓库里的普通文件（见 [`Self::fs_list_confined`]）。
+    pub fn fs_open_confined(
+        &self,
+        repo: &str,
+        path: &str,
+        limit: u64,
+    ) -> BoxFuture<'static, Result<(FsStat, Vec<u8>)>> {
+        self.open_whole(repo, path, limit, true)
     }
 
     /// 跑 git 的那台电脑上 git 的版本号（主机上的握手时 kuaid 报过）；认不出是 None。
@@ -566,7 +615,7 @@ impl Channel {
                 let (repo, path) = (repo.to_string(), path.to_string());
                 local::blocking(move || fr_core::files::stat(&repo, &path))
             }
-            Channel::Remote(conn) => conn.fs_stat(repo, path),
+            Channel::Remote(conn) => conn.fs_stat(repo, path, false),
         }
     }
 
@@ -577,10 +626,23 @@ impl Channel {
         path: &str,
         limit: u64,
     ) -> BoxFuture<'static, Result<(FsStat, Vec<u8>)>> {
+        self.open_whole(repo, path, limit, false)
+    }
+
+    /// [`Self::fs_open`]；`confine` 见 [`Self::fs_open_confined`]。
+    fn open_whole(
+        &self,
+        repo: &str,
+        path: &str,
+        limit: u64,
+        confine: bool,
+    ) -> BoxFuture<'static, Result<(FsStat, Vec<u8>)>> {
         let (channel, repo, path) = (self.clone(), repo.to_string(), path.to_string());
         async move {
             let first = limit.min(fr_core::files::READ_MAX);
-            let (stat, mut bytes) = channel.fs_read(&repo, &path, 0, first, Some(limit)).await?;
+            let (stat, mut bytes) = channel
+                .read_some(&repo, &path, (0, first), Some(limit), confine)
+                .await?;
             if stat.size > limit {
                 return Ok((stat, bytes));
             }
@@ -588,7 +650,7 @@ impl Channel {
             while (bytes.len() as u64) < stat.size && (bytes.len() as u64) < limit {
                 let rest = limit - bytes.len() as u64;
                 let (_, more) = channel
-                    .fs_read(&repo, &path, bytes.len() as u64, rest, None)
+                    .read_some(&repo, &path, (bytes.len() as u64, rest), None, confine)
                     .await?;
                 if more.is_empty() {
                     break;
@@ -610,12 +672,28 @@ impl Channel {
         len: u64,
         whole: Option<u64>,
     ) -> BoxFuture<'static, Result<(FsStat, Vec<u8>)>> {
+        self.read_some(repo, path, (offset, len), whole, false)
+    }
+
+    /// [`Self::fs_read`]；`confine` 见 [`Self::fs_read_confined`]。
+    fn read_some(
+        &self,
+        repo: &str,
+        path: &str,
+        (offset, len): (u64, u64),
+        whole: Option<u64>,
+        confine: bool,
+    ) -> BoxFuture<'static, Result<(FsStat, Vec<u8>)>> {
         match self {
             Channel::Local => {
                 let (repo, path) = (repo.to_string(), path.to_string());
-                local::blocking(move || fr_core::files::read(&repo, &path, offset, len, whole))
+                let read = match confine {
+                    true => fr_core::files::read_confined,
+                    false => fr_core::files::read,
+                };
+                local::blocking(move || read(&repo, &path, offset, len, whole))
             }
-            Channel::Remote(conn) => conn.fs_read(repo, path, offset, len, whole),
+            Channel::Remote(conn) => conn.fs_read(repo, path, (offset, len), whole, confine),
         }
     }
 
@@ -682,6 +760,8 @@ impl Channel {
     }
 
     /// 把 `bytes` 写到文件的 `offset` 那里，别的地方不动；`create` 为真时文件不在就新建。
+    ///
+    /// 同一个文件的写入按调用的先后做：kuaid 那边排着队（协议 17），本机的当场写完。
     pub fn fs_pwrite(
         &self,
         repo: &str,
@@ -692,15 +772,53 @@ impl Channel {
     ) -> BoxFuture<'static, Result<FsStat>> {
         match self {
             Channel::Local => {
-                let (repo, path) = (repo.to_string(), path.to_string());
-                local::blocking(move || {
-                    fr_core::files::write_at(&repo, &path, offset, &bytes, create)
-                })
+                futures::future::ready(fr_core::files::write_at(repo, path, offset, &bytes, create))
+                    .boxed()
             }
             Channel::Remote(conn) => {
                 let params =
                     json!({ "repo": repo, "path": path, "offset": offset, "create": create });
                 conn.fs_call("fs_pwrite", params, bytes)
+            }
+        }
+    }
+
+    /// 把 `bytes` 接到文件末尾，按主机上这时候的末尾（见 [`fr_core::files::append`]）。先后同
+    /// [`Self::fs_pwrite`]。`offset` 是这边估的末尾：旧的 kuaid（协议 17 以前）不认追加，照它写。
+    pub fn fs_append(
+        &self,
+        repo: &str,
+        path: &str,
+        offset: u64,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<'static, Result<FsStat>> {
+        match self {
+            Channel::Local => {
+                futures::future::ready(fr_core::files::append(repo, path, &bytes)).boxed()
+            }
+            Channel::Remote(conn) => {
+                let params =
+                    json!({ "repo": repo, "path": path, "offset": offset, "append": true });
+                conn.fs_call("fs_pwrite", params, bytes)
+            }
+        }
+    }
+
+    /// 改权限位（见 [`fr_core::files::set_mode`]）。
+    pub fn fs_chmod(
+        &self,
+        repo: &str,
+        path: &str,
+        mode: u32,
+    ) -> BoxFuture<'static, Result<FsStat>> {
+        match self {
+            Channel::Local => {
+                let (repo, path) = (repo.to_string(), path.to_string());
+                local::blocking(move || fr_core::files::set_mode(&repo, &path, mode))
+            }
+            Channel::Remote(conn) => {
+                let params = json!({ "repo": repo, "path": path, "mode": mode });
+                conn.fs_call("fs_chmod", params, Vec::new())
             }
         }
     }
@@ -769,7 +887,7 @@ impl Channel {
         }
     }
 
-    /// 改名，`to` 已经有文件就盖掉（目录不盖）。
+    /// 改名，`to` 已经有就盖掉（目录只能盖空目录，见 [`fr_core::files::rename_over`]）。
     pub fn fs_rename_over(
         &self,
         repo: &str,
@@ -784,6 +902,26 @@ impl Channel {
             Channel::Remote(conn) => {
                 let params = json!({ "repo": repo, "path": from, "to": to, "replace": true });
                 conn.fs_simple("fs_rename", params)
+            }
+        }
+    }
+
+    /// 只删这一种（`dir` 为真是空目录，为假是文件），永久删除（见 [`fr_core::files::remove_kind`]）。
+    pub fn fs_remove_kind(
+        &self,
+        repo: &str,
+        path: &str,
+        dir: bool,
+    ) -> BoxFuture<'static, Result<()>> {
+        match self {
+            Channel::Local => {
+                let (repo, path) = (repo.to_string(), path.to_string());
+                local::blocking(move || fr_core::files::remove_kind(&repo, &path, dir))
+            }
+            Channel::Remote(conn) => {
+                let kind = if dir { "dir" } else { "file" };
+                let params = json!({ "repo": repo, "path": path, "kind": kind });
+                conn.fs_simple("fs_remove", params)
             }
         }
     }

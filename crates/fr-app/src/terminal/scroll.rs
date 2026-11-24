@@ -74,14 +74,36 @@ pub(super) struct ScrollUi {
     pub flash: Option<(i32, Instant)>,
     /// 消息在哪一行（见 [`ScrollUi::mark_lines`]）
     lines: RefCell<Option<Lines>>,
+    /// 收到过几回输出（见 [`ScrollUi::saw_output`]）：屏幕原地重画、往回翻的行数没变时，靠它知道算好的
+    /// 位置可能旧了
+    outputs: u64,
+    /// 画的是没重新找的位置，过一会儿再画一次（见 `TerminalView::scroll_overlays`）
+    recheck: Option<Task<()>>,
 }
 
 /// 算好的消息位置。
 struct Lines {
-    marks: usize,
+    /// 是哪些消息（见 [`marks_key`]）
+    marks: u64,
     history: usize,
+    /// 那时的列数、行数：改了大小会重新折行
+    size: (usize, usize),
+    /// 那时收到过几回输出
+    outputs: u64,
     at: Instant,
     rows: Vec<Option<i32>>,
+}
+
+/// 消息列表的样子：条数一样、内容换了（最后一条接着写长了，满了挤掉最早的，kuaid 发来新的一份）也
+/// 认得出。
+fn marks_key(marks: &[TermMark]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    marks.len().hash(&mut hasher);
+    for mark in marks {
+        mark.text.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 impl ScrollUi {
@@ -94,10 +116,17 @@ impl ScrollUi {
         self.hovered = None;
         self.flash = None;
         self.lines.borrow_mut().take();
+        self.recheck = None;
     }
 
-    /// 各条消息在网格上的哪一行（往回翻的记录是负的），找不到的是 `None`。按条数、往回翻的行数缓存：
-    /// 记录在长时最多隔 `within` 重新找一次，中间按多出来的行数往上挪；`Duration::ZERO` 是现在就要
+    /// 终端有了新输出（屏幕上的字可能变了）。
+    pub fn saw_output(&mut self) {
+        self.outputs = self.outputs.wrapping_add(1);
+    }
+
+    /// 各条消息在网格上的哪一行（往回翻的记录是负的），找不到的是 `None`。按消息、往回翻的行数、
+    /// 大小缓存：之后有了输出，最多隔 `within` 重新找一次，中间记录长了就按多出来的行数往上挪，屏幕
+    /// 原地重画的先用原来的（[`ScrollUi::recheck_in`] 说过多久再画一次）；`Duration::ZERO` 是现在就要
     /// 准的（点了刻度要跳过去）。
     pub fn mark_lines(
         &self,
@@ -107,14 +136,18 @@ impl ScrollUi {
     ) -> Vec<Option<i32>> {
         let grid = term.grid();
         let history = grid.history_size();
+        let size = (grid.columns(), grid.screen_lines());
+        let key = marks_key(marks);
         if let Some(lines) = self.lines.borrow().as_ref()
-            && lines.marks == marks.len()
+            && lines.marks == key
+            && lines.size == size
         {
-            if lines.history == history {
+            let fresh = lines.at.elapsed() < within;
+            if lines.history == history && (lines.outputs == self.outputs || fresh) {
                 return lines.rows.clone();
             }
             let grown = history as i32 - lines.history as i32;
-            if grown > 0 && lines.at.elapsed() < within {
+            if grown > 0 && fresh {
                 return lines
                     .rows
                     .iter()
@@ -129,12 +162,23 @@ impl ScrollUi {
             .map(|at| at.map(|at| at as i32 - history as i32))
             .collect();
         *self.lines.borrow_mut() = Some(Lines {
-            marks: marks.len(),
+            marks: key,
             history,
+            size,
+            outputs: self.outputs,
             at: Instant::now(),
             rows: found.clone(),
         });
         found
+    }
+
+    /// 刚才 [`ScrollUi::mark_lines`] 给的是没重新找的位置（之后又有了输出）：过多久再画一次才会重新找。
+    /// 输出停了就不会再画，不再画一次的话，原地画出来的消息一直没有刻度。
+    fn recheck_in(&self, within: Duration) -> Option<Duration> {
+        let lines = self.lines.borrow();
+        let lines = lines.as_ref()?;
+        (lines.outputs != self.outputs)
+            .then(|| within.saturating_sub(lines.at.elapsed()) + Duration::from_millis(20))
     }
 }
 
@@ -464,7 +508,20 @@ impl TerminalView {
                 true => Vec::new(),
                 false => {
                     let within = if busy { RELOCATE } else { RELOCATE_IDLE };
-                    self.scroll.mark_lines(&term, &self.marks, within)
+                    let lines = self.scroll.mark_lines(&term, &self.marks, within);
+                    if let Some(wait) = self.scroll.recheck_in(within)
+                        && self.scroll.recheck.is_none()
+                    {
+                        self.scroll.recheck = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(wait).await;
+                            this.update(cx, |this, cx| {
+                                this.scroll.recheck = None;
+                                cx.notify();
+                            })
+                            .ok();
+                        }));
+                    }
+                    lines
                 }
             };
             let reply = match self.scroll.hovered {
@@ -849,7 +906,45 @@ pub(super) fn flash_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{Fixed, Ticks, current, dragged, shown, thumb};
+    use super::{Fixed, RELOCATE, ScrollUi, Ticks, current, dragged, shown, thumb};
+    use crate::terminal::{Grid, Proxy};
+    use alacritty_terminal::term::Term;
+    use alacritty_terminal::vte::ansi::Processor;
+    use fr_channel::TermMark;
+    use std::time::Duration;
+
+    #[test]
+    fn 原地画出来的消息_往回翻的行数没变也重新找() {
+        let (proxy, _rx) = Proxy::new();
+        let mut term = Term::new(Default::default(), &Grid { cols: 30, rows: 5 }, proxy);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"$ ");
+        let mut ui = ScrollUi::default();
+        let marks = vec![TermMark {
+            text: "hello world".into(),
+            at: 0,
+        }];
+        // 还排着队、没显示出来
+        assert_eq!(ui.mark_lines(&term, &marks, RELOCATE), vec![None]);
+        assert_eq!(ui.recheck_in(RELOCATE), None);
+        // 原地画出来了：刚找过，先用原来的，说好过一会儿再画一次
+        parser.advance(&mut term, b"hello world");
+        ui.saw_output();
+        assert_eq!(ui.mark_lines(&term, &marks, RELOCATE), vec![None]);
+        assert!(
+            ui.recheck_in(RELOCATE)
+                .is_some_and(|wait| wait <= RELOCATE * 2)
+        );
+        // 隔够了（ZERO：点了刻度、现在就要准的）：重新找，不用再画
+        assert_eq!(ui.mark_lines(&term, &marks, Duration::ZERO), vec![Some(0)]);
+        assert_eq!(ui.recheck_in(RELOCATE), None);
+        // 条数一样、内容换了：不用原来的
+        let other = vec![TermMark {
+            text: "something else".into(),
+            at: 0,
+        }];
+        assert_eq!(ui.mark_lines(&term, &other, RELOCATE), vec![None]);
+    }
 
     #[test]
     fn 固定的输入区画在最下面_画的是现在屏幕上的那几行() {

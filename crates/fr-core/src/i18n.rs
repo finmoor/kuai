@@ -404,10 +404,25 @@ mod tests {
         );
     }
 
+    /// 直接写出值的占位符（`{n}`）：`{n|file|files}` 只换词形、不写出数字。
+    fn printed(text: &str) -> Vec<&str> {
+        let mut found: Vec<&str> = text
+            .split('{')
+            .skip(1)
+            .filter_map(|part| part.split_once('}').map(|(name, _)| name))
+            .filter(|name| !name.contains('|'))
+            .collect();
+        found.sort_unstable();
+        found.dedup();
+        found
+    }
+
     #[test]
     fn 译文里的占位符和原文一样() {
         for (zh, en) in super::english() {
             assert_eq!(placeholders(zh), placeholders(en), "原文：{zh}\n译文：{en}");
+            // 原文写出了数字，译文只写单复数的话数字就没了（「Local · repositories」）
+            assert_eq!(printed(zh), printed(en), "原文：{zh}\n译文：{en}");
             assert!(
                 !en.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
                 "译文里还有汉字：{en}"

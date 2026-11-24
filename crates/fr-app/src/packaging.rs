@@ -12,10 +12,14 @@ const DEB_LIST: &str = "/var/lib/dpkg/info/kuai.list";
 
 /// 从 AppImage 启动的：那个 .AppImage 文件。
 static APPIMAGE: OnceLock<Option<PathBuf>> = OnceLock::new();
+/// 是不是 .deb 装的：启动时定了就不变（apt 换掉程序文件以后再看就认不出了，见 `fr_core::exe`）
+static DEB: OnceLock<bool> = OnceLock::new();
 
 /// 启动时调一次（在开别的线程之前）。从 AppImage 启动的话，记下那个文件，再把 AppImage 的运行时
 /// 设的环境变量去掉：不然会传给终端里的程序（它们不是从 AppImage 启动的）。
 pub fn take_env() {
+    // 程序路径先记下：.deb 升级装好以后、重启以前，现取的路径带着「(deleted)」
+    fr_core::exe::remember();
     #[cfg(target_os = "linux")]
     keep_inherited_fds();
     let found = std::env::var_os("APPIMAGE")
@@ -24,7 +28,7 @@ pub fn take_env() {
         .filter(|_| {
             // 程序真在 AppImage 里（APPDIR 是它挂出来的目录），不是从别的 AppImage 里开的终端里启动的
             let dir = std::env::var_os("APPDIR").map(PathBuf::from);
-            let exe = std::env::current_exe().ok();
+            let exe = fr_core::exe::path().ok();
             matches!((dir, exe), (Some(dir), Some(exe)) if exe.starts_with(&dir))
         });
     if cfg!(target_os = "linux") && found.is_some() {
@@ -68,9 +72,11 @@ pub fn appimage() -> Option<&'static Path> {
 
 /// 是 .deb 装的。
 pub fn deb() -> bool {
-    cfg!(target_os = "linux")
-        && std::env::current_exe().is_ok_and(|exe| exe == Path::new(DEB_EXE))
-        && Path::new(DEB_LIST).is_file()
+    *DEB.get_or_init(|| {
+        cfg!(target_os = "linux")
+            && fr_core::exe::path().is_ok_and(|exe| exe == Path::new(DEB_EXE))
+            && Path::new(DEB_LIST).is_file()
+    })
 }
 
 /// 应用菜单、开机自启里写的程序：AppImage 写那个 .AppImage 文件（程序本身在它运行时才挂出来的
@@ -78,6 +84,6 @@ pub fn deb() -> bool {
 pub fn launcher() -> std::io::Result<PathBuf> {
     match appimage() {
         Some(file) => Ok(file.to_path_buf()),
-        None => std::env::current_exe(),
+        None => fr_core::exe::path(),
     }
 }

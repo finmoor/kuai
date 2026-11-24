@@ -25,18 +25,19 @@ use crate::out::Outbox;
 
 /// 起 ssh 的命令：连 `server`（这台电脑配置的服务器的 id），在上面执行 `remote`。
 /// `env` 是发起的客户端的（askpass 的标记、它那条连接转发过来的 ssh-agent）；
-/// `helper` 是转接跳板机用的程序，就是 kuaid 自己（见 [`fr_core::hop`]）。
+/// `helper` 是转接跳板机用的程序，就是 kuaid 自己（见 [`fr_core::hop`]）。`quiet`：客户端在后台自己
+/// 重连，不许问人，要密码、要确认主机密钥都直接失败（不然每隔一会儿弹一次框）。
 pub fn command(
     store: &Store,
-    server: &str,
-    remote: &str,
+    (server, remote): (&str, &str),
     env: &[(String, String)],
     helper: &Path,
+    quiet: bool,
 ) -> Result<Command> {
     let (target, route) = store.route(server)?;
     let askpass_env = fr_core::git::extra_env();
     // 开不了密码转发（见 `Shared::start_askpass`）就只用密钥，要密码直接失败
-    let askpass = !askpass_env.is_empty();
+    let askpass = !askpass_env.is_empty() && !quiet;
     let tag = env
         .iter()
         .find(|(name, _)| name == fr_core::askpass::TAG_ENV)
@@ -262,7 +263,7 @@ mod tests {
     fn 照这台的配置连_跳板机的密码也问发起的客户端() {
         let env = vec![(fr_core::askpass::TAG_ENV.to_string(), "c7".to_string())];
         let helper = Path::new(r"C:\Users\me\.kuai\1.14.0-abc\kuaid.exe");
-        let cmd = command(&store(), "s91", "true", &env, helper).unwrap();
+        let cmd = command(&store(), ("s91", "true"), &env, helper, false).unwrap();
         let list = args(&cmd);
         // 目标服务器用密码登录，命令在最后
         assert!(list.contains(&"PreferredAuthentications=keyboard-interactive,password".into()));
@@ -289,10 +290,15 @@ mod tests {
         assert!(hops.contains("\"tag\":\"c7\""), "{hops}");
 
         // 直接连的：10 秒连不上就放弃
-        let direct = args(&command(&store(), "s49", "true", &env, helper).unwrap());
+        let direct = args(&command(&store(), ("s49", "true"), &env, helper, false).unwrap());
         assert!(direct.contains(&"ConnectTimeout=10".into()));
         assert!(direct.contains(&"IdentitiesOnly=yes".into()));
-        assert!(command(&store(), "没有", "true", &env, helper).is_err());
+        assert!(command(&store(), ("没有", "true"), &env, helper, false).is_err());
+        // 客户端在后台重连（quiet）：不问人，要密码、要确认主机密钥就失败；跳板机也一样
+        let quiet = command(&store(), ("s91", "true"), &env, helper, true).unwrap();
+        assert!(args(&quiet).contains(&"BatchMode=yes".into()));
+        let hops = env_of(&quiet, hop::HOPS_ENV).unwrap();
+        assert!(hops.contains("BatchMode=yes"), "{hops}");
     }
 
     #[test]

@@ -1282,13 +1282,23 @@ impl RepoEntry {
     }
 
     /// `other` 是不是在这个仓库的目录下面（同一台机器上、路径以这个仓库的路径加一个斜杠开头）。
+    /// Windows 上的路径和 [`Self::same_repo`] 一样不分大小写、正反斜杠：kuaid 报上来的子仓库是小写、
+    /// 正斜杠的，原来认不出它在哪个仓库下面（工作区按钮写「未加入工作区」、还能再单独加进去）。
     pub fn contains(&self, other: &RepoEntry) -> bool {
-        let root = self.path.trim_end_matches(['/', '\\']);
-        self.server == other.server
-            && other
-                .path
-                .strip_prefix(root)
-                .is_some_and(|rest| rest.len() > 1 && rest.starts_with(['/', '\\']))
+        if self.server != other.server {
+            return false;
+        }
+        let windows = |path: &str| path.as_bytes().get(1) == Some(&b':');
+        let (root, path) = match windows(&self.path) && windows(&other.path) {
+            true => (
+                fr_core::dir::windows_key(&self.path),
+                fr_core::dir::windows_key(&other.path),
+            ),
+            false => (self.path.clone(), other.path.clone()),
+        };
+        let root = root.trim_end_matches(['/', '\\']);
+        path.strip_prefix(root)
+            .is_some_and(|rest| rest.len() > 1 && rest.starts_with(['/', '\\']))
     }
 }
 
@@ -1385,9 +1395,18 @@ impl LoadIssue {
 /// 这次运行不写设置文件：它读不了，或者坏了又没能另存一份，写了就把原来的盖掉了。
 static READ_ONLY: AtomicBool = AtomicBool::new(false);
 
-/// 这次运行不写设置文件（见 [`READ_ONLY`]）。
+/// 锁不上设置文件时的原因（见 [`hold_writes`]）。
+static UNLOCKED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// 锁不上设置文件（见 `instance::claim`）：不知道有没有别的 Kuai 在用同一份，这次运行不写它，
+/// 免得互相覆盖。
+pub fn hold_writes(err: &str) {
+    let _ = UNLOCKED.set(err.to_string());
+}
+
+/// 这次运行不写设置文件（见 [`READ_ONLY`]、[`hold_writes`]）。
 pub fn read_only() -> bool {
-    READ_ONLY.load(Ordering::Relaxed)
+    READ_ONLY.load(Ordering::Relaxed) || UNLOCKED.get().is_some()
 }
 
 /// 读设置。没有设置文件（新装）是默认设置，不算出问题。
@@ -1512,6 +1531,12 @@ pub fn save(settings: &Settings) -> Result<()> {
     if READ_ONLY.load(Ordering::Relaxed) {
         anyhow::bail!(tr("设置文件读取失败，这次运行中的改动不会保存。"));
     }
+    if let Some(err) = UNLOCKED.get() {
+        anyhow::bail!(tf!(
+            "无法锁定设置文件（{err}），这次运行中的改动不会保存。",
+            err
+        ));
+    }
     let path = file();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
@@ -1587,6 +1612,30 @@ mod tests {
         // Linux 上的路径分大小写
         assert!(!at(Some("sb"), "/data/Repo").same_repo(&at(Some("sb"), "/data/repo")));
         assert!(at(Some("sb"), "/data/repo").same_repo(&at(Some("sb"), "/data/repo")));
+    }
+
+    #[test]
+    fn 子目录的几种写法() {
+        let at = |server: Option<&str>, path: &str| RepoEntry {
+            server: server.map(str::to_string),
+            path: path.into(),
+        };
+        let root = at(None, r"D:\Work\Kuai");
+        assert!(root.contains(&at(None, r"D:\Work\Kuai\sub")));
+        assert!(root.contains(&at(None, "d:/work/kuai/sub")), "kuaid 的写法");
+        assert!(!root.contains(&at(None, "d:/work/kuai")), "它自己不算");
+        assert!(
+            !root.contains(&at(None, "d:/work/kuai2/sub")),
+            "按一段一段比"
+        );
+        assert!(
+            !root.contains(&at(Some("sa"), "d:/work/kuai/sub")),
+            "别的电脑"
+        );
+        assert!(at(None, r"D:\").contains(&at(None, "d:/x")));
+        // Linux 上的路径分大小写
+        assert!(at(Some("sb"), "/data/repo").contains(&at(Some("sb"), "/data/repo/sub")));
+        assert!(!at(Some("sb"), "/data/Repo").contains(&at(Some("sb"), "/data/repo/sub")));
     }
 
     #[test]

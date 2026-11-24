@@ -246,6 +246,29 @@ fn add(mut preset: Preset, cx: &mut App) {
     });
 }
 
+/// 拖着的第 `from` 个预设放到第 `index` 个上（排到它前面；`index` 是列表长度时排到最后）。
+fn move_preset(from: usize, index: usize, cx: &mut App) {
+    if from == index {
+        return;
+    }
+    edit(cx, move |list, _| {
+        if from < list.len() {
+            let preset = list.remove(from);
+            let to = drop_index(from, index).min(list.len());
+            list.insert(to, preset);
+        }
+    });
+}
+
+/// 第 `from` 个放到第 `index` 个前面以后在第几个：往下拖时先拿了出来，后面的都往前挪了一位。原来
+/// 照 `index` 插，往下拖的落到了指示线下面那一行的后面。
+fn drop_index(from: usize, index: usize) -> usize {
+    match from < index {
+        true => index - 1,
+        false => index,
+    }
+}
+
 /// 还没用过的 `custom-N`。
 fn free_id(list: &[Preset]) -> String {
     (1..)
@@ -256,28 +279,107 @@ fn free_id(list: &[Preset]) -> String {
 
 // ---------- 哪个终端是从哪个预设开的 ----------
 
-/// 仓库的第几个终端是从哪个预设开的（只在内存里，见模块说明）。
+/// 仓库的第几个终端是从哪个预设开的（只在内存里，见模块说明）。按序号记，再记下开出来的是 kuaid
+/// 里的哪个会话：序号会被重用（这个结束了，别的 Kuai 在同一个仓库又开了一个，拿到同一个序号），
+/// 别人的那个不按这个预设显示，重启它时也不输入这条命令。
 #[derive(Default)]
-struct Started(HashMap<TermSlot, Start>);
+struct Started(HashMap<TermSlot, Launched>);
+
+struct Launched {
+    start: Start,
+    /// 开出来的会话（kuaid 给的编号）；刚开、还没回话，或者正在重启，是 None
+    term: Option<String>,
+}
 
 impl Global for Started {}
 
-/// 新开了一个终端：记下它要输入什么（只开 shell 的是 None，把这个编号以前记的去掉）。
-pub fn remember(slot: TermSlot, start: Option<Start>, cx: &mut App) {
-    let started = cx.default_global::<Started>();
-    match start {
-        Some(start) => {
-            started.0.insert(slot, start);
+impl Started {
+    fn remember(&mut self, slot: TermSlot, start: Option<Start>) {
+        match start {
+            Some(start) => {
+                self.0.insert(slot, Launched { start, term: None });
+            }
+            None => {
+                self.0.remove(&slot);
+            }
         }
-        None => {
-            started.0.remove(&slot);
+    }
+
+    fn get(&self, slot: &TermSlot, term: Option<&str>) -> Option<Start> {
+        let found = self.0.get(slot)?;
+        match (&found.term, term) {
+            (Some(bound), Some(term)) if bound != term => None,
+            _ => Some(found.start.clone()),
+        }
+    }
+
+    fn opened(&mut self, slot: &TermSlot, term: &str, created: bool) {
+        let Some(found) = self.0.get_mut(slot) else {
+            return;
+        };
+        match (&found.term, created) {
+            (None, true) => found.term = Some(term.to_string()),
+            (None, false) => {
+                self.0.remove(slot);
+            }
+            // 断线后接回自己的那个；别的会话不动它
+            (Some(_), _) => {}
+        }
+    }
+
+    /// 记着的是 `term` 的（或者还没开好）。
+    fn owns(&self, slot: &TermSlot, term: &str) -> Option<bool> {
+        let found = self.0.get(slot)?;
+        Some(found.term.as_deref().is_none_or(|bound| bound == term))
+    }
+
+    fn restarting(&mut self, slot: &TermSlot, term: &str) {
+        match self.owns(slot, term) {
+            Some(true) => {
+                if let Some(found) = self.0.get_mut(slot) {
+                    found.term = None;
+                }
+            }
+            Some(false) => {
+                self.0.remove(slot);
+            }
+            None => {}
+        }
+    }
+
+    fn ended(&mut self, slot: &TermSlot, term: &str) {
+        if self.owns(slot, term) == Some(true) {
+            self.0.remove(slot);
         }
     }
 }
 
-/// 这个终端是从哪个预设开的。
-pub fn started(slot: &TermSlot, cx: &App) -> Option<Start> {
-    cx.try_global::<Started>()?.0.get(slot).cloned()
+/// 新开了一个终端：记下它要输入什么（只开 shell 的是 None，把这个编号以前记的去掉）。
+pub fn remember(slot: TermSlot, start: Option<Start>, cx: &mut App) {
+    cx.default_global::<Started>().remember(slot, start);
+}
+
+/// 这个终端是从哪个预设开的。`term`：问的是 kuaid 里的哪个会话，不知道是 None；记着的是别的会话的
+/// 就不算。
+pub fn started(slot: &TermSlot, term: Option<&str>, cx: &App) -> Option<Start> {
+    cx.try_global::<Started>()?.get(slot, term)
+}
+
+/// 从预设开的终端开好了（kuaid 回了话，会话是 `term`）。`created`：是新开的，记下是哪个会话；接上的
+/// 是已有的（不是这次开的，比如别处刚用这个序号开了一个）就不算这个预设的。
+pub fn opened(slot: &TermSlot, term: &str, created: bool, cx: &mut App) {
+    cx.default_global::<Started>().opened(slot, term, created);
+}
+
+/// 要重启 kuaid 里的 `term` 这个终端：记着的是它的，重启以后新开的接着算这个预设的（再输入一遍）；
+/// 不是它的就去掉。
+pub fn restarting(slot: &TermSlot, term: &str, cx: &mut App) {
+    cx.default_global::<Started>().restarting(slot, term);
+}
+
+/// kuaid 里的 `term` 这个终端结束了：记着的是它的就去掉。
+pub fn ended(slot: &TermSlot, term: &str, cx: &mut App) {
+    cx.default_global::<Started>().ended(slot, term);
 }
 
 /// 终端叫什么：从预设开的，标题还是 shell 自己的（见 [`shell_title`]）或者没有标题时叫预设的名字；
@@ -854,18 +956,7 @@ fn table(cx: &mut App) -> AnyElement {
             .drag_over::<DragPreset>(move |style, _, _, cx| {
                 style.border_t_2().border_color(cx.theme().primary)
             })
-            .on_drop(move |drag: &DragPreset, _, cx| {
-                let from = drag.index;
-                if from == index {
-                    return;
-                }
-                edit(cx, move |list, _| {
-                    if from < list.len() {
-                        let preset = list.remove(from);
-                        list.insert(index.min(list.len()), preset);
-                    }
-                });
-            })
+            .on_drop(move |drag: &DragPreset, _, cx| move_preset(drag.index, index, cx))
             .child(
                 ui::icon(IconName::GripVertical)
                     .flex_none()
@@ -960,10 +1051,17 @@ fn table(cx: &mut App) -> AnyElement {
     let missing = builtins()
         .into_iter()
         .any(|builtin| !presets.iter().any(|preset| preset.id == builtin.id));
+    // 拖到底下这一行：排到最后（每一行的指示线都画在上边，拖到一行上是排到它前面）
+    let count = presets.len();
     let footer = h_flex()
+        .id("preset-footer")
         .pt_2()
         .gap_2()
         .flex_wrap()
+        .drag_over::<DragPreset>(|style, _, _, cx| {
+            style.border_t_2().border_color(cx.theme().primary)
+        })
+        .on_drop(move |drag: &DragPreset, _, cx| move_preset(drag.index, count, cx))
         .child(
             Button::new("preset-add")
                 .small()
@@ -976,7 +1074,7 @@ fn table(cx: &mut App) -> AnyElement {
                 .small()
                 .label(tr("恢复内置预设"))
                 .disabled(!missing)
-                .tooltip(tr("把删掉的内置预设加回来"))
+                .tooltip(tr("恢复已删除的内置预设"))
                 .on_click(|_, _, cx| edit(cx, restore_builtins)),
         );
     v_flex()
@@ -1212,8 +1310,65 @@ fn edit_dialog(existing: Option<Preset>, window: &mut Window, cx: &mut App) {
 mod tests {
     // 不用 `super::*`：那样会把界面库的 `test` 宏也带进来，盖掉标准的 `#[test]`
     use super::{
-        Preset, Start, builtins, display_name, free_id, logo, program_of, restore_builtins,
+        Preset, Start, Started, builtins, display_name, drop_index, free_id, logo, program_of,
+        restore_builtins,
     };
+
+    #[test]
+    fn 拖到一行上是排到它前面() {
+        let moved = |from: usize, index: usize| {
+            let mut list = vec!['A', 'B', 'C'];
+            let item = list.remove(from);
+            list.insert(drop_index(from, index).min(list.len()), item);
+            list.into_iter().collect::<String>()
+        };
+        // 往下拖：A 拖到 C 上，排在 C 前面
+        assert_eq!(moved(0, 2), "BAC");
+        // 往上拖：C 拖到 A 上
+        assert_eq!(moved(2, 0), "CAB");
+        // 拖到底下那一行：排到最后
+        assert_eq!(moved(0, 3), "BCA");
+        assert_eq!(moved(1, 3), "ACB");
+    }
+
+    #[test]
+    fn 预设按会话记_序号被别人重用了不算() {
+        let slot = crate::settings::TermSlot {
+            entry: crate::settings::RepoEntry {
+                server: None,
+                path: "/work".into(),
+            },
+            number: 1,
+        };
+        let start = Start::command("npm run dev");
+        let mut started = Started::default();
+        started.remember(slot.clone(), Some(start.clone()));
+        // 还没开好：谁问都算
+        assert!(started.get(&slot, Some("t1")).is_some());
+        started.opened(&slot, "t1", true);
+        assert!(started.get(&slot, Some("t1")).is_some());
+        // 别处用同一个序号开的另一个会话
+        assert!(started.get(&slot, Some("t2")).is_none());
+        // 重启别人的那个：不输入这条命令
+        started.restarting(&slot, "t2");
+        assert!(started.get(&slot, None).is_none());
+        // 自己的重启：新开的接着算
+        started.remember(slot.clone(), Some(start.clone()));
+        started.opened(&slot, "t1", true);
+        started.restarting(&slot, "t1");
+        assert!(started.get(&slot, None).is_some());
+        started.opened(&slot, "t3", true);
+        assert!(started.get(&slot, Some("t3")).is_some());
+        // 结束别人的不动，结束自己的去掉
+        started.ended(&slot, "t9");
+        assert!(started.get(&slot, Some("t3")).is_some());
+        started.ended(&slot, "t3");
+        assert!(started.get(&slot, None).is_none());
+        // 想新开、接上的却是已有的：不算这个预设的
+        started.remember(slot.clone(), Some(start));
+        started.opened(&slot, "t4", false);
+        assert!(started.get(&slot, None).is_none());
+    }
 
     #[test]
     fn 程序名取命令的第一个词() {

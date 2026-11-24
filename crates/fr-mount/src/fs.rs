@@ -11,7 +11,9 @@
 //!   `on_error` 告诉界面。和在路上的写入重叠的写、读、截断、改名都先等它们落地：服务器上每个请求
 //!   各在各的线程里做，不等的话先后会乱。
 //! - 删除：Windows 上系统在最后一个句柄关掉时（Cleanup）才真的删，那一步报不了错。服务器不让删
-//!   （没权限）时经 `on_error` 告诉界面，文件照旧留着。Linux 上删除是马上做的，错误直接交给删的程序。
+//!   （没权限）时经 `on_error` 告诉界面，文件照旧留着。Linux 上删除是马上做的，错误直接交给删的程序；
+//!   删的（或者改名盖掉的）文件还开着时，主机上先改成藏起来的名字，最后一个句柄关掉时再删
+//!   （[`Mount::hide`]），开着它的程序接着读写原来那个。
 //! - 列目录、查文件属性的结果留 2 秒：资源管理器会反复问同一批东西，还会试探一堆不存在的名字
 //!   （`desktop.ini` 这类），都从留着的那份目录里答，不再问服务器。
 //! - 等回音有期限（[`REPLY_TIMEOUT`]）：主机上的文件操作卡住时（SSH 照样通着，比如挂死的网络盘），
@@ -122,6 +124,8 @@ struct Pending {
     writing: BoxFuture<'static, Result<FsStat>>,
     /// 发出去的时刻
     sent: Instant,
+    /// 是在主机上追加到末尾的（`offset` 是这边估的）：落地以后大小以主机上的为准
+    append: bool,
 }
 
 /// 写入、删除没成时要用的：出了错怎么换成状态码、告诉谁。
@@ -163,7 +167,15 @@ pub(crate) struct Mount {
     /// 打开着的文件（不算目录）有几个：退出前拿来问「还有文件开着」
     pub(crate) open_files: AtomicUsize,
     pub(crate) counters: Arc<Counters>,
+    /// 要卸载了（[`Mount::finish`]）：不再收新的写入
+    closing: std::sync::atomic::AtomicBool,
+    /// 藏起来的名字的编号（[`Mount::hide`]）
+    #[cfg_attr(windows, allow(dead_code))]
+    next_hidden: AtomicU64,
 }
+
+/// 删掉、盖掉时还开着的文件在主机上藏起来用的名字的开头（[`Mount::hide`]）。列目录时不显示。
+const HIDDEN_PREFIX: &str = ".kuai-deleted-";
 
 /// 一个打开着的文件或目录。
 pub(crate) struct Node {
@@ -191,6 +203,12 @@ struct NodeState {
     dirty: bool,
     /// 上次刷盘（[`Mount::flush_file`]）以后写过、改过大小或时间
     unsynced: bool,
+    /// `stat` 上次和主机对过的时刻：开着的文件过了 [`TTL`] 再问一次（[`Mount::refresh`]）
+    checked: Instant,
+    /// 删掉了（不再按路径认它）：再写报「不存在」，不会写到同名新建的文件上
+    gone: bool,
+    /// 删掉时还开着，主机上改成了藏起来的名字：最后一个句柄关掉时删（[`Mount::hide`]）
+    orphan: bool,
     /// 这次列目录用的那一份，按名字排好；翻页时要前后一致
     #[cfg(windows)]
     listing: Option<Arc<Vec<Row>>>,
@@ -207,6 +225,7 @@ impl NodeState {
             self.cache.renew();
             self.stat = stat;
         }
+        self.checked = Instant::now();
         self.cache.fill(asked.first, asked.count, bytes);
     }
 }
@@ -555,6 +574,7 @@ fn stat_of(entry: &FsEntry) -> FsStat {
         mtime: entry.mtime,
         // 原来一律可写：同一个只读文件列目录时没有只读属性、看属性时又是只读
         readonly: entry.readonly,
+        mode: entry.mode,
     }
 }
 
@@ -603,6 +623,9 @@ pub(crate) fn status_of(message: &str, windows: bool) -> NTSTATUS {
         (true, 267) | (false, 20) => STATUS_NOT_A_DIRECTORY,
         // EISDIR
         (false, 21) => STATUS_FILE_IS_A_DIRECTORY,
+        // ERROR_NOT_SAME_DEVICE / EXDEV：改名跨了主机上的文件系统。原来算成读写出错（EIO），
+        // `mv` 收不到「跨设备」，不会改成复制再删
+        (true, 17) | (false, 18) => STATUS_NOT_SAME_DEVICE,
         _ => STATUS_UNEXPECTED_IO_ERROR,
     }
 }
@@ -635,8 +658,15 @@ fn settle(incoming: mpsc::Receiver<Pending>, sink: Arc<Sink>) {
         }
         state.flying_bytes = state.flying_bytes.saturating_sub(len);
         match result {
-            // 都落地了：修改时间以服务器上的为准。大小不动：这段时间里可能又截断过
-            Ok(stat) if state.flying.is_empty() => state.stat.mtime = stat.mtime,
+            // 都落地了：修改时间以服务器上的为准。大小不动：截断要先等写入落地，这里不会有，可
+            // 在路上的那些各自估的末尾不一定对。追加的末尾是主机定的（别的程序也在追加时比这边估的
+            // 长），以主机上的为准
+            Ok(stat) if state.flying.is_empty() => {
+                state.stat.mtime = stat.mtime;
+                if pending.append {
+                    state.stat.size = stat.size;
+                }
+            }
             Ok(_) => {}
             Err((status, message)) => {
                 log::warn!("写入 /{} 失败：{message}", state.path);
@@ -739,6 +769,8 @@ impl Mount {
             sink,
             open_files: AtomicUsize::new(0),
             counters,
+            closing: Default::default(),
+            next_hidden: AtomicU64::new(0),
         })
     }
 
@@ -839,7 +871,8 @@ impl Mount {
         }
         let listing = self.channel()?.fs_list_all(&self.root, dir);
         let mut entries = self.wait("fs_list", dir, listing)?;
-        entries.retain(|entry| representable(&entry.name));
+        entries
+            .retain(|entry| representable(&entry.name) && !entry.name.starts_with(HIDDEN_PREFIX));
         let entries = Arc::new(entries);
         let mut dirs = lock(&self.dirs);
         if dirs.len() > CACHE_MAX {
@@ -899,6 +932,9 @@ impl Mount {
                             resync: false,
                             dirty: false,
                             unsynced: false,
+                            checked: Instant::now(),
+                            gone: false,
+                            orphan: false,
                             #[cfg(windows)]
                             listing: None,
                         }),
@@ -922,6 +958,49 @@ impl Mount {
             }
         }
         node
+    }
+
+    /// 开着的文件现在的情况。自己没在写、上次和主机对过超过 [`TTL`] 的再问一次主机：开着的期间
+    /// 主机上别人改了、接着写长了（`tail -f` 那样）要看得到，原来一直用打开时的那份。变了就扔掉读到
+    /// 的旧数据（[`Cache::renew`]）。问不到（断线）就用留着的。
+    pub(crate) fn refresh(&self, node: &Node) -> FsStat {
+        let state = lock(&node.state);
+        let busy = !state.flying.is_empty() || state.dirty;
+        if busy || state.gone || state.stat.dir || state.checked.elapsed() < TTL {
+            return state.stat;
+        }
+        let path = state.path.clone();
+        drop(state);
+        let asked = self
+            .channel()
+            .and_then(|channel| self.wait("fs_stat", &path, channel.fs_stat(&self.root, &path)));
+        let mut state = lock(&node.state);
+        // 等的时候这边写了、改了名：以这边的为准
+        if let Ok(stat) = asked
+            && stat.exists
+            && state.path == path
+            && state.flying.is_empty()
+            && !state.dirty
+        {
+            if stat.mtime != state.stat.mtime || stat.size != state.stat.size {
+                state.stat = stat;
+                state.cache.renew();
+                node.arrived.notify_all();
+            }
+            state.stat.readonly = stat.readonly;
+            state.stat.mode = stat.mode;
+            state.checked = Instant::now();
+            self.remember(&path, state.stat);
+        }
+        state.stat
+    }
+
+    /// 这个路径上开着的那个节点（没开着就是 None），不问主机。
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) fn opened(&self, path: &str) -> Option<Arc<Node>> {
+        lock(&self.nodes)
+            .get(&self.key(path))
+            .and_then(Weak::upgrade)
     }
 
     fn open(&self, path: &str) -> Nt<Arc<Node>> {
@@ -990,6 +1069,7 @@ impl Mount {
             let path = state.path.clone();
             if let Ok(stat) = self.wait("fs_stat", &path, channel.fs_stat(&self.root, &path)) {
                 state.stat = stat;
+                state.checked = Instant::now();
                 self.remember(&path, stat);
             }
         }
@@ -1126,12 +1206,22 @@ impl Mount {
         // 是哪一路连着往后读的：头一遍认，从头再读时不再算一次
         let mut followed = None;
         let mut restarts = 0;
+        // 读到这边记的末尾时问过主机没有（见 `refresh`）
+        let mut refreshed = false;
         'again: loop {
             // 这次读到的都要是同一代的。等数据时不锁着文件，这期间文件可能变了（这边写了、截断了，
             // 或者读回来的数据说主机上的变了）：已经拷出去的是旧的，从头再读，不然前半是旧的、
             // 后半是新的
             let generation = state.cache.generation;
             if offset >= state.stat.size {
+                // 开着的期间主机上可能接着写长了：这边记的是一阵子以前的，问一次再说读完了
+                if !refreshed && state.checked.elapsed() >= TTL {
+                    refreshed = true;
+                    drop(state);
+                    self.refresh(node);
+                    state = self.drain(node, lock(&node.state));
+                    continue 'again;
+                }
                 return Err(STATUS_END_OF_FILE);
             }
             let end = (offset + buffer.len() as u64).min(state.stat.size);
@@ -1235,6 +1325,14 @@ impl Mount {
     ) -> Nt<(usize, FsStat)> {
         self.writable()?;
         let mut state = lock(&node.state);
+        // 要卸载了：收下的写入要在卸载前落到主机上，这之后的不再收（见 `finish`）
+        if self.closing.load(Relaxed) {
+            return Err(STATUS_CONNECTION_DISCONNECTED);
+        }
+        // 删掉了：路径上可能已经是同名新建的另一个文件
+        if state.gone {
+            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+        }
         if let Some(status) = state.failed.take() {
             return Err(status);
         }
@@ -1272,7 +1370,13 @@ impl Mount {
         let mut at = offset;
         for chunk in data[..len as usize].chunks(CHUNK) {
             let size = chunk.len() as u64;
-            let writing = channel.fs_pwrite(&self.root, &state.path, at, chunk.to_vec(), false);
+            // 追加的交给主机接在它那时的末尾（`O_APPEND`）：这边记的末尾可能旧了（主机上别的程序
+            // 也在追加），按它算偏移会盖掉人家刚写的。同一个文件的写入 kuaid 按先后做，连着追加的几段
+            // 不会乱
+            let writing = match to_end {
+                true => channel.fs_append(&self.root, &state.path, at, chunk.to_vec()),
+                false => channel.fs_pwrite(&self.root, &state.path, at, chunk.to_vec(), false),
+            };
             self.counters.calls.fetch_add(1, Relaxed);
             self.counters.up.fetch_add(size, Relaxed);
             state.flying.push((at, size));
@@ -1283,6 +1387,7 @@ impl Mount {
                 len: size,
                 writing,
                 sent: Instant::now(),
+                append: to_end,
             };
             if sender.send(pending).is_err() {
                 // 等回音的线程没了：这个盘正在卸载
@@ -1347,8 +1452,11 @@ impl Mount {
     }
 
     /// 在主机上删掉。`notify`：没删成时经 `on_error` 告诉用户（Windows 上真删的时候已经报不了错，
-    /// 程序以为删掉了）；Linux 上错误直接交给删的程序，不另外说。
-    fn remove(&self, node: &Node, notify: bool) -> Nt<()> {
+    /// 程序以为删掉了）；Linux 上错误直接交给删的程序，不另外说。`kind`：只删这一种（`Some(true)`
+    /// 是目录）：Linux 上 unlink、rmdir 看过是哪一种才来删，主机上同名的这期间换成了另一种的话不删
+    /// （原来主机上按那时是什么删，rmdir 可能删掉一个文件）。删掉以后这个节点不再按路径认：
+    /// 同名新建的是另一个，这个的句柄写不到它上面。
+    fn remove(&self, node: &Node, notify: bool, kind: Option<bool>) -> Nt<()> {
         self.writable()?;
         // 要删了：没落地的写入成没成都无所谓
         let mut state = self.drain(node, lock(&node.state));
@@ -1358,7 +1466,10 @@ impl Mount {
         let removed = match self.channel() {
             Ok(channel) => {
                 self.counters.calls.fetch_add(1, Relaxed);
-                let removing = channel.fs_remove_shallow(&self.root, &path);
+                let removing = match kind {
+                    Some(dir) => channel.fs_remove_kind(&self.root, &path, dir),
+                    None => channel.fs_remove_shallow(&self.root, &path),
+                };
                 match block_until(removing, Instant::now() + REPLY_TIMEOUT) {
                     Some(result) => result.map_err(|err| {
                         let message = format!("{err:#}");
@@ -1384,9 +1495,69 @@ impl Mount {
         }
         state.stat = FsStat::default();
         state.dirty = false;
+        state.gone = true;
+        drop(state);
+        self.detach(&path, node);
         self.invalidate_tree(&path);
         self.remember(&path, FsStat::default());
         Ok(())
+    }
+
+    /// 不再按 `path` 认 `node`（删掉了、藏起来了）：之后打开这个路径的用新的节点。
+    fn detach(&self, path: &str, node: &Node) {
+        let key = self.key(path);
+        let mut nodes = lock(&self.nodes);
+        if nodes
+            .get(&key)
+            .is_some_and(|weak| std::ptr::eq(weak.as_ptr(), node))
+        {
+            nodes.remove(&key);
+        }
+    }
+
+    /// 删掉（或者改名盖掉）还开着的文件（Linux）：主机上先改成藏起来的名字（同一个目录里的
+    /// `.kuai-deleted-<进程号>-<编号>`，列目录时不显示），开着它的程序接着读写这个，最后一个句柄关掉时
+    /// 再删（[`Mount::close`]）。和本机的文件一样：删掉以后开着它的照样读写，同名新建的是另一个文件。
+    /// 原来马上删掉，开着的句柄读到的是空的、写的丢了，同名新建以后还会写到新文件上。Kuai 没正常
+    /// 退出时主机上会留下这个文件。返回藏起来的路径。
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) fn hide(&self, node: &Node) -> Nt<String> {
+        self.writable()?;
+        // 在路上的写入发的是原来的路径：先等它们落地
+        let mut state = self.drain(node, lock(&node.state));
+        let from = state.path.clone();
+        let name = format!(
+            "{HIDDEN_PREFIX}{}-{}",
+            std::process::id(),
+            self.next_hidden.fetch_add(1, Relaxed)
+        );
+        let to = match split(&from).0 {
+            "" => name,
+            parent => format!("{parent}/{name}"),
+        };
+        let channel = self.channel()?;
+        self.wait(
+            "fs_rename",
+            &from,
+            channel.fs_rename(&self.root, &from, &to),
+        )?;
+        state.path = to.clone();
+        state.orphan = true;
+        drop(state);
+        {
+            let mut nodes = lock(&self.nodes);
+            let key = self.key(&from);
+            if nodes
+                .get(&key)
+                .is_some_and(|weak| std::ptr::eq(weak.as_ptr(), node))
+                && let Some(weak) = nodes.remove(&key)
+            {
+                nodes.insert(self.key(&to), weak);
+            }
+        }
+        self.invalidate(&from);
+        self.remember(&from, FsStat::default());
+        Ok(to)
     }
 
     /// 打开来要写内容（`writing`）而主机上这个用户写不了这个文件：打开时就拒绝。原来打开照样
@@ -1451,8 +1622,18 @@ impl Mount {
             if !replace {
                 return Err(STATUS_OBJECT_NAME_COLLISION);
             }
+            // Windows 上盖不了目录
+            #[cfg(windows)]
             if target.dir {
                 return Err(STATUS_ACCESS_DENIED);
+            }
+            // Linux 的 rename：目录可以盖空目录（主机上做，一步完成，不空报 ENOTEMPTY），文件和目录
+            // 互相盖不了。原来目标是目录一律报没权限，换掉空目录的程序以为是权限问题
+            #[cfg(not(windows))]
+            match (state.stat.dir, target.dir) {
+                (false, true) => return Err(STATUS_FILE_IS_A_DIRECTORY),
+                (true, false) => return Err(STATUS_NOT_A_DIRECTORY),
+                _ => {}
             }
             channel.fs_rename_over(&self.root, &from, to)
         } else {
@@ -1501,17 +1682,19 @@ impl Mount {
         }
     }
 
-    /// 截短或接长。`allocation` 是系统在预留空间：比文件小才算截断，别的不用管。
+    /// 截短或接长。`allocation` 是系统在预留空间：比文件小才算截断，别的不用管。明说要截的
+    /// （`truncate`、打开时截成 0）一律交给主机：这边记的大小可能是旧的（主机上别人写长了），和要的
+    /// 一样就不截的话，截断成功了文件却没变，再写一小段就留着后面的旧内容。
     fn resize(&self, node: &Node, size: u64, allocation: bool) -> Nt<FsStat> {
         self.writable()?;
         let mut state = self.settled(node, lock(&node.state))?;
-        let current = state.stat.size;
-        if size == current || (allocation && size >= current) {
+        if allocation && size >= state.stat.size {
             return Ok(state.stat);
         }
         let path = state.path.clone();
         let resizing = self.channel()?.fs_resize(&self.root, &path, size, false);
         state.stat = self.wait("fs_resize", &path, resizing)?;
+        state.checked = Instant::now();
         state.cache.renew();
         node.arrived.notify_all();
         state.dirty = true;
@@ -1520,12 +1703,12 @@ impl Mount {
         Ok(state.stat)
     }
 
-    /// 改修改时间（1970 年起的毫秒数），0 是不改。属性（只读、隐藏）不管。
-    fn set_mtime(&self, node: &Node, mtime: u64) -> Nt<FsStat> {
+    /// 改修改时间（1970 年起的毫秒数），None 是不改（0 是 1970 年那一刻，照改）。属性（只读、隐藏）不管。
+    fn set_mtime(&self, node: &Node, mtime: Option<u64>) -> Nt<FsStat> {
         let mut state = self.settled(node, lock(&node.state))?;
-        if mtime == 0 || self.read_only || state.stat.dir {
+        let Some(mtime) = mtime.filter(|_| !self.read_only && !state.stat.dir) else {
             return Ok(state.stat);
-        }
+        };
         let path = state.path.clone();
         let touching = self.channel()?.fs_touch(&self.root, &path, mtime);
         state.stat = self.wait("fs_touch", &path, touching)?;
@@ -1535,19 +1718,68 @@ impl Mount {
         Ok(state.stat)
     }
 
-    fn close(&self, node: Arc<Node>) {
-        // 系统可能在 Cleanup 之后才把缓存里的页写回来，这里再等一次
-        let _ = self.commit(&node);
-        let key = self.key(&lock(&node.state).path);
+    /// 改权限位（Linux 的 chmod）：主机上真的改（Windows 主机上只有只读属性）。原来当作改好了，
+    /// 主机上不变。
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) fn chmod(&self, node: &Node, mode: u32) -> Nt<FsStat> {
+        self.writable()?;
+        let mut state = self.settled(node, lock(&node.state))?;
+        let path = state.path.clone();
+        let changing = self.channel()?.fs_chmod(&self.root, &path, mode);
+        let stat = self.wait("fs_chmod", &path, changing)?;
+        // 大小、时间用这边的：这边可能写长了，主机给的是落地以后的，一样
+        state.stat.readonly = stat.readonly;
+        state.stat.mode = stat.mode;
+        state.checked = Instant::now();
+        self.invalidate(&path);
+        self.remember(&path, state.stat);
+        Ok(state.stat)
+    }
+
+    /// 一个句柄关了。`writer`：这个句柄是写的。系统可能在 Cleanup 之后才把缓存里的页写回来，写的
+    /// 句柄这里再等一次；读的句柄不等，也不领走写入的错（那是写的程序的，见 [`Self::settled`]）。
+    /// 最后一个句柄关掉时，删掉时藏起来的（[`Self::hide`]）在主机上删掉。
+    pub(crate) fn close(&self, node: Arc<Node>, writer: bool) {
+        if writer {
+            let _ = self.commit(&node);
+        }
+        let (key, orphan) = {
+            let state = lock(&node.state);
+            (
+                self.key(&state.path),
+                state.orphan.then(|| state.path.clone()),
+            )
+        };
+        let last = Arc::strong_count(&node) == 1;
+        if last && orphan.is_some() {
+            drop(self.drain(&node, lock(&node.state)));
+        }
         drop(node);
         let mut nodes = lock(&self.nodes);
         if nodes.get(&key).is_some_and(|weak| weak.strong_count() == 0) {
             nodes.remove(&key);
         }
+        drop(nodes);
+        if let Some(path) = orphan.filter(|_| last) {
+            let removed = self.channel().and_then(|channel| {
+                self.wait(
+                    "fs_remove",
+                    &path,
+                    channel.fs_remove_kind(&self.root, &path, false),
+                )
+            });
+            if let Err(status) = removed
+                && status != STATUS_OBJECT_NAME_NOT_FOUND
+            {
+                log::warn!("删不掉藏起来的 /{path}（{status}）");
+            }
+        }
     }
 
-    /// 卸载前：等所有开着的文件在路上的写入落地。
+    /// 卸载前：不再收新的写入，等所有开着的文件在路上的写入落地。原来不拦：卸载时还开着文件的程序
+    /// （Linux 上 `-z` 卸载以后照样能写）在这之后写的，收下了却来不及写到主机上。
     pub(crate) fn finish(&self) {
+        self.closing.store(true, Relaxed);
         let nodes: Vec<Arc<Node>> = lock(&self.nodes)
             .values()
             .filter_map(Weak::upgrade)
@@ -1603,6 +1835,13 @@ mod tests {
         assert_eq!(linux("x (os error 5)"), STATUS_UNEXPECTED_IO_ERROR);
         assert_eq!(windows("x (os error 145)"), STATUS_DIRECTORY_NOT_EMPTY);
         assert_eq!(linux("连接已关闭"), STATUS_UNEXPECTED_IO_ERROR);
+        // 改名跨了主机上的文件系统：EXDEV / ERROR_NOT_SAME_DEVICE，`mv` 见到它改成复制再删
+        assert_eq!(
+            linux("无法重命名 a: Invalid cross-device link (os error 18)"),
+            STATUS_NOT_SAME_DEVICE
+        );
+        assert_eq!(windows("x (os error 17)"), STATUS_NOT_SAME_DEVICE);
+        assert_eq!(linux("x (os error 17)"), STATUS_OBJECT_NAME_COLLISION);
     }
 
     #[cfg(windows)]
@@ -1710,9 +1949,14 @@ mod tests {
         // 2023-11-14 22:13:20 UTC
         assert_eq!(filetime(1_700_000_000_000), 133_444_736_000_000_000);
         assert_eq!(
-            (133_444_736_000_000_000 - windows::EPOCH_GAP) / 10_000,
-            1_700_000_000_000
+            windows::millis_of(133_444_736_000_000_000),
+            Some(1_700_000_000_000)
         );
+        // 0 和全 1 是不改；正好 1970 年那一刻是 0，照改
+        assert_eq!(windows::millis_of(0), None);
+        assert_eq!(windows::millis_of(u64::MAX), None);
+        assert_eq!(windows::millis_of(windows::EPOCH_GAP), Some(0));
+        assert_eq!(windows::millis_of(windows::EPOCH_GAP - 1), None);
     }
 
     /// 当作服务器上映射的那个目录，用完删掉。
@@ -2106,6 +2350,132 @@ mod tests {
     }
 
     #[test]
+    fn 追加接在主机上的末尾_别人刚追加的不盖掉() {
+        let dir = TempDir::new();
+        dir.write("log.txt", b"12345");
+        let mount = local_mount(&dir);
+        let node = mount.open("log.txt").unwrap();
+        // 打开以后主机上别的程序又追加了一段：这边记的末尾还是 5
+        dir.write("log.txt", b"12345XYZ");
+        mount.write(&node, b"abc", 0, true, false).unwrap();
+        mount.commit(&node).unwrap();
+        assert_eq!(
+            std::fs::read(dir.0.join("log.txt")).unwrap(),
+            b"12345XYZabc"
+        );
+        // 落地以后大小以主机上的为准
+        assert_eq!(lock(&node.state).stat.size, 11);
+    }
+
+    #[test]
+    fn 截断一律交给主机_这边记的大小一样也截() {
+        let dir = TempDir::new();
+        dir.write("t.bin", b"");
+        let mount = local_mount(&dir);
+        let node = mount.open("t.bin").unwrap();
+        assert_eq!(lock(&node.state).stat.size, 0);
+        // 主机上别人写长了，这边记的还是 0：截成 0 也要截，不然再写一小段后面留着旧的
+        dir.write("t.bin", b"old content");
+        assert_eq!(mount.resize(&node, 0, false).unwrap().size, 0);
+        assert_eq!(std::fs::read(dir.0.join("t.bin")).unwrap(), b"");
+        // 预留空间（比现在大）不用管
+        assert_eq!(mount.resize(&node, 100, true).unwrap().size, 0);
+        assert_eq!(std::fs::read(dir.0.join("t.bin")).unwrap(), b"");
+    }
+
+    #[test]
+    fn 开着的文件过了留存的时间再问主机() {
+        let dir = TempDir::new();
+        dir.write("grow.log", b"first\n");
+        let mount = local_mount(&dir);
+        let node = mount.open("grow.log").unwrap();
+        assert_eq!(read_at(&mount, &node, 0, 100), b"first\n");
+        // 主机上接着写长了（tail -f 看着的那种）
+        dir.write("grow.log", b"first\nsecond\n");
+        // 刚对过的不问
+        assert_eq!(mount.refresh(&node).size, 6);
+        // 过了留存的时间：读到这边记的末尾时再问一次，读得到新写的
+        lock(&node.state).checked -= TTL;
+        assert_eq!(read_at(&mount, &node, 6, 100), b"second\n");
+        lock(&node.state).checked -= TTL;
+        assert_eq!(mount.refresh(&node).size, 13);
+        // 自己写着的不问（这边的比主机上的新）
+        mount.write(&node, b"!", 13, false, false).unwrap();
+        dir.write("grow.log", b"x");
+        lock(&node.state).checked -= TTL;
+        assert_eq!(mount.refresh(&node).size, 14);
+    }
+
+    #[test]
+    fn 删掉以后同名新建的是另一个_删掉的那个写不进去() {
+        let dir = TempDir::new();
+        dir.write("a.txt", b"a");
+        let mount = local_mount(&dir);
+        let node = mount.open("a.txt").unwrap();
+        mount.remove(&node, false, Some(false)).unwrap();
+        let fresh = mount.create("a.txt", false).unwrap();
+        assert!(!Arc::ptr_eq(&fresh, &node));
+        assert!(matches!(
+            mount.write(&node, b"x", 0, false, false),
+            Err(STATUS_OBJECT_NAME_NOT_FOUND)
+        ));
+        mount.close(fresh, true);
+        mount.close(node, false);
+        assert_eq!(std::fs::read(dir.0.join("a.txt")).unwrap(), b"");
+        // 只删说的那一种：说是目录的不删文件
+        dir.write("b.txt", b"b");
+        let file = mount.open("b.txt").unwrap();
+        assert!(mount.remove(&file, false, Some(true)).is_err());
+        assert!(dir.0.join("b.txt").is_file());
+        mount.close(file, false);
+    }
+
+    #[test]
+    fn 藏起来的文件开着的照样读写_关了以后删掉() {
+        let dir = TempDir::new();
+        dir.write("open.txt", b"old");
+        let mount = local_mount(&dir);
+        let node = mount.open("open.txt").unwrap();
+        let hidden = mount.hide(&node).unwrap();
+        assert!(hidden.starts_with(HIDDEN_PREFIX));
+        // 原来的名字没了，列目录也看不到藏起来的
+        assert!(!dir.0.join("open.txt").exists());
+        assert!(mount.list("", Duration::ZERO).unwrap().is_empty());
+        // 同名新建的是另一个文件
+        let fresh = mount.create("open.txt", false).unwrap();
+        assert!(!Arc::ptr_eq(&fresh, &node));
+        mount.write(&fresh, b"new", 0, false, false).unwrap();
+        mount.close(fresh, true);
+        // 开着的接着读写原来那个
+        assert_eq!(read_at(&mount, &node, 0, 10), b"old");
+        mount.write(&node, b"OLD", 0, false, false).unwrap();
+        mount.commit(&node).unwrap();
+        assert_eq!(std::fs::read(dir.0.join("open.txt")).unwrap(), b"new");
+        assert_eq!(std::fs::read(dir.0.join(&hidden)).unwrap(), b"OLD");
+        // 最后一个句柄关了：藏起来的删掉
+        let other = node.clone();
+        mount.close(other, false);
+        assert!(dir.0.join(&hidden).exists());
+        mount.close(node, true);
+        assert!(!dir.0.join(&hidden).exists());
+    }
+
+    #[test]
+    fn 要卸载了不再收写入() {
+        let dir = TempDir::new();
+        dir.write("w.bin", b"");
+        let mount = local_mount(&dir);
+        let node = mount.open("w.bin").unwrap();
+        mount.write(&node, b"kept", 0, false, false).unwrap();
+        mount.finish();
+        assert!(matches!(
+            mount.write(&node, b"late", 4, false, false),
+            Err(STATUS_CONNECTION_DISCONNECTED)
+        ));
+        assert_eq!(std::fs::read(dir.0.join("w.bin")).unwrap(), b"kept");
+    }
+
+    #[test]
     fn 目录改了名_里面打开着的文件跟着换路径() {
         let dir = TempDir::new();
         std::fs::create_dir(dir.0.join("d")).unwrap();
@@ -2373,7 +2743,7 @@ mod tests {
         mount.commit(&node).unwrap();
         assert!(std::fs::read(files.join("a.bin")).unwrap() == model);
         assert!(read_at(&mount, &node, 0, 4_000_000) == model);
-        mount.close(node);
+        mount.close(node, true);
 
         // 新建一个（含新目录），写进去，再改名盖掉 a.bin：资源管理器、编辑器存盘就是这样
         mount.create("sub", true).unwrap();
@@ -2388,8 +2758,8 @@ mod tests {
         mount.rename(&made, "a.bin", true).unwrap();
         assert_eq!(std::fs::read(files.join("a.bin")).unwrap(), text);
         assert!(!files.join("sub").join("b.txt").exists());
-        mount.remove(&made, true).unwrap();
-        mount.close(made);
+        mount.remove(&made, true, None).unwrap();
+        mount.close(made, true);
         assert!(!files.join("a.bin").exists());
         assert!(
             errors.lock().unwrap().is_empty(),
@@ -2481,6 +2851,6 @@ mod tests {
         mount.resize(&node, fresh.len() as u64, false).unwrap();
         mount.flush_file(&node).unwrap();
         assert!(std::fs::read(files.join("c.bin")).unwrap() == fresh);
-        mount.close(node);
+        mount.close(node, true);
     }
 }

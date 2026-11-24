@@ -154,6 +154,26 @@ fn popover_body(
             )
             .child(h_flex().justify_end().child(cancel_button(updater)))
         }
+        // .deb 的装好了、还没重启
+        Stage::Ready(release) if this.installed => body
+            .child(header(
+                IconName::ShieldCheck,
+                success,
+                tf!("{version} 已安装", version = release.version),
+                None,
+                cx,
+            ))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(tr("重启 Kuai 后生效。")),
+            )
+            .child(
+                h_flex()
+                    .justify_end()
+                    .child(restart_button(updater, Some(popover), false)),
+            ),
         Stage::Ready(release) => body
             .child(header(
                 IconName::ShieldCheck,
@@ -260,7 +280,11 @@ pub fn about_version(updater: &Entity<Updater>, cx: &App) -> AnyElement {
         }
         Stage::Ready(release) => right
             .child(status(
-                tf!("{version} 已下载", version = release.version).into(),
+                match this.installed {
+                    true => tf!("{version} 已安装", version = release.version),
+                    false => tf!("{version} 已下载", version = release.version),
+                }
+                .into(),
             ))
             .child(restart_button(updater, None, this.installing)),
         Stage::Failed { release, problem } => {

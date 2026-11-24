@@ -195,8 +195,9 @@ Ctrl+C 中断（选中文字时为复制）；Ctrl+Shift+C 复制；Ctrl+V、Shi
   会询问是否删除；如本机有 kuaid 的文件夹（%USERPROFILE%\.kuai），会询问是否同时停止 kuaid 并删除该文件夹
   （默认保留：其他电脑连接到本机后打开的终端也在其中）；设置文件会保留，如不再需要，请删除上述文件夹。
 - 卸载解压版：先在设置中关闭「开机时自动启动」，移除保存了密码的主机，然后删除此文件夹和上述设置文件。
-- 远程主机上：先运行 ~/.kuai/*/kuaid --stop（结束终端并退出常驻进程），然后删除 ~/.kuai。
-- 查看主机上的常驻进程和终端：~/.kuai/*/kuaid --status；日志位于 ~/.kuai/run/kuaid.log。
+- 远程主机上：先运行 ~/.kuai/"$(cat ~/.kuai/run/current)"/kuaid --stop（结束终端并退出常驻进程），
+  显示「常驻进程已退出」后删除 ~/.kuai。~/.kuai 下可能有几个版本，常驻进程用的那个记在 ~/.kuai/run/current 中。
+- 查看主机上的常驻进程和终端：~/.kuai/"$(cat ~/.kuai/run/current)"/kuaid --status；日志位于 ~/.kuai/run/kuaid.log。
 - kuaid\x86_64-pc-windows-msvc 中的 conpty.dll、OpenConsole.exe 是微软 Windows Terminal 项目发布的
   新版 ConPTY（MIT 许可），供 Windows 上的终端使用。
 - 本机和 Windows 主机上的 kuaid 位于 %USERPROFILE%\.kuai 下，用法相同：在命令行中运行其中的

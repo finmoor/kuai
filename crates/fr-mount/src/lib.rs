@@ -279,6 +279,11 @@ mod imp {
                 up: counters.up.load(Relaxed),
             }
         }
+
+        /// 映射没了时完成（Linux 上在外面卸掉了）。WinFsp 的盘在 Kuai 外面卸不掉，永远不完成。
+        pub fn ended(&mut self) -> futures::future::BoxFuture<'static, ()> {
+            Box::pin(futures::future::pending())
+        }
     }
 
     impl Drop for Mounted {
@@ -309,6 +314,7 @@ mod linux {
     use fr_core::tf;
     use fuser::MountOption;
     use futures::executor::block_on;
+    use futures::future::BoxFuture;
 
     use super::{Options, Stats};
     use crate::fs::linux::{Fuse, THREADS};
@@ -347,6 +353,10 @@ mod linux {
         place: String,
         /// 文件夹是映射时建的：卸载后删掉
         created: bool,
+        /// 会话结束时收到（见 [`Mounted::ended`]）
+        ended: Option<futures::channel::oneshot::Receiver<()>>,
+        /// 文件夹走到底的路径（`/proc/self/mountinfo` 里写的是这个），卸载时认它
+        real: PathBuf,
     }
 
     /// 上次 Kuai 没正常退出，映射还挂在那里（读它报「Transport endpoint is not connected」）：
@@ -408,6 +418,7 @@ mod linux {
             }
         };
 
+        let real = std::fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf());
         let settings = Settings {
             root,
             place: place.clone(),
@@ -432,12 +443,15 @@ mod linux {
         config.mount_options = mount_options;
         config.n_threads = Some(THREADS);
         config.clone_fd = true;
-        match fuser::spawn_mount(Fuse::new(mount.clone()), folder, &config) {
+        let (ended_tx, ended) = futures::channel::oneshot::channel();
+        match fuser::spawn_mount(Fuse::new(mount.clone(), ended_tx), folder, &config) {
             Ok(session) => Ok(Mounted {
                 session: Some(session),
                 mount,
                 place,
                 created,
+                ended: Some(ended),
+                real,
             }),
             Err(err) => {
                 if created {
@@ -473,17 +487,81 @@ mod linux {
                 up: counters.up.load(Relaxed),
             }
         }
+
+        /// 映射没了时完成：在外面卸掉了（文件管理器里点了卸载、`fusermount3 -u`），或者放掉了它。
+        /// 只能拿一次，再拿是永远不完成的。
+        pub fn ended(&mut self) -> BoxFuture<'static, ()> {
+            match self.ended.take() {
+                Some(ended) => Box::pin(async move {
+                    let _ = ended.await;
+                }),
+                None => Box::pin(futures::future::pending()),
+            }
+        }
     }
 
     impl Drop for Mounted {
         fn drop(&mut self) {
-            // 卸载（fusermount3 -u -z）：还有程序开着里面的文件也马上卸，那些文件关掉之前照样能读写
-            drop(self.session.take());
+            // 先不再收新的写入、等收下的都落到主机上（见 `Mount::finish`），再卸载
             self.mount.finish();
+            // 放掉会话时 fuser 卸载（不带 -z）：还有程序开着里面的文件、当前目录在里面时卸不掉，这时
+            // 用 fusermount3 -u -z，先从目录树上摘下来，那些程序用完了系统再真的卸（开着的文件照样能读，
+            // 写报错）。原来卸不掉就留在那里，Kuai 退出以后成了「连不上」的死目录
+            drop(self.session.take());
+            if mounted_at(&self.real)
+                && let Some(fusermount) = fusermount()
+            {
+                log::info!("{} 还有程序在用，先摘下来", self.place);
+                let _ = std::process::Command::new(fusermount)
+                    .args(["-u", "-z"])
+                    .arg(&self.real)
+                    .output();
+            }
             if self.created {
                 let _ = std::fs::remove_dir(&self.place);
             }
         }
+    }
+
+    /// `folder` 上是不是挂着 Kuai 的映射：`/proc/self/mountinfo` 里第 5 项是挂载点，` - ` 后面第一项
+    /// 是类型（`fuse.kuai`）。只认我们的，别的程序后来挂在这里的不动。
+    fn mounted_at(folder: &Path) -> bool {
+        let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") else {
+            return false;
+        };
+        text.lines().any(|line| {
+            let point = line.split(' ').nth(4).map(unescape);
+            let kind = line
+                .split_once(" - ")
+                .and_then(|(_, rest)| rest.split(' ').next());
+            kind == Some("fuse.kuai") && point.is_some_and(|point| Path::new(&point) == folder)
+        })
+    }
+
+    /// mountinfo 里的路径：空格、制表符、换行、反斜杠写成 `\ooo`（三位八进制）。
+    pub(crate) fn unescape(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut at = 0;
+        while at < bytes.len() {
+            let code = bytes.get(at + 1..at + 4).filter(|digits| {
+                bytes[at] == b'\\' && digits.iter().all(|digit| (b'0'..=b'7').contains(digit))
+            });
+            match code {
+                Some(digits) => {
+                    let value = digits
+                        .iter()
+                        .fold(0u32, |value, digit| value * 8 + u32::from(digit - b'0'));
+                    out.push(value as u8);
+                    at += 4;
+                }
+                None => {
+                    out.push(bytes[at]);
+                    at += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
     }
 }
 
@@ -535,6 +613,10 @@ mod stub {
         pub fn stats(&self) -> Stats {
             Stats::default()
         }
+
+        pub fn ended(&mut self) -> futures::future::BoxFuture<'static, ()> {
+            Box::pin(futures::future::pending())
+        }
     }
 }
 
@@ -573,6 +655,110 @@ mod fuse_tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// 等到 `done` 成立，最多等几秒（内核关文件时的 release 是后发的）。
+    fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        done()
+    }
+
+    /// 删掉、改名盖掉还开着的文件：开着的接着读写原来那个，同名新建的是另一个，最后一个句柄关了
+    /// 主机上藏起来的也删掉。目录盖空目录，不空的报 ENOTEMPTY，文件盖目录报 EISDIR。主机上的权限位
+    /// 看得到，可执行的脚本能直接运行，chmod 在主机上真的改，改属主报 EPERM。
+    #[test]
+    fn 经_fuse_删掉开着的文件_改名盖掉_目录盖空目录_权限() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if std::env::var_os("FR_FUSE_TEST").is_none_or(|flag| flag != "1") || !installed() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("fr-fuse-posix-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (host, place) = (base.join("host"), base.join("mnt"));
+        fs::create_dir_all(&host).unwrap();
+        fs::write(host.join("open.txt"), b"old").unwrap();
+        let options = Options {
+            root: host.to_string_lossy().into_owned(),
+            place: place.to_string_lossy().into_owned(),
+            read_only: false,
+            windows: false,
+            label: "test".into(),
+            share: String::new(),
+        };
+        let mounted = mount(Channel::Local, options, |_| {}).unwrap();
+
+        // 删掉开着的
+        let mut held = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(place.join("open.txt"))
+            .unwrap();
+        fs::remove_file(place.join("open.txt")).unwrap();
+        assert!(!place.join("open.txt").exists());
+        assert!(sorted_names(&place).is_empty(), "藏起来的不该显示");
+        fs::write(place.join("open.txt"), b"new").unwrap();
+        let mut text = String::new();
+        held.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "old");
+        held.seek(SeekFrom::Start(0)).unwrap();
+        held.write_all(b"OLD").unwrap();
+        held.sync_all().unwrap();
+        assert_eq!(fs::read(place.join("open.txt")).unwrap(), b"new");
+        assert_eq!(fs::read(host.join("open.txt")).unwrap(), b"new");
+        drop(held);
+        assert!(
+            wait_until(|| sorted_names(&host) == ["open.txt"]),
+            "关了以后藏起来的没删：{:?}",
+            sorted_names(&host)
+        );
+
+        // 改名盖掉开着的
+        fs::write(place.join("b.txt"), b"bee").unwrap();
+        let mut held = fs::File::open(place.join("open.txt")).unwrap();
+        fs::rename(place.join("b.txt"), place.join("open.txt")).unwrap();
+        assert_eq!(fs::read(place.join("open.txt")).unwrap(), b"bee");
+        let mut text = String::new();
+        held.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "new");
+        drop(held);
+        assert!(wait_until(|| sorted_names(&host) == ["open.txt"]));
+
+        // 目录盖空目录；不空的、文件盖目录不行
+        fs::create_dir_all(place.join("src/inner")).unwrap();
+        fs::create_dir(place.join("empty")).unwrap();
+        fs::rename(place.join("src"), place.join("empty")).unwrap();
+        assert!(host.join("empty/inner").is_dir() && !host.join("src").exists());
+        fs::create_dir(place.join("other")).unwrap();
+        let err = fs::rename(place.join("other"), place.join("empty")).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTEMPTY));
+        let err = fs::rename(place.join("open.txt"), place.join("other")).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EISDIR));
+
+        // 权限位
+        fs::write(host.join("run.sh"), b"#!/bin/sh\necho hi\n").unwrap();
+        fs::set_permissions(host.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        // 刚在主机上建的：留着的目录过了留存的时间才看得到
+        let mode =
+            |path: &Path| fs::metadata(path).map_or(0, |meta| meta.permissions().mode() & 0o7777);
+        assert!(wait_until(|| mode(&place.join("run.sh")) == 0o755));
+        let ran = std::process::Command::new(place.join("run.sh"))
+            .output()
+            .unwrap();
+        assert_eq!(ran.stdout, b"hi\n");
+        fs::set_permissions(place.join("run.sh"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(mode(&host.join("run.sh")), 0o700);
+        assert_eq!(mode(&place.join("run.sh")), 0o700);
+        let err = std::os::unix::fs::chown(place.join("run.sh"), Some(0), None).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+
+        drop(mounted);
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -718,5 +904,112 @@ mod fuse_tests {
         drop(mounted);
         assert!(place.is_dir() && fs::read_dir(&place).unwrap().next().is_none());
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn mountinfo_里的路径() {
+        assert_eq!(
+            super::linux::unescape(r"/home/me/Kuai/a\040b\011c\134d"),
+            "/home/me/Kuai/a b\tc\\d"
+        );
+        assert_eq!(super::linux::unescape(r"/plain/\9x"), r"/plain/\9x");
+        assert_eq!(super::linux::unescape("/中文/目录"), "/中文/目录");
+    }
+
+    /// 卸载时还有程序开着里面的文件、当前目录在里面：照样卸掉（-z），不留成「连不上」的死目录；
+    /// 卸载以后再写报错，卸载前收下的都在主机上。
+    #[test]
+    fn 经_fuse_卸载时还开着文件_摘下来_收下的写入都在主机上() {
+        use std::time::Duration;
+        if std::env::var_os("FR_FUSE_TEST").is_none_or(|flag| flag != "1") || !installed() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("fr-fuse-busy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (host, place) = (base.join("host"), base.join("mnt"));
+        fs::create_dir_all(&host).unwrap();
+        let options = Options {
+            root: host.to_string_lossy().into_owned(),
+            place: place.to_string_lossy().into_owned(),
+            read_only: false,
+            windows: false,
+            label: "test".into(),
+            share: String::new(),
+        };
+        let mounted = mount(Channel::Local, options, |_| {}).unwrap();
+        // 一直往里写，记下写成了多少
+        let writer = {
+            let file = place.join("log.bin");
+            std::thread::spawn(move || {
+                let mut out = fs::File::create(&file).unwrap();
+                let mut written = 0u64;
+                let chunk = [7u8; 4096];
+                while out.write_all(&chunk).is_ok() {
+                    written += chunk.len() as u64;
+                    if written > 64 << 20 {
+                        break;
+                    }
+                }
+                drop(out);
+                written
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        drop(mounted);
+        let written = writer.join().unwrap();
+        assert!(written > 0);
+        // 写成了的都在主机上
+        assert_eq!(fs::metadata(host.join("log.bin")).unwrap().len(), written);
+        // 卸掉了：mountinfo 里没有它
+        let real = fs::canonicalize(&base).unwrap().join("mnt");
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap();
+        assert!(
+            !mountinfo
+                .lines()
+                .any(|line| line.split(' ').nth(4).map(super::linux::unescape)
+                    == Some(real.to_string_lossy().into_owned())),
+            "还挂着"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn 经_fuse_在外面卸掉了_ended_会完成() {
+        use std::time::Duration;
+        if std::env::var_os("FR_FUSE_TEST").is_none_or(|flag| flag != "1") || !installed() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("fr-fuse-ended-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (host, place) = (base.join("host"), base.join("mnt"));
+        fs::create_dir_all(&host).unwrap();
+        let options = Options {
+            root: host.to_string_lossy().into_owned(),
+            place: place.to_string_lossy().into_owned(),
+            read_only: false,
+            windows: false,
+            label: "test".into(),
+            share: String::new(),
+        };
+        let mut mounted = mount(Channel::Local, options, |_| {}).unwrap();
+        let ended = mounted.ended();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            futures::executor::block_on(ended);
+            let _ = tx.send(());
+        });
+        // 挂着的时候不完成
+        assert!(rx.recv_timeout(Duration::from_millis(500)).is_err());
+        // 文件管理器里点「卸载」也是这样卸的
+        let status = std::process::Command::new("fusermount3")
+            .arg("-u")
+            .arg(&place)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("在外面卸掉以后 ended 没完成");
+        drop(mounted);
+        let _ = fs::remove_dir_all(&base);
     }
 }

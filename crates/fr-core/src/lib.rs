@@ -4,6 +4,7 @@ pub mod askpass;
 pub mod blame;
 pub mod compare;
 pub mod dir;
+pub mod exe;
 pub mod exec;
 pub mod files;
 pub mod git;

@@ -180,10 +180,11 @@ fn workspace_action<A: Action>(
     });
 }
 
-/// 设置文件的问题在主窗口上说：启动时读它出了问题（见 [`settings::LoadIssue`]），之后存不了。
-/// 这两种通知都不自己消失，用户得看到。
+/// 设置文件的问题在主窗口上说：启动时读它出了问题（见 [`settings::LoadIssue`]）、锁不上它
+/// （`unlocked`），之后存不了。这几种通知都不自己消失，用户得看到。
 fn tell_settings_problems(
     load_issue: Option<settings::LoadIssue>,
+    unlocked: Option<String>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -191,6 +192,13 @@ fn tell_settings_problems(
     use gpui_kit::component::notification::Notification;
     if let Some(issue) = load_issue {
         window.push_notification(Notification::error(issue.text()).autohide(false), cx);
+    }
+    if let Some(err) = unlocked {
+        let text = fr_core::tf!(
+            "无法锁定设置文件（{err}），无法确定是否有另一个 Kuai 在使用它。这次运行中的改动不会保存，以免互相覆盖。",
+            err
+        );
+        window.push_notification(Notification::error(text).autohide(false), cx);
     }
     let mut failures = app_state::save_failures();
     window
@@ -444,7 +452,7 @@ fn main() {
         activation,
         ..Default::default()
     };
-    let (_instance, incoming) = match instance::claim(&request) {
+    let (single, incoming) = match instance::claim(&request) {
         instance::Claim::First(guard, incoming) => (guard, incoming),
         instance::Claim::Forwarded => return,
     };
@@ -467,6 +475,11 @@ fn main() {
     std::thread::spawn(fr_core::git::local_version);
 
     let (settings, load_issue) = settings::load();
+    // 锁不上设置文件：这次运行不写它（见 `instance::Guard::unlocked`）
+    let unlocked = single.unlocked().map(str::to_string);
+    if let Some(err) = &unlocked {
+        settings::hold_writes(err);
+    }
     // 语言在画任何界面之前就定下来
     fr_core::i18n::set_lang(settings.language.resolve());
 
@@ -614,12 +627,19 @@ fn main() {
                 let workspace = cx.new(|cx| Workspace::new(app, updater, prompts, window, cx));
                 cx.set_global(MainWorkspace(workspace.downgrade(), window.window_handle()));
                 if start_minimized {
-                    workspace.update(cx, |ws, _| ws.start_in_tray(window));
+                    workspace.update(cx, |ws, cx| ws.start_in_tray(window, cx));
                 }
-                if let Some(dir) = open_arg {
-                    workspace.update(cx, |ws, cx| ws.open_local_dir(dir, window, cx));
-                }
-                tell_settings_problems(load_issue, window, cx);
+                // 通知、对话框要等组件库给窗口装上它那一层（open_window 在这个闭包返回以后才装），
+                // 在这里直接推会 panic：原来设置文件读不出来、命令行给的目录不存在时一启动就崩
+                let opener = workspace.downgrade();
+                window.defer(cx, move |window, cx| {
+                    if let Some(dir) = open_arg {
+                        opener
+                            .update(cx, |ws, cx| ws.open_local_dir(dir, window, cx))
+                            .ok();
+                    }
+                    tell_settings_problems(load_issue, unlocked, window, cx);
+                });
                 workspace
             })
             .expect("打开窗口失败");

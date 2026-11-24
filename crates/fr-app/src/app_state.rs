@@ -72,6 +72,9 @@ pub struct AppState {
     /// 最近一次连接失败在登录阶段的哪一步（诊断用，见 `diagnose`）；登录上以后才失败的是空的。
     /// 开始连接时就放进来，后台线程在连接结果出来之前写好：等同一个结果的诊断框读到的一定是这一次的
     login_failures: HashMap<String, FailureSlot>,
+    /// 每次连接一个「不要了」的标记（[`Self::drop_conns`] 时立起）：还在连、还在重试的那一次看到它就
+    /// 停下，不再按旧的设置连；它报的进度也不再写到同一台的新连接上
+    conn_dropped: HashMap<String, Arc<std::sync::atomic::AtomicBool>>,
     /// 过一会儿再存设置的任务（拖动窗口时位置一直在变，不每次都写文件）
     save_later: Option<Task<()>>,
     /// 映射到本机的目录（见 `mapping`）
@@ -111,6 +114,7 @@ impl AppState {
             stages: HashMap::new(),
             retrying: HashMap::new(),
             login_failures: HashMap::new(),
+            conn_dropped: HashMap::new(),
             save_later: None,
             mounts: crate::mapping::Mounts::new(),
             machines: HashMap::new(),
@@ -268,15 +272,28 @@ impl AppState {
         let failure_slot = FailureSlot::default();
         self.login_failures
             .insert(id.to_string(), failure_slot.clone());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(old) = self.conn_dropped.insert(id.to_string(), dropped.clone()) {
+            old.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let is_dropped = {
+            let dropped = dropped.clone();
+            move || dropped.load(std::sync::atomic::Ordering::Relaxed)
+        };
         let (progress_tx, mut progress_rx) = futures::channel::mpsc::unbounded::<Progress>();
         let retry_tx = progress_tx.clone();
         let on_stage =
             Arc::new(move |done: usize| drop(progress_tx.unbounded_send(Progress::Stage(done))))
                 as fr_channel::StageHandler;
         let stage_id = id.to_string();
+        let progress_dropped = is_dropped.clone();
         cx.spawn(async move |this, cx| {
             use futures::StreamExt as _;
             while let Some(progress) = progress_rx.next().await {
+                // 这次连接不要了（改了、删了主机）：它的进度不写，免得盖掉同一台的新连接
+                if progress_dropped() {
+                    return;
+                }
                 let updated = this.update(cx, |this, cx| {
                     match progress {
                         Progress::Stage(done) => {
@@ -298,8 +315,11 @@ impl AppState {
         .detach();
         let connecting = match split_relay(id) {
             Some((via, server)) => {
-                let via_connecting = self.connect(via, cx);
+                // 自己在重连的（不许问人）：转接的那台也照这样连，那边的 ssh 也不许问（见
+                // `ConnectOptions::no_prompt`）
+                let via_connecting = self.connect_with(via, no_prompt, cx);
                 let server = server.to_string();
+                let slot = failure_slot.clone();
                 cx.background_executor()
                     .spawn(async move {
                         let via = via_connecting.await?;
@@ -317,11 +337,16 @@ impl AppState {
                                 })
                                 .collect(),
                             on_stage: (!route.is_empty()).then_some(on_stage),
+                            no_prompt,
                             ..ConnectOptions::default()
                         };
                         Connection::connect_via(&via, &server, &target.destination, &options)
                             .map(Arc::new)
-                            .map_err(failed)
+                            .map_err(|err| {
+                                // 登录阶段在哪一步失败的、要不要人来处理（后台重连看它停不停）
+                                *slot.lock().unwrap() = fr_channel::login_failure(&err).cloned();
+                                failed(err)
+                            })
                     })
                     .shared()
             }
@@ -340,6 +365,10 @@ impl AppState {
                         options.no_prompt = no_prompt;
                         let mut retry = 0;
                         loop {
+                            // 等的时候主机被改了、删了：不再按旧的设置连
+                            if is_dropped() {
+                                return Err(SharedString::from(tr("主机设置已更改，已断开")));
+                            }
                             let started = Instant::now();
                             let err = match Connection::connect(&server.destination, &options) {
                                 Ok(conn) => return Ok(Arc::new(conn)),
@@ -514,12 +543,20 @@ impl AppState {
         self.machines.retain(|k, _| !gone(k));
         self.links.retain(|k, _| !gone(k));
         self.watches.retain(|k, _| !gone(k));
+        // 浏览器里打开过的那几台上的网页：旧地址作废，不然读到的是新那台上同一路径的仓库
+        crate::web_serve::forget_servers(|server| {
+            server == key || (and_relayed && server.starts_with(&relayed))
+        });
         self.drop_conns(gone, cx);
     }
 
     /// 丢掉键满足 `gone` 的连接，并且断开（[`Connection::close`]）：打开着的仓库、终端手里还拿着
     /// 它的话，原来一直连着原来那台，现在看到断开，按新的设置重连。还在连的，连上以后断开。
     fn drop_conns(&mut self, gone: impl Fn(&String) -> bool, cx: &mut Context<Self>) {
+        // 还在连、还在重试的也停下（见 `conn_dropped`）
+        for (_, dropped) in self.conn_dropped.extract_if(|key, _| gone(key)) {
+            dropped.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let keys: Vec<String> = self.conns.keys().filter(|key| gone(key)).cloned().collect();
         for key in keys {
             let Some(connecting) = self.conns.remove(&key) else {
@@ -556,6 +593,7 @@ impl AppState {
         // 它的连接，和经它连的那几台的
         let relayed = format!("{id}>");
         let gone = |key: &String| key == id || key.starts_with(&relayed);
+        crate::web_serve::forget_servers(|server| server == id || server.starts_with(&relayed));
         self.drop_conns(gone, cx);
         self.links.retain(|key, _| !gone(key));
         self.machines.retain(|key, _| !gone(key));

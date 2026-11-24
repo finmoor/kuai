@@ -6,7 +6,8 @@
 //! Linux 上是 StatusNotifierItem（经 D-Bus，用 ksni，不链接 GTK）：KDE 自带托盘，Ubuntu 的 GNOME
 //! 带着 AppIndicator 扩展，别的 GNOME（Fedora 等）默认没有。启动时问一下有没有托盘（[`probe`]），
 //! 没有就不显示托盘的选项；开机自启时桌面可能还没起好托盘，托盘图标照样建，等它上线（ksni 盯着），
-//! 上线、下线都记下来，窗口只在托盘真在的时候才收进去（[`available`]）。Wayland 上窗口藏不起来
+//! 上线、下线都记下来，窗口只在托盘真在的时候才收进去（[`available`]）；下线时收在里面的窗口拿出来
+//! （[`TrayAction::Lost`]）。Wayland 上窗口藏不起来
 //! （GPUI 做不到），「关闭到托盘」改成最小化，「最小化到托盘」不显示（见 [`can_hide`]）。
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -22,20 +23,15 @@ static HOST: AtomicU8 = AtomicU8::new(if cfg!(windows) { 2 } else { 0 });
 /// 主窗口能不能藏起来（Windows、X11 能；Wayland 不能）。
 static CAN_HIDE: AtomicBool = AtomicBool::new(cfg!(windows));
 
-/// 这个桌面上现在有没有托盘。Linux 上等启动时开始的 [`probe`] 问完（只有头一次可能要等，最多
-/// 2 秒），之后跟着托盘图标看到的上线、下线变。
+/// 这个桌面上现在有没有托盘（还不知道的算没有）。Linux 上启动时 [`probe`] 问，之后跟着托盘图标看到的
+/// 上线、下线变。不等：原来还不知道时在界面线程上等它问完，最多卡 2 秒，问不到就记成没有托盘。
 pub fn available() -> bool {
-    if cfg!(target_os = "linux") {
-        let started = std::time::Instant::now();
-        while HOST.load(Ordering::Relaxed) == 0 {
-            if started.elapsed() > std::time::Duration::from_secs(2) {
-                HOST.store(1, Ordering::Relaxed);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
     HOST.load(Ordering::Relaxed) == 2
+}
+
+/// 还不知道有没有托盘（Linux 上启动时的 [`probe`] 还没问完）。
+pub fn unknown() -> bool {
+    HOST.load(Ordering::Relaxed) == 0
 }
 
 /// 主窗口能不能藏进托盘（不在任务栏上）。Wayland 上不能，只能最小化。
@@ -77,6 +73,9 @@ pub enum TrayAction {
     Show { token: Option<String> },
     /// 退出程序
     Quit,
+    /// 托盘不在了（Linux：托盘宿主下线）：收在里面的窗口要拿出来
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Lost,
 }
 
 pub struct Tray {
@@ -281,6 +280,7 @@ mod linux {
         fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
             log::info!("托盘不在：{reason:?}");
             super::HOST.store(1, Ordering::Relaxed);
+            let _ = self.actions.unbounded_send(TrayAction::Lost);
             true
         }
 

@@ -385,11 +385,115 @@ pub fn open_folder(dir: &str) -> Result<(), String> {
 /// 在另起的线程上打开：ShellExecute 要等打开的程序（浏览器、Office）回话，等的时候处理窗口消息，在
 /// 界面线程上调的话界面库会重入（日志里一串「RefCell already borrowed」，那一阵画不出来）；
 /// `xdg-open` 要等它退出才知道打开没有。
+///
+/// 程序、脚本、快捷方式（[`runs_code`]）的「默认程序」就是运行它：先问一下。想看脚本写了什么却点了
+/// 「用默认程序打开」，或者主机上下载下来的程序，都不该一点就运行；下载的副本也没有「来自网络」的
+/// 标记，SmartScreen 不拦。
 pub fn open_file(path: &str, window: &mut Window, cx: &mut App) {
     let path = native_path(path);
     if !Path::new(&path).is_file() {
         return report(Err(tf!("文件不存在：{path}", path)), window, cx);
     }
+    if runs_code(&path) {
+        let name = Path::new(&path)
+            .file_name()
+            .map_or_else(|| path.clone(), |name| name.to_string_lossy().into_owned());
+        let description = tf!(
+            "{name} 是程序或脚本，用默认程序打开会直接运行它。请只运行信任的文件。",
+            name
+        );
+        return ask(
+            (tr("运行此文件？"), description, tr("运行")),
+            move |window, cx| launch_file(path, window, cx),
+            window,
+            cx,
+        );
+    }
+    launch_file(path, window, cx);
+}
+
+/// 默认程序就是运行它的文件：Windows 上的程序、脚本、快捷方式，Linux 上的桌面启动文件（`.desktop`，
+/// `xdg-open` 会照里面写的命令运行）。
+pub fn runs_code(path: &str) -> bool {
+    let ext = Path::new(path)
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    #[cfg(windows)]
+    let listed = [
+        "exe",
+        "com",
+        "bat",
+        "cmd",
+        "scr",
+        "pif",
+        "msi",
+        "msp",
+        "cpl",
+        "msc",
+        "lnk",
+        "url",
+        "vbs",
+        "vbe",
+        "js",
+        "jse",
+        "wsf",
+        "wsh",
+        "hta",
+        "reg",
+        "jar",
+        "appref-ms",
+        "application",
+        "scf",
+    ];
+    #[cfg(not(windows))]
+    let listed = ["desktop"];
+    listed.contains(&ext.as_str())
+}
+
+/// 问一句：`title`、`description`、确定按钮上的字；点了确定才做 `action`。
+pub fn ask(
+    (title, description, ok): (&'static str, String, &'static str),
+    action: impl FnOnce(&mut Window, &mut App) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+    use gpui_kit::component::dialog::DialogFooter;
+    use gpui_kit::{ClickEvent, ParentElement as _};
+    // 对话框每次重画都会调一遍下面的闭包，要做的事只能取走一次
+    let job = std::rc::Rc::new(std::cell::Cell::new(Some(action)));
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let job = job.clone();
+        let go = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            window.close_dialog(cx);
+            if let Some(action) = job.take() {
+                action(window, cx);
+            }
+        };
+        alert
+            .title(title)
+            .description(description.clone())
+            .on_ok(|_, _, _| false)
+            .footer(
+                DialogFooter::new()
+                    .child(
+                        Button::new("cancel")
+                            .label(tr("取消"))
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    )
+                    .child(
+                        Button::new("ok")
+                            .label(ok)
+                            .with_variant(ButtonVariant::Primary)
+                            .on_click(go),
+                    ),
+            )
+    });
+}
+
+/// [`open_file`] 真正去打开（已经问过了）。
+fn launch_file(path: String, window: &mut Window, cx: &mut App) {
     let (send, done) = futures::channel::oneshot::channel();
     std::thread::spawn(move || {
         let _ = send.send(system_open(&path));

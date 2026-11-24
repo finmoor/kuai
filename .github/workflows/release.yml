@@ -11,8 +11,9 @@ on:
   push:
     tags: ['v*']
 
+# 默认只读：测试、打包的两个任务跑第三方的工具和脚本，用不着改仓库、建 Release；只有 publish 要写
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   windows:
@@ -21,6 +22,8 @@ jobs:
       TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -80,6 +83,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -98,7 +103,8 @@ jobs:
           name: kuaid
           path: kuaid-from-windows
 
-      # AppImage 的打包程序和运行时：固定版本，核对校验值（GitHub 给附件记的 SHA-256）
+      # AppImage 的打包程序和运行时：固定版本，核对校验值（GitHub 给附件记的 SHA-256）。换运行时的
+      # 版本时照 vendor/appimage-runtime/README.md 换许可证
       - name: 下 AppImage 的打包工具
         run: |
           mkdir -p appimage-tools && cd appimage-tools
@@ -126,10 +132,15 @@ jobs:
   publish:
     needs: [windows, linux]
     runs-on: ubuntu-latest
+    # 建 Release、传附件
+    permissions:
+      contents: write
     env:
       TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/download-artifact@v4
         with:

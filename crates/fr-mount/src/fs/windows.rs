@@ -13,11 +13,12 @@ pub(crate) fn filetime(millis: u64) -> u64 {
     millis * 10_000 + EPOCH_GAP
 }
 
-/// Windows 的文件时间换成 1970 年起的毫秒数；0 和全 1 是「不改」，1970 年以前的也不管，都是 0。
-fn millis_of(filetime: u64) -> u64 {
+/// Windows 的文件时间换成 1970 年起的毫秒数；0 和全 1 是「不改」（None），1970 年以前的也不管。
+/// 正好是 1970 年那一刻的是 `Some(0)`：原来也换成 0，和「不改」混在一起，设不成那个时间。
+pub(crate) fn millis_of(filetime: u64) -> Option<u64> {
     match filetime == u64::MAX || filetime < EPOCH_GAP {
-        true => 0,
-        false => (filetime - EPOCH_GAP) / 10_000,
+        true => None,
+        false => Some((filetime - EPOCH_GAP) / 10_000),
     }
 }
 
@@ -294,7 +295,7 @@ unsafe extern "C" fn cleanup(fs: Fs, context: Ctx, _name: PWSTR, flags: u32) {
         handle(context).uncount(mount);
         if flags & CLEANUP_DELETE != 0 {
             // 系统这时已经当作删掉了（Cleanup 报不了错）：没删成的经 `on_error` 告诉用户
-            let _ = mount.remove(node, true);
+            let _ = mount.remove(node, true, None);
             return Ok(());
         }
         mount.commit(node).map(|_| ())
@@ -306,7 +307,7 @@ unsafe extern "C" fn close(fs: Fs, context: Ctx) {
         let mount = mount(fs);
         let handle = Box::from_raw(context.cast::<Handle>());
         handle.uncount(mount);
-        mount.close(handle.node);
+        mount.close(handle.node, true);
         Ok(())
     });
 }

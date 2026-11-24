@@ -246,8 +246,28 @@ fn row_in<'a>(hub: &'a [RepoGroup], slot: &TermSlot) -> Option<&'a Row> {
 /// 一个仓库的终端分成两段：固定的（按固定的先后）、没固定的。标签栏和侧栏都是这个顺序。
 /// 仓库在不在 `scope` 那台电脑上。经别的电脑连的算那台电脑的：经 A 连的 B 上的仓库是 A 的。
 fn on_machine(scope: &str, entry: &RepoEntry) -> bool {
+    home_machine(entry) == scope
+}
+
+/// 仓库算哪台电脑的（只看一台时按它筛）：经 A 连的 B 上的仓库是 A 的。
+fn home_machine(entry: &RepoEntry) -> &str {
     let machine = machine_of(entry);
-    split_relay(machine).map_or(machine, |(via, _)| via) == scope
+    split_relay(machine).map_or(machine, |(via, _)| via)
+}
+
+/// 仓库在侧栏里列在哪个工作区下面（不在工作区里是 None）。
+fn listed_in(hub: &[RepoGroup], entry: &RepoEntry) -> Option<WorkspaceKey> {
+    hub.iter().find_map(|group| match &group.key {
+        GroupKey::Workspace(key)
+            if group
+                .repos
+                .iter()
+                .any(|(listed, _)| listed.same_repo(entry)) =>
+        {
+            Some(key.clone())
+        }
+        _ => None,
+    })
 }
 
 fn ordered(rows: &[Row], pins: &[TermSlot]) -> (Vec<Row>, Vec<Row>) {
@@ -773,10 +793,44 @@ impl TermOverview {
         cx.notify();
     }
 
-    /// 这一页不显示了：不用再接着那个终端。
+    /// 这一页不显示了：不用再接着那个终端。刚开的、预设的命令还没输入的先留着，输入了再放：
+    /// 放掉的话 kuaid 里已经开好的 shell 等不到这条命令（等提示符的计时在画面上）。
     pub fn hidden(&mut self, cx: &mut Context<Self>) {
         self.visible = false;
-        self.peek = None;
+        let starting = self
+            .peek
+            .as_ref()
+            .is_some_and(|peek| peek.owned && peek.view.read(cx).run_pending());
+        if starting {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(200))
+                        .await;
+                    let done = this.update(cx, |this, cx| {
+                        // 又回到这一页了：接着用它
+                        if this.visible {
+                            return true;
+                        }
+                        let pending = this
+                            .peek
+                            .as_ref()
+                            .is_some_and(|peek| peek.view.read(cx).run_pending());
+                        if !pending {
+                            this.peek = None;
+                            cx.notify();
+                        }
+                        !pending
+                    });
+                    if done.unwrap_or(true) {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        } else {
+            self.peek = None;
+        }
         cx.notify();
     }
 
@@ -985,17 +1039,7 @@ impl TermOverview {
     /// 这个仓库在侧栏里列在哪个工作区下面（「打开工作区」在几个工作区里时它排第一）；在「未加入
     /// 工作区」里、不在侧栏里是 None。
     pub fn listed_under(&self, entry: &RepoEntry, cx: &App) -> Option<WorkspaceKey> {
-        self.hub(cx).into_iter().find_map(|group| match group.key {
-            GroupKey::Workspace(key)
-                if group
-                    .repos
-                    .iter()
-                    .any(|(listed, _)| listed.same_repo(entry)) =>
-            {
-                Some(key)
-            }
-            _ => None,
-        })
+        listed_in(&self.hub(cx), entry)
     }
 
     /// 焦点放到右边的终端里，开始输入（后退回到这一页时，离开前就在输入的也放回去）。
@@ -1028,6 +1072,28 @@ impl TermOverview {
     }
 
     /// 换一台服务器看（没有是全部）。右边显示着的终端不动。
+    /// 只看一台电脑时，要显示的终端在侧栏里列不出来（Ctrl+Shift+N 选了别台主机的仓库）：换成看
+    /// 列着它的那台，哪台都不单独列它（比如它在本机的工作区里）就看全部。固定了的在上面列着，不用换。
+    fn reveal(&mut self, slot: &TermSlot, hub: &[RepoGroup], cx: &mut Context<Self>) {
+        let Some(scope) = self.scope(cx) else {
+            return;
+        };
+        if self.pinned_term(slot, cx) || self.pinned_repo(&slot.entry, cx) {
+            return;
+        }
+        let lists = |machine: &str, cx: &App| {
+            self.scoped(machine, hub, cx)
+                .iter()
+                .any(|group| group.repos.iter().any(|(entry, _)| *entry == slot.entry))
+        };
+        if lists(&scope, cx) {
+            return;
+        }
+        let home = home_machine(&slot.entry).to_string();
+        let to = lists(&home, cx).then_some(home);
+        self.set_scope(to, cx);
+    }
+
     fn set_scope(&mut self, scope: Option<String>, cx: &mut Context<Self>) {
         self.app
             .update(cx, |app, cx| app.edit_term_hub(cx, |hub| hub.scope = scope));
@@ -1237,6 +1303,7 @@ impl TermOverview {
             self.toggle_repo(&slot.entry, cx);
         }
         let hub = self.hub(cx);
+        self.reveal(&slot, &hub, cx);
         let home = hub
             .iter()
             .find(|group| group.repos.iter().any(|(entry, _)| *entry == slot.entry));
@@ -1259,7 +1326,7 @@ impl TermOverview {
     fn open_view(&mut self, slot: TermSlot, window: &mut Window, cx: &mut Context<Self>) {
         let (entry, app, number) = (slot.entry.clone(), self.app.clone(), slot.number);
         // 从预设开的（新建、重启）：新开出来的 shell 里替用户输入命令
-        let start = presets::started(&slot, cx);
+        let start = presets::started(&slot, None, cx);
         let view = cx.new(|cx| {
             let mut view = TerminalView::new(
                 move |cx| {
@@ -1271,7 +1338,7 @@ impl TermOverview {
                 window,
                 cx,
             );
-            view.run_on_start(start);
+            view.run_on_start(start, Some(slot.clone()));
             view
         });
         view.focus_handle(cx).focus(window, cx);
@@ -1289,7 +1356,7 @@ impl TermOverview {
     /// [`crate::terminal::short_title`]）；从预设开的、标题还是 shell 的写预设的名字（见
     /// [`presets::display_name`]）；都没有的写「终端 N」。
     pub(crate) fn term_name(row: &Row, cx: &App) -> SharedString {
-        let start = presets::started(&row.slot(), cx);
+        let start = presets::started(&row.slot(), Some(&row.id.term), cx);
         presets::display_name(row.title.as_deref(), start.as_ref())
             .unwrap_or_else(|| tf!("终端 {n}", n = row.number.to_string()).into())
     }
@@ -1397,6 +1464,7 @@ impl TermOverview {
         let Some(closing) = self.close(&row, cx) else {
             return Self::failed(false, tr("未连接"), window, cx);
         };
+        presets::ended(slot, &row.id.term, cx);
         if let Some(next) = next {
             self.shown = next;
         }
@@ -1445,6 +1513,10 @@ impl TermOverview {
         let row = self.find(slot, cx);
         if Self::changed(row.as_ref(), id, window, cx) {
             return;
+        }
+        // 从预设开的：重启以后新开的再输入一遍（记着的是别的会话的就不输入）
+        if let Some(row) = &row {
+            presets::restarting(slot, &row.id.term, cx);
         }
         // 问的这一会儿它自己没了（结束以后被清掉了）：不用关，直接在这个位置上开一个新的
         let closing = match &row {
@@ -1762,7 +1834,9 @@ impl TermOverview {
                 .programs
                 .as_deref()
                 .and_then(|programs| presets::program_icon(programs, cx))
-                .or_else(|| presets::started(&row.slot(), cx).map(|start| start.icon)),
+                .or_else(|| {
+                    presets::started(&row.slot(), Some(&row.id.term), cx).map(|start| start.icon)
+                }),
             Program::Shell | Program::Unknown => None,
         };
         if let Some(icon) = known {
@@ -2145,7 +2219,7 @@ impl TermOverview {
         &self,
         index: usize,
         group: &SideGroup,
-        scoped: bool,
+        scope: Option<&str>,
         sticky: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2162,9 +2236,10 @@ impl TermOverview {
             GroupKey::Workspace(key) => (app.workspace_name(key), false),
             GroupKey::Unbound(_) => (tr("未加入工作区").into(), true),
         };
-        // 主机上的标出是哪台；只列着一台的时候不用标
+        // 主机上的标出是哪台；只看一台时，那台自己的不用标（经它连的别台照样标，不然几节都叫
+        // 「未加入工作区」，分不出是哪台）
         let at = group.key.machine();
-        let machine = (at != LOCAL && !scoped).then(|| app.machine_name(at));
+        let machine = (at != LOCAL && scope != Some(at)).then(|| app.machine_name(at));
         let chip = |text: SharedString| {
             div()
                 .flex_none()
@@ -2631,9 +2706,10 @@ impl TermOverview {
             }
         }
         let scoped = side.scope.is_some();
+        let scope = side.scope.as_deref();
         // 一个工作区是滚动区域里的一个孩子（标题和它下面的行），吸顶的标题按孩子的位置算
         for (at, group) in side.groups.iter().enumerate() {
-            let mut rows = vec![self.render_group_head(at, group, scoped, false, cx)];
+            let mut rows = vec![self.render_group_head(at, group, scope, false, cx)];
             if !group.collapsed {
                 for repo in &group.repos {
                     self.push_repo(repo, &on, &mut index, &mut rows, cx);
@@ -2653,7 +2729,7 @@ impl TermOverview {
                 .top(px(push))
                 .left_0()
                 .right_0()
-                .child(self.render_group_head(at, &side.groups[at], scoped, true, cx))
+                .child(self.render_group_head(at, &side.groups[at], scope, true, cx))
         });
         // 树是空的：列着全部电脑、上面又有固定的时候不用说（没有的已经在上面了）
         let empty = side.groups.is_empty() && !side.offline && (scoped || !has_pinned);
@@ -3002,7 +3078,7 @@ impl TermOverview {
         // 两个按钮对着哪个仓库（和 `go` 一样）、它在侧栏里列在哪个工作区下面
         let go_to = shown.as_ref().map(|row| row.entry.clone()).or(repo.clone());
         let target = go_to.clone().map(|entry| {
-            let home = self.listed_under(&entry, cx);
+            let home = listed_in(hub, &entry);
             (entry, home)
         });
         h_flex()

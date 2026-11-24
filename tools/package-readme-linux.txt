@@ -43,8 +43,9 @@ https://github.com/finmoor/kuai 。
 --------
 - 设置：~/.config/kuai/settings.json，不包含密码。
 - 仓库列表和工作区：~/.config/kuai/workspaces.json，由本机的 kuaid 读写。
-- 本机的 kuaid 和终端：~/.kuai/。查看常驻进程和终端：~/.kuai/*/kuaid --status；
-  结束终端并退出常驻进程：~/.kuai/*/kuaid --stop。
+- 本机的 kuaid 和终端：~/.kuai/。~/.kuai 下可能有几个版本，常驻进程用的那个记在 ~/.kuai/run/current 中。
+  查看常驻进程和终端：~/.kuai/"$(cat ~/.kuai/run/current)"/kuaid --status；
+  结束终端并退出常驻进程：~/.kuai/"$(cat ~/.kuai/run/current)"/kuaid --stop。
 - 开机自动启动：~/.config/autostart/kuai.desktop。
 - 更新时下载的文件：~/.cache/kuai/update/。
 
@@ -53,15 +54,17 @@ https://github.com/finmoor/kuai 。
 有新版本时，标题栏齿轮左侧显示「新版本 x.y.z」，点击可查看更新内容，点击「更新」开始下载，
 下载完成后点击「重启以完成更新」，在原文件夹中替换文件。远程主机上和本机 kuaid 中的终端不受影响。
 文件夹没有写入权限时无法自动更新，请前往 https://github.com/finmoor/kuai/releases 手动下载。
-.deb 安装的会弹出系统的管理员认证，由 apt 安装新的 .deb；AppImage 会替换原来的 .AppImage 文件。
+.deb 安装的会弹出系统的管理员认证，由 apt 安装新的 .deb（需要 pkexec；没有时请下载新的 .deb，
+用 sudo apt install ./kuai_<版本>_amd64.deb 安装）；AppImage 会替换原来的 .AppImage 文件。
 
 卸载
 ----
 1. 在设置中关闭「开机时自动启动」，移除保存了密码的主机。
 2. 删除此文件夹，以及 ~/.local/share/applications/kuai.desktop、
    ~/.local/share/icons/hicolor/256x256/apps/kuai.png、~/.config/kuai、~/.cache/kuai。
-3. 不再需要本机终端时，先运行 ~/.kuai/*/kuaid --stop，然后删除 ~/.kuai。
-4. 远程主机上：先运行 ~/.kuai/*/kuaid --stop，然后删除 ~/.kuai。
+3. 不再需要本机终端时，先运行 ~/.kuai/"$(cat ~/.kuai/run/current)"/kuaid --stop，
+   显示「常驻进程已退出」后删除 ~/.kuai。
+4. 远程主机上：同样先运行 ~/.kuai/"$(cat ~/.kuai/run/current)"/kuaid --stop，再删除 ~/.kuai。
 
 其他
 ----

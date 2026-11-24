@@ -16,6 +16,8 @@ use fr_core::tf;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write};
+#[cfg(unix)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -334,7 +336,9 @@ fn spawn_pipes(mut cmd: Command) -> Result<Pipes> {
 }
 
 /// 请 `via` 那台电脑的 kuaid 起 ssh 连它配置的服务器 `server`，在上面执行 `command`。
-fn relay_pipes(via: &Arc<Connection>, server: &str, command: &str) -> Result<Pipes> {
+/// `quiet`：不许那边问人（后台自己重连时，见 [`ConnectOptions::no_prompt`]），那边的 ssh 要密码、要确认
+/// 主机密钥就失败（协议 17；旧的 kuaid 不认，照样问）。
+fn relay_pipes(via: &Arc<Connection>, server: &str, command: &str, quiet: bool) -> Result<Pipes> {
     let (out_tx, out_rx) = std::sync::mpsc::channel();
     let (err_tx, err_rx) = std::sync::mpsc::channel();
     let exit = Arc::new(RelayExit::default());
@@ -353,7 +357,10 @@ fn relay_pipes(via: &Arc<Connection>, server: &str, command: &str) -> Result<Pip
     let request = Request {
         id,
         method: "relay_open".into(),
-        params: json!({ "server": server, "command": command }),
+        params: match quiet {
+            true => json!({ "server": server, "command": command, "quiet": true }),
+            false => json!({ "server": server, "command": command }),
+        },
         bytes: 0,
     };
     if let Err(err) = inner.send(request, Vec::new()) {
@@ -402,7 +409,10 @@ impl Route<'_> {
                 Ok((spawn_pipes(cmd)?, saved))
             }
             // 登录方式、要不要转发 ssh-agent 都照那台电脑的配置
-            Route::Via { via, server } => Ok((relay_pipes(via, server, script)?, Vec::new())),
+            Route::Via { via, server } => Ok((
+                relay_pipes(via, server, script, options.no_prompt)?,
+                Vec::new(),
+            )),
         }
     }
 
@@ -665,6 +675,8 @@ impl Connection {
         let mut windows = known_windows(destination);
         let (mut tried_sh, mut tried_cmd) = (false, false);
         let mut refused: Option<String> = None;
+        // sh 那一遍问出来是 Windows（Git Bash、MSYS）时的结果：cmd 的写法跑不了就用它
+        let mut by_sh: Option<Probe> = None;
         loop {
             let script = match windows {
                 true => windows_probe_script(dir.as_deref()),
@@ -679,7 +691,7 @@ impl Connection {
                     git,
                 } => {
                     let kind = server_os(&os);
-                    return Ok(Probe {
+                    let mut probe = Probe {
                         os: match kind {
                             Some(Os::Linux) => "Linux".into(),
                             Some(Os::Windows) => "Windows".into(),
@@ -689,12 +701,30 @@ impl Connection {
                         supported: kind.is_some(),
                         kuaid: installed,
                         git,
-                    });
+                    };
+                    // Windows 主机上 ssh 进的是 sh：sh 的脚本按 $HOME 找不带 .exe 的 kuaid，和连接时
+                    // （cmd 的写法，%USERPROFILE% 下的 kuaid.exe）查的不是一个，按 Windows 的写法再问
+                    if matches!(kind, Some(Os::Windows)) && !windows && !tried_cmd {
+                        tried_sh = true;
+                        windows = true;
+                        by_sh = Some(probe);
+                        continue;
+                    }
+                    // cmd 那一遍没问出 git 的版本：用 sh 那一遍的
+                    if probe.git.is_none()
+                        && let Some(sh) = &by_sh
+                    {
+                        probe.git = sh.git.clone();
+                    }
+                    return Ok(probe);
                 }
                 Started::Refused(message) => {
                     match windows {
                         true => tried_cmd = true,
                         false => tried_sh = true,
+                    }
+                    if let Some(probe) = by_sh.take() {
+                        return Ok(probe);
                     }
                     let first = refused.get_or_insert(message).clone();
                     if tried_sh && tried_cmd {
@@ -831,10 +861,14 @@ impl Connection {
         }
     }
 
-    /// 这台电脑上的 kuaid 常驻进程多半在跑（它在跑的时候留着这个文件）：里面可能有留着的终端。
-    /// 只是看一眼，不拉起它。
+    /// 这台电脑上的 kuaid 常驻进程多半在跑（它在跑的时候留着这个文件：Windows 上是记着端口的
+    /// `kuaid.port`，Linux 上是 `kuaid.sock`）：里面可能有留着的终端。只是看一眼，不拉起它。
     pub fn local_daemon_running() -> bool {
-        local_kuai_root().join("run").join("kuaid.port").is_file()
+        let run = local_kuai_root().join("run");
+        match cfg!(windows) {
+            true => run.join("kuaid.port").is_file(),
+            false => run.join("kuaid.sock").exists(),
+        }
     }
 
     /// 连接还在不在。断开后所有调用都会失败，要重新连接。
@@ -1175,12 +1209,18 @@ impl Connection {
         UploadStream::spawn(move |tx| upload_blocking(&inner, first, source, tx))
     }
 
+    /// `confine`：只认仓库里的（协议 17，见 `fr_core::files::confined`）。
     pub(crate) fn fs_list(
         &self,
         repo: &str,
         dir: &str,
+        confine: bool,
     ) -> BoxFuture<'static, Result<Vec<FsEntry>>> {
-        let call = self.call("fs_list", json!({ "repo": repo, "path": dir }), Vec::new());
+        let mut params = json!({ "repo": repo, "path": dir });
+        if confine {
+            params["confine"] = json!(true);
+        }
+        let call = self.call("fs_list", params, Vec::new());
         async move {
             let (mut result, _) = call.await?;
             serde_json::from_value(result["entries"].take()).context(tr("kuaid 返回的结果格式错误"))
@@ -1193,8 +1233,17 @@ impl Connection {
         async move { parsed(call.await?.0) }.boxed()
     }
 
-    pub(crate) fn fs_stat(&self, repo: &str, path: &str) -> BoxFuture<'static, Result<FsStat>> {
-        let call = self.call("fs_stat", json!({ "repo": repo, "path": path }), Vec::new());
+    pub(crate) fn fs_stat(
+        &self,
+        repo: &str,
+        path: &str,
+        confine: bool,
+    ) -> BoxFuture<'static, Result<FsStat>> {
+        let mut params = json!({ "repo": repo, "path": path });
+        if confine {
+            params["confine"] = json!(true);
+        }
+        let call = self.call("fs_stat", params, Vec::new());
         async move { parsed(call.await?.0) }.boxed()
     }
 
@@ -1202,13 +1251,16 @@ impl Connection {
         &self,
         repo: &str,
         path: &str,
-        offset: u64,
-        len: u64,
+        (offset, len): (u64, u64),
         whole: Option<u64>,
+        confine: bool,
     ) -> BoxFuture<'static, Result<(FsStat, Vec<u8>)>> {
         let mut params = json!({ "repo": repo, "path": path, "offset": offset, "len": len });
         if let Some(whole) = whole {
             params["whole"] = json!(whole);
+        }
+        if confine {
+            params["confine"] = json!(true);
         }
         let call = self.call("fs_read", params, Vec::new());
         async move {
@@ -1460,11 +1512,12 @@ impl Drop for Connection {
     }
 }
 
-/// 本机的 kuaid 把 `.kuai` 放在谁的主目录下：和 kuaid 自己认的一样（`FR_KUAID_HOME` 测试时用）。
+/// 本机的 kuaid 把 `.kuai` 放在谁的主目录下：和 kuaid 自己认的一样（`FR_KUAID_HOME` 测试时用，
+/// 各平台都认，见 kuaid 的 `dirs::home_dir`）。原来 Linux 上不认，测试实例往平时的 `~/.kuai` 里装 kuaid。
 fn local_home() -> PathBuf {
     match std::env::var_os("FR_KUAID_HOME").filter(|dir| !dir.is_empty()) {
-        Some(dir) if cfg!(windows) => PathBuf::from(dir),
-        _ => PathBuf::from(fr_core::dir::home()),
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(fr_core::dir::home()),
     }
 }
 
@@ -1476,18 +1529,44 @@ pub fn local_kuai_root() -> PathBuf {
 /// 客户端放套接字、锁文件的目录（Unix 上的单实例、askpass）：`$XDG_RUNTIME_DIR/kuai`（只给自己，
 /// 退出登录就清掉），没有 `XDG_RUNTIME_DIR` 时是 `~/.kuai/run`。不放程序所在的目录：装在 /opt
 /// 这类目录时写不进去，路径长了还会超过 Unix 套接字地址的上限（108 字节）。
+///
+/// 只用只给自己的目录：是目录（不是链接）、属主是自己，权限松了收紧成 0700；`XDG_RUNTIME_DIR` 下的
+/// 不是这样（变量设错了、目录是别人的）就用 `~/.kuai/run`。都不行时照样返回后者，绑定套接字时报错。
 #[cfg(unix)]
 pub fn local_run_dir() -> PathBuf {
-    use std::os::unix::fs::DirBuilderExt as _;
-    let dir = match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
-        Some(dir) if dir.is_absolute() && dir.is_dir() => dir.join("kuai"),
-        _ => local_kuai_root().join("run"),
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+    let private = |dir: &Path| -> bool {
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir);
+        let Ok(meta) = std::fs::symlink_metadata(dir) else {
+            return false;
+        };
+        if !meta.is_dir() {
+            return false;
+        }
+        // 自己是谁：/proc/self 的属主（Linux）；看不到就不比
+        if let Ok(me) = std::fs::metadata("/proc/self")
+            && me.uid() != meta.uid()
+        {
+            return false;
+        }
+        meta.mode() & 0o077 == 0
+            || std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).is_ok()
     };
-    let _ = std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir);
-    dir
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute() && dir.is_dir())
+        .map(|dir| dir.join("kuai"));
+    if let Some(dir) = runtime
+        && private(&dir)
+    {
+        return dir;
+    }
+    let fallback = local_kuai_root().join("run");
+    let _ = private(&fallback);
+    fallback
 }
 
 /// 结束 ssh 和它启动的进程。经跳板机连接时，ssh 下面还挂着转接用的那几层（见 `hop`）：正常情况下
@@ -1851,6 +1930,19 @@ fn start(
     let response = match protocol::read_message::<_, Response>(&mut reader) {
         Ok(Some((response, _))) => response,
         Err(err) if !timed_out() => return Err(err),
+        // 已经看到 kuaid 起来了（登录上了），它却没回握手：起来就退出了、卡住了。不是登录失败，
+        // 不按连不上去重试，诊断也不停在登录那一步
+        Ok(None) | Err(_) if expect_marker => {
+            let _ = link.wait();
+            let said = stderr.tail.lock().unwrap().trim().to_string();
+            match said.is_empty() {
+                true => bail!("{}", tr("主机上的 kuaid 已启动，但没有完成握手")),
+                false => bail!(
+                    "{}",
+                    tf!("主机上的 kuaid 已启动，但没有完成握手：{said}", said)
+                ),
+            }
+        }
         // 读到头了，或者期限到了、ssh 被结束了：按连接失败报
         Ok(None) | Err(_) => return Err(failed(&stderr, give_up(&[]))),
     };
@@ -2151,9 +2243,18 @@ fn failed(log: &StderrLog, failure: GaveUp) -> anyhow::Error {
         ssh: failure.ssh,
         reason: failure.reason,
         message: failure.message,
-        denied: log.tail.lock().unwrap().contains("Permission denied"),
+        denied: auth_refused(&log.tail.lock().unwrap()),
     }
     .into()
+}
+
+/// ssh 说服务器不让登录：密钥、密码不对（Permission denied），试的密钥太多、超过了服务器的上限
+/// （Too many authentication failures：ssh-agent 里的密钥多于 MaxAuthTries 时服务器直接断开，不说
+/// Permission denied），或者能用的认证方式都试完了。再试也一样，一直试还会被当成在猜密码。
+fn auth_refused(stderr: &str) -> bool {
+    stderr.contains("Permission denied")
+        || stderr.contains("Too many authentication failures")
+        || stderr.contains("No more authentication methods")
 }
 
 /// 连接失败：给人看的话、问题在哪一段、原因、ssh 的原话。
@@ -2256,7 +2357,9 @@ fn without_banner(stderr: &str) -> String {
 
 /// 连不上、登录不了一台服务器的原因。
 fn login_hint(stderr: &str, timed_out: bool) -> &'static str {
-    if stderr.contains("Permission denied") {
+    if stderr.contains("Too many authentication failures") {
+        tr("登录被拒绝：尝试的密钥过多，超过了服务器的上限，请在主机设置中指定私钥文件")
+    } else if auth_refused(stderr) {
         tr("登录被拒绝：密钥或密码错误，或已取消输入")
     } else if stderr.contains("Could not resolve hostname") {
         tr("无法解析主机名")
@@ -2389,7 +2492,8 @@ fn ssh(
             });
         }
         cmd.env(hop::HOPS_ENV, hop::encode(&hops));
-        let helper = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kuai"));
+        // 启动时记下的路径：.deb 升级装好、还没重启时，现取的带着「(deleted)」，ssh 启动不了它
+        let helper = fr_core::exe::path().unwrap_or_else(|_| PathBuf::from("kuai"));
         let proxy = hop::proxy_command(&helper, hops.len() - 1);
         cmd.args(["-o", &format!("ProxyCommand={proxy}")]);
         cmd.args(STAGE_OPTIONS);
@@ -2614,6 +2718,16 @@ mod tests {
         ] {
             assert!(!failure(ssh, false).needs_user(), "{ssh}");
         }
+        // 试的密钥太多、服务器直接断开（不说 Permission denied）：也是登录被拒绝，不再试
+        let many = "Received disconnect from 10.0.0.1 port 22:2: Too many authentication failures";
+        assert!(auth_refused(many));
+        assert!(auth_refused("user@host: Permission denied (publickey)."));
+        assert!(auth_refused("No more authentication methods to try."));
+        assert!(!auth_refused("Connection timed out during banner exchange"));
+        assert_ne!(
+            login_hint(many, false),
+            login_hint("Permission denied", false)
+        );
     }
 
     #[test]

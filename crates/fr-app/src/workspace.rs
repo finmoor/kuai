@@ -103,20 +103,28 @@ enum Page {
     Repo(usize),
 }
 
-/// 后退、前进记下的一步：在哪一页。仓库按它本身记（标签页的位置会变），工作区页记着选中的是
-/// 哪个工作区。设计见 `docs/design/back-and-workspace/`（方向 B）。
+/// 后退、前进记下的一步：在哪一页。仓库按它本身记（标签页的位置会变），工作区页记着列的是哪台
+/// 电脑、选中的是哪个工作区（那台上还没有工作区时是 None）。设计见 `docs/design/back-and-workspace/`
+/// （方向 B）。
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Nav {
     Servers,
     Terms,
-    Workspaces(Option<WorkspaceKey>),
+    Workspaces {
+        machine: String,
+        key: Option<WorkspaceKey>,
+    },
     Repo(RepoEntry),
 }
 
-/// 还回得去：仓库的标签页关了就回不去，后退、前进时跳过。
-fn reachable(tabs: &[RepoTab], nav: &Nav) -> bool {
+/// 还回得去：仓库的标签页关了、工作区删了、主机移除了就回不去，后退、前进时跳过（提示里也不写）。
+fn reachable(tabs: &[RepoTab], app: &AppState, nav: &Nav) -> bool {
     match nav {
         Nav::Repo(entry) => tabs.iter().any(|tab| tab.entry.same_repo(entry)),
+        Nav::Workspaces { machine, key } => {
+            let known = machine == LOCAL || app.settings.servers.iter().any(|s| s.id == *machine);
+            known && key.as_ref().is_none_or(|key| app.workspace(key).is_some())
+        }
         _ => true,
     }
 }
@@ -141,6 +149,65 @@ pub(crate) fn go_to_workspace(
         this.update(cx, |this, cx| this.open_workspace(key, entry, window, cx))
             .ok();
     });
+}
+
+/// 开机自启时等多久问出有没有托盘（桌面刚登录，会话总线、托盘可能还没起来）。
+const TRAY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 退出、重启以前要问的：会结束几个本机终端里的程序，丢掉几个没保存的文件，映射的目录里别的
+/// 程序开着的几个文件之后读写不了。
+struct Losses {
+    terminals: usize,
+    unsaved: usize,
+    mapped: usize,
+}
+
+impl Losses {
+    fn none(&self) -> bool {
+        self.terminals == 0 && self.unsaved == 0 && self.mapped == 0
+    }
+
+    /// 对话框里的说明。`restart`：是重启（升级），不是退出。
+    fn describe(&self, restart: bool) -> String {
+        let (n, m, k) = (self.unsaved, self.terminals, self.mapped);
+        let mapped = match restart {
+            false => tf!(
+                "其他程序在映射的目录中打开了 {n} 个文件，退出后将无法继续读写。",
+                n = k
+            ),
+            true => tf!(
+                "其他程序在映射的目录中打开了 {n} 个文件，重启后将无法继续读写。",
+                n = k
+            ),
+        };
+        let main = match (m, n, restart) {
+            (0, 0, _) => return mapped,
+            (_, 0, false) => tf!(
+                "有 {n} 个本机终端正在运行，退出将结束其中的程序。远程主机上的终端不受影响。",
+                n = m
+            ),
+            (_, 0, true) => tf!(
+                "有 {n} 个本机终端正在运行，重启将结束其中的程序。远程主机上的终端不受影响。",
+                n = m
+            ),
+            (0, _, false) => tf!("有 {n} 个文件尚未保存，退出后修改将丢失。", n),
+            (0, _, true) => tf!("有 {n} 个文件尚未保存，重启后修改将丢失。", n),
+            (_, _, false) => tf!(
+                "有 {n} 个文件尚未保存，退出后修改将丢失。另有 {m} 个本机终端正在运行，退出将结束其中的程序。",
+                n,
+                m
+            ),
+            (_, _, true) => tf!(
+                "有 {n} 个文件尚未保存，重启后修改将丢失。另有 {m} 个本机终端正在运行，重启将结束其中的程序。",
+                n,
+                m
+            ),
+        };
+        match k {
+            0 => main,
+            _ => format!("{main}\n{mapped}"),
+        }
+    }
 }
 
 /// 上一次应用到窗口上的外观设置；变了才重新应用。
@@ -199,6 +266,8 @@ pub struct Workspace {
     drafts: Vec<(RepoEntry, String)>,
     tray: Option<Tray>,
     hwnd: Option<Hwnd>,
+    /// 窗口收进了托盘（藏起来了）：托盘下线时要拿出来
+    tucked: Cell<bool>,
     applied: Option<Applied>,
     /// 托盘菜单里点了「退出」：这次关闭不再收进托盘
     quitting: Rc<Cell<bool>>,
@@ -242,9 +311,11 @@ impl Workspace {
                         this.open(entry.clone(), window, cx);
                         this.hint_home(home, cx);
                     }
-                    PageEvent::OpenAll { entries, show } => {
-                        this.open_all(entries.clone(), *show, window, cx)
-                    }
+                    PageEvent::OpenAll {
+                        entries,
+                        show,
+                        home,
+                    } => this.open_all(entries.clone(), *show, home.clone(), window, cx),
                     PageEvent::Rename(entry) => this.rename_repo(entry.clone(), window, cx),
                     PageEvent::Terminals(entry) => this.show_terminals_of(entry, window, cx),
                     PageEvent::NewTerminal(entry) => {
@@ -311,11 +382,9 @@ impl Workspace {
             cx.observe(&updater, |_, _, cx| cx.notify()),
             cx.subscribe_in(&updater, window, |this, _, event, window, cx| match event {
                 UpdateEvent::Restart => this.restart_for_update(window, cx),
-                // .deb 的新版本在后台装好、拉起来了
-                UpdateEvent::Quit => {
-                    this.quitting.set(true);
-                    cx.quit();
-                }
+                // .deb 的新版本在后台装好了：问过再重启。原来装好就直接退出，等认证的那几分钟里
+                // 改了没保存的、新开的终端都没了
+                UpdateEvent::Installed => this.restart_for_update(window, cx),
             }),
             // 退出时先撤掉托盘图标：进程退出前没撤的话，托盘里会留一个点不开的图标，鼠标移过去才消失
             cx.on_app_quit(|this, cx| {
@@ -454,6 +523,19 @@ impl Workspace {
             }
         })
         .detach();
+        // 还不知道有没有托盘（Linux 上启动时还在问）：问完了重画一遍，设置页里的托盘选项跟着出来
+        if crate::tray::unknown() {
+            cx.spawn(async move |_, cx| {
+                let started = std::time::Instant::now();
+                while crate::tray::unknown() && started.elapsed() < TRAY_WAIT {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(50))
+                        .await;
+                }
+                cx.update(|cx| cx.refresh_windows());
+            })
+            .detach();
+        }
         let mut this = Self {
             app: app.clone(),
             updater,
@@ -479,6 +561,7 @@ impl Workspace {
             drafts: Vec::new(),
             tray: None,
             hwnd: win::hwnd(window),
+            tucked: Cell::new(false),
             applied: None,
             quitting,
             _subscriptions: subscriptions,
@@ -517,7 +600,9 @@ impl Workspace {
         let wanted = Applied {
             palette: palette.id,
             lang,
-            tray: settings.minimize_to_tray || settings.close_to_tray,
+            // Wayland 上藏不起来，「最小化到托盘」不显示，存着的值（X11 上开的）也不算：不然设置页
+            // 上关不掉它，开机自启照样最小化
+            tray: (settings.minimize_to_tray && crate::tray::can_hide()) || settings.close_to_tray,
         };
         let before = self.applied.clone();
         if before.as_ref() == Some(&wanted) {
@@ -549,10 +634,15 @@ impl Workspace {
         window.refresh();
     }
 
-    /// 点了「重启完成升级」：本机终端里还有程序在跑就先问一下（服务器上的终端开在 kuaid 里，
-    /// 不受影响），再换上新版本、拉起新的 Kuai、自己退出。换没成的话，小牌上显示原因。
+    /// 「重启完成升级」，.deb 的新版本在后台装好了（[`UpdateEvent::Installed`]）也到这里：会丢掉
+    /// 东西（没保存的文件、本机终端里在跑的程序、映射的目录里别的程序开着的文件）就先问一下，原来
+    /// 只问终端。.deb 的还没装就先去装：装的时候不丢东西，装好了再来问。
     fn restart_for_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let terminals = self.live_terminals(cx);
+        if self.updater.read(cx).installs_first() {
+            self.updater.update(cx, |u, cx| u.install_and_relaunch(cx));
+            return;
+        }
+        let losses = self.losses(cx);
         let (updater, quitting) = (self.updater.clone(), self.quitting.clone());
         let restart = Rc::new(move |cx: &mut App| {
             if updater.update(cx, |u, cx| u.install_and_relaunch(cx)) {
@@ -560,18 +650,20 @@ impl Workspace {
                 cx.quit();
             }
         });
-        if terminals == 0 {
+        if losses.none() {
             restart(cx);
             return;
         }
+        let description = losses.describe(true);
+        let (ok, variant) = match losses.unsaved {
+            0 => (tr("重启"), ButtonVariant::Primary),
+            _ => (tr("放弃修改并重启"), ButtonVariant::Danger),
+        };
         window.open_alert_dialog(cx, move |alert, _, _| {
             let restart = restart.clone();
             alert
                 .title(tr("重启 Kuai 以完成更新"))
-                .description(tf!(
-                    "有 {n} 个本机终端正在运行，重启将结束其中的程序。远程主机上的终端不受影响。",
-                    n = terminals
-                ))
+                .description(description.clone())
                 .on_ok(|_, _, _| false)
                 .footer(
                     DialogFooter::new()
@@ -580,17 +672,23 @@ impl Workspace {
                                 .label(tr("取消"))
                                 .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
-                        .child(
-                            Button::new("ok")
-                                .label(tr("重启"))
-                                .with_variant(ButtonVariant::Primary)
-                                .on_click(move |_, window, cx| {
-                                    window.close_dialog(cx);
-                                    restart(cx);
-                                }),
-                        ),
+                        .child(Button::new("ok").label(ok).with_variant(variant).on_click(
+                            move |_, window, cx| {
+                                window.close_dialog(cx);
+                                restart(cx);
+                            },
+                        )),
                 )
         });
+    }
+
+    /// 退出、重启会丢掉的（见 [`Losses`]）。
+    fn losses(&self, cx: &App) -> Losses {
+        Losses {
+            terminals: self.live_terminals(cx),
+            unsaved: self.unsaved_files(cx),
+            mapped: self.app.read(cx).mapped_open_files(),
+        }
     }
 
     /// 把藏到托盘、最小化或者被挡住的窗口叫到最前面。
@@ -598,6 +696,7 @@ impl Workspace {
     /// 放到这一轮更新之后再做：`ShowWindow` 会同步调用窗口过程，GPUI 在那里还要借用整个 App，
     /// 在更新里直接调会撞上正借着的 App（日志里的 `RefCell already borrowed`，这一帧可能不重画）。
     fn show_window(&self, cx: &mut Context<Self>) {
+        self.tucked.set(false);
         if let Some(hwnd) = self.hwnd {
             cx.spawn(async move |_, _| win::show(hwnd)).detach();
         }
@@ -614,6 +713,7 @@ impl Workspace {
             self.show_window(cx);
             return;
         }
+        self.tucked.set(false);
         self.updater
             .update(cx, |updater, cx| updater.window_shown(cx));
         win::activate(window, token.as_deref());
@@ -632,7 +732,10 @@ impl Workspace {
     /// （没有窗口句柄），最小化。
     fn hide_window(&self, window: &mut Window, cx: &mut Context<Self>) {
         match self.hwnd {
-            Some(hwnd) => cx.spawn(async move |_, _| win::hide(hwnd)).detach(),
+            Some(hwnd) => {
+                self.tucked.set(true);
+                cx.spawn(async move |_, _| win::hide(hwnd)).detach();
+            }
             None => window.minimize_window(),
         }
     }
@@ -667,13 +770,19 @@ impl Workspace {
                 });
             }
             TrayAction::Quit => self.quit_from_tray(cx),
+            // 托盘下线了（桌面重启了外壳、关了托盘扩展）：收在里面的窗口拿出来，不然任务栏上也
+            // 没有它，找不回来
+            TrayAction::Lost => {
+                if self.tucked.get() {
+                    self.show_window(cx);
+                }
+            }
         }
     }
 
     /// 托盘菜单的「退出」：本机终端里没有程序在运行就直接退出；有就把窗口叫出来，问一下。
     fn quit_from_tray(&mut self, cx: &mut Context<Self>) {
-        let mapped = self.app.read(cx).mapped_open_files();
-        if self.live_terminals(cx) == 0 && self.unsaved_files(cx) == 0 && mapped == 0 {
+        if self.losses(cx).none() {
             self.quitting.set(true);
             cx.quit();
             return;
@@ -692,36 +801,12 @@ impl Workspace {
     /// 有托盘时多一个「最小化到托盘」，窗口藏起来，终端接着运行。返回问了没有：一个都没有时
     /// 不问，由调用的地方直接退出。
     fn confirm_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let terminals = self.live_terminals(cx);
-        let unsaved = self.unsaved_files(cx);
-        // 映射到本机的目录里，别的程序还开着的文件：退出以后映射就没了
-        let mapped = self.app.read(cx).mapped_open_files();
-        if terminals == 0 && unsaved == 0 && mapped == 0 {
+        let losses = self.losses(cx);
+        if losses.none() {
             return false;
         }
-        let mapped_note = tf!(
-            "其他程序在映射的目录中打开了 {n} 个文件，退出后将无法继续读写。",
-            n = mapped
-        );
-        let description = match (terminals, unsaved) {
-            (0, 0) => mapped_note.clone(),
-            (_, 0) => tf!(
-                "有 {n} 个本机终端正在运行，退出将结束其中的程序。远程主机上的终端不受影响。",
-                n = terminals
-            ),
-            (0, _) => tf!("有 {n} 个文件尚未保存，退出后修改将丢失。", n = unsaved),
-            _ => tf!(
-                "有 {n} 个文件尚未保存，退出后修改将丢失。另有 {m} 个本机终端正在运行，退出将结束其中的程序。",
-                n = unsaved,
-                m = terminals
-            ),
-        };
-        let description = match mapped {
-            0 => description,
-            _ if terminals == 0 && unsaved == 0 => description,
-            _ => format!("{description}\n{mapped_note}"),
-        };
-        let ok = match (terminals, unsaved) {
+        let description = losses.describe(false);
+        let ok = match (losses.terminals, losses.unsaved) {
             (0, 0) => tr("退出"),
             (0, _) => tr("放弃修改并退出"),
             _ => tr("结束并退出"),
@@ -774,17 +859,45 @@ impl Workspace {
             && win::is_minimized(hwnd)
             && !win::cursor_on_taskbar()
         {
+            self.tucked.set(true);
             win::hide(hwnd);
         }
     }
 
-    /// 开机自启带 `--minimized` 启动：有托盘就直接收进托盘（Wayland 上最小化）。
-    pub fn start_in_tray(&mut self, window: &mut Window) {
+    /// 开机自启带 `--minimized` 启动：有托盘就直接收进托盘（Wayland 上最小化）。Linux 上还不知道
+    /// 有没有托盘（桌面刚起来，`tray::probe` 还在问）就在后台等它问完再定，不卡界面；一直问不到就
+    /// 不收。
+    pub fn start_in_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !crate::tray::unknown() {
+            self.tuck_away(window);
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let started = std::time::Instant::now();
+            while crate::tray::unknown() && started.elapsed() < TRAY_WAIT {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.tuck_away(window);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 有托盘就把窗口收进去（Wayland 上最小化）。
+    fn tuck_away(&mut self, window: &mut Window) {
         if !self.in_tray() {
             return;
         }
         match self.hwnd {
-            Some(hwnd) => win::hide(hwnd),
+            Some(hwnd) => {
+                self.tucked.set(true);
+                win::hide(hwnd);
+            }
             None => window.minimize_window(),
         }
     }
@@ -984,12 +1097,16 @@ impl Workspace {
         &mut self,
         entries: Vec<RepoEntry>,
         show: bool,
+        home: WorkspaceKey,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let mut first = None;
         for entry in entries {
             let ix = self.ensure_tab(entry, window, cx);
+            // 和单个打开的一样：仓库页的工作区按钮先写是从哪个工作区开的
+            let view = self.tabs[ix].view.clone();
+            view.update(cx, |view, cx| view.set_home_hint(Some(home.clone()), cx));
             first.get_or_insert(ix);
         }
         match first.filter(|_| show) {
@@ -1070,10 +1187,16 @@ impl Workspace {
         match self.page {
             Page::Servers => Nav::Servers,
             Page::Terms => Nav::Terms,
-            Page::Workspaces => Nav::Workspaces(self.workspaces.read(cx).selected(cx)),
+            Page::Workspaces => {
+                let (machine, key) = self.workspaces.read(cx).selection(cx);
+                Nav::Workspaces { machine, key }
+            }
             Page::Repo(ix) => match self.tabs.get(ix) {
                 Some(tab) => Nav::Repo(tab.entry.clone()),
-                None => Nav::Workspaces(None),
+                None => Nav::Workspaces {
+                    machine: LOCAL.to_string(),
+                    key: None,
+                },
             },
         }
     }
@@ -1084,10 +1207,10 @@ impl Workspace {
         match nav {
             Nav::Servers => trc("页面", "主机").into(),
             Nav::Terms => trc("页面", "会话").into(),
-            Nav::Workspaces(Some(key)) => {
+            Nav::Workspaces { key: Some(key), .. } => {
                 tf!("工作区「{name}」", name = app.workspace_name(key)).into()
             }
-            Nav::Workspaces(None) => trc("页面", "工作区").into(),
+            Nav::Workspaces { key: None, .. } => trc("页面", "工作区").into(),
             Nav::Repo(entry) => app.repo_name(entry),
         }
     }
@@ -1100,14 +1223,16 @@ impl Workspace {
             if self.showing_settings {
                 return Some(self.nav_label(&here, cx));
             }
+            // 回到的那一层：进了两层时是外面那个子仓库，不是标签页的仓库
             if let Some(tab) = self.active_repo()
-                && tab.view.read(cx).active_sub().is_some()
+                && let Some(target) = tab.view.read(cx).back_target(cx)
             {
-                return Some(self.app.read(cx).repo_name(&tab.entry));
+                return Some(self.app.read(cx).repo_name(&target));
             }
         }
+        let app = self.app.read(cx);
         self.history
-            .peek(back, &here, |nav| reachable(&self.tabs, nav))
+            .peek(back, &here, |nav| reachable(&self.tabs, app, nav))
             .map(|nav| self.nav_label(nav, cx))
     }
 
@@ -1135,8 +1260,11 @@ impl Workspace {
 
     fn travel(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
         let here = self.here(cx);
-        let tabs = &self.tabs;
-        let Some(nav) = self.history.step(back, here, |nav| reachable(tabs, nav)) else {
+        let (tabs, app) = (&self.tabs, self.app.read(cx));
+        let Some(nav) = self
+            .history
+            .step(back, here, |nav| reachable(tabs, app, nav))
+        else {
             return;
         };
         self.traveling = true;
@@ -1155,10 +1283,14 @@ impl Workspace {
                         .update(cx, |overview, cx| overview.type_in(window, cx));
                 }
             }
-            Nav::Workspaces(key) => {
+            Nav::Workspaces { machine, key } => {
                 let known = |key: &WorkspaceKey| self.app.read(cx).workspace(key).is_some();
-                if let Some(key) = key.filter(known) {
-                    self.app.update(cx, |app, cx| app.set_current(key, cx));
+                match key.filter(known) {
+                    Some(key) => self.app.update(cx, |app, cx| app.set_current(key, cx)),
+                    // 那台上没有选中的工作区（还没有）：照旧列那台
+                    None => self
+                        .app
+                        .update(cx, |app, _| app.menu_machine = Some(machine)),
                 }
                 self.show_page(Page::Workspaces, window, cx);
             }
@@ -2907,8 +3039,9 @@ pub(crate) struct QuickOpen {
     app: Entity<AppState>,
     input: Entity<InputState>,
     purpose: PickFor,
-    /// 上下键选中的是匹配结果里的第几个
-    selected: usize,
+    /// 高亮的（回车会选的）是哪个仓库：按仓库记，不按第几行（列表会变：别的主机连上了，列表里多了
+    /// 仓库）。None 是第一个；画的时候记成画出来高亮的那个，之后列表变了它也不跟着换
+    selected: Option<RepoEntry>,
     /// 新建终端：框上面那一排要运行的程序选的是第几个（0 是只开 shell，往后是菜单里列的预设，见
     /// [`Self::programs`]）。开始时是「默认运行」的那个，Tab、Shift+Tab 换
     program: usize,
@@ -2959,7 +3092,7 @@ impl QuickOpen {
         let subscription = cx.subscribe(&input, |this: &mut Self, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 // 筛选的字变了：回到第一个
-                this.selected = 0;
+                this.selected = None;
                 cx.notify();
             }
         });
@@ -2972,19 +3105,22 @@ impl QuickOpen {
             app,
             input,
             purpose,
-            selected: 0,
+            selected: None,
             program,
             _subscription: subscription,
         }
     }
 
-    /// 新建终端时可以选的程序：只开 shell（None），再是菜单里列的预设（id 和要输入的）。
+    /// 新建终端时可以选的程序：只开 shell（None），再是菜单里列的预设（id 和要输入的）。「默认运行」
+    /// 的那个设成不在菜单里显示也列上：侧栏的「新终端」、Ctrl+Shift+` 照样运行它，这里原来却退回
+    /// 只开 shell。
     fn programs(cx: &App) -> Vec<Option<(String, crate::presets::Start)>> {
+        let default = crate::presets::default_preset(cx).map(|preset| preset.id);
         std::iter::once(None)
             .chain(
                 crate::presets::all(cx)
                     .iter()
-                    .filter(|preset| preset.shown)
+                    .filter(|preset| preset.shown || default.as_ref() == Some(&preset.id))
                     .map(|preset| Some((preset.id.clone(), crate::presets::Start::of(preset)))),
             )
             .collect()
@@ -3055,9 +3191,19 @@ impl QuickOpen {
             .collect()
     }
 
+    /// 回车：选高亮的那个。它已经不在列表里了（列表变了）就不选，换成高亮现在的第一个，再按一次。
     fn pick_selected(&mut self, cx: &mut Context<Self>) {
-        if let Some((entry, ..)) = self.matches(cx).into_iter().nth(self.selected) {
-            cx.emit(Picked(entry));
+        let matches = self.matches(cx);
+        let target = match &self.selected {
+            Some(entry) => Some(entry.clone()),
+            None => matches.first().map(|(entry, ..)| entry.clone()),
+        };
+        match target.filter(|target| matches.iter().any(|(entry, ..)| entry == target)) {
+            Some(entry) => cx.emit(Picked(entry)),
+            None => {
+                self.selected = None;
+                cx.notify();
+            }
         }
     }
 
@@ -3077,15 +3223,22 @@ impl QuickOpen {
 
     /// 上下键：在匹配结果里移动，到头绕回去。
     fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let count = self.matches(cx).len();
+        let matches = self.matches(cx);
+        let count = matches.len();
         if count == 0 {
             return;
         }
-        match event.keystroke.key.as_str() {
-            "down" => self.selected = (self.selected + 1) % count,
-            "up" => self.selected = (self.selected + count - 1) % count,
+        let at = self
+            .selected
+            .as_ref()
+            .and_then(|selected| matches.iter().position(|(entry, ..)| entry == selected))
+            .unwrap_or(0);
+        let next = match event.keystroke.key.as_str() {
+            "down" => (at + 1) % count,
+            "up" => (at + count - 1) % count,
             _ => return,
-        }
+        };
+        self.selected = Some(matches[next].0.clone());
         cx.stop_propagation();
         cx.notify();
     }
@@ -3178,7 +3331,18 @@ impl Render for QuickOpen {
         let theme = cx.theme();
         let (muted, hover, active) = (theme.muted_foreground, theme.list_hover, theme.list_active);
         let matches = self.matches(cx);
-        let selected = self.selected.min(matches.len().saturating_sub(1));
+        // 高亮的那个不在列表里了（还没选过、列表变了）：高亮第一个，记下它
+        let selected = match self
+            .selected
+            .as_ref()
+            .and_then(|selected| matches.iter().position(|(entry, ..)| entry == selected))
+        {
+            Some(at) => at,
+            None => {
+                self.selected = matches.first().map(|(entry, ..)| entry.clone());
+                0
+            }
+        };
         let rows: Vec<AnyElement> = matches
             .into_iter()
             .enumerate()

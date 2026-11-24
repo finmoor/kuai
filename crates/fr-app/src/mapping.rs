@@ -66,10 +66,12 @@ enum Slot {
     /// 正在映射（在等连接，或者在挂）。带着这一次的编号：期间改了配置、断开又映射，旧的那次
     /// 做完时编号对不上，结果丢掉（原来只看是不是「正在映射」，旧配置的结果会被当成新的挂上）
     Busy(u64),
-    /// 映射着；`machine` 是挂上时那台电脑的标识（握手时报的）
+    /// 映射着；`machine` 是挂上时那台电脑的标识（握手时报的），`attempt` 是挂上的那一次的编号
+    /// （盘在外面被卸掉时用来认是不是还是这一个，见 [`AppState::mount_ended`]）
     Live {
         mounted: fr_mount::Mounted,
         machine: String,
+        attempt: u64,
     },
     Failed(SharedString),
 }
@@ -296,6 +298,28 @@ impl AppState {
         matches!(self.mounts.slots.get(id), Some(Slot::Live { .. }))
     }
 
+    /// 映射着的盘自己没了（Linux 上在文件管理器里点了卸载、`fusermount3 -u`）：还是 `attempt` 那一次
+    /// 挂的就清掉，界面上回到没映射着，可以直接再映射（原来一直显示映射着，再映射也不做）。我们
+    /// 自己断开的先拿掉了槽，这里不管。
+    fn mount_ended(&mut self, id: &str, attempt: u64, cx: &mut Context<Self>) {
+        if !matches!(self.mounts.slots.get(id), Some(Slot::Live { attempt: now, .. }) if *now == attempt)
+        {
+            return;
+        }
+        let Some(Slot::Live { mounted, .. }) = self.mounts.slots.remove(id) else {
+            return;
+        };
+        let place = mounted.place().to_string();
+        log::info!("映射到 {place} 的目录在 Kuai 以外被卸载");
+        cx.background_executor()
+            .spawn(async move { drop(mounted) })
+            .detach();
+        cx.emit(Notice::Info(
+            tf!("{place} 已在 Kuai 以外卸载，映射已断开。", place = &place).into(),
+        ));
+        cx.notify();
+    }
+
     /// 这台服务器上包含 `path` 的映射（配置了就算，不管现在映射着没有）；有几条时取最里面的。
     pub fn covering(&self, server: &str, path: &str) -> Option<&Mapping> {
         self.server(server)?
@@ -475,7 +499,9 @@ impl AppState {
             .unwrap_or_default();
         for mapping in mappings {
             match self.mounts.slots.get(&mapping.id) {
-                Some(Slot::Live { mounted, machine }) if *machine == conn.hello.machine => {
+                Some(Slot::Live {
+                    mounted, machine, ..
+                }) if *machine == conn.hello.machine => {
                     mounted.set_channel(Some(Channel::Remote(conn.clone())));
                 }
                 Some(Slot::Live { .. }) => {
@@ -563,9 +589,11 @@ impl AppState {
             let (remote, local) = (mapping.remote.clone(), mapping.local_root());
             let named = mapping.drive_name().map(str::to_string);
             let mut machine = String::new();
+            let mut used = None;
             let mounting = match connecting.await {
                 Ok(conn) => {
                     machine = conn.hello.machine.clone();
+                    used = Some(conn.clone());
                     let options = fr_mount::Options {
                         root: mapping.remote.clone(),
                         place: mapping.local.clone(),
@@ -596,10 +624,46 @@ impl AppState {
                     }
                     return;
                 }
+                // 挂的这一阵子又连上了一次（断网后在后台连回来）：连上时只给映射着的换连接，正在
+                // 映射的跳过了，这里补上。还是那台电脑就换到现在的连接；换了一台（改了地址）的
+                // 不要，用现在的连接重新映射
+                if let (Ok(mounted), Some(used)) = (&mounting, &used)
+                    && let crate::app_state::ConnStatus::Ready(now) = this.status(&server.id)
+                    && !std::sync::Arc::ptr_eq(&now, used)
+                {
+                    if now.hello.machine == machine {
+                        mounted.set_channel(Some(Channel::Remote(now)));
+                    } else {
+                        log::info!("映射 {remote} 挂上时连的已经不是现在这台电脑，重新映射");
+                        if let Ok(mounted) = mounting {
+                            cx.background_executor()
+                                .spawn(async move { drop(mounted) })
+                                .detach();
+                        }
+                        this.mounts.slots.remove(&id);
+                        this.start_mount(&id, announce, cx);
+                        return;
+                    }
+                }
                 match mounting {
-                    Ok(mounted) => {
+                    Ok(mut mounted) => {
                         log::info!("映射 {remote} → {local}");
-                        let live = Slot::Live { mounted, machine };
+                        // 盘在外面被卸掉了（Linux 上在文件管理器里点了卸载）：回到没映射着
+                        let ended = mounted.ended();
+                        cx.spawn({
+                            let id = id.clone();
+                            async move |this, cx| {
+                                ended.await;
+                                this.update(cx, |this, cx| this.mount_ended(&id, attempt, cx))
+                                    .ok();
+                            }
+                        })
+                        .detach();
+                        let live = Slot::Live {
+                            mounted,
+                            machine,
+                            attempt,
+                        };
                         this.mounts.slots.insert(id.clone(), live);
                         if let Some(label) = &explorer_label {
                             set_explorer_label(&unc, Some(label), &mapping.local);

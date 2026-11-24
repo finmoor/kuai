@@ -37,13 +37,8 @@ fn write_files() -> std::io::Result<()> {
     let entry = data.join("applications").join("kuai.desktop");
     // .deb 装的：系统里有应用菜单项和图标了。以前用解压版时写的那份会盖住系统的，删掉
     if crate::packaging::deb() {
-        let ours = std::fs::read_to_string(&entry).is_ok_and(|text| {
-            text.contains(
-                "
-StartupWMClass=kuai
-",
-            )
-        });
+        let ours = std::fs::read_to_string(&entry)
+            .is_ok_and(|text| text.contains("\nStartupWMClass=kuai\n"));
         if ours {
             std::fs::remove_file(&entry)?;
         }
@@ -61,7 +56,11 @@ StartupWMClass=kuai
         .join("apps")
         .join("kuai.png");
     write_if_changed(&icon, ICON)?;
-    write_if_changed(&entry, desktop_entry(exe).as_bytes())?;
+    // 程序路径里有写不进桌面入口的字符（见 `autostart::exec_quote`）：不写，应用菜单里就没有这一项
+    let Some(text) = desktop_entry(exe) else {
+        return Ok(());
+    };
+    write_if_changed(&entry, text.as_bytes())?;
     Ok(())
 }
 
@@ -80,9 +79,9 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     })
 }
 
-/// 应用菜单里那一项。程序路径的写法和开机自启的一样（`autostart::exec_quote`）。
-fn desktop_entry(exe: &str) -> String {
-    format!(
+/// 应用菜单里那一项。程序路径的写法和开机自启的一样（`autostart::exec_quote`），写不进去是 None。
+fn desktop_entry(exe: &str) -> Option<String> {
+    Some(format!(
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=Kuai\n\
@@ -94,8 +93,8 @@ fn desktop_entry(exe: &str) -> String {
          Categories=Development;RevisionControl;\n\
          StartupWMClass=kuai\n\
          StartupNotify=true\n",
-        crate::autostart::exec_quote(exe)
-    )
+        crate::autostart::exec_quote(exe)?
+    ))
 }
 
 #[cfg(test)]
@@ -104,7 +103,7 @@ mod tests {
 
     #[test]
     fn 应用菜单项指向这个程序() {
-        let text = desktop_entry("/opt/Kuai 1/kuai");
+        let text = desktop_entry("/opt/Kuai 1/kuai").unwrap();
         assert!(text.contains("\nExec=\"/opt/Kuai 1/kuai\"\n"), "{text}");
         assert!(text.contains("\nStartupWMClass=kuai\n"));
         assert!(text.contains("\nIcon=kuai\n"));

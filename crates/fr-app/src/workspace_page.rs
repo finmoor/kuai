@@ -43,7 +43,12 @@ pub enum PageEvent {
     /// 在标签页中打开（已经开着就切过去）
     Open(RepoEntry),
     /// 一次打开几个。`show` 为真时显示第一个；假的是子仓库找完了接着开的，只加在后面
-    OpenAll { entries: Vec<RepoEntry>, show: bool },
+    /// `home`：从哪个工作区开的（仓库页的工作区按钮先写它）
+    OpenAll {
+        entries: Vec<RepoEntry>,
+        show: bool,
+        home: WorkspaceKey,
+    },
     /// 给仓库改显示的名字（对话框由主窗口开）
     Rename(RepoEntry),
     /// 到会话页看这个仓库的终端
@@ -58,8 +63,8 @@ pub struct WorkspacePage {
     app: Entity<AppState>,
     board: Entity<TermBoard>,
     scan: Entity<RepoScan>,
-    /// 点「全部打开」时子仓库还没找完的仓库：找完了接着把它们的子仓库开出来
-    open_later: Vec<RepoEntry>,
+    /// 点「全部打开」时子仓库还没找完的仓库（和从哪个工作区开的）：找完了接着把它们的子仓库开出来
+    open_later: Vec<(RepoEntry, WorkspaceKey)>,
     /// 这一页显示着
     visible: bool,
     /// 「打开工作区」过来时要标出来的那个仓库（或子仓库）：那一行带选中的底色，滚到看得见。离开这一页、
@@ -67,10 +72,12 @@ pub struct WorkspacePage {
     hit: Option<RepoEntry>,
     /// 标出来的那一行还没滚到看得见
     scroll_to_hit: bool,
+    /// 滚到的那一行就是要标的那个（不是子仓库还没找到、收着时代它标出来的仓库那一行）
+    hit_exact: bool,
     /// 右边那一栏的滚动
     scroll: ScrollHandle,
-    /// 标出来的那个仓库上一帧画在哪（滚到它用）
-    hit_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// 标出来的那一行上一帧画在哪（滚到它用，见 [`crate::repo_rows::Block::hit_at`]）
+    hit_bounds: crate::repo_rows::HitCell,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -119,6 +126,7 @@ impl WorkspacePage {
             visible: false,
             hit: None,
             scroll_to_hit: false,
+            hit_exact: false,
             scroll: ScrollHandle::new(),
             hit_bounds: Rc::new(Cell::new(None)),
             _subscriptions: subscriptions,
@@ -134,6 +142,7 @@ impl WorkspacePage {
     pub fn reveal(&mut self, key: WorkspaceKey, entry: Option<RepoEntry>, cx: &mut Context<Self>) {
         self.app.update(cx, |app, cx| app.set_current(key, cx));
         self.scroll_to_hit = entry.is_some();
+        self.hit_exact = false;
         self.hit = entry;
         self.hit_bounds.set(None);
         if self.visible {
@@ -144,10 +153,11 @@ impl WorkspacePage {
 
     /// 标出来的那一行不在看得见的地方：滚过去（按上一帧画的位置算）。
     fn scroll_hit_into_view(&mut self, cx: &mut Context<Self>) {
-        let Some(hit) = self.hit_bounds.get() else {
+        let Some((hit, exact)) = self.hit_bounds.get() else {
             return;
         };
         self.scroll_to_hit = false;
+        self.hit_exact = exact;
         let view = self.scroll.bounds();
         let margin = px(12.);
         let was = self.scroll.offset();
@@ -183,7 +193,7 @@ impl WorkspacePage {
     }
 
     /// 列的是哪台电脑，选中的是哪个工作区（那台上的工作区还没读到、一个都没有时是 None）。
-    fn selection(&self, cx: &App) -> (String, Option<WorkspaceKey>) {
+    pub fn selection(&self, cx: &App) -> (String, Option<WorkspaceKey>) {
         let app = self.app.read(cx);
         let machine = app.menu_machine();
         let current = app.current();
@@ -208,21 +218,28 @@ impl WorkspacePage {
         if self.open_later.is_empty() {
             return;
         }
-        let mut found: Vec<RepoEntry> = Vec::new();
+        let mut found: Vec<(WorkspaceKey, Vec<RepoEntry>)> = Vec::new();
         let scan = self.scan.read(cx);
-        self.open_later.retain(|root| {
+        self.open_later.retain(|(root, home)| {
             let Some(subs) = scan.get(root).and_then(|scanned| scanned.subs.clone()) else {
                 // 读不了（服务器断开了）就不等了
                 return scan.pending(root);
             };
-            found.extend(subs.iter().map(|relative| sub_entry(root, relative)));
+            let subs = subs.iter().map(|relative| sub_entry(root, relative));
+            match found.iter_mut().find(|(key, _)| key == home) {
+                Some((_, entries)) => entries.extend(subs),
+                None => found.push((home.clone(), subs.collect())),
+            }
             false
         });
-        if !found.is_empty() {
-            cx.emit(PageEvent::OpenAll {
-                entries: found,
-                show: false,
-            });
+        for (home, entries) in found {
+            if !entries.is_empty() {
+                cx.emit(PageEvent::OpenAll {
+                    entries,
+                    show: false,
+                    home,
+                });
+            }
         }
     }
 
@@ -263,14 +280,15 @@ impl WorkspacePage {
         // 接在还没补开完的后面（同一个不重复）：原来是换掉，连着对两个工作区「全部打开」时，
         // 前一个还没找完的子仓库就不开了
         for root in later {
-            if !self.open_later.contains(&root) {
-                self.open_later.push(root);
+            if !self.open_later.iter().any(|(other, _)| *other == root) {
+                self.open_later.push((root, key.clone()));
             }
         }
         if !entries.is_empty() {
             cx.emit(PageEvent::OpenAll {
                 entries,
                 show: true,
+                home: key.clone(),
             });
         }
     }
@@ -1140,6 +1158,7 @@ impl WorkspacePage {
                         .hit
                         .clone()
                         .filter(|hit| entry.same_repo(hit) || entry.contains(hit)),
+                    hit_at: Some(self.hit_bounds.clone()),
                 }
             };
             let (term_entry, leave_entry, leave_key) = (entry.clone(), entry.clone(), key.clone());
@@ -1177,24 +1196,7 @@ impl WorkspacePage {
         blocks
             .into_iter()
             .enumerate()
-            .map(|(ix, (block, actions))| {
-                let hit = block.hit.is_some();
-                let element = render_block(ix, block, actions, columns, &handlers, cx);
-                if !hit {
-                    return element;
-                }
-                // 标出来的那个仓库画在哪：下一帧按它滚到看得见
-                let cell = self.hit_bounds.clone();
-                div()
-                    .relative()
-                    .child(element)
-                    .child(
-                        canvas(move |bounds, _, _| cell.set(Some(bounds)), |_, _, _, _| {})
-                            .absolute()
-                            .inset_0(),
-                    )
-                    .into_any_element()
-            })
+            .map(|(ix, (block, actions))| render_block(ix, block, actions, columns, &handlers, cx))
             .collect()
     }
 }
@@ -1227,6 +1229,13 @@ impl Render for WorkspacePage {
         // 「打开工作区」过来的：这一帧画完知道那一行在哪，下一帧滚过去
         if self.scroll_to_hit {
             cx.on_next_frame(window, |this, _, cx| this.scroll_hit_into_view(cx));
+        } else if self.hit.is_some() && !self.hit_exact {
+            // 先滚到了仓库那一行（子仓库还没找到）：找到了、标在子仓库那一行上以后再滚一次
+            cx.on_next_frame(window, |this, _, cx| {
+                if this.hit_bounds.get().is_some_and(|(_, exact)| exact) {
+                    this.scroll_hit_into_view(cx);
+                }
+            });
         }
         h_flex()
             .size_full()

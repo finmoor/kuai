@@ -127,10 +127,16 @@ use serde_json::Value;
 /// 16：终端流里带上发出去的消息（[`TermMarks`]）；[`TermOpened`] 多了 `restore`（还原屏幕的输出分几段、
 /// 各多长），往回翻的记录多时先发只有屏幕的一段。这两样 kuaid 只给握手时说自己是 16 以上的客户端
 /// （见 [`TERM_MARKS_SINCE`]）。
+/// 17：`fs_list`、`fs_stat`、`fs_read` 可以带 `confine`：跟着符号链接走到底还在仓库里、不在 `.git`
+/// 里的才给，`fs_read` 只读普通文件（本机网页服务、Markdown 预览用，见 `files::confined`）。旧的
+/// kuaid 不认这一项、照常跟着链接读，所以要升到 17。`relay_open` 可以带 `quiet`（不许问人时不弹框）。
+/// 映射到本机的盘（Linux 上的 FUSE）要的：文件的权限位（[`FsStat::mode`]）、`fs_chmod`；`fs_pwrite`
+/// 可以带 `append`（在主机上追加到末尾），同一个文件的 `fs_pwrite` 按收到的先后做；`fs_remove` 可以带
+/// `kind`（只删这一种，`file` 或 `dir`）；`fs_rename` 带 `replace` 时目录可以盖空目录。
 ///
 /// 客户端握手（`hello`）时带上自己的 `protocol`，kuaid 按它决定发不发新加的东西：kuaid 可以比客户端
 /// 新（另一台电脑上更新的 Kuai 换上的），旧客户端认不得的不能发给它。
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// 客户端的协议从这一版起，kuaid 才在终端流里发消息刻度（[`TermMarks`]）、分段还原屏幕
 /// （[`TermOpened::restore`]）。更旧的客户端把终端流里带结果的消息都当成 [`TermOpened`]，收到刻度
@@ -386,6 +392,9 @@ pub struct FsEntry {
     /// 只读（和 [`FsStat::readonly`] 一样；旧的 kuaid 不给，当作可写）
     #[serde(default, skip_serializing_if = "is_false")]
     pub readonly: bool,
+    /// 权限位（同 [`FsStat::mode`]）
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub mode: u32,
 }
 
 /// 一个文件现在的情况。
@@ -404,6 +413,9 @@ pub struct FsStat {
     /// 只读（没有写权限）
     #[serde(default, skip_serializing_if = "is_false")]
     pub readonly: bool,
+    /// 权限位（`st_mode & 0o7777`）：Linux 主机给（协议 17）；Windows 主机、旧的 kuaid 不给，0 是不知道
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub mode: u32,
 }
 
 /// `fs_space` 的结果：目录所在的盘的大小（字节）。
@@ -496,6 +508,10 @@ pub struct SubRepos {
 }
 
 fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+fn is_zero_u32(n: &u32) -> bool {
     *n == 0
 }
 

@@ -93,7 +93,20 @@ fn stat_of(meta: &Metadata, full: &Path) -> FsStat {
         size: if meta.is_dir() { 0 } else { meta.len() },
         mtime: mtime(meta),
         readonly: readonly(meta, full),
+        mode: mode_of(meta),
     }
+}
+
+/// 权限位；Windows 上没有，是 0。
+#[cfg(unix)]
+fn mode_of(meta: &Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    meta.permissions().mode() & 0o7777
+}
+
+#[cfg(not(unix))]
+fn mode_of(_: &Metadata) -> u32 {
+    0
 }
 
 /// 这个用户写不了它（目录：在里面建、删不了）。Linux 上按这个用户实际的权限问系统：root 的
@@ -130,6 +143,84 @@ pub fn is_git_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("git~1")
 }
 
+/// 本机网页服务、Markdown 预览用：`path` 跟着符号链接（Windows 上还有联接这类重解析点）走到底以后
+/// 真正在哪。还在仓库里、不在 Git 的数据目录里才给，返回那个真实的路径；什么都没有（包括指向的东西
+/// 不在了的链接）是 `None`。
+///
+/// 文件页别的操作不用它：仓库里的链接指到外面是用户自己放的（见模块说明）；可网页里的脚本、
+/// Markdown 里的图片是仓库的内容，不可信，不能借链接读到仓库外面去。
+pub fn confined(repo: &str, path: &str) -> Result<Option<PathBuf>> {
+    let full = resolve(repo, path)?;
+    let real = match fs::canonicalize(&full) {
+        Ok(real) => real,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| tf!("无法读取 {path}", path = full.display()));
+        }
+    };
+    let root = fs::canonicalize(repo).with_context(|| tf!("无法读取 {path}", path = repo))?;
+    inside_root(&root, &real, path)?;
+    Ok(Some(real))
+}
+
+/// `real`（已经走到底的路径）在 `root`（同样走到底的仓库根）里、不在 `.git` 里。
+fn inside_root(root: &Path, real: &Path, path: &str) -> Result<()> {
+    let Ok(rest) = real.strip_prefix(root) else {
+        bail!("{}", tf!("{path} 指向仓库以外", path));
+    };
+    let in_git = rest.components().any(|part| match part {
+        Component::Normal(name) => is_git_name(&name.to_string_lossy()),
+        _ => false,
+    });
+    if in_git {
+        bail!("{}", tf!("{path} 在 Git 的数据目录中", path));
+    }
+    Ok(())
+}
+
+/// 同 [`stat`]，但只认仓库里的（[`confined`]）。
+pub fn stat_confined(repo: &str, path: &str) -> Result<FsStat> {
+    match confined(repo, path)? {
+        Some(real) => stat_at(&real),
+        None => Ok(FsStat::default()),
+    }
+}
+
+/// 同 [`read`]，但只读仓库里的普通文件（[`confined`]）：命名管道、设备打开就会一直等着，不读。
+pub fn read_confined(
+    repo: &str,
+    path: &str,
+    offset: u64,
+    len: u64,
+    whole: Option<u64>,
+) -> Result<(FsStat, Vec<u8>)> {
+    if path.split('/').all(str::is_empty) {
+        bail!("{}", tf!("路径无效：{path}", path));
+    }
+    let Some(real) = confined(repo, path)? else {
+        bail!("{}", tf!("找不到 {path}", path));
+    };
+    let meta =
+        fs::metadata(&real).with_context(|| tf!("无法读取 {path}", path = real.display()))?;
+    if meta.is_dir() {
+        bail!("{}", tf!("{path} 是目录", path));
+    }
+    if !meta.is_file() {
+        bail!("{}", tf!("{path} 不是普通文件", path));
+    }
+    read_at(&real, path, offset, len, whole)
+}
+
+/// 同 [`list`]，但只列仓库里的目录（[`confined`]）；里面指到仓库外、`.git` 里的链接照样列出名字，
+/// 不说指向的东西有多大、什么时候改的（当成指向的东西不在了）。
+pub fn list_confined(repo: &str, dir: &str) -> Result<Vec<FsEntry>> {
+    let Some(real) = confined(repo, dir)? else {
+        bail!("{}", tf!("找不到 {path}", path = dir));
+    };
+    let root = fs::canonicalize(repo).with_context(|| tf!("无法读取 {path}", path = repo))?;
+    list_at(&real, false, Some(&root))
+}
+
 /// 列出一层：文件和目录都列，`.git` 不列。顺序不保证，由界面排。
 pub fn list(repo: &str, dir: &str) -> Result<Vec<FsEntry>> {
     list_with(repo, dir, false)
@@ -137,9 +228,13 @@ pub fn list(repo: &str, dir: &str) -> Result<Vec<FsEntry>> {
 
 /// 同 [`list`]；`all` 为真时 `.git` 也列（映射到本机的盘上要看得到它）。
 pub fn list_with(repo: &str, dir: &str, all: bool) -> Result<Vec<FsEntry>> {
-    let full = resolve(repo, dir)?;
+    list_at(&resolve(repo, dir)?, all, None)
+}
+
+/// 列出 `full` 这一层。`confine` 是仓库根（走到底的）时，指到它外面的链接不跟过去。
+fn list_at(full: &Path, all: bool, confine: Option<&Path>) -> Result<Vec<FsEntry>> {
     let entries =
-        fs::read_dir(&full).with_context(|| tf!("无法读取 {path}", path = full.display()))?;
+        fs::read_dir(full).with_context(|| tf!("无法读取 {path}", path = full.display()))?;
     let mut listed = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -147,9 +242,16 @@ pub fn list_with(repo: &str, dir: &str, all: bool) -> Result<Vec<FsEntry>> {
             continue;
         }
         let link = entry.file_type().is_ok_and(|kind| kind.is_symlink());
+        let followed = || {
+            let real = fs::canonicalize(entry.path()).ok()?;
+            match confine {
+                Some(root) if inside_root(root, &real, &name).is_err() => None,
+                _ => fs::metadata(real).ok(),
+            }
+        };
         // 符号链接看它指向的；指向的东西不在了就当成一个空文件
         let meta = match link {
-            true => fs::metadata(entry.path()).ok(),
+            true => followed(),
             false => entry.metadata().ok(),
         };
         let stat = meta
@@ -163,6 +265,7 @@ pub fn list_with(repo: &str, dir: &str, all: bool) -> Result<Vec<FsEntry>> {
             size: stat.size,
             mtime: stat.mtime,
             readonly: stat.readonly,
+            mode: stat.mode,
         });
     }
     Ok(listed)
@@ -182,10 +285,20 @@ pub fn read(
     len: u64,
     whole: Option<u64>,
 ) -> Result<(FsStat, Vec<u8>)> {
-    let full = resolve_inside(repo, path)?;
+    read_at(&resolve_inside(repo, path)?, path, offset, len, whole)
+}
+
+/// [`read`] 读磁盘上的 `full`（`path` 是相对仓库根的写法，报错用）。
+fn read_at(
+    full: &Path,
+    path: &str,
+    offset: u64,
+    len: u64,
+    whole: Option<u64>,
+) -> Result<(FsStat, Vec<u8>)> {
     let unreadable = || tf!("无法读取 {path}", path = full.display());
-    let mut file = File::open(&full).with_context(unreadable)?;
-    let stat = stat_of(&file.metadata().with_context(unreadable)?, &full);
+    let mut file = File::open(full).with_context(unreadable)?;
+    let stat = stat_of(&file.metadata().with_context(unreadable)?, full);
     if stat.dir {
         bail!("{}", tf!("{path} 是目录", path));
     }
@@ -525,6 +638,42 @@ pub fn write_at(repo: &str, path: &str, offset: u64, bytes: &[u8], create: bool)
     Ok(stat_of(&file.metadata().with_context(failed)?, &full))
 }
 
+/// 把 `bytes` 接到文件末尾（按主机上这时候的末尾，`O_APPEND`）：别的程序同时也在往里追加时不会
+/// 盖掉它们写的。返回写完以后文件的情况。
+pub fn append(repo: &str, path: &str, bytes: &[u8]) -> Result<FsStat> {
+    let full = resolve_inside(repo, path)?;
+    let failed = || tf!("无法写入 {path}", path = full.display());
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&full)
+        .with_context(failed)?;
+    file.write_all(bytes).with_context(failed)?;
+    Ok(stat_of(&file.metadata().with_context(failed)?, &full))
+}
+
+/// 改权限位（`mode & 0o7777`）。Windows 上只有只读属性：属主没有写权限就设上，有就去掉；目录不动。
+pub fn set_mode(repo: &str, path: &str, mode: u32) -> Result<FsStat> {
+    let full = resolve_inside(repo, path)?;
+    let failed = || tf!("无法修改 {path} 的权限", path = full.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&full, fs::Permissions::from_mode(mode & 0o7777))
+            .with_context(failed)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let meta = fs::metadata(&full).with_context(failed)?;
+        if !meta.is_dir() {
+            let mut permissions = meta.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(mode & 0o200 == 0);
+            fs::set_permissions(&full, permissions).with_context(failed)?;
+        }
+    }
+    stat_at(&full)
+}
+
 /// 把文件截短或接长到 `size` 字节。`new` 为真是新建一个文件：已经有了就失败。
 pub fn resize(repo: &str, path: &str, size: u64, new: bool) -> Result<FsStat> {
     let full = resolve_inside(repo, path)?;
@@ -607,8 +756,11 @@ pub fn space(repo: &str) -> Result<FsSpace> {
     Ok(FsSpace { total, free })
 }
 
-/// 同 [`rename`]，`to` 已经有文件时直接盖掉（一步完成，中间没有两个都不在的时候）。目录不盖：
-/// `to` 是目录就失败。
+/// 同 [`rename`]，`to` 已经有文件时直接盖掉（一步完成，中间没有两个都不在的时候）。
+///
+/// `to` 是目录时照 Linux 的 rename 来（协议 17，Linux 上的映射盘要）：目录盖空目录可以，不空的报
+/// 「目录不是空的」，文件、目录互相盖不了。Linux 上系统本来就是这样，一步完成；Windows 上系统盖不了
+/// 目录，空目录先删掉再改名。
 ///
 /// 盖掉的是普通文件时，权限和属主照被盖掉的那个（同 [`replace`]）：Windows 上的程序存盘常常是
 /// 先写一个临时文件、再改名盖过去（映射到本机的盘上就走到这里），不然脚本的可执行位就没了。
@@ -616,8 +768,17 @@ pub fn rename_over(repo: &str, from: &str, to: &str) -> Result<()> {
     let source = resolve_inside(repo, from)?;
     let target = resolve_inside(repo, to)?;
     let existing = fs::symlink_metadata(&target).ok();
+    #[cfg(windows)]
     if existing.as_ref().is_some_and(|meta| meta.is_dir()) && source != target {
-        bail!("{}", tf!("{path} 已存在", path = to));
+        let failed = || tf!("无法重命名 {path}", path = from);
+        // ERROR_ACCESS_DENIED：文件盖不了目录；ERROR_DIR_NOT_EMPTY：目录不是空的
+        if !fs::symlink_metadata(&source).is_ok_and(|meta| meta.is_dir()) {
+            return Err(std::io::Error::from_raw_os_error(5)).with_context(failed);
+        }
+        if fs::read_dir(&target).with_context(failed)?.next().is_some() {
+            return Err(std::io::Error::from_raw_os_error(145)).with_context(failed);
+        }
+        fs::remove_dir(&target).with_context(failed)?;
     }
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)
@@ -632,6 +793,19 @@ pub fn rename_over(repo: &str, from: &str, to: &str) -> Result<()> {
         keep_owner(&source, &meta);
     }
     fs::rename(&source, &target).with_context(|| tf!("无法重命名 {path}", path = from))
+}
+
+/// 只删这一种：`dir` 为真只删空目录，为假只删文件（协议 17）。Linux 上的映射盘删之前看过是哪一种，
+/// 交给 [`remove_shallow`] 的话，看过以后主机上同名的换成了另一种（文件换成了空目录）也会删掉。
+/// 是另一种时报系统的错（`unlink` 一个目录是 EISDIR，`rmdir` 一个文件是 ENOTDIR）。
+pub fn remove_kind(repo: &str, path: &str, dir: bool) -> Result<()> {
+    let full = resolve_inside(repo, path)?;
+    let failed = || tf!("无法删除 {path}", path = full.display());
+    match dir {
+        true => fs::remove_dir(&full),
+        false => fs::remove_file(&full),
+    }
+    .with_context(failed)
 }
 
 /// 只删文件和空目录：目录里有东西就失败（映射到本机的盘上，删目录是系统自己一层层来的）。
@@ -707,6 +881,131 @@ pub fn find_repos(repo: &str) -> Result<SubRepos> {
     }
     found.repos.sort_by_cached_key(|path| path.to_lowercase());
     Ok(found)
+}
+
+/// Linux（和别的 Unix）：把 `full` 移到回收站。先交给 `gio trash`（照 freedesktop 的回收站规范，
+/// 别的盘上的放那块盘自己的 `.Trash-<uid>`，文件管理器里能还原）；没有 gio、gio 也放不了时自己移进
+/// `~/.local/share/Trash`（[`home_trash`]，只能是同一块盘上的）。都不行就报错，不改成直接删：确认框
+/// 说的是移到回收站。
+#[cfg(unix)]
+pub fn move_to_trash(full: &Path) -> Result<()> {
+    let gio = std::process::Command::new("gio")
+        .arg("trash")
+        .arg("--")
+        .arg(full)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output();
+    let said = match gio {
+        Ok(out) if out.status.success() => return Ok(()),
+        Ok(out) => Some(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+        Err(_) => None,
+    };
+    home_trash(full).map_err(|err| match said {
+        Some(text) if !text.is_empty() => anyhow::anyhow!("{text}"),
+        _ => err,
+    })
+}
+
+/// 照 freedesktop 的回收站规范移进 `$XDG_DATA_HOME/Trash`（没设就是 `~/.local/share/Trash`）：
+/// `files/` 里放东西，`info/` 里同名加 `.trashinfo` 记原来在哪、什么时候删的。重名的后面加 ` 2`、
+/// ` 3`（先独占地建 info 占住名字）。跨盘移不了（EXDEV）就报错。
+#[cfg(unix)]
+fn home_trash(full: &Path) -> Result<()> {
+    let env = |name| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    let data = env("XDG_DATA_HOME")
+        .or_else(|| env("HOME").map(|home| home.join(".local").join("share")))
+        .context(tr("找不到回收站"))?;
+    trash_into(&data.join("Trash"), full)
+}
+
+/// [`home_trash`] 移进回收站目录 `trash`。
+#[cfg(unix)]
+fn trash_into(trash: &Path, full: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::DirBuilderExt as _;
+    let (files, info) = (trash.join("files"), trash.join("info"));
+    for dir in [&files, &info] {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+    }
+    let absolute = match full.is_absolute() {
+        true => full.to_path_buf(),
+        false => std::env::current_dir()?.join(full),
+    };
+    let name = absolute
+        .file_name()
+        .context(tr("找不到回收站"))?
+        .to_string_lossy()
+        .into_owned();
+    let mut encoded = String::new();
+    for &byte in absolute.as_os_str().as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    let record = format!(
+        "[Trash Info]\nPath={encoded}\nDeletionDate={}\n",
+        local_time_now()
+    );
+    for n in 1u32.. {
+        let taken = match n {
+            1 => name.clone(),
+            n => format!("{name} {n}"),
+        };
+        let note = info.join(format!("{taken}.trashinfo"));
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&note)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        };
+        file.write_all(record.as_bytes())?;
+        drop(file);
+        return match fs::rename(&absolute, files.join(&taken)) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let _ = fs::remove_file(&note);
+                Err(err.into())
+            }
+        };
+    }
+    unreachable!()
+}
+
+/// 现在的本地时间，回收站记录的写法：`2026-11-24T15:04:05`。
+#[cfg(unix)]
+// musl 版的 libc 把 time_t 标成了过时的（以后要换成 64 位），这里只是照着系统的定义传给 localtime_r
+#[allow(deprecated)]
+fn local_time_now() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs()) as libc::time_t;
+    // SAFETY: localtime_r 只写给它的 tm
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&now, &mut tm) };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
 }
 
 #[cfg(test)]
@@ -805,6 +1104,62 @@ mod tests {
         assert!(set_mtime(root, "d", then).unwrap().dir);
         // 不能动仓库根
         assert!(write_at(root, "", 0, b"x", true).is_err());
+    }
+
+    /// 映射盘（Linux 上的 FUSE）要的那几样（协议 17）。
+    #[test]
+    fn 目录盖空目录_追加_改权限_按种类删() {
+        let repo = TempRepo::new();
+        let root = repo.repo();
+        let os_code = |err: &anyhow::Error| {
+            err.chain()
+                .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+                .and_then(std::io::Error::raw_os_error)
+        };
+        // 目录盖空目录可以；不空的不行，报「目录不是空的」（映射盘上换成 ENOTEMPTY）
+        fs::create_dir_all(repo.0.join("src/inner")).unwrap();
+        fs::create_dir(repo.0.join("empty")).unwrap();
+        rename_over(root, "src", "empty").unwrap();
+        assert!(repo.0.join("empty/inner").is_dir());
+        assert!(!repo.0.join("src").exists());
+        fs::create_dir(repo.0.join("other")).unwrap();
+        let err = rename_over(root, "other", "empty").unwrap_err();
+        #[cfg(unix)]
+        assert_eq!(os_code(&err), Some(libc::ENOTEMPTY));
+        #[cfg(windows)]
+        assert_eq!(os_code(&err), Some(145));
+        // 文件盖不了目录
+        fs::write(repo.0.join("f.txt"), b"x").unwrap();
+        assert!(rename_over(root, "f.txt", "other").is_err());
+        assert!(repo.0.join("f.txt").is_file() && repo.0.join("other").is_dir());
+        // 追加：接在主机上这时候的末尾
+        fs::write(repo.0.join("log"), b"12345").unwrap();
+        assert_eq!(append(root, "log", b"abc").unwrap().size, 8);
+        assert_eq!(fs::read(repo.0.join("log")).unwrap(), b"12345abc");
+        assert!(append(root, "nope", b"x").is_err());
+        // 权限位：Linux 上照给的改，列目录、查属性都带着；Windows 上只有只读属性
+        #[cfg(unix)]
+        {
+            assert_eq!(set_mode(root, "f.txt", 0o755).unwrap().mode, 0o755);
+            assert_eq!(stat(root, "f.txt").unwrap().mode, 0o755);
+            let listed = list(root, "").unwrap();
+            let entry = listed.iter().find(|entry| entry.name == "f.txt").unwrap();
+            assert_eq!(entry.mode, 0o755);
+        }
+        #[cfg(windows)]
+        {
+            assert!(set_mode(root, "f.txt", 0o444).unwrap().readonly);
+            assert!(!set_mode(root, "f.txt", 0o644).unwrap().readonly);
+            assert_eq!(stat(root, "f.txt").unwrap().mode, 0);
+        }
+        // 按种类删：说是文件的不删目录，说是目录的不删文件
+        assert!(remove_kind(root, "other", false).is_err());
+        assert!(repo.0.join("other").is_dir());
+        assert!(remove_kind(root, "f.txt", true).is_err());
+        assert!(repo.0.join("f.txt").is_file());
+        remove_kind(root, "other", true).unwrap();
+        remove_kind(root, "f.txt", false).unwrap();
+        assert!(!repo.0.join("other").exists() && !repo.0.join("f.txt").exists());
     }
 
     #[test]
@@ -1185,5 +1540,86 @@ mod tests {
         set("new.txt", 0o600);
         rename_over(temp.repo(), "new.txt", "moved.txt").unwrap();
         assert_eq!(mode("moved.txt"), 0o600);
+    }
+
+    /// 网页服务、Markdown 预览读的：跟着链接出了仓库、进了 `.git` 的都不给，指回仓库里的照常。
+    #[test]
+    fn 只认仓库里的_不跟着链接出去() {
+        let repo = TempRepo::new();
+        let outside = TempRepo::new();
+        fs::write(outside.0.join("secret.txt"), b"s").unwrap();
+        repo.write("a.html", b"<p>");
+        fs::write(repo.0.join(".git").join("config"), b"c").unwrap();
+        let got =
+            |path: &str| read_confined(repo.repo(), path, 0, 10, None).map(|(_, bytes)| bytes);
+        assert_eq!(got("a.html").unwrap(), b"<p>");
+        assert!(got("").is_err());
+        assert!(!stat_confined(repo.repo(), "nothing").unwrap().exists);
+        assert!(got("nothing").is_err());
+        assert!(stat_confined(repo.repo(), "").unwrap().dir);
+        // 建链接要权限（Windows 上没开开发者模式时建不了）：建不了就只测上面这些
+        let link = |target: &Path, name: &str| -> bool {
+            #[cfg(unix)]
+            let made = std::os::unix::fs::symlink(target, repo.0.join(name));
+            #[cfg(windows)]
+            let made = std::os::windows::fs::symlink_dir(target, repo.0.join(name));
+            made.is_ok()
+        };
+        if !link(&outside.0, "out") {
+            eprintln!("建不了符号链接，跳过链接那几项");
+            return;
+        }
+        assert!(link(&repo.0.join(".git"), "g"));
+        assert!(link(&repo.0, "self"));
+        assert!(got("out/secret.txt").is_err());
+        assert!(stat_confined(repo.repo(), "out").is_err());
+        assert!(list_confined(repo.repo(), "out").is_err());
+        assert!(got("g/config").is_err());
+        assert_eq!(got("self/a.html").unwrap(), b"<p>");
+        // 列目录时，指到外面的链接只有名字，看不出指向的东西
+        let listed = list_confined(repo.repo(), "").unwrap();
+        let out = listed.iter().find(|entry| entry.name == "out").unwrap();
+        assert!(out.link && !out.dir && out.mtime == 0);
+        let inner = listed.iter().find(|entry| entry.name == "self").unwrap();
+        assert!(inner.link && inner.dir);
+        // 文件页照旧跟着链接走
+        assert_eq!(
+            read(repo.repo(), "out/secret.txt", 0, 10, None).unwrap().1,
+            b"s"
+        );
+    }
+
+    /// 自己移进回收站（没有 gio 时）：重名的加编号，记录里有原来的路径（百分号编码）。
+    #[cfg(unix)]
+    #[test]
+    fn 移进回收站_重名的加编号() {
+        let repo = TempRepo::new();
+        let trash = repo.0.join("trash");
+        for _ in 0..2 {
+            fs::write(repo.0.join("a b.txt"), b"x").unwrap();
+            trash_into(&trash, &repo.0.join("a b.txt")).unwrap();
+        }
+        assert!(!repo.0.join("a b.txt").exists());
+        assert!(trash.join("files").join("a b.txt").is_file());
+        assert!(trash.join("files").join("a b.txt 2").is_file());
+        let note = fs::read_to_string(trash.join("info").join("a b.txt 2.trashinfo")).unwrap();
+        assert!(note.starts_with("[Trash Info]\nPath=/"), "{note}");
+        assert!(note.contains("a%20b.txt\nDeletionDate=20"), "{note}");
+        // 没有的移不了，也不留记录
+        assert!(trash_into(&trash, &repo.0.join("none")).is_err());
+        assert!(!trash.join("info").join("none.trashinfo").exists());
+    }
+
+    /// 命名管道打开就等着有人写：网页服务不读它，免得一个连接一直卡着。
+    #[cfg(unix)]
+    #[test]
+    fn 只认仓库里的_不读命名管道() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let repo = TempRepo::new();
+        let fifo = std::ffi::CString::new(repo.0.join("pipe").as_os_str().as_bytes()).unwrap();
+        // SAFETY: 以 0 结尾的路径
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let error = read_confined(repo.repo(), "pipe", 0, 10, None).unwrap_err();
+        assert!(format!("{error:#}").contains("pipe"));
     }
 }

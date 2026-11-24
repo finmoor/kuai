@@ -5,6 +5,7 @@
 //! 下面，左边一条竖线：图标、名字和相对目录、已打开、分支、改动数。「已打开」、终端个数、分支、
 //! 改动数、悬停的按钮各占固定的宽度（没有的也留着位置，见 [`Columns`]），所以各行对齐成一张表。
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use fr_core::i18n::tr;
@@ -98,6 +99,32 @@ pub(crate) struct Block {
     pub chips: Vec<AnyElement>,
     /// 要标出来的这个仓库或它的某个子仓库（工作区页上「打开工作区」过来的）：那一行带选中的底色
     pub hit: Option<RepoEntry>,
+    /// 标出来的那一行画在哪、是不是正是要标的那个，记在这里（工作区页按它滚到看得见）。原来量的是
+    /// 整个仓库连同子仓库的那一块，块比看得见的地方高时，靠下的子仓库那一行滚过去也看不见
+    pub hit_at: Option<HitCell>,
+}
+
+/// 标出来的那一行上一帧画在哪；后一项：是要标的那个本身（子仓库收着、还没找到时标在仓库那一行上，
+/// 不算）。
+pub(crate) type HitCell = Rc<Cell<Option<(Bounds<Pixels>, bool)>>>;
+
+/// 在标出来的那一行上量一下画在哪（[`Block::hit_at`]）。
+fn measured(row: AnyElement, cell: Option<&HitCell>, exact: bool) -> AnyElement {
+    let Some(cell) = cell.cloned() else {
+        return row;
+    };
+    div()
+        .relative()
+        .child(row)
+        .child(
+            canvas(
+                move |bounds, _, _| cell.set(Some((bounds, exact))),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0(),
+        )
+        .into_any_element()
 }
 
 /// 一行里能点的几样。
@@ -296,6 +323,16 @@ pub(crate) fn render_block<T: 'static>(
                 })),
         );
     let head = with_menu(head, &block.entry, false, handlers);
+    let head = match hit_head {
+        true => {
+            let exact = block
+                .hit
+                .as_ref()
+                .is_some_and(|hit| hit.same_repo(&block.entry));
+            measured(head, block.hit_at.as_ref(), exact)
+        }
+        false => head,
+    };
     if !unfolded {
         return head;
     }
@@ -353,12 +390,16 @@ pub(crate) fn render_block<T: 'static>(
                             columns.compact,
                             cx,
                         ));
-                with_menu(
+                let row = with_menu(
                     row.child(div().flex_none().w(px(ACTION_WIDTH * slots as f32 + 4.))),
                     &sub,
                     true,
                     handlers,
-                )
+                );
+                match hit {
+                    true => measured(row, block.hit_at.as_ref(), true),
+                    false => row,
+                }
             })
             .collect();
     v_flex()

@@ -64,9 +64,19 @@ pub enum Claim {
 
 /// 占着「只运行一个」的位置；丢掉就让出去。
 pub struct Guard {
-    _imp: imp::Guard,
+    /// 没锁上时是 None（见 `unlocked`）
+    _imp: Option<imp::Guard>,
     /// 写给 kuaid 看的那个文件和里面的内容：退出时还是我们写的那份就删掉
     announced: Option<(PathBuf, String)>,
+    unlocked: Option<String>,
+}
+
+impl Guard {
+    /// 没锁上（锁文件建不出来、锁不了）时是原因：不知道有没有别的 Kuai 在用同一份设置，这次运行
+    /// 不写设置文件，免得互相覆盖（见 `settings::hold_writes`）。
+    pub fn unlocked(&self) -> Option<&str> {
+        self.unlocked.as_deref()
+    }
 }
 
 impl Drop for Guard {
@@ -159,20 +169,41 @@ pub fn claim(request: &Request) -> Claim {
     if let Some(pid) = wait_pid() {
         imp::wait_for_exit(pid, Duration::from_secs(15));
     }
-    let key = key(&crate::settings::file());
+    let settings = crate::settings::file();
+    let key = key(&settings);
     // 已经运行的那个刚启动、还没建好管道，或者正在退出：等一会儿
     let deadline = Instant::now() + Duration::from_secs(6);
     loop {
-        if let Some(guard) = imp::take(&key) {
-            let (tx, rx) = mpsc::unbounded();
-            imp::listen(&key, tx);
-            let guard = Guard {
-                _imp: guard,
-                announced: imp::pipe_name(&key).and_then(announce),
-            };
-            return Claim::First(guard, rx);
+        match imp::take(&key, &settings) {
+            Ok(Some(guard)) => {
+                let (tx, rx) = mpsc::unbounded();
+                imp::listen(&key, tx);
+                let guard = Guard {
+                    _imp: Some(guard),
+                    announced: imp::pipe_name(&key).and_then(announce),
+                    unlocked: None,
+                };
+                return Claim::First(guard, rx);
+            }
+            Ok(None) => {}
+            // 锁不上，又不是别的 Kuai 占着（目录不能写、文件系统不支持锁）：有别的在运行就交给它；
+            // 没有的话照常打开，但不知道有没有别的 Kuai 在用同一份设置，这次运行不写设置文件（见
+            // `Guard::unlocked`）。不守套接字：守的时候要先删掉旧的，可能是别的 Kuai 正守着的
+            Err(err) => {
+                log::warn!("无法锁定 {err}");
+                if imp::forward(&key, &settings, request) {
+                    return Claim::Forwarded;
+                }
+                let (_, rx) = mpsc::unbounded();
+                let guard = Guard {
+                    _imp: None,
+                    announced: None,
+                    unlocked: Some(err),
+                };
+                return Claim::First(guard, rx);
+            }
         }
-        if imp::forward(&key, request) {
+        if imp::forward(&key, &settings, request) {
             return Claim::Forwarded;
         }
         if Instant::now() >= deadline {
@@ -214,7 +245,7 @@ mod imp {
 
     use futures::channel::mpsc::UnboundedSender;
 
-    use super::{Incoming, Request};
+    use super::{Incoming, Path, Request};
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -293,20 +324,20 @@ mod imp {
     }
 
     /// 建互斥量；已经有了（另一个 Kuai 在运行）返回 None。
-    pub fn take(key: &str) -> Option<Guard> {
+    pub fn take(key: &str, _settings: &Path) -> Result<Option<Guard>, String> {
         let name = wide(&format!(r"Local\Kuai-{key}"));
         // SAFETY：名字以 0 结尾；返回的句柄由 Guard 关，或者马上关掉
         unsafe {
             let mutex = CreateMutexW(null(), 0, name.as_ptr());
             // 建不出来多半是别的权限级别（管理员）运行的 Kuai 建的：也算已经有一个
             if mutex.is_null() {
-                return None;
+                return Ok(None);
             }
             if GetLastError() == ERROR_ALREADY_EXISTS {
                 CloseHandle(mutex);
-                return None;
+                return Ok(None);
             }
-            Some(Guard(mutex))
+            Ok(Some(Guard(mutex)))
         }
     }
 
@@ -437,7 +468,7 @@ mod imp {
     }
 
     /// 把请求交给正在运行的 Kuai，它处理完返回 true。
-    pub fn forward(key: &str, request: &Request) -> bool {
+    pub fn forward(key: &str, _settings: &Path, request: &Request) -> bool {
         let Ok(line) = serde_json::to_string(request) else {
             return false;
         };
@@ -484,10 +515,10 @@ mod imp {
     }
 }
 
-/// Linux 等 Unix 系统：有没有已经运行的看文件锁 `kuai-<键>.lock`（进程退出、崩溃时系统自动放开）；
-/// 请求经 Unix 套接字 `kuai-<键>.sock` 交过去，一样是一行 JSON、处理完回一个字节。两个文件放在
-/// `$XDG_RUNTIME_DIR/kuai`（只有本人能进的目录），没有这个变量时放在 `~/.kuai/run/`
-/// （[`fr_channel::local_run_dir`]）。
+/// Linux 等 Unix 系统：有没有已经运行的看设置文件旁边的文件锁 `settings.json.lock`（进程退出、崩溃
+/// 时系统自动放开）；请求经 Unix 套接字 `kuai-<键>.sock` 交过去，一样是一行 JSON、处理完回一个字节。
+/// 套接字放在 `$XDG_RUNTIME_DIR/kuai`（只有本人能进的目录），没有这个变量时放在 `~/.kuai/run/`
+/// （[`fr_channel::local_run_dir`]）；在哪写在锁文件里，后启动的照着找。
 ///
 /// kuaid 在 Unix 上自己拉起常驻进程，不来找 Kuai（Windows 上那样做是为了离开会话 0），所以不写
 /// `kuai.pipe`。
@@ -496,7 +527,7 @@ mod imp {
     use std::fs::File;
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc::sync_channel;
     use std::time::{Duration, Instant};
 
@@ -510,45 +541,69 @@ mod imp {
     const READ_LIMIT: Duration = Duration::from_secs(3);
     const REPLY_LIMIT: Duration = Duration::from_secs(3);
 
-    /// 放锁和套接字的目录。
-    fn dir() -> PathBuf {
-        fr_channel::local_run_dir()
+    /// 守着的套接字：放在只给自己的运行目录里（[`fr_channel::local_run_dir`]），名字带设置文件的
+    /// 哈希。套接字的路径有长度上限，不放到设置文件旁边。
+    fn socket_path(key: &str) -> PathBuf {
+        fr_channel::local_run_dir().join(format!("kuai-{key}.sock"))
     }
 
-    fn socket_path(key: &str) -> PathBuf {
-        dir().join(format!("kuai-{key}.sock"))
+    /// 锁文件：设置文件旁边的 `settings.json.lock`。和设置文件绑在一起：用同一份设置的锁的一定是
+    /// 同一个文件，不随环境变量（XDG_RUNTIME_DIR）变。原来放在运行目录里，从不同的环境启动的两个
+    /// Kuai（一个有 XDG_RUNTIME_DIR、一个没有）锁的是两个文件，都以为只有自己，存设置时互相覆盖。
+    fn lock_path(settings: &Path) -> PathBuf {
+        let mut name = settings
+            .file_name()
+            .map(std::ffi::OsString::from)
+            .unwrap_or_else(|| "settings.json".into());
+        name.push(".lock");
+        settings.with_file_name(name)
     }
 
     pub fn pipe_name(_: &str) -> Option<String> {
         None
     }
 
-    /// 拿着锁文件；`None` 是锁文件建不出来，这时不管有没有别的 Kuai，照常运行。
-    pub struct Guard(#[allow(dead_code)] Option<File>);
+    /// 拿着锁文件。
+    pub struct Guard(#[allow(dead_code)] File);
 
-    /// 锁上锁文件；锁不上（另一个 Kuai 在运行）返回 None。
-    pub fn take(key: &str) -> Option<Guard> {
-        let path = dir().join(format!("kuai-{key}.lock"));
-        let file = match File::options()
+    /// 锁上锁文件，写上守着的套接字在哪：后启动的照着找过来，它算出来的运行目录和我们的不一样
+    /// 也找得到。锁不上（另一个 Kuai 在运行）返回 None；建不出来、锁不了（文件系统不支持）是 Err。
+    pub fn take(key: &str, settings: &Path) -> Result<Option<Guard>, String> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = lock_path(settings);
+        let failed = |err: std::io::Error| format!("{}：{err}", path.display());
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(failed)?;
+        }
+        let file = File::options()
             .create(true)
             .truncate(false)
             .write(true)
             .open(&path)
-        {
-            Ok(file) => file,
-            Err(err) => {
-                log::warn!("无法创建 {}：{err}", path.display());
-                return Some(Guard(None));
-            }
-        };
+            .map_err(failed)?;
         match file.try_lock() {
-            Ok(()) => Some(Guard(Some(file))),
-            Err(std::fs::TryLockError::WouldBlock) => None,
-            Err(std::fs::TryLockError::Error(err)) => {
-                log::warn!("无法锁定 {}：{err}", path.display());
-                Some(Guard(None))
-            }
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(err)) => return Err(failed(err)),
         }
+        let socket = socket_path(key);
+        let written = file
+            .set_len(0)
+            .and_then(|()| (&file).write_all(socket.as_os_str().as_bytes()));
+        if let Err(err) = written {
+            log::warn!("没写上 {}：{err}", path.display());
+        }
+        Ok(Some(Guard(file)))
+    }
+
+    /// 运行着的那个守着的套接字：写在锁文件里；没写（旧版本、刚锁上还没写）就按自己算的。
+    fn running_socket(key: &str, settings: &Path) -> PathBuf {
+        use std::os::unix::ffi::OsStringExt as _;
+        std::fs::read(lock_path(settings))
+            .ok()
+            .filter(|bytes| !bytes.is_empty() && !bytes.contains(&0))
+            .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+            .unwrap_or_else(|| socket_path(key))
     }
 
     /// 后台线程守着套接字，收到的请求送进 `tx`。一个连接一个线程：哪个连上来不说话也挡不住别的。
@@ -624,11 +679,11 @@ mod imp {
     }
 
     /// 把请求交给正在运行的 Kuai，它处理完返回 true。
-    pub fn forward(key: &str, request: &Request) -> bool {
+    pub fn forward(key: &str, settings: &Path, request: &Request) -> bool {
         let Ok(line) = serde_json::to_string(request) else {
             return false;
         };
-        let Ok(mut stream) = UnixStream::connect(socket_path(key)) else {
+        let Ok(mut stream) = UnixStream::connect(running_socket(key, settings)) else {
             return false;
         };
         // 那边最多等界面线程 3 秒
@@ -687,18 +742,18 @@ mod imp {
     use futures::channel::mpsc::UnboundedSender;
     use std::time::Duration;
 
-    use super::{Incoming, Request};
+    use super::{Incoming, Path, Request};
 
     pub struct Guard;
 
-    pub fn take(_: &str) -> Option<Guard> {
-        Some(Guard)
+    pub fn take(_: &str, _: &Path) -> Result<Option<Guard>, String> {
+        Ok(Some(Guard))
     }
     pub fn pipe_name(_: &str) -> Option<String> {
         None
     }
     pub fn listen(_: &str, _: UnboundedSender<Incoming>) {}
-    pub fn forward(_: &str, _: &Request) -> bool {
+    pub fn forward(_: &str, _: &Path, _: &Request) -> bool {
         false
     }
     pub fn wait_for_exit(_: u32, _: Duration) {}
@@ -742,7 +797,7 @@ mod tests {
             ..Default::default()
         };
         let forwarded = (0..100).any(|_| {
-            let done = imp::forward(&key, &request);
+            let done = imp::forward(&key, Path::new(""), &request);
             if !done {
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -757,8 +812,17 @@ mod tests {
     fn 套接字一来一回_连上不说话的挡不住别人_锁住了别人拿不到() {
         use futures::StreamExt as _;
         let key = format!("test-{}", std::process::id());
-        let guard = imp::take(&key).expect("第一个拿得到");
-        assert!(imp::take(&key).is_none(), "锁着的时候第二个也拿到了");
+        // 锁文件在设置文件旁边：用一份测试的设置，不碰平时的
+        let dir = std::env::temp_dir().join(format!("kuai-instance-{}", std::process::id()));
+        let settings = dir.join("settings.json");
+        let guard = imp::take(&key, &settings).unwrap().expect("第一个拿得到");
+        assert!(
+            imp::take(&key, &settings).unwrap().is_none(),
+            "锁着的时候第二个也拿到了"
+        );
+        assert!(dir.join("settings.json.lock").is_file());
+        // 锁文件建不出来是出错，不是「有别的在运行」
+        assert!(imp::take(&key, Path::new("/proc/kuai-test/settings.json")).is_err());
         let (tx, mut rx) = mpsc::unbounded();
         imp::listen(&key, tx);
         // 界面那头：收到就算处理完，把请求转回来核对
@@ -777,7 +841,10 @@ mod tests {
             show: true,
             ..Default::default()
         };
-        assert!(imp::forward(&key, &request));
+        assert!(imp::forward(&key, &settings, &request));
+        assert_eq!(seen.recv_timeout(Duration::from_secs(5)).unwrap(), request);
+        // 后启动的照锁文件里写的找：它自己算出来的不一样（运行目录不同）也找得到
+        assert!(imp::forward("another", &settings, &request));
         assert_eq!(seen.recv_timeout(Duration::from_secs(5)).unwrap(), request);
         drop(silent);
         drop(guard);
@@ -785,7 +852,7 @@ mod tests {
         // 也拿着锁文件（exec 时才关），多试几次
         let again = (0..100)
             .find_map(|_| {
-                let taken = imp::take(&key);
+                let taken = imp::take(&key, &settings).unwrap();
                 if taken.is_none() {
                     std::thread::sleep(Duration::from_millis(20));
                 }
@@ -794,8 +861,7 @@ mod tests {
             .expect("放开以后拿不到");
         drop(again);
         let _ = std::fs::remove_file(&socket);
-        let lock = fr_channel::local_run_dir().join(format!("kuai-{key}.lock"));
-        let _ = std::fs::remove_file(lock);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

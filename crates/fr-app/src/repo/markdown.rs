@@ -2,12 +2,15 @@
 //! Ctrl+Shift+V 在它和源文件之间切换。显示的是编辑器里现在的文字（没保存的也算）。
 //!
 //! - 链接：网址交给浏览器；指向仓库里的文件、目录的（相对这个文件所在的目录，`/` 开头的从仓库根算）
-//!   在文件页打开，Markdown 打开成预览。
-//! - 图片：本机仓库按路径读；远程主机上的经仓库通道读回来记着（[`MdImages`]），读回来之前空着。
+//!   在文件页打开，Markdown 打开成预览。`.git` 里的不算。
+//! - 图片：仓库里的经仓库通道读（只认仓库里的：跟着符号链接出了仓库的不读，见
+//!   `fr_core::files::confined`）；网址上的自己下（界面库没有 HTTP 客户端），`data:` 的就地解开。
+//!   读回来记着（[`MdImages`]），读回来之前空着。
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures::StreamExt as _;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
@@ -17,7 +20,7 @@ use gpui_kit::*;
 use super::RepoView;
 use super::files::{Class, IMAGE_LIMIT, OpenFile, TextDoc, classify, split};
 
-/// 远程主机上的一张图片读到哪了。
+/// 一张图片读到哪了。
 #[derive(Clone)]
 enum Fetch {
     Reading,
@@ -25,8 +28,8 @@ enum Fetch {
     Done(Option<Arc<Image>>),
 }
 
-/// Markdown 预览里远程主机上的图片：按相对仓库根的路径记着读回来的。预览画到没读过的图片时，把
-/// 路径发给读图片的任务（第一次预览时起，见 [`RepoView::start_md_images`]）。
+/// Markdown 预览里的图片：仓库里的按相对仓库根的路径、网址上的按地址记着读回来的。预览画到没读过的
+/// 图片时，把它发给读图片的任务（第一次预览时起，见 [`RepoView::start_md_images`]）。
 #[derive(Default)]
 pub(crate) struct MdImages {
     got: Arc<Mutex<HashMap<String, Fetch>>>,
@@ -60,6 +63,8 @@ pub(super) fn resolve_link(dir: &str, link: &str) -> Option<String> {
             ".." => {
                 parts.pop()?;
             }
+            // Git 的数据目录不打开、不读（config 里可能有远程地址带着的口令；网页服务那边也不给）
+            part if fr_core::files::is_git_name(part) => return None,
             part => parts.push(part),
         }
     }
@@ -71,37 +76,192 @@ fn missing() -> ImageSource {
     ImageSource::Resource(Resource::Path(Arc::from(Path::new(""))))
 }
 
+/// 网址上的、`data:` 的图片：不在仓库里，地址照原样当键记着。
+fn web_image(uri: &str) -> bool {
+    let lower = uri.trim().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("data:")
+}
+
+/// 网址上的、`data:` 的图片读回来（网址上的自己下，最多 [`IMAGE_LIMIT`]）。
+fn fetch_web_image(uri: &str) -> Option<(ImageFormat, Vec<u8>)> {
+    let uri = uri.trim();
+    if uri.len() > 5 && uri[..5].eq_ignore_ascii_case("data:") {
+        return data_image(&uri[5..]);
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(20)))
+        .user_agent(format!("Kuai/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .into();
+    let mut response = agent.get(uri).call().ok()?;
+    let mime = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(IMAGE_LIMIT)
+        .read_to_vec()
+        .ok()?;
+    Some((image_format(&mime, &bytes)?, bytes))
+}
+
+/// `data:` 后面那段（`image/png;base64,iVBOR…` 或 `image/svg+xml,%3Csvg…`）里的图片。
+fn data_image(rest: &str) -> Option<(ImageFormat, Vec<u8>)> {
+    let (meta, data) = rest.split_once(',')?;
+    let base64 = meta.to_ascii_lowercase().ends_with(";base64");
+    let mime = meta.split(';').next().unwrap_or_default();
+    let bytes = match base64 {
+        true => decode_base64(data)?,
+        false => crate::web_serve::decode_path(data)?.into_bytes(),
+    };
+    Some((image_format(mime, &bytes)?, bytes))
+}
+
+/// Base64（标准的和网址用的两种字母表都认；空白跳过，结尾的 `=` 可有可无）。
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    let value = |byte: u8| match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' | b'-' => Some(62),
+        b'/' | b'_' => Some(63),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let (mut bits, mut count) = (0u32, 0u32);
+    for byte in text.bytes() {
+        if byte.is_ascii_whitespace() || byte == b'=' {
+            continue;
+        }
+        bits = (bits << 6) | u32::from(value(byte)?);
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            out.push((bits >> count) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// 图片的格式：先看给的类型（`image/png`），认不出再看开头几个字节。
+fn image_format(mime: &str, bytes: &[u8]) -> Option<ImageFormat> {
+    let mime = mime.split(';').next().unwrap_or_default().trim();
+    let by_type = match mime.to_ascii_lowercase().as_str() {
+        "image/png" => Some(ImageFormat::Png),
+        "image/jpeg" | "image/jpg" => Some(ImageFormat::Jpeg),
+        "image/gif" => Some(ImageFormat::Gif),
+        "image/webp" => Some(ImageFormat::Webp),
+        "image/svg+xml" => Some(ImageFormat::Svg),
+        "image/bmp" => Some(ImageFormat::Bmp),
+        "image/x-icon" | "image/vnd.microsoft.icon" => Some(ImageFormat::Ico),
+        _ => None,
+    };
+    by_type.or_else(|| sniff_image(bytes))
+}
+
+/// 看开头几个字节认图片格式。
+fn sniff_image(bytes: &[u8]) -> Option<ImageFormat> {
+    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
+    let text = text.trim_start_matches('\u{feff}').trim_start();
+    Some(match bytes {
+        [0x89, b'P', b'N', b'G', ..] => ImageFormat::Png,
+        [0xFF, 0xD8, 0xFF, ..] => ImageFormat::Jpeg,
+        [b'G', b'I', b'F', b'8', ..] => ImageFormat::Gif,
+        [
+            b'R',
+            b'I',
+            b'F',
+            b'F',
+            _,
+            _,
+            _,
+            _,
+            b'W',
+            b'E',
+            b'B',
+            b'P',
+            ..,
+        ] => ImageFormat::Webp,
+        [b'B', b'M', ..] => ImageFormat::Bmp,
+        [0, 0, 1, 0, ..] => ImageFormat::Ico,
+        _ if text.starts_with("<svg") || (text.starts_with("<?xml") && text.contains("<svg")) => {
+            ImageFormat::Svg
+        }
+        _ => return None,
+    })
+}
+
 impl RepoView {
-    /// 远程主机上的仓库：起读 Markdown 图片的任务（已经起过不再起）。
+    /// 起读 Markdown 图片的任务（已经起过不再起）。
     pub(super) fn start_md_images(&mut self, cx: &mut Context<Self>) {
-        if self.entry.server.is_none() || self.files.md_images.want.is_some() {
+        if self.files.md_images.want.is_some() {
             return;
         }
         let (want, mut wanted) = unbounded::<String>();
         let task = cx.spawn(async move |this, cx| {
             while let Some(path) = wanted.next().await {
-                let Ok(Some((channel, repo))) = this.update(cx, |this, _| this.files_channel())
-                else {
-                    // 还没连上：下次画到它时再读
-                    this.update(cx, |this, _| this.files.md_images.forget(&path))
-                        .ok();
-                    continue;
-                };
-                let image = match (
-                    channel.fs_open(&repo, &path, IMAGE_LIMIT).await,
-                    classify(&path),
-                ) {
-                    (Ok((stat, bytes)), Class::Image(format))
-                        if stat.exists && !bytes.is_empty() =>
-                    {
-                        log::info!("Markdown 预览里的图片 {path}：读回 {} 字节", bytes.len());
-                        Some(Arc::new(Image::from_bytes(format, bytes)))
+                let read = match web_image(&path) {
+                    true => {
+                        let uri = path.clone();
+                        let got = cx
+                            .background_executor()
+                            .spawn(async move { fetch_web_image(&uri) })
+                            .await;
+                        let what = match path
+                            .get(..5)
+                            .is_some_and(|head| head.eq_ignore_ascii_case("data:"))
+                        {
+                            true => "的 data: 图片",
+                            false => "网址上的图片",
+                        };
+                        log::info!(
+                            "Markdown 预览里{what}：{}",
+                            match &got {
+                                Some((_, bytes)) => format!("读回 {} 字节", bytes.len()),
+                                None => "读不了".to_string(),
+                            }
+                        );
+                        got
                     }
-                    _ => {
-                        log::info!("Markdown 预览里的图片 {path} 读不了");
-                        None
+                    false => {
+                        let Ok(Some((channel, repo))) =
+                            this.update(cx, |this, _| this.files_channel())
+                        else {
+                            // 还没连上：下次画到它时再读
+                            this.update(cx, |this, _| this.files.md_images.forget(&path))
+                                .ok();
+                            continue;
+                        };
+                        match channel.fs_open_confined(&repo, &path, IMAGE_LIMIT).await {
+                            Ok((stat, bytes)) if stat.exists && !bytes.is_empty() => {
+                                let format = match classify(&path) {
+                                    Class::Image(format) => Some(format),
+                                    _ => sniff_image(&bytes),
+                                };
+                                log::info!(
+                                    "Markdown 预览里的图片 {path}：读回 {} 字节",
+                                    bytes.len()
+                                );
+                                format.map(|format| (format, bytes))
+                            }
+                            other => {
+                                log::info!(
+                                    "Markdown 预览里的图片 {path} 读不了：{}",
+                                    match other {
+                                        Err(err) => format!("{err:#}"),
+                                        Ok(_) => "没有这个文件或是空的".to_string(),
+                                    }
+                                );
+                                None
+                            }
+                        }
                     }
                 };
+                let image = read.map(|(format, bytes)| Arc::new(Image::from_bytes(format, bytes)));
                 let alive = this.update(cx, |this, cx| {
                     this.files.md_images.set(path, Fetch::Done(image));
                     cx.notify();
@@ -135,7 +295,9 @@ impl RepoView {
             .py(px(20.))
             .on_link_click(move |url, _, window, cx| {
                 let url = url.to_string();
-                if url.to_ascii_lowercase().starts_with("http") {
+                // 只认完整的网址：`http.md`、`https-setup.md` 这类是仓库里的文件
+                let lower = url.trim().to_ascii_lowercase();
+                if lower.starts_with("http://") || lower.starts_with("https://") {
                     return crate::shell::report(crate::shell::open_link(&url), window, cx);
                 }
                 let Some(path) = resolve_link(&link_dir, &url) else {
@@ -148,22 +310,22 @@ impl RepoView {
             .into_any_element()
     }
 
-    /// 预览里的图片从哪读：网址照原样（界面库自己读）；仓库里的本机按路径、远程主机上的经仓库通道。
+    /// 预览里的图片从哪读：都交给读图片的任务（[`Self::start_md_images`]），读回来之前空着。
+    /// 网址上的、`data:` 的按地址记，仓库里的按相对仓库根的路径记；出了仓库、进了 `.git` 的不读。
     fn md_image_source(
         &self,
         dir: String,
     ) -> impl Fn(&SharedUri) -> ImageSource + Send + Sync + 'static {
-        let root = (self.entry.server.is_none()).then(|| self.entry.path.clone());
         let got = self.files.md_images.got.clone();
         let want = self.files.md_images.want.clone();
         move |uri: &SharedUri| {
-            let Some(path) = resolve_link(&dir, uri.as_ref()) else {
-                return ImageSource::Resource(Resource::Uri(uri.clone()));
+            let path = match web_image(uri.as_ref()) {
+                true => uri.to_string(),
+                false => match resolve_link(&dir, uri.as_ref()) {
+                    Some(path) => path,
+                    None => return missing(),
+                },
             };
-            if let Some(root) = &root {
-                let full = crate::open_with::full_path(root, false, &path);
-                return ImageSource::Resource(Resource::Path(Arc::from(Path::new(&full))));
-            }
             let mut got = got.lock().unwrap_or_else(|err| err.into_inner());
             match got.get(&path) {
                 Some(Fetch::Done(Some(image))) => ImageSource::Image(image.clone()),
@@ -226,7 +388,36 @@ impl MdImages {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_link;
+    use super::{ImageFormat, data_image, decode_base64, resolve_link, sniff_image, web_image};
+
+    #[test]
+    fn 网址上的图片和_data_图片() {
+        assert!(web_image("https://img.shields.io/badge/a-b-c"));
+        assert!(web_image(" HTTP://x/a.png"));
+        assert!(web_image("data:image/png;base64,AAAA"));
+        assert!(!web_image("http.png"));
+        assert!(!web_image("img/https.png"));
+        assert_eq!(decode_base64("aGk=").unwrap(), b"hi");
+        assert_eq!(decode_base64("aG\nk").unwrap(), b"hi");
+        assert_eq!(decode_base64("-_-_").unwrap(), [0xfb, 0xff, 0xbf]);
+        assert!(decode_base64("a*b").is_none());
+        // 1×1 的 PNG 开头
+        let (format, bytes) = data_image("image/png;base64,iVBORw0KGgo=").unwrap();
+        assert!(matches!(format, ImageFormat::Png));
+        assert_eq!(&bytes[..4], b"\x89PNG");
+        let (format, bytes) = data_image("image/svg+xml,%3Csvg%3E%3C/svg%3E").unwrap();
+        assert!(matches!(format, ImageFormat::Svg));
+        assert_eq!(bytes, b"<svg></svg>");
+        // 类型没写对的看内容
+        let (format, _) = data_image(";base64,R0lGODlhAQABAA==").unwrap();
+        assert!(matches!(format, ImageFormat::Gif));
+        assert!(data_image("text/plain,hello").is_none());
+        assert!(matches!(
+            sniff_image(b"<?xml version=\"1.0\"?>\n<svg xmlns=\"\"/>"),
+            Some(ImageFormat::Svg)
+        ));
+        assert!(sniff_image(b"<html>").is_none());
+    }
 
     #[test]
     fn 链接指向仓库里的哪() {
@@ -247,6 +438,9 @@ mod tests {
             "data:image/png;base64,xx",
             "../../out.md",
             "",
+            ".git/config",
+            "/sub/.GIT/HEAD",
+            "../.git/config",
         ] {
             assert_eq!(at("docs", none), None, "{none}");
         }

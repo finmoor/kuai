@@ -33,6 +33,7 @@ use crate::clone::{CloneEvent, CloneView};
 use crate::machines::LOCAL;
 use crate::repo_rows::{Block, Columns, Handlers, MenuFor, render_block};
 use crate::repo_scan::RepoScan;
+use crate::secrets::Saved;
 use crate::settings::{Auth, RepoEntry, Server, Target};
 use crate::term_board::TermBoard;
 use crate::ui;
@@ -153,8 +154,13 @@ impl ManagerView {
         let editing = edit.is_some();
         let old = edit.unwrap_or_default();
         let target = Target::parse(&old.destination);
-        // 这台服务器存着密码或口令（是哪一种，看它原来的登录方式）
-        let had_secret = editing && crate::secrets::get(&old.id).is_some();
+        // 这台服务器存着的密码或口令（是哪一种，看它原来的登录方式）
+        let saved = match editing {
+            true => crate::secrets::saved_for(&old),
+            false => Saved::Absent,
+        };
+        // 存着、连接时在用：提示「已保存」，可以点「清除」
+        let had_secret = saved == Saved::Usable;
         let old_auth = old.auth;
         let secret_hint = move |auth: Auth| {
             if had_secret && auth == old_auth {
@@ -330,13 +336,26 @@ impl ManagerView {
                         }
                     };
                     let auth = server.auth;
-                    // 存着的密码、口令：填了新的就换；没填、登录方式没变、也没点清除，就留着。密码只对
-                    // 原来的地址作数，口令只对原来的私钥文件作数：改了就不留，不然旧密码会自动交给新地址
+                    // 存着的密码、口令：填了新的就换；没填、登录方式没变、也没点清除，就留着（钥匙圈锁着
+                    // 读不出来的也留着）。密码只对原来的地址作数，口令只对原来的私钥文件作数：改了就不留，
+                    // 不然旧密码会自动交给新地址；存着的对不上现在这种登录的（见 secrets::binding）也删掉
                     let bound = same_secret_binding(&old, &server);
-                    let keep = had_secret && auth == old.auth && bound && !forget.get();
+                    let keep = matches!(saved, Saved::Usable | Saved::Unknown)
+                        && auth == old.auth
+                        && bound
+                        && !forget.get();
                     let secret_changed = !secret.is_empty() || (had_secret && !keep);
                     let unbound = had_secret && secret.is_empty() && auth == old.auth && !bound;
-                    let account = server.destination.clone();
+                    let job = if !secret.is_empty() {
+                        SecretJob::Save(secret)
+                    } else if forget.get() {
+                        SecretJob::Forget
+                    } else if saved != Saved::Absent && !keep {
+                        SecretJob::Drop
+                    } else {
+                        SecretJob::Keep
+                    };
+                    let mut stored = server.clone();
                     window.close_dialog(cx);
                     let (id, reconnect) = app.update(cx, |app, cx| {
                         if editing {
@@ -346,35 +365,44 @@ impl ManagerView {
                             (app.add_server(server, cx), true)
                         }
                     });
-                    if !secret.is_empty() {
-                        if let Err(err) = crate::secrets::set(&id, &account, &secret) {
-                            window.push_notification(
-                                Notification::error(tf!("密码保存失败，连接时需重新输入：{err}", err)),
-                                cx,
-                            );
-                        }
-                    } else if had_secret && !keep {
-                        crate::secrets::delete(&id);
-                        if unbound && !forget.get() {
-                            let text = match auth {
-                                Auth::Password => tr("地址已修改，原来保存的密码已清除，连接时需重新输入。"),
-                                Auth::Key => tr("私钥文件已修改，原来保存的口令已清除，连接时需重新输入。"),
-                            };
-                            window.push_notification(Notification::info(text), cx);
-                        }
-                    }
-                    if reconnect {
-                        // 马上开始连接，结果显示在列表上
-                        app.update(cx, |app, cx| drop(app.connect(&id, cx)));
-                        if editing {
-                            window.push_notification(
-                                Notification::info(tr(
-                                    "已使用新设置重新连接，已打开的标签页需重新打开后生效。",
-                                )),
-                                cx,
-                            );
-                        }
-                    }
+                    stored.id = id.clone();
+                    // 存、删可能要等（Linux 上钥匙圈锁着、还没有时弹系统的框等用户），放到后台做，不卡
+                    // 界面；做完再连，连接时要读存着的
+                    let done = cx.background_executor().spawn(async move { job.run(&stored) });
+                    let (app, forgot) = (app.clone(), forget.get());
+                    window
+                        .spawn(cx, async move |cx| {
+                            let done = done.await;
+                            cx.update(|window, cx| {
+                                match done {
+                                    Err(text) => {
+                                        window.push_notification(Notification::error(text), cx)
+                                    }
+                                    Ok(()) if unbound && !forgot => {
+                                        let text = match auth {
+                                            Auth::Password => tr("地址已修改，原来保存的密码已清除，连接时需重新输入。"),
+                                            Auth::Key => tr("私钥文件已修改，原来保存的口令已清除，连接时需重新输入。"),
+                                        };
+                                        window.push_notification(Notification::info(text), cx);
+                                    }
+                                    Ok(()) => {}
+                                }
+                                if reconnect {
+                                    // 马上开始连接，结果显示在列表上
+                                    app.update(cx, |app, cx| drop(app.connect(&id, cx)));
+                                    if editing {
+                                        window.push_notification(
+                                            Notification::info(tr(
+                                                "已使用新设置重新连接，已打开的标签页需重新打开后生效。",
+                                            )),
+                                            cx,
+                                        );
+                                    }
+                                }
+                            })
+                            .ok();
+                        })
+                        .detach();
                 }
             };
             // 测试连接：拿表单里现在填的打开诊断对话框，逐步登录一次，不保存。密码、口令用这次填的；
@@ -444,8 +472,8 @@ impl ManagerView {
             };
             // 密码、口令那一格；存着的可以点「清除」
             let secret_field = |label: &'static str, input: &Entity<InputState>| {
-                let saved = had_secret && auth_now == old_auth && !forget.get();
-                let clear = saved.then(|| {
+                let shown = had_secret && auth_now == old_auth && !forget.get();
+                let clear = shown.then(|| {
                     let (forget, input) = (forget.clone(), input.clone());
                     Button::new("forget-secret")
                         .ghost()
@@ -854,6 +882,35 @@ impl ManagerView {
 /// 经服务器连的（服务器页上它的名字后面）：「经由 A」。
 /// 存着的密码、口令还能不能给改过的设置用：密码只对原来的地址（用户、主机、端口）作数，私钥口令
 /// 只对原来的私钥文件作数。
+/// 主机表单保存时对存着的密码、口令做什么。
+enum SecretJob {
+    /// 不用动
+    Keep,
+    /// 存下这次填的
+    Save(String),
+    /// 用户点了「清除」：删掉，钥匙圈锁着就弹框要解锁
+    Forget,
+    /// 已经不作数了（登录方式、地址、私钥文件改了）：删掉，钥匙圈锁着就算了（留着也不会交错）
+    Drop,
+}
+
+impl SecretJob {
+    /// 做完；出错时是给用户看的那句话。可能要等（见 [`crate::secrets::set`]），在后台线程上跑。
+    fn run(self, server: &Server) -> Result<(), String> {
+        match self {
+            Self::Keep => Ok(()),
+            Self::Save(secret) => crate::secrets::set(server, &secret)
+                .map_err(|err| tf!("密码保存失败，连接时需重新输入：{err}", err)),
+            Self::Forget => crate::secrets::forget(&server.id)
+                .map_err(|err| tf!("未能清除保存的密码：{err}", err)),
+            Self::Drop => {
+                crate::secrets::delete(&server.id);
+                Ok(())
+            }
+        }
+    }
+}
+
 fn same_secret_binding(old: &Server, new: &Server) -> bool {
     match new.auth {
         Auth::Password => new.destination == old.destination,
@@ -1889,6 +1946,7 @@ impl ManagerView {
                     terms: crate::workspace_page::terminal_summary(board, entry),
                     chips: self.repo_chips(entry, colors, cx),
                     hit: None,
+                    hit_at: None,
                 }
             };
             let (rename, remove) = (entry.clone(), entry.clone());

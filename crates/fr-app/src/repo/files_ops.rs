@@ -1180,10 +1180,43 @@ static NEXT_COPY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 
 /// 新下载的一份副本放进哪个目录：[`copies_dir`] 下每次一个。文件名和主机上的一样（换掉本机不能用
 /// 的字符，见 [`local_file_name`]），默认程序的标题栏里看得出是哪个文件。
+///
+/// 每份的子目录当场独占地建好（Linux 上只给自己，0700）：已经有了（别的程序先建好的、上次同一个
+/// 进程号留下的）就换一个编号，下载不会写进别人建的目录里。建不了时把路径照样交出去，下载那边报错。
 pub(crate) fn new_copy_dir() -> PathBuf {
     sweep_old_copies();
-    let number = NEXT_COPY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    copies_dir().join(format!("{}-{number}", std::process::id()))
+    let root = copies_dir();
+    let _ = private_dir(&root, true);
+    loop {
+        let number = NEXT_COPY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = root.join(format!("{}-{number}", std::process::id()));
+        match private_dir(&dir, false) {
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            _ => return dir,
+        }
+    }
+}
+
+/// 建一个只给自己的目录（Linux 上 0700）。`all` 为真时缺的上几层一起建、已经有了也算成（并改成
+/// 0700）；为假时只建这一层，已经有了算出错。
+fn private_dir(dir: &Path, all: bool) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        std::fs::DirBuilder::new()
+            .recursive(all)
+            .mode(0o700)
+            .create(dir)?;
+        if all {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    match all {
+        true => std::fs::create_dir_all(dir),
+        false => std::fs::create_dir(dir),
+    }
 }
 
 /// 清掉以前留下的副本：Kuai 没关标签页就退出时，副本留在临时目录里。别的进程的、七天没动过的删掉

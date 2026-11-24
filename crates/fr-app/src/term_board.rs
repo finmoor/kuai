@@ -18,7 +18,7 @@
 //!
 //! 不准的情况：十几秒不出字的命令（链接、下载）会先被当成已停下，再出字时变回运行中。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -612,7 +612,7 @@ impl TermBoard {
     pub fn repos(&self, cx: &App) -> Vec<RepoGroup> {
         let app = self.app.read(cx);
         let order = workspace_order(app);
-        let grouped: Vec<RepoEntry> = order.iter().flat_map(|key| app.members(key)).collect();
+        let grouped: HashSet<RepoEntry> = order.iter().flat_map(|key| app.members(key)).collect();
         let workspaces = self.reachable_members(order, app);
         let (mut groups, rows) = group_by_workspace(workspaces, self.all_rows());
         let listed: Vec<RepoEntry> = app
@@ -658,32 +658,75 @@ impl TermBoard {
     }
 }
 
+/// 终端按仓库分好（各仓库的终端保持原来的先后），会话页每次重画都要分组：不再对每个仓库扫一遍
+/// 全部终端。
+struct ByRepo {
+    rows: HashMap<RepoEntry, Vec<Row>>,
+    /// 各仓库第一次出现的先后
+    order: Vec<RepoEntry>,
+}
+
+impl ByRepo {
+    fn new(rows: Vec<Row>) -> Self {
+        let mut by = ByRepo {
+            rows: HashMap::new(),
+            order: Vec::new(),
+        };
+        for row in rows {
+            match by.rows.get_mut(&row.entry) {
+                Some(mine) => mine.push(row),
+                None => {
+                    by.order.push(row.entry.clone());
+                    by.rows.insert(row.entry.clone(), vec![row]);
+                }
+            }
+        }
+        by
+    }
+
+    /// 拿走这个仓库的终端。
+    fn take(&mut self, entry: &RepoEntry) -> Vec<Row> {
+        self.rows.remove(entry).unwrap_or_default()
+    }
+
+    /// 还没拿走的，按仓库第一次出现的先后。
+    fn rest(mut self) -> Vec<(RepoEntry, Vec<Row>)> {
+        let order = std::mem::take(&mut self.order);
+        order
+            .into_iter()
+            .filter_map(|entry| {
+                let mine = self.rows.remove(&entry)?;
+                Some((entry, mine))
+            })
+            .collect()
+    }
+}
+
 /// 未加入工作区的仓库按主机分节：`listed` 是主机仓库列表里的（已经按主机排好），`rows` 是没归到
 /// 哪个工作区的终端。列表里的仓库按列表的先后，终端归到各自的仓库；剩下的终端（子仓库这类列表里
 /// 没有的）按仓库接在它所在主机那一节的后面，那台没有这一节就新起一节。
-fn group_unbound(listed: Vec<RepoEntry>, mut rows: Vec<Row>) -> Vec<RepoGroup> {
+fn group_unbound(listed: Vec<RepoEntry>, rows: ByRepo) -> Vec<RepoGroup> {
+    let mut rows = rows;
     let mut groups: Vec<RepoGroup> = Vec::new();
-    let add = |groups: &mut Vec<RepoGroup>, entry: RepoEntry, mine: Vec<Row>| {
-        let key = GroupKey::Unbound(machine_of(&entry).to_string());
-        match groups.iter_mut().find(|group| group.key == key) {
-            Some(group) => group.repos.push((entry, mine)),
-            None => groups.push(RepoGroup {
-                key,
-                repos: vec![(entry, mine)],
-            }),
+    let mut at: HashMap<String, usize> = HashMap::new();
+    let mut add = |groups: &mut Vec<RepoGroup>, entry: RepoEntry, mine: Vec<Row>| {
+        let machine = machine_of(&entry).to_string();
+        match at.get(&machine) {
+            Some(&index) => groups[index].repos.push((entry, mine)),
+            None => {
+                at.insert(machine.clone(), groups.len());
+                groups.push(RepoGroup {
+                    key: GroupKey::Unbound(machine),
+                    repos: vec![(entry, mine)],
+                });
+            }
         }
     };
     for entry in listed {
-        let (mine, rest): (Vec<Row>, Vec<Row>) =
-            rows.into_iter().partition(|row| row.entry == entry);
-        rows = rest;
+        let mine = rows.take(&entry);
         add(&mut groups, entry, mine);
     }
-    while let Some(first) = rows.first() {
-        let entry = first.entry.clone();
-        let (mine, rest): (Vec<Row>, Vec<Row>) =
-            rows.into_iter().partition(|row| row.entry == entry);
-        rows = rest;
+    for (entry, mine) in rows.rest() {
         add(&mut groups, entry, mine);
     }
     groups
@@ -693,20 +736,18 @@ fn group_unbound(listed: Vec<RepoEntry>, mut rows: Vec<Row>) -> Vec<RepoGroup> {
 /// 工作区不出现。返回分好的组，和不属于其中任何仓库的终端。
 fn group_by_workspace(
     workspaces: Vec<(WorkspaceKey, Vec<RepoEntry>)>,
-    mut rows: Vec<Row>,
-) -> (Vec<RepoGroup>, Vec<Row>) {
-    let mut seen: Vec<RepoEntry> = Vec::new();
+    rows: Vec<Row>,
+) -> (Vec<RepoGroup>, ByRepo) {
+    let mut rows = ByRepo::new(rows);
+    let mut seen: HashSet<RepoEntry> = HashSet::new();
     let mut groups: Vec<RepoGroup> = Vec::new();
     for (key, members) in workspaces {
         let mut repos: Vec<(RepoEntry, Vec<Row>)> = Vec::new();
         for entry in members {
-            if seen.contains(&entry) {
+            if !seen.insert(entry.clone()) {
                 continue;
             }
-            let (mine, rest): (Vec<Row>, Vec<Row>) =
-                rows.into_iter().partition(|row| row.entry == entry);
-            rows = rest;
-            seen.push(entry.clone());
+            let mine = rows.take(&entry);
             repos.push((entry, mine));
         }
         if !repos.is_empty() {
@@ -759,8 +800,8 @@ fn owner(app: &AppState, machine: &str, key: &str) -> (RepoEntry, u32) {
 mod tests {
     use std::time::{Duration, Instant};
 
+    use super::{ByRepo, TermState, free_number, group_unbound, state_of};
     use super::{GroupKey, Program, RepoEntry, Row, TermId, WorkspaceKey, group_by_workspace};
-    use super::{TermState, free_number, group_unbound, state_of};
 
     #[test]
     fn 未加入工作区的仓库按主机分节_没有终端的也列() {
@@ -797,7 +838,7 @@ mod tests {
             row(entry(None, "C:/a/sub"), 1),
             row(entry(None, "C:/b"), 1),
         ];
-        let groups = group_unbound(listed, rows);
+        let groups = group_unbound(listed, ByRepo::new(rows));
         let keys: Vec<&GroupKey> = groups.iter().map(|group| &group.key).collect();
         assert_eq!(
             keys,
@@ -829,7 +870,7 @@ mod tests {
             [("/c".to_string(), vec![]), ("/x".to_string(), vec![1])]
         );
         // 没有未加入工作区的仓库、也没有剩下的终端：一节都没有
-        assert!(group_unbound(Vec::new(), Vec::new()).is_empty());
+        assert!(group_unbound(Vec::new(), ByRepo::new(Vec::new())).is_empty());
     }
 
     #[test]

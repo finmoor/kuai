@@ -241,7 +241,7 @@ fn candidates(target: &Target) -> Vec<PathBuf> {
     if let Some(dir) = std::env::var_os("FR_KUAID_DIR") {
         list.push(PathBuf::from(dir).join(target.triple).join(target.file));
     }
-    if let Ok(exe) = std::env::current_exe()
+    if let Ok(exe) = fr_core::exe::path()
         && let Some(dir) = exe.parent()
     {
         list.push(dir.join("kuaid").join(target.triple).join(target.file));

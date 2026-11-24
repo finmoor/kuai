@@ -5,16 +5,20 @@
 //! （没问成的过一会儿再试，见 [`wait_before_next`]；窗口从托盘叫回来、再次启动时也问，见
 //! [`Updater::window_shown`]）
 //! （`update_view.rs`）。点「升级」才下载，下到 `%LOCALAPPDATA%\kuai\update\`（Linux 上是
-//! `~/.cache/kuai/update/`），和 GitHub 给附件记的
+//! `~/.cache/kuai/update/`）里这一份 Kuai 自己的子目录（装法、装在哪不一样的各用各的，见
+//! [`own_dir`]），和 GitHub 给附件记的
 //! SHA-256（API 里的 `digest`）对一遍，放进暂存目录。下哪个、怎么换看这份 Kuai 是怎么装的（[`Kind`]）：
 //! - 安装版（`tools/installer/kuai.iss` 装的）：下新的安装程序。点「重启完成升级」时在后台跑它
 //!   （不弹向导），它等这个进程退出后装上、打开新的 Kuai。这样「设置 → 应用」里的版本号也跟着变。
-//! - 解压版：下 zip 解压。点「重启完成升级」时别的文件直接覆盖，kuai.exe 用 self-replace 换
-//!   （运行中的 exe 只能改名、不能删），再拉起新的 Kuai、自己退出。
+//! - 解压版：下 zip 解压。点「重启完成升级」时别的文件逐个换上（原来的先挪开，哪个没成就都换回去，
+//!   见 [`swap_in`]），kuai.exe 用 self-replace 换（运行中的 exe 只能改名、不能删），再拉起新的
+//!   Kuai、自己退出。
 //! - Linux 的解压版：下 tar.gz（`kuai-<版本>-linux-x64.tar.gz`），换法和解压版一样，程序叫 `kuai`。
 //! - .deb 装的（`/opt/kuai`，见 `packaging.rs`）：下新的 .deb（`kuai_<版本>_amd64.deb`）。点「重启完成
-//!   升级」时经 pkexec 交给 apt 装（弹系统的管理员认证），装好了拉起新的 Kuai、自己退出；没授权就
-//!   照旧运行，告诉人。等认证时界面照常（在后台线程上等）。
+//!   升级」时经 pkexec 交给 apt 装（弹系统的管理员认证；提权以后先把包拷到只有 root 能写的地方、
+//!   对过 GitHub 记的校验值再装，见 [`DEB_SCRIPT`]），装好了再问一下（没保存的文件、在跑的本机
+//!   终端），重启成新的 Kuai；不重启也行，下次启动就是新的。没授权就照旧运行，告诉人。等认证时
+//!   界面照常（在后台线程上等）。启动时不装（要弹认证），下好的留着，问到这个版本时接着用。
 //! - AppImage：下新的 AppImage（`kuai-<版本>-linux-x64.AppImage`），换掉启动的那个 .AppImage 文件
 //!   （先写在它旁边再改名），拉起它。
 //!
@@ -90,6 +94,8 @@ const SETUP_LOG: &str = "setup.log";
 const STARTUP_FAILED: &str = "startup-failed";
 /// 每次下载自己的工作目录的前缀（见 [`fetch_and_stage`]）
 const WORK_PREFIX: &str = "download-";
+/// 解压版换文件时，原来的文件先挪进程序文件夹里的这个文件夹（后面接进程号），见 [`Swap`]
+const OLD_PREFIX: &str = ".kuai-update-old-";
 
 /// 每次下载的编号：取消以后马上重下，新的一次用新的工作目录，旧线程还在写也碰不到它。
 static NEXT_DOWNLOAD: AtomicU64 = AtomicU64::new(0);
@@ -147,6 +153,8 @@ enum Kind {
     AppImage,
 }
 
+/// 按启动时的程序路径认（`fr_core::exe`）：.deb 装好新版本以后、重启以前，现取的路径带着
+/// 「(deleted)」，原来认成解压版，升级的目录、刚升级完的记号都找错了地方。
 fn kind() -> Kind {
     if crate::packaging::appimage().is_some() {
         return Kind::AppImage;
@@ -154,7 +162,7 @@ fn kind() -> Kind {
     if crate::packaging::deb() {
         return Kind::Deb;
     }
-    let installed = std::env::current_exe()
+    let installed = fr_core::exe::path()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join("unins000.exe").is_file()))
         .unwrap_or(false);
@@ -201,10 +209,11 @@ pub enum Problem {
 }
 
 pub enum UpdateEvent {
-    /// 点了「重启完成升级」：工作区窗口先问一下本机终端，再调 [`Updater::install_and_relaunch`]
+    /// 点了「重启完成升级」：工作区窗口先问一下（没保存的文件、本机终端），再调
+    /// [`Updater::install_and_relaunch`]
     Restart,
-    /// 新版本装好、拉起来了（.deb 的在后台装完）：工作区窗口退出程序
-    Quit,
+    /// .deb 的新版本在后台装好了：工作区窗口问一下，重启成新的（不重启也行，下次启动就是新的）
+    Installed,
 }
 
 pub struct Updater {
@@ -222,6 +231,8 @@ pub struct Updater {
     pub updated_from: Option<String>,
     /// .deb：正在等管理员认证、apt 装
     pub installing: bool,
+    /// .deb：新版本已经装好了（跑着的还是旧的，重启就是新的）
+    pub installed: bool,
     _work: Option<Task<()>>,
     /// 「重试」先重新问一遍 GitHub；单放一处，问完开始下载时要换掉 `_work`
     _refetch: Option<Task<()>>,
@@ -254,9 +265,14 @@ impl Updater {
             // 上次在后台跑的安装程序没装上：不再自动重试（不然每次启动都先跑一遍它），告诉人
             Some(from) if from == env!("CARGO_PKG_VERSION") => {
                 discard_staged();
-                let log = update_dir().join(SETUP_LOG);
-                let problem =
-                    Problem::Install(tf!("安装失败，日志位于 {path}", path = log.display()));
+                // 只有安装版是退出以后由安装程序换的、有它写的记录；别的装法是换好了才写记号
+                let problem = match kind() {
+                    Kind::Installed => {
+                        let log = own_dir().join(SETUP_LOG);
+                        Problem::Install(tf!("安装失败，日志位于 {path}", path = log.display()))
+                    }
+                    _ => Problem::Install(tr("上次的更新没有完成，请重新下载").into()),
+                };
                 stage = Stage::Failed {
                     release: None,
                     problem,
@@ -286,6 +302,7 @@ impl Updater {
             failures: 0,
             updated_from,
             installing: false,
+            installed: false,
             _work: None,
             _refetch: None,
             _schedule: schedule,
@@ -333,15 +350,21 @@ impl Updater {
         self.checking = true;
         self.tried_at = Some(Instant::now());
         cx.notify();
-        let task = cx
-            .background_executor()
-            .spawn(async move { fetch_latest() });
+        // 问到的新版本已经下好了（.deb 的启动时不装，重开 Kuai 以后接着用它）：对的是 GitHub 这次
+        // 给的校验值，不是暂存目录里记的
+        let task = cx.background_executor().spawn(async move {
+            let release = fetch_latest()?;
+            let staged = release
+                .as_ref()
+                .is_some_and(|r| r.version > current_version() && staged_matches(r));
+            anyhow::Ok((release, staged))
+        });
         self._work = Some(cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
                 this.checking = false;
                 match result {
-                    Ok(release) => {
+                    Ok((release, staged)) => {
                         this.checked_at = Some(Instant::now());
                         this.failures = 0;
                         let newer = release.filter(|r| r.version > current_version());
@@ -354,6 +377,7 @@ impl Updater {
                                 },
                                 Some(release),
                             ) if !manual => *slot = Some(release),
+                            (stage, Some(release)) if staged => *stage = Stage::Ready(release),
                             (stage, Some(release)) => *stage = Stage::Available(release),
                             (stage, None) => *stage = Stage::Idle,
                         }
@@ -528,13 +552,39 @@ impl Updater {
         }
     }
 
+    /// .deb 的还没装：「重启完成升级」先在后台装（等管理员认证），装好了（[`UpdateEvent::Installed`]）
+    /// 再问要不要重启。装的时候不丢东西，不用先问。
+    pub fn installs_first(&self) -> bool {
+        match &self.stage {
+            Stage::Ready(release) => {
+                !self.installed && staging_dir(&release.version).join(DEB_FILE).is_file()
+            }
+            _ => false,
+        }
+    }
+
     /// 换上下好的新版本，拉起新的 Kuai。返回 true 时调用方马上退出程序。.deb 的在后台装（要等
-    /// 人在系统的认证框里授权），这里返回 false，装好以后发 [`UpdateEvent::Quit`]。
+    /// 人在系统的认证框里授权），这里返回 false，装好以后发 [`UpdateEvent::Installed`]；装好了的
+    /// 再调就是拉起新的。
     pub fn install_and_relaunch(&mut self, cx: &mut Context<Self>) -> bool {
         let Stage::Ready(release) = &self.stage else {
             return false;
         };
         let release = release.clone();
+        if self.installed {
+            return match relaunch(Path::new(crate::packaging::DEB_EXE)) {
+                Ok(()) => true,
+                Err(err) => {
+                    self.installed = false;
+                    self.stage = Stage::Failed {
+                        release: Some(release),
+                        problem: Problem::Install(format!("{err:#}")),
+                    };
+                    cx.notify();
+                    false
+                }
+            };
+        }
         let staging = staging_dir(&release.version);
         if staging.join(DEB_FILE).is_file() {
             self.install_deb_in_background(release, staging, cx);
@@ -556,8 +606,9 @@ impl Updater {
 }
 
 impl Updater {
-    /// .deb：在后台线程上经 pkexec 让 apt 装，装好了拉起新的 Kuai，发 [`UpdateEvent::Quit`]；
-    /// 没装成（没授权、apt 出错）回到「出错」，暂存的留着，「重试」会重新下载。
+    /// .deb：在后台线程上经 pkexec 让 apt 装（[`install_deb`]），装好了发 [`UpdateEvent::Installed`]，
+    /// 由工作区窗口问过再重启；没装成（没授权、apt 出错）回到「出错」，暂存的留着，「重试」会重新
+    /// 下载。
     fn install_deb_in_background(
         &mut self,
         release: Release,
@@ -569,23 +620,26 @@ impl Updater {
         }
         self.installing = true;
         cx.notify();
+        // 提权那一边对的是 GitHub 给的校验值（下载时核对过的），不是暂存目录里记的
+        let digest = release.asset.sha256.clone();
         let task = cx.background_executor().spawn(async move {
             verify_staged(&staging)?;
-            let _ = fs::write(update_dir().join(DONE_MARK), env!("CARGO_PKG_VERSION"));
-            let installed = install_deb(&staging.join(DEB_FILE));
-            if installed.is_err() {
-                let _ = fs::remove_file(update_dir().join(DONE_MARK));
-            }
-            installed?;
+            let digest = digest.context(tr("GitHub 未提供此文件的校验值"))?;
+            install_deb(&staging.join(DEB_FILE), &digest)?;
+            // 装好了才写：原来装之前就写，等认证时退出了 Kuai，下次启动当成「装了没换上」
+            let _ = fs::write(own_dir().join(DONE_MARK), env!("CARGO_PKG_VERSION"));
             let _ = fs::remove_dir_all(&staging);
-            relaunch(Path::new(crate::packaging::DEB_EXE))
+            anyhow::Ok(())
         });
         self._work = Some(cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
                 this.installing = false;
                 match result {
-                    Ok(()) => cx.emit(UpdateEvent::Quit),
+                    Ok(()) => {
+                        this.installed = true;
+                        cx.emit(UpdateEvent::Installed);
+                    }
                     Err(err) => {
                         log::warn!("装 .deb 没成：{err:#}");
                         this.stage = Stage::Failed {
@@ -625,7 +679,7 @@ pub fn apply_staged_at_startup() -> bool {
             // 记下原因、删掉暂存的，界面起来以后告诉人，要重试就重新下载
             log::warn!("启动时换上新版本没成：{err:#}");
             let text = format!("{version}\n{err:#}");
-            let _ = fs::write(update_dir().join(STARTUP_FAILED), text);
+            let _ = fs::write(own_dir().join(STARTUP_FAILED), text);
             discard_staged();
             false
         }
@@ -634,7 +688,7 @@ pub fn apply_staged_at_startup() -> bool {
 
 /// 启动时换新版本没成时记下的（版本、原因），读完删掉。
 fn take_startup_failure() -> Option<(String, String)> {
-    let path = update_dir().join(STARTUP_FAILED);
+    let path = own_dir().join(STARTUP_FAILED);
     let text = fs::read_to_string(&path).ok()?;
     let _ = fs::remove_file(&path);
     let (version, err) = text.split_once('\n').unwrap_or((text.as_str(), ""));
@@ -824,8 +878,41 @@ fn update_dir() -> PathBuf {
         .join("update")
 }
 
+/// 这一份 Kuai 自己的目录：装法（安装版、解压版、.deb、AppImage）、装在哪不一样的各用各的，暂存的
+/// 新版本、记号互不相干。原来都直接放在 [`update_dir`] 里、同一个版本共用一个暂存目录：同一台
+/// 电脑上换着用 AppImage 和解压版，会捡到另一种装法下好的包。
+fn own_dir() -> PathBuf {
+    update_dir().join(install_tag(kind()))
+}
+
+/// [`own_dir`] 的名字：装法，加上装在哪（程序所在的文件夹、AppImage 文件）的 SHA-256 的前 8 位。
+fn install_tag(kind: Kind) -> String {
+    let exe_dir = || {
+        let exe = fr_core::exe::path().ok()?;
+        exe.parent().map(Path::to_path_buf)
+    };
+    let (name, place) = match kind {
+        Kind::Deb => return "deb".into(),
+        Kind::AppImage => (
+            "appimage",
+            crate::packaging::appimage().map(Path::to_path_buf),
+        ),
+        Kind::Installed => ("setup", exe_dir()),
+        Kind::Portable => ("portable", exe_dir()),
+    };
+    let place = place.map_or_else(String::new, |place| place.to_string_lossy().into_owned());
+    // Windows 上的路径不分大小写，斜杠有两种写法
+    let place = match cfg!(windows) {
+        true => place.to_lowercase().replace('/', "\\"),
+        false => place,
+    };
+    let digest = Sha256::digest(place.as_bytes());
+    let short: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("{name}-{short}")
+}
+
 fn staging_dir(version: &Version) -> PathBuf {
-    update_dir().join(version.to_string())
+    own_dir().join(version.to_string())
 }
 
 /// 能升级的话返回程序所在的文件夹：得是打好的包（[`EXE`]），文件夹得能写。.deb 装的由 apt 换
@@ -841,7 +928,7 @@ fn install_dir() -> Result<PathBuf, Problem> {
         }
         Kind::Installed | Kind::Portable => {}
     }
-    let exe = std::env::current_exe().map_err(|err| Problem::Install(err.to_string()))?;
+    let exe = fr_core::exe::path().map_err(|err| Problem::Install(err.to_string()))?;
     let packaged = exe.file_name().is_some_and(|name| match cfg!(windows) {
         true => name.eq_ignore_ascii_case(EXE),
         false => name == EXE,
@@ -855,16 +942,55 @@ fn install_dir() -> Result<PathBuf, Problem> {
     writable(dir)
 }
 
-/// 这个文件夹能写就返回它。
+/// 这个文件夹能写就返回它。试写的文件名每次不一样、只新建：不会截断已有的同名文件，也不会跟着
+/// 同名的链接写到别处。
 fn writable(dir: &Path) -> Result<PathBuf, Problem> {
-    let probe = dir.join(".kuai-write-test");
-    match File::create(&probe) {
-        Ok(_) => {
+    let probe = dir.join(unique_name(".kuai-write-test"));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file);
             let _ = fs::remove_file(&probe);
             Ok(dir.to_path_buf())
         }
         Err(_) => Err(Problem::NotWritable(dir.to_path_buf())),
     }
+}
+
+/// `prefix` 后面接进程号、编号、纳秒：临时文件用，不和已有的撞名。
+fn unique_name(prefix: &str) -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{}-{n}-{nanos}", std::process::id())
+}
+
+/// Unix 上给新写的程序加上可执行权限（AppImage）。
+fn executable(file: &File) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(fs::Permissions::from_mode(0o755))?;
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(())
+}
+
+/// 把 `from` 拷成新文件 `to`（只新建，见 [`writable`]），写完落盘。返回打开着的 `to`，调用方再设权限。
+fn write_new(from: &Path, to: &Path) -> Result<File> {
+    let mut out = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    io::copy(&mut File::open(from)?, &mut out)?;
+    out.sync_all()?;
+    Ok(out)
 }
 
 /// 在下载线程里跑：下载、核对校验值、放进暂存目录（安装程序直接放，发布包解压）。
@@ -875,7 +1001,7 @@ fn fetch_and_stage(release: &Release, got: &AtomicU64, cancel: &AtomicBool) -> R
     // 这一次自己的工作目录：下载、核对、解压都在里面，做完整个目录一次改名放进暂存目录。原来
     // 几次下载共用同一个 .part、发布包和暂存目录，取消以后马上重下，旧线程还在写、删、解压同一份
     let n = NEXT_DOWNLOAD.fetch_add(1, Ordering::Relaxed);
-    let work = update_dir().join(format!("{WORK_PREFIX}{}-{n}", std::process::id()));
+    let work = own_dir().join(format!("{WORK_PREFIX}{}-{n}", std::process::id()));
     let _ = fs::remove_dir_all(&work);
     fs::create_dir_all(&work).map_err(|err| Problem::Install(err.to_string()))?;
     let staged = work.join("staged");
@@ -912,17 +1038,47 @@ fn fetch_into(
         return Err(Problem::Digest);
     }
     // 安装程序、.deb、AppImage 不用解压，原样放进暂存目录
-    let single = [
-        (is_setup as fn(&str) -> bool, SETUP_EXE),
-        (is_deb, DEB_FILE),
-        (is_appimage, APPIMAGE_FILE),
-    ];
-    if let Some((_, name)) = single.iter().find(|(is, _)| is(&release.asset.name)) {
+    if let Some(name) = single_file(&release.asset.name) {
         return stage_single(&part, staged, name)
             .map_err(|err| Problem::Install(format!("{err:#}")));
     }
     fs::rename(&part, &package).map_err(|err| Problem::Install(err.to_string()))?;
     extract(&package, staged).map_err(|err| Problem::Install(format!("{err:#}")))
+}
+
+/// 不用解压的发布包（安装程序、.deb、AppImage）在暂存目录里叫什么。
+fn single_file(asset: &str) -> Option<&'static str> {
+    let single = [
+        (is_setup as fn(&str) -> bool, SETUP_EXE),
+        (is_deb, DEB_FILE),
+        (is_appimage, APPIMAGE_FILE),
+    ];
+    single
+        .into_iter()
+        .find(|(is, _)| is(asset))
+        .map(|(_, name)| name)
+}
+
+/// 暂存目录里已经有这个版本、和 GitHub 记的校验值对得上的安装包（不用解压的那几种）。
+fn staged_matches(release: &Release) -> bool {
+    let (Some(expected), Some(name)) = (&release.asset.sha256, single_file(&release.asset.name))
+    else {
+        return false;
+    };
+    let staging = staging_dir(&release.version);
+    verify_staged(&staging).is_ok()
+        && sha256_file(&staging.join(name)).is_ok_and(|digest| digest == *expected)
+}
+
+/// 文件的 SHA-256，小写十六进制。
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    io::copy(&mut File::open(path)?, &mut hasher)?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 /// 下好的安装程序、.deb、AppImage 挪进暂存目录，叫 `name`。
@@ -960,13 +1116,7 @@ fn staged_files(root: &Path) -> Result<Vec<String>> {
             if rel == READY_MARK {
                 continue;
             }
-            let mut hasher = Sha256::new();
-            io::copy(&mut File::open(&path)?, &mut hasher)?;
-            let digest: String = hasher
-                .finalize()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
+            let digest = sha256_file(&path)?;
             lines.push(format!("{digest} {rel}"));
         }
         Ok(())
@@ -1172,26 +1322,49 @@ fn install_and_launch(staging: &Path) -> Result<()> {
     relaunch(&exe)
 }
 
-/// .deb 装的：经 pkexec 让 apt 装下好的包（弹系统的管理员认证，等它装完）。没有 apt 的用 dpkg。
-fn install_deb(deb: &Path) -> Result<()> {
-    let apt = ["/usr/bin/apt-get", "/bin/apt-get"]
-        .into_iter()
-        .find(|path| Path::new(path).is_file());
-    let mut command = std::process::Command::new("pkexec");
-    match apt {
-        // 装本机的 .deb 要写完整路径；降级（发版撤回时）也照装
-        Some(apt) => command.args([apt, "install", "-y", "--allow-downgrades"]),
-        None => command.args(["/usr/bin/dpkg", "-i"]),
-    };
-    let output = command
+/// 提权以后跑的（`$1` 是暂存的 .deb，`$2` 是它该有的 SHA-256）：先拷进只有 root 能写的临时
+/// 文件夹，对过校验值再装，装完删掉。暂存目录这个用户能写，等认证的时候被换掉的话对不上，不装
+/// （退出码 3）。原来在普通进程里对过就按路径交给 apt，装的未必是对过的那份。没有 apt 的用
+/// dpkg；降级（发版撤回时）也照装。
+const DEB_SCRIPT: &str = r#"set -eu
+dir=$(mktemp -d)
+trap 'rm -rf "$dir"' EXIT
+cp -- "$1" "$dir/kuai.deb"
+actual=$(sha256sum -- "$dir/kuai.deb" | cut -d ' ' -f 1)
+[ "$actual" = "$2" ] || exit 3
+if [ -x /usr/bin/apt-get ]; then
+  /usr/bin/apt-get install -y --allow-downgrades "$dir/kuai.deb"
+else
+  /usr/bin/dpkg -i "$dir/kuai.deb"
+fi
+"#;
+
+/// .deb 装的：经 pkexec 装下好的包（弹系统的管理员认证，等它装完），见 [`DEB_SCRIPT`]。`digest`
+/// 是 GitHub 给这个附件记的 SHA-256。
+fn install_deb(deb: &Path, digest: &str) -> Result<()> {
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!(tr("GitHub 未提供此文件的校验值"));
+    }
+    let output = std::process::Command::new("pkexec")
+        .args(["/bin/sh", "-c", DEB_SCRIPT, "kuai-update"])
         .arg(deb)
+        .arg(digest.to_ascii_lowercase())
         .stdin(std::process::Stdio::null())
-        .output()
-        .context(tr("无法启动 pkexec"))?;
+        .output();
+    // 精简的桌面上可能没装（.deb 只是推荐装 pkexec）：说清楚怎么手动装
+    let output = match output {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            bail!(tr(
+                "未找到 pkexec，无法在 Kuai 中安装。请从发布页下载新的 .deb，用 sudo apt install 安装。"
+            ))
+        }
+        other => other.context(tr("无法启动 pkexec"))?,
+    };
     match output.status.code() {
         Some(0) => Ok(()),
         // pkexec：126 是没授权（点了取消），127 是认证没通过
         Some(126 | 127) => bail!(tr("未获得管理员授权，未安装")),
+        Some(3) => bail!(tr("暂存的新版本与下载时核对的不一致，请重新下载")),
         _ => {
             let text = String::from_utf8_lossy(&output.stderr);
             let last = text.lines().rev().find(|line| !line.trim().is_empty());
@@ -1207,19 +1380,22 @@ fn replace_appimage(staged: &Path) -> Result<PathBuf> {
         .context(tr("未找到程序所在的文件夹"))?
         .to_path_buf();
     let name = file.file_name().context(tr("未找到程序所在的文件夹"))?;
-    let partial = file.with_file_name(format!(".{}.kuai-update", name.to_string_lossy()));
-    fs::copy(staged, &partial).with_context(|| tf!("无法替换 {path}", path = file.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(&partial, fs::Permissions::from_mode(0o755))?;
+    // 名字每次不一样、只新建（见 [`writable`]）：原来是固定的名字，已有的同名文件、链接会被盖掉、跟过去
+    let partial = file.with_file_name(unique_name(&format!(
+        ".{}.kuai-update",
+        name.to_string_lossy()
+    )));
+    let written = write_new(staged, &partial).and_then(|out| executable(&out));
+    if let Err(err) = written {
+        let _ = fs::remove_file(&partial);
+        return Err(err).with_context(|| tf!("无法替换 {path}", path = file.display()));
     }
     fs::rename(&partial, &file)
         .inspect_err(|_| {
             let _ = fs::remove_file(&partial);
         })
         .with_context(|| tf!("无法替换 {path}", path = file.display()))?;
-    let _ = fs::write(update_dir().join(DONE_MARK), env!("CARGO_PKG_VERSION"));
+    let _ = fs::write(own_dir().join(DONE_MARK), env!("CARGO_PKG_VERSION"));
     Ok(file)
 }
 
@@ -1227,11 +1403,11 @@ fn replace_appimage(staged: &Path) -> Result<PathBuf> {
 /// 所在的文件夹，装好后打开新的 Kuai（`/relaunch`），见 `tools/installer/kuai.iss`。
 /// 没装上的话新的 Kuai 不会打开；下次启动时读到记号里还是自己的版本号，就知道没装上。
 fn run_setup(setup: &Path) -> Result<()> {
-    let exe = std::env::current_exe()?;
+    let exe = fr_core::exe::path()?;
     let dir = exe.parent().context(tr("未找到程序所在的文件夹"))?;
     let dir = dir.to_string_lossy();
     let dir = dir.strip_prefix(r"\\?\").unwrap_or(&dir);
-    let _ = fs::write(update_dir().join(DONE_MARK), env!("CARGO_PKG_VERSION"));
+    let _ = fs::write(own_dir().join(DONE_MARK), env!("CARGO_PKG_VERSION"));
     let mut command = std::process::Command::new(setup);
     command.args([
         "/VERYSILENT",
@@ -1241,7 +1417,7 @@ fn run_setup(setup: &Path) -> Result<()> {
     ]);
     // 带空格的路径照 Inno Setup 文档写成 /DIR="…"（交给 arg 的话整个参数外面加引号，成了
     // "/DIR=…"；Inno 解析时也会去掉，但不是文档写的格式）。Windows 路径里不会有引号
-    let log = update_dir().join(SETUP_LOG);
+    let log = own_dir().join(SETUP_LOG);
     raw_switch(&mut command, "DIR", dir);
     raw_switch(&mut command, "LOG", &log.to_string_lossy());
     command
@@ -1262,38 +1438,142 @@ fn raw_switch(command: &mut std::process::Command, name: &str, value: &str) {
     command.arg(format!("/{name}={value}"));
 }
 
-/// 解压版：把暂存目录里的新版本换到程序所在的文件夹：别的文件直接覆盖，程序（[`EXE`]）最后换。
-/// 返回 exe 的路径（已经是新版本了）。调用方先核对过暂存目录（[`verify_staged`]）。
+/// 解压版：把暂存目录里的新版本换到程序所在的文件夹，别的文件先换（[`swap_in`]），程序（[`EXE`]）
+/// 最后换；哪一步没成，换过的都换回去。返回 exe 的路径（已经是新版本了）。调用方先核对过暂存目录
+/// （[`verify_staged`]）。
 fn install(staging: &Path) -> Result<PathBuf> {
-    let exe = std::env::current_exe()?;
+    let exe = fr_core::exe::path()?;
     let dir = exe.parent().context(tr("未找到程序所在的文件夹"))?;
-    copy_tree(staging, staging, dir)?;
-    self_replace::self_replace(staging.join(EXE))
-        .with_context(|| tf!("无法替换 {path}", path = EXE))?;
-    let _ = fs::write(update_dir().join(DONE_MARK), env!("CARGO_PKG_VERSION"));
+    let swap = swap_in(staging, dir)?;
+    if let Err(err) = self_replace::self_replace(staging.join(EXE)) {
+        swap.undo();
+        return Err(anyhow::Error::new(err).context(tf!("无法替换 {path}", path = EXE)));
+    }
+    swap.finish();
+    let _ = fs::write(own_dir().join(DONE_MARK), env!("CARGO_PKG_VERSION"));
     // 换上了就删掉：万一新程序报的版本号不比现在新（发版时标签打错），启动时也不会一遍遍地换
     let _ = fs::remove_dir_all(staging);
     Ok(exe)
 }
 
-fn copy_tree(root: &Path, from: &Path, to: &Path) -> Result<()> {
-    for entry in fs::read_dir(from)? {
-        let entry = entry?;
-        let path = entry.path();
-        let rel = path.strip_prefix(root)?;
-        if rel == Path::new(EXE) || rel == Path::new(READY_MARK) {
-            continue;
+/// 解压版换文件的记录。换下来的原文件挪进程序文件夹里的 `.kuai-update-old-<进程号>`（在同一个盘上，
+/// 挪就是改名；Windows 上正在运行的程序也挪得动），哪一步没成就照着挪回去（[`Swap::undo`]）。原来是
+/// 直接覆盖：盘满了这类错误会留下半套新、半套旧（随包的 kuaid 可能只写了一半），也换不回去。
+struct Swap {
+    dir: PathBuf,
+    backup: PathBuf,
+    /// 换过的：相对路径、原来有没有这个文件，按换的先后
+    done: Vec<(PathBuf, bool)>,
+    /// 为放新文件新建的文件夹，按建的先后
+    made: Vec<PathBuf>,
+}
+
+impl Swap {
+    /// 换上一个文件：新的先拷成旁边一个新名字的文件，原来的挪开，再改名换上。
+    fn put(&mut self, staging: &Path, rel: &Path) -> Result<()> {
+        let target = self.dir.join(rel);
+        let fail = || tf!("无法替换 {path}", path = target.display());
+        let parent = target.parent().context(tr("未找到程序所在的文件夹"))?;
+        let mut missing = Vec::new();
+        let mut at = Some(parent);
+        while let Some(dir) = at.filter(|dir| !dir.exists()) {
+            missing.push(dir.to_path_buf());
+            at = dir.parent();
         }
-        let target = to.join(rel);
-        if entry.file_type()?.is_dir() {
-            fs::create_dir_all(&target)?;
-            copy_tree(root, &path, to)?;
-        } else {
-            fs::copy(&path, &target)
-                .with_context(|| tf!("无法替换 {path}", path = target.display()))?;
+        for dir in missing.into_iter().rev() {
+            fs::create_dir(&dir).with_context(fail)?;
+            self.made.push(dir);
+        }
+        let name = target.file_name().context(tr("未找到程序所在的文件夹"))?;
+        let fresh = target.with_file_name(unique_name(&format!(
+            ".{}.kuai-new",
+            name.to_string_lossy()
+        )));
+        let source = staging.join(rel);
+        let written = write_new(&source, &fresh).and_then(|out| {
+            out.set_permissions(fs::metadata(&source)?.permissions())?;
+            Ok(())
+        });
+        if let Err(err) = written {
+            let _ = fs::remove_file(&fresh);
+            return Err(err).with_context(fail);
+        }
+        let had = fs::symlink_metadata(&target).is_ok();
+        if had {
+            let old = self.backup.join(rel);
+            let moved = old
+                .parent()
+                .map_or(Ok(()), fs::create_dir_all)
+                .and_then(|()| fs::rename(&target, &old));
+            if let Err(err) = moved {
+                let _ = fs::remove_file(&fresh);
+                return Err(err).with_context(fail);
+            }
+        }
+        self.done.push((rel.to_path_buf(), had));
+        if let Err(err) = fs::rename(&fresh, &target) {
+            let _ = fs::remove_file(&fresh);
+            return Err(err).with_context(fail);
+        }
+        Ok(())
+    }
+
+    /// 没换成：换过的挪回去，新建的文件夹删掉。
+    fn undo(self) {
+        for (rel, had) in self.done.iter().rev() {
+            let target = self.dir.join(rel);
+            let _ = fs::remove_file(&target);
+            if *had {
+                let _ = fs::rename(self.backup.join(rel), &target);
+            }
+        }
+        for dir in self.made.iter().rev() {
+            let _ = fs::remove_dir(dir);
+        }
+        let _ = fs::remove_dir_all(&self.backup);
+    }
+
+    /// 都换好了：换下来的删掉（Windows 上正在运行的删不掉，升级后启动时再删，见
+    /// [`remove_obsolete_files`]）。
+    fn finish(self) {
+        let _ = fs::remove_dir_all(&self.backup);
+    }
+}
+
+/// 把暂存目录里程序、就绪记号以外的文件换进 `dir`（按路径的先后一个个换）。没成就把换过的换回去，
+/// 返回错误。
+fn swap_in(staging: &Path, dir: &Path) -> Result<Swap> {
+    fn walk(root: &Path, from: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                walk(root, &path, out)?;
+                continue;
+            }
+            let rel = path.strip_prefix(root)?.to_path_buf();
+            if rel != Path::new(EXE) && rel != Path::new(READY_MARK) {
+                out.push(rel);
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    walk(staging, staging, &mut files)?;
+    files.sort();
+    let mut swap = Swap {
+        dir: dir.to_path_buf(),
+        backup: dir.join(format!("{OLD_PREFIX}{}", std::process::id())),
+        done: Vec::new(),
+        made: Vec::new(),
+    };
+    for rel in &files {
+        if let Err(err) = swap.put(staging, rel) {
+            swap.undo();
+            return Err(err);
         }
     }
-    Ok(())
+    Ok(swap)
 }
 
 /// 拉起新的 Kuai，参数照旧（开机自启带的「收进托盘」不带：人正看着呢）。
@@ -1317,7 +1597,7 @@ fn relaunch(exe: &Path) -> Result<()> {
 
 /// 暂存好了的版本里最新的那个。
 fn newest_staged() -> Option<Version> {
-    fs::read_dir(update_dir())
+    fs::read_dir(own_dir())
         .ok()?
         .flatten()
         .filter(|entry| entry.path().join(READY_MARK).is_file())
@@ -1325,22 +1605,26 @@ fn newest_staged() -> Option<Version> {
         .max()
 }
 
-/// 记号里的版本号：换之前的版本。
+/// 记号里的版本号：换之前的版本。1.23 及以前写在 [`update_dir`] 里（不分是哪一份 Kuai），从那些
+/// 版本升上来的头一次启动去那里找。
 fn peek_done_mark() -> Option<String> {
-    let from = fs::read_to_string(update_dir().join(DONE_MARK)).ok()?;
-    Some(from.trim().to_string()).filter(|v| !v.is_empty())
+    [own_dir(), update_dir()].iter().find_map(|dir| {
+        let from = fs::read_to_string(dir.join(DONE_MARK)).ok()?;
+        Some(from.trim().to_string()).filter(|v| !v.is_empty())
+    })
 }
 
 /// 刚升级完：读出原来的版本号，删掉记号。
 fn take_done_mark() -> Option<String> {
     let from = peek_done_mark();
+    let _ = fs::remove_file(own_dir().join(DONE_MARK));
     let _ = fs::remove_file(update_dir().join(DONE_MARK));
     from
 }
 
 /// 删掉所有暂存的版本（上次没装上，不再自动重试）。
 fn discard_staged() {
-    let Ok(entries) = fs::read_dir(update_dir()) else {
+    let Ok(entries) = fs::read_dir(own_dir()) else {
         return;
     };
     for entry in entries.flatten() {
@@ -1362,7 +1646,7 @@ const OBSOLETE_FILES: &[&str] = &[
 /// 升级完了：删掉程序文件夹里旧版本留下的 [`OBSOLETE_FILES`]。文件夹不可写（.deb 装在 /opt、
 /// AppImage 是只读挂载）时删不掉也不要紧，那两种本来就不会留下
 fn remove_obsolete_files() {
-    let Some(dir) = std::env::current_exe()
+    let Some(dir) = fr_core::exe::path()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
     else {
@@ -1371,21 +1655,33 @@ fn remove_obsolete_files() {
     for name in OBSOLETE_FILES {
         let _ = fs::remove_file(dir.join(name));
     }
+    // 解压版换文件时挪开的旧文件（[`Swap`]）：换的时候正在运行、删不掉的留到了现在
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(OLD_PREFIX) {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
 }
 
-/// 升级完了：删掉不比现在新的暂存目录和下了一半的文件。
+/// 升级完了：删掉不比现在新的暂存目录和下了一半的文件（1.23 及以前直接放在 [`update_dir`] 里的
+/// 也删；别的那几份 Kuai 自己的目录名字不是版本号，不动）。
 fn clean_old_downloads() {
-    let Ok(entries) = fs::read_dir(update_dir()) else {
-        return;
-    };
     let current = current_version();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let old = Version::parse(&name).is_ok_and(|v| v <= current);
-        if old || name.starts_with(WORK_PREFIX) {
-            let _ = fs::remove_dir_all(entry.path());
-        } else if name.ends_with(".part") || name.ends_with(".zip") || name.ends_with(".tar.gz") {
-            let _ = fs::remove_file(entry.path());
+    for dir in [own_dir(), update_dir()] {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let old = Version::parse(&name).is_ok_and(|v| v <= current);
+            if old || name.starts_with(WORK_PREFIX) {
+                let _ = fs::remove_dir_all(entry.path());
+            } else if name.ends_with(".part") || name.ends_with(".zip") || name.ends_with(".tar.gz")
+            {
+                let _ = fs::remove_file(entry.path());
+            }
         }
     }
 }
@@ -1396,7 +1692,7 @@ mod tests {
     use super::{CHECK_EVERY, wait_before_next};
     use super::{
         EXE, GhAsset, GhRelease, Kind, PACKAGE_SUFFIX, READY_MARK, SETUP_EXE, Version, common_top,
-        copy_tree, extract, stage_single, verify_staged,
+        extract, install_tag, stage_single, swap_in, verify_staged, writable,
     };
     use super::{parse_release, plain};
     use std::fs::{self, File};
@@ -1569,12 +1865,67 @@ mod tests {
             b"old",
         )
         .unwrap();
-        copy_tree(&staging, &staging, &installed).unwrap();
+        swap_in(&staging, &installed).unwrap().finish();
         let kuaid = installed.join("kuaid/x86_64-unknown-linux-musl/kuaid");
         assert_eq!(fs::read(kuaid).unwrap(), b"new kuaid");
         assert_eq!(fs::read(installed.join(EXE)).unwrap(), b"old exe");
         assert!(!installed.join(READY_MARK).exists());
+        // 换下来的旧文件、临时文件都不留
+        let left: Vec<String> = fs::read_dir(&installed)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left.len(), 2, "{left:?}");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 换文件中途没成_换过的都换回去() {
+        let root = std::env::temp_dir().join(format!("kuai-swap-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (staging, installed) = (root.join("staging"), root.join("installed"));
+        fs::create_dir_all(staging.join("b")).unwrap();
+        fs::write(staging.join("a"), b"new a").unwrap();
+        fs::write(staging.join("b/c"), b"new c").unwrap();
+        fs::write(staging.join("new-only"), b"new").unwrap();
+        fs::create_dir_all(&installed).unwrap();
+        fs::write(installed.join("a"), b"old a").unwrap();
+        // b 在程序文件夹里是个文件：b/c 放不进去
+        fs::write(installed.join("b"), b"old b").unwrap();
+        assert!(swap_in(&staging, &installed).is_err());
+        assert_eq!(fs::read(installed.join("a")).unwrap(), b"old a");
+        assert_eq!(fs::read(installed.join("b")).unwrap(), b"old b");
+        let mut left: Vec<String> = fs::read_dir(&installed)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["a", "b"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 试写不碰已有的同名文件() {
+        let root = std::env::temp_dir().join(format!("kuai-probe-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".kuai-write-test"), b"keep").unwrap();
+        assert!(writable(&root).is_ok());
+        assert_eq!(fs::read(root.join(".kuai-write-test")).unwrap(), b"keep");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 各种装法各用各的目录() {
+        assert_eq!(install_tag(Kind::Deb), "deb");
+        let portable = install_tag(Kind::Portable);
+        let installed = install_tag(Kind::Installed);
+        assert!(portable.starts_with("portable-") && portable.len() == "portable-".len() + 8);
+        assert_ne!(portable, installed);
+        assert!(Version::parse(&portable).is_err());
     }
 
     /// 往 tar 里加一条：名字直接写进头里（`append_data` 不让写 `..`，测不了不安全的路径）

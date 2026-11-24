@@ -942,11 +942,19 @@ impl AppState {
     /// 登录被拒绝、主机密钥不对要人来处理（见 [`fr_channel::LoginFailure::needs_user`]）；登录上以后才出的
     /// 错（kuaid 起不来、git 太旧）等也等不好。本机的 kuaid、经别的电脑连的（错误只有一句话）一直试。
     pub(crate) fn worth_retrying(&self, key: &str) -> bool {
-        if key == LOCAL || split_relay(key).is_some() {
+        if key == LOCAL {
             return true;
         }
-        self.last_login_failure(key)
-            .is_some_and(|failure| !failure.needs_user())
+        match split_relay(key) {
+            // 经别的电脑连的：那台连不上、转接中途断了（没记登录失败）接着试；那边的 ssh 说登录
+            // 被拒绝、主机密钥不对（后台重连时不许问，见 `connect_with`）要人来处理
+            Some(_) => !self
+                .last_login_failure(key)
+                .is_some_and(|failure| failure.needs_user()),
+            None => self
+                .last_login_failure(key)
+                .is_some_and(|failure| !failure.needs_user()),
+        }
     }
 
     /// 过一会儿重连，连不上隔得越来越久（2 秒起，最多 30 秒；窗口回到前台时马上试一次，见
@@ -990,7 +998,9 @@ impl AppState {
                         log::info!("{key} 连不上，要人来处理，不再自己重连");
                         break;
                     }
-                    wait = (wait * 2).min(RECONNECT_MAX);
+                    // 窗口回到前台时马上试的那一次（`retry_now`，从 0 起）没连上：照常从
+                    // RECONNECT_FIRST 等起，不然 0 翻倍还是 0，连不上的一直不停地连
+                    wait = (wait * 2).clamp(RECONNECT_FIRST, RECONNECT_MAX);
                 }
                 // 不再连了（连上了、不用了、要人来处理）：从表里去掉，下次断开时还能再安排
                 this.update(cx, |this, _| this.reconnects.remove(&key)).ok();
@@ -1560,9 +1570,10 @@ impl AppState {
             (rank(a), a).cmp(&(rank(b), b))
         });
         let mut repos: Vec<RepoEntry> = Vec::new();
+        let mut seen: std::collections::HashSet<RepoEntry> = std::collections::HashSet::new();
         for machine in machines {
             for entry in self.repos_on(machine).unwrap_or_default() {
-                if !repos.contains(&entry) {
+                if seen.insert(entry.clone()) {
                     repos.push(entry);
                 }
             }

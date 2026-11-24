@@ -6,7 +6,8 @@
 
 只算编进程序的依赖：这个平台的客户端 fr-app，和包里带的 kuaid（Linux 版、Windows 版）的
 普通依赖（连带过程宏），不算只在编译时跑的构建脚本依赖和测试用的。全文一样的许可证只印一次，
-后面列出用它的库。另外加上不是 cargo 依赖、原样随包带的程序文件（VENDORED）。
+后面列出用它的库。另外加上不是 cargo 依赖、原样随包带的程序文件（VENDORED；Linux 版的清单里还有
+AppImage 开头的运行时和它静态链接的库，见 vendor/appimage-runtime/README.md）。
 Windows 版的清单用 CRLF，Linux 版的用 LF。
 """
 import collections
@@ -21,13 +22,57 @@ CLIENT = {'windows': 'x86_64-pc-windows-msvc', 'linux': 'x86_64-unknown-linux-gn
 KUAID = ['x86_64-unknown-linux-musl', 'x86_64-pc-windows-msvc']
 LICENSE_PREFIXES = ('license', 'licence', 'copying', 'notice', 'unlicense', 'copyright')
 REPO = pathlib.Path(__file__).resolve().parent.parent
-# 原样随包带的程序文件：许可证全文在 manifest_path 所在的目录里。换版本时和 vendor/conpty/README.md 一起改
+# 原样随包带的程序文件：许可证全文在 manifest_path 所在的目录里。换版本时和 vendor/conpty/README.md、
+# vendor/appimage-runtime/README.md 一起改。platforms：只在这几个平台的包里（不写是都有）
+RUNTIME = REPO / 'vendor' / 'appimage-runtime'
 VENDORED = [
     {
         'name': 'Microsoft.Windows.Console.ConPTY (conpty.dll, OpenConsole.exe)',
         'version': '1.25.260930003',
         'license': 'MIT',
         'manifest_path': str(REPO / 'vendor' / 'conpty' / 'README.md'),
+    },
+    {
+        'name': 'AppImage type2-runtime (runtime of the .AppImage)',
+        'version': '20251108',
+        'license': 'MIT',
+        'manifest_path': str(RUNTIME / 'README.md'),
+        'platforms': ['linux'],
+    },
+    {
+        'name': 'libfuse (in the AppImage runtime)',
+        'version': '3.15.0',
+        'license': 'LGPL-2.1',
+        'manifest_path': str(RUNTIME / 'libfuse' / 'LICENSE'),
+        'platforms': ['linux'],
+    },
+    {
+        'name': 'squashfuse (in the AppImage runtime)',
+        'version': '0.5.2',
+        'license': 'BSD-2-Clause',
+        'manifest_path': str(RUNTIME / 'squashfuse' / 'LICENSE'),
+        'platforms': ['linux'],
+    },
+    {
+        'name': 'musl libc (in the AppImage runtime)',
+        'version': 'Alpine 3.21',
+        'license': 'MIT',
+        'manifest_path': str(RUNTIME / 'musl' / 'COPYRIGHT'),
+        'platforms': ['linux'],
+    },
+    {
+        'name': 'zstd (in the AppImage runtime)',
+        'version': 'Alpine 3.21',
+        'license': 'BSD-3-Clause',
+        'manifest_path': str(RUNTIME / 'zstd' / 'LICENSE'),
+        'platforms': ['linux'],
+    },
+    {
+        'name': 'zlib (in the AppImage runtime)',
+        'version': 'Alpine 3.21',
+        'license': 'Zlib',
+        'manifest_path': str(RUNTIME / 'zlib' / 'LICENSE'),
+        'platforms': ['linux'],
     },
 ]
 
@@ -79,7 +124,8 @@ def main():
         for package in runtime_packages(metadata(target), root):
             packages[(package['name'], package['version'])] = package
     for package in VENDORED:
-        packages[(package['name'], package['version'])] = package
+        if platform in package.get('platforms', CLIENT):
+            packages[(package['name'], package['version'])] = package
     rows = sorted(packages.values(), key=lambda p: (p['name'].lower(), p['version']))
 
     texts = collections.OrderedDict()  # 全文的哈希 -> (全文, [用它的库])

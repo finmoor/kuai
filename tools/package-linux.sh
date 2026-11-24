@@ -7,7 +7,8 @@
 # 带 --deb 时另打 dist/kuai_<版本>_amd64.deb：装在 /opt/kuai，/usr/bin/kuai 链接过去，应用菜单项和
 # 图标放在系统目录；Kuai 升级时下新的 .deb 经 pkexec 交给 apt 装（crates/fr-app/src/update.rs）。
 # 带 --appimage <appimagetool> <runtime> 时另打 dist/kuai-<版本>-linux-x64.AppImage：AppImage 的
-# 程序（appimagetool 1.9.1）和运行时（type2-runtime 20251108）由调用的地方下好、核对过校验值再给。
+# 程序（appimagetool 1.9.1）和运行时（type2-runtime 20251108）由调用的地方下好、核对过校验值再给；
+# 运行时和它静态链接的库的许可证见 vendor/appimage-runtime/，写进 THIRD-PARTY-LICENSES.txt。
 # 发版时（.github/workflows/release.yml）把它和 Windows 版一起传到 GitHub Releases，
 # Kuai 检查更新时找 kuai-*-linux-x64.tar.gz（crates/fr-app/src/update.rs）。
 #
@@ -167,7 +168,7 @@ Architecture: amd64
 Maintainer: Kuai <https://github.com/finmoor/kuai/issues>
 Installed-Size: $installed_size
 Depends: libc6 (>= 2.35), libgcc-s1, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libvulkan1
-Recommends: git, openssh-client, fuse3, mesa-vulkan-drivers
+Recommends: git, openssh-client, fuse3, mesa-vulkan-drivers, pkexec | policykit-1
 Section: devel
 Priority: optional
 Homepage: https://github.com/finmoor/kuai

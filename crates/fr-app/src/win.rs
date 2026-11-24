@@ -326,13 +326,29 @@ mod imp {
 mod wayland {
     use gpui_kit::Window;
     use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+    use std::cell::RefCell;
     use wayland_client::backend::{Backend, ObjectId};
-    use wayland_client::globals::{GlobalListContents, registry_queue_init};
+    use wayland_client::globals::{GlobalList, GlobalListContents, registry_queue_init};
     use wayland_client::protocol::{wl_registry::WlRegistry, wl_surface::WlSurface};
-    use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
+    use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
     use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1::XdgActivationV1;
 
     struct State;
+
+    /// 绑好的 `xdg_activation_v1`，同一条连接上接着用：wl_registry 在合成器那边要等连接断开才释放，
+    /// 原来每激活一次就新建一个 registry、绑一次，一直攒着。
+    struct Activator {
+        /// 是哪条连接的（GPUI 的 wl_display）
+        display: usize,
+        conn: Connection,
+        queue: EventQueue<State>,
+        _globals: GlobalList,
+        activation: XdgActivationV1,
+    }
+
+    thread_local! {
+        static ACTIVATOR: RefCell<Option<Activator>> = const { RefCell::new(None) };
+    }
 
     impl Dispatch<WlRegistry, GlobalListContents> for State {
         fn event(
@@ -368,20 +384,35 @@ mod wayland {
             RawWindowHandle::Wayland(window) => window.surface,
             _ => return Ok(false),
         };
-        // SAFETY：两个指针都是 GPUI 那条还开着的连接上的（窗口还开着），这里只借用、不接管：
-        // 外来的 display 不会被关掉，surface 在这条连接上的 ObjectId 只用来发一次请求
-        let conn = Connection::from_backend(unsafe {
-            Backend::from_foreign_display(display.as_ptr().cast())
-        });
-        let surface_id =
-            unsafe { ObjectId::from_ptr(WlSurface::interface(), surface.as_ptr().cast()) }?;
-        let surface = WlSurface::from_id(&conn, surface_id)?;
-        let (globals, queue) = registry_queue_init::<State>(&conn)?;
-        let activation: XdgActivationV1 = globals.bind(&queue.handle(), 1..=1, ())?;
-        activation.activate(token.to_string(), &surface);
-        activation.destroy();
-        conn.flush()?;
-        Ok(true)
+        let key = display.as_ptr() as usize;
+        ACTIVATOR.with_borrow_mut(|slot| {
+            if slot.as_ref().is_none_or(|made| made.display != key) {
+                // SAFETY：指针是 GPUI 那条还开着的连接（它和程序一样长），这里只借用、不接管：外来的
+                // display 不会被关掉
+                let conn = Connection::from_backend(unsafe {
+                    Backend::from_foreign_display(display.as_ptr().cast())
+                });
+                let (globals, queue) = registry_queue_init::<State>(&conn)?;
+                let activation: XdgActivationV1 = globals.bind(&queue.handle(), 1..=1, ())?;
+                *slot = Some(Activator {
+                    display: key,
+                    conn,
+                    queue,
+                    _globals: globals,
+                    activation,
+                });
+            }
+            let made = slot.as_mut().expect("刚建好");
+            // 攒下的事件（全局对象增减）清掉
+            made.queue.dispatch_pending(&mut State)?;
+            // SAFETY：surface 是这条连接上窗口的（窗口还开着），ObjectId 只用来发这一次请求
+            let surface_id =
+                unsafe { ObjectId::from_ptr(WlSurface::interface(), surface.as_ptr().cast()) }?;
+            let surface = WlSurface::from_id(&made.conn, surface_id)?;
+            made.activation.activate(token.to_string(), &surface);
+            made.conn.flush()?;
+            Ok(true)
+        })
     }
 }
 

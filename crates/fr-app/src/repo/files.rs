@@ -346,9 +346,25 @@ pub(super) fn modified(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-/// 「用默认程序打开」下载的副本都放在这个目录下面，每次下载一个子目录。
+/// 「用默认程序打开」下载的副本都放在这个目录下面，每次下载一个子目录（见 `new_copy_dir`）。Windows
+/// 上是 `%TEMP%\kuai-open`（本来就只有这个用户进得去）；Linux 上的 `/tmp` 是大家共用的，别的用户能先
+/// 建好同名的目录、读到副本，放在 `~/.cache/kuai/open`（`$XDG_CACHE_HOME`），建的时候只给自己。
 pub(super) fn copies_dir() -> PathBuf {
-    std::env::temp_dir().join("kuai-open")
+    #[cfg(windows)]
+    return std::env::temp_dir().join("kuai-open");
+    #[cfg(not(windows))]
+    {
+        let env = |name| {
+            std::env::var_os(name)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        };
+        env("XDG_CACHE_HOME")
+            .or_else(|| env("HOME").map(|home| home.join(".cache")))
+            .unwrap_or_else(std::env::temp_dir)
+            .join("kuai")
+            .join("open")
+    }
 }
 
 /// 删掉一份副本所在的子目录。只删 [`copies_dir`] 下面的子目录，路径不对就不动。
@@ -395,7 +411,7 @@ pub(crate) fn local_file_name(name: &str) -> String {
 }
 
 /// 两次看到的是不是同一版：有没有、大小、修改时间都一样。
-pub(super) fn same_version(a: &FsStat, b: &FsStat) -> bool {
+pub(crate) fn same_version(a: &FsStat, b: &FsStat) -> bool {
     a.exists == b.exists && a.size == b.size && a.mtime == b.mtime
 }
 

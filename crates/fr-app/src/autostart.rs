@@ -179,7 +179,7 @@ mod imp {
     pub fn set(on: bool) -> Result<()> {
         let file = file().context(tr("添加启动项失败"))?;
         if on {
-            let text = desktop_entry(&exe()?);
+            let text = desktop_entry(&exe()?).context(tr("添加启动项失败"))?;
             let dir = file.parent().context(tr("添加启动项失败"))?;
             std::fs::create_dir_all(dir).context(tr("添加启动项失败"))?;
             // 先写到旁边再改名：桌面环境不会读到写了一半的
@@ -199,19 +199,20 @@ mod imp {
     }
 }
 
-/// 自启文件的内容（freedesktop 的 desktop entry）。
+/// 自启文件的内容（freedesktop 的 desktop entry）。程序路径写不进去（见 [`exec_quote`]）是 None。
 #[cfg_attr(windows, allow(dead_code))]
-fn desktop_entry(exe: &str) -> String {
-    format!(
+fn desktop_entry(exe: &str) -> Option<String> {
+    Some(format!(
         "[Desktop Entry]\nType=Application\nName=Kuai\nExec={} {MINIMIZED_FLAG}\nIcon=kuai\n\
          Terminal=false\nX-GNOME-Autostart-enabled=true\n",
-        exec_quote(exe)
-    )
+        exec_quote(exe)?
+    ))
 }
 
 /// 按 desktop entry 的规矩把程序路径写进 `Exec=`：加双引号，里面的 `"`、`` ` ``、`$`、`\` 前面加
-/// 反斜杠；整个值再按字符串的规矩把反斜杠写两遍；`%` 写成 `%%`（不然当成 `%f` 这类占位）。
-pub(crate) fn exec_quote(path: &str) -> String {
+/// 反斜杠；整个值再按字符串的规矩把反斜杠写两遍，换行、制表符、回车写成 `\n`、`\t`、`\r`（原来原样
+/// 写进去，一行断成两行）；`%` 写成 `%%`（不然当成 `%f` 这类占位）。别的控制字符写不进去，是 None。
+pub(crate) fn exec_quote(path: &str) -> Option<String> {
     let mut quoted = String::from("\"");
     for c in path.chars() {
         match c {
@@ -221,17 +222,47 @@ pub(crate) fn exec_quote(path: &str) -> String {
             }
             '\\' => quoted.push_str("\\\\\\\\"),
             '%' => quoted.push_str("%%"),
+            '\n' => quoted.push_str("\\n"),
+            '\t' => quoted.push_str("\\t"),
+            '\r' => quoted.push_str("\\r"),
+            c if c.is_control() => return None,
             c => quoted.push(c),
         }
     }
     quoted.push('"');
-    quoted
+    Some(quoted)
+}
+
+/// 按 desktop entry 字符串的规矩还原：`\s`、`\n`、`\t`、`\r`、`\\`。
+#[cfg_attr(windows, allow(dead_code))]
+fn unescape_value(value: &str) -> String {
+    let mut out = String::new();
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('s') => out.push(' '),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// 读出 `Exec=` 里的程序（第一个参数），按 [`exec_quote`] 的写法还原。
 #[cfg_attr(windows, allow(dead_code))]
 fn exec_program(exec: &str) -> Option<String> {
-    let exec = exec.trim().replace("\\\\", "\\").replace("%%", "%");
+    let exec = unescape_value(exec.trim()).replace("%%", "%");
     let Some(rest) = exec.strip_prefix('"') else {
         return exec.split_whitespace().next().map(str::to_string);
     };
@@ -289,7 +320,7 @@ mod tests {
     #[test]
     fn 自启文件指向这个程序才算开着() {
         let exe = r#"/opt/Kuai "新"/$HOME`x`/a\b%f/kuai"#;
-        let text = desktop_entry(exe);
+        let text = desktop_entry(exe).unwrap();
         assert!(text.starts_with("[Desktop Entry]\n"));
         assert!(text.contains(" --minimized\n"), "{text}");
         let exec = text
@@ -315,6 +346,18 @@ mod tests {
             exec_program("/usr/bin/kuai --minimized").as_deref(),
             Some("/usr/bin/kuai")
         );
+        // 路径里有换行、制表符：写成转义，还是一行，读回来一样
+        let odd = "/opt/a\nb\tc/kuai";
+        let text = desktop_entry(odd).unwrap();
+        assert_eq!(text.lines().count(), 7, "{text}");
+        let exec = text
+            .lines()
+            .find_map(|line| line.strip_prefix("Exec="))
+            .unwrap();
+        assert_eq!(exec_program(exec).as_deref(), Some(odd), "{exec}");
+        assert!(entry_enabled(&text, odd));
+        // 别的控制字符写不进去
+        assert!(desktop_entry("/opt/a\u{1}b/kuai").is_none());
     }
 
     /// 真的写注册表（换成测试用的键）：任务管理器里禁用过的，这里打开时把那一笔删掉。

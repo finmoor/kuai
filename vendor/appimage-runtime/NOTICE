@@ -1,0 +1,16 @@
+The AppImage edition of Kuai begins with the AppImage type 2 runtime
+(AppImage/type2-runtime, release 20251108, MIT license). The runtime is a
+separate program that mounts the bundled files via FUSE and starts Kuai.
+It statically links code from libfuse 3.15.0 (LGPL-2.1, with the type2-runtime
+patch patches/libfuse/mount.c.diff), squashfuse 0.5.2 (BSD-2-Clause), and the
+Alpine Linux 3.21 packages of musl libc (MIT), zstd (BSD-3-Clause) and zlib
+(Zlib).
+
+Complete corresponding source code and build instructions:
+  https://github.com/AppImage/type2-runtime/tree/20251108
+  (scripts/common/install-dependencies.sh downloads libfuse and squashfuse,
+  scripts/chroot/chroot_build.sh sets up the Alpine Linux 3.21 build system)
+  https://github.com/libfuse/libfuse/releases/tag/fuse-3.15.0
+  https://github.com/vasi/squashfuse/releases/tag/0.5.2
+You may modify the runtime or the libraries, rebuild the runtime, and replace
+the first part of the AppImage with it (appimagetool --runtime-file).

@@ -203,6 +203,9 @@ fn dropdown(
             }))
         },
     );
+    if more.is_empty() {
+        return menu;
+    }
     let (entry, add) = (entry.clone(), add.clone());
     menu.separator().submenu(
         tr("添加到其他工作区"),
@@ -285,7 +288,11 @@ pub(crate) fn context_items(
             rows(state, others, false, cx),
         )
     };
+    // 一个能加的都没有（子仓库、都已经加了、主机断开）：不出这一项，原来是点开只有一句话的子菜单
     let add_sub = |menu: PopupMenu, label: &'static str, window: &mut Window, cx| {
+        if others.is_empty() {
+            return menu;
+        }
         let (entry, add, others) = (entry.clone(), add.clone(), others.clone());
         menu.submenu(label, window, cx, move |sub, _, _| {
             add_items(sub, others.clone(), &entry, &add, muted)

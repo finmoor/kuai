@@ -20,3 +20,7 @@ pub const STATUS_FILE_IS_A_DIRECTORY: NTSTATUS = libc::EISDIR;
 pub const STATUS_UNEXPECTED_IO_ERROR: NTSTATUS = libc::EIO;
 pub const STATUS_IO_TIMEOUT: NTSTATUS = libc::ETIMEDOUT;
 pub const STATUS_DIRECTORY_NOT_EMPTY: NTSTATUS = libc::ENOTEMPTY;
+/// 跨了主机上的文件系统（改名挪不过去）：`mv` 见到它会改成复制再删
+pub const STATUS_NOT_SAME_DEVICE: NTSTATUS = libc::EXDEV;
+/// 只有 root 能做的（改属主、改组）
+pub const STATUS_PRIVILEGE_NOT_HELD: NTSTATUS = libc::EPERM;

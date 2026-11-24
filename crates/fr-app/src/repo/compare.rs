@@ -1095,7 +1095,14 @@ impl RepoView {
             (_, None) => div().into_any_element(),
             (_, Some(i)) => {
                 let (text, with_numbers) = forms[i].clone();
-                let full = forms[0].0.clone();
+                // 写全的那句连同增删的行数（短的写法可能连行数也省了）
+                let full: SharedString = match &numbers {
+                    Some((added, removed)) if forms[0].0.is_empty() => {
+                        format!("{added} {removed}").into()
+                    }
+                    Some((added, removed)) => format!("{} · {added} {removed}", forms[0].0).into(),
+                    None => forms[0].0.clone(),
+                };
                 // 鼠标停上去：领先、落后说的是什么；写的是短的时，先写全的那句
                 let tip = totals.map(|_| {
                     SharedString::from(tf!(

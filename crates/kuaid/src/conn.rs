@@ -168,6 +168,40 @@ pub struct Conn {
     /// [`fr_core::protocol::TERM_MARKS_SINCE`]）。握手前按现在这一版算（只有测试不握手）；握手时没说
     /// 的是很旧的客户端，按 0 算
     protocol: AtomicU32,
+    /// 同一个文件的 `fs_pwrite` 排着队做（见 [`Writes`]）
+    writes: Arc<Writes>,
+}
+
+/// 同一个文件的 `fs_pwrite` 按收到的先后做（协议 17）。别的文件请求各在各的线程里做（主机上的文件
+/// 操作卡住时不挡别的），同一个文件的写入要是也那样，先后会乱：映射盘上连着追加的两段，后发的可能
+/// 先写到末尾。按仓库加路径排队，一个文件一个线程，队里空了线程就结束。
+#[derive(Default)]
+struct Writes(Mutex<HashMap<String, std::collections::VecDeque<Job>>>);
+
+type Job = Box<dyn FnOnce() + Send>;
+
+impl Writes {
+    fn push(self: &Arc<Self>, key: String, job: Job) {
+        let mut queues = self.0.lock().unwrap();
+        if let Some(queue) = queues.get_mut(&key) {
+            queue.push_back(job);
+            return;
+        }
+        queues.insert(key.clone(), Default::default());
+        drop(queues);
+        let writes = self.clone();
+        std::thread::spawn(move || {
+            let mut next = Some(job);
+            while let Some(job) = next.take() {
+                job();
+                let mut queues = writes.0.lock().unwrap();
+                next = queues.get_mut(&key).and_then(|queue| queue.pop_front());
+                if next.is_none() {
+                    queues.remove(&key);
+                }
+            }
+        });
+    }
 }
 
 impl Conn {
@@ -261,6 +295,9 @@ struct RelayOpen {
     server: String,
     /// 在那台服务器上执行的命令
     command: String,
+    /// 不许问人（客户端在后台自己重连，协议 17）：要密码、要确认主机密钥就失败
+    #[serde(default)]
+    quiet: bool,
 }
 
 #[derive(Deserialize)]
@@ -287,6 +324,7 @@ pub fn serve(shared: &Arc<Shared>, reader: impl Read, writer: impl Write + Send 
         uploads: Mutex::new(Uploads::new(shared.drop_dir.clone())),
         relays: Arc::default(),
         protocol: AtomicU32::new(PROTOCOL_VERSION),
+        writes: Arc::default(),
     });
     shared.conns.lock().unwrap().insert(conn.id, conn.clone());
     let mut watchers: HashMap<u64, fr_core::watch::Watcher> = HashMap::new();
@@ -362,10 +400,10 @@ fn handle(
                     let store = shared.workspaces.get();
                     let cmd = crate::relay::command(
                         &store,
-                        &params.server,
-                        &params.command,
+                        (&params.server, &params.command),
                         &conn.env(),
                         &helper,
+                        params.quiet,
                     )?;
                     conn.relays.open(id, cmd, &conn.out)
                 });
@@ -487,9 +525,15 @@ fn handle(
             conn.reply(id, reply);
         }
         method if method.starts_with("fs_") => {
-            // 读写文件可能慢（大文件、网络盘）：放到自己的线程里，这边接着读下一个请求
+            // 读写文件可能慢（大文件、网络盘）：放到自己的线程里，这边接着读下一个请求。同一个文件的
+            // 写入排着队做（见 `Writes`）
+            let queue = (method == "fs_pwrite").then(|| {
+                let text = |name: &str| param(name).and_then(Value::as_str).unwrap_or_default();
+                format!("{}\n{}", text("repo"), text("path"))
+            });
+            let writes = conn.writes.clone();
             let conn = conn.clone();
-            std::thread::spawn(move || match fs_request(request, &payload) {
+            let job = move || match fs_request(request, &payload) {
                 Ok((result, bytes)) => {
                     let response = Response {
                         id,
@@ -500,7 +544,11 @@ fn handle(
                     conn.send(&response, &bytes);
                 }
                 Err(err) => conn.reply(id, Err(err)),
-            });
+            };
+            match queue {
+                Some(key) => writes.push(key, Box::new(job)),
+                None => drop(std::thread::spawn(job)),
+            }
         }
         "upgrade" => {
             let exe = param("exe").and_then(Value::as_str).unwrap_or_default();
@@ -585,14 +633,22 @@ fn fs_request(request: Request, payload: &[u8]) -> Result<(Value, Vec<u8>)> {
     let flag = |name: &str| request.params.get(name).and_then(Value::as_bool) == Some(true);
     let (repo, path) = (text("repo"), text("path"));
     let done = |result: Value| Ok((result, Vec::new()));
+    // 只认仓库里的（本机网页服务、Markdown 预览读的，协议 17）
+    let confine = flag("confine");
     match request.method.as_str() {
+        "fs_list" if confine => done(json!({ "entries": files::list_confined(repo, path)? })),
         "fs_list" => done(json!({ "entries": files::list_with(repo, path, flag("all"))? })),
         "fs_repos" => done(serde_json::to_value(files::find_repos(repo)?)?),
+        "fs_stat" if confine => done(serde_json::to_value(files::stat_confined(repo, path)?)?),
         "fs_stat" => done(serde_json::to_value(files::stat(repo, path)?)?),
         "fs_read" => {
             let (offset, len) = (number("offset").unwrap_or(0), number("len"));
             let len = len.unwrap_or(files::READ_MAX);
-            let (stat, bytes) = files::read(repo, path, offset, len, number("whole"))?;
+            let read = match confine {
+                true => files::read_confined,
+                false => files::read,
+            };
+            let (stat, bytes) = read(repo, path, offset, len, number("whole"))?;
             Ok((serde_json::to_value(stat)?, bytes))
         }
         "fs_write" => {
@@ -602,9 +658,11 @@ fn fs_request(request: Request, payload: &[u8]) -> Result<(Value, Vec<u8>)> {
         }
         "fs_mkdir" => files::make_dir(repo, path).and_then(|()| done(json!({}))),
         "fs_sync" => done(serde_json::to_value(files::sync(repo, path)?)?),
-        "fs_remove" => match flag("shallow") {
-            true => files::remove_shallow(repo, path),
-            false => files::remove(repo, path),
+        "fs_remove" => match (text("kind"), flag("shallow")) {
+            ("file", _) => files::remove_kind(repo, path, false),
+            ("dir", _) => files::remove_kind(repo, path, true),
+            (_, true) => files::remove_shallow(repo, path),
+            (_, false) => files::remove(repo, path),
         }
         .and_then(|()| done(json!({}))),
         "fs_rename" => match flag("replace") {
@@ -612,10 +670,21 @@ fn fs_request(request: Request, payload: &[u8]) -> Result<(Value, Vec<u8>)> {
             false => files::rename(repo, path, text("to")),
         }
         .and_then(|()| done(json!({}))),
+        "fs_pwrite" if flag("append") => {
+            done(serde_json::to_value(files::append(repo, path, payload)?)?)
+        }
         "fs_pwrite" => {
             let offset = number("offset").unwrap_or(0);
             let stat = files::write_at(repo, path, offset, payload, flag("create"))?;
             done(serde_json::to_value(stat)?)
+        }
+        "fs_chmod" => {
+            let mode = number("mode").context("fs_chmod 没有给权限")?;
+            done(serde_json::to_value(files::set_mode(
+                repo,
+                path,
+                mode as u32,
+            )?)?)
         }
         "fs_resize" => {
             let size = number("size").context("fs_resize 没有给大小")?;
@@ -1162,6 +1231,36 @@ mod tests {
         client.call("fs_remove", shallow("m/b.bin"));
         client.call("fs_remove", shallow("m"));
         assert!(!repo.0.join("m").exists());
+
+        // 协议 17：追加（同一个文件的写入按收到的先后做，连着发的几段不乱）、改权限、按种类删
+        client.call("fs_mkdir", at("n"));
+        client.send("fs_pwrite", at_offset("n/log", 0, true), b"");
+        assert!(client.next().0.result.is_some());
+        let pieces: Vec<String> = (0..50).map(|n| format!("{n:02};")).collect();
+        let append = json!({ "repo": root, "path": "n/log", "offset": 0, "append": true });
+        for piece in &pieces {
+            client.send("fs_pwrite", append.clone(), piece.as_bytes());
+        }
+        for _ in &pieces {
+            assert!(client.next().0.result.is_some());
+        }
+        assert_eq!(
+            std::fs::read_to_string(repo.0.join("n/log")).unwrap(),
+            pieces.concat()
+        );
+        #[cfg(unix)]
+        {
+            let mode = json!({ "repo": root, "path": "n/log", "mode": 0o750 });
+            assert_eq!(client.call("fs_chmod", mode)["mode"], 0o750);
+        }
+        let kind = |path: &str, kind: &str| json!({ "repo": root, "path": path, "kind": kind });
+        client.send("fs_remove", kind("n/log", "dir"), &[]);
+        assert!(client.next().0.error.is_some(), "说是目录的不删文件");
+        client.call("fs_remove", kind("n/log", "file"));
+        client.send("fs_remove", kind("n", "file"), &[]);
+        assert!(client.next().0.error.is_some(), "说是文件的不删目录");
+        client.call("fs_remove", kind("n", "dir"));
+        assert!(!repo.0.join("n").exists());
 
         // 建目录、改名、删除
         client.call("fs_mkdir", at("docs/图"));

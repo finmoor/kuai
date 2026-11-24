@@ -2,13 +2,17 @@
 //! 来问，这里换成路径交给 [`Mount`]，结果换成 FUSE 的答复。
 //!
 //! - inode 按路径发：内核查到一个名字（lookup）就记一次，它说忘了（forget）几次就减几次，减到 0
-//!   才扔。改名时这个路径下面记着的跟着换。
-//! - 权限：文件 0644、目录 0755，主机上写不了的（只读）去掉写权限，属主是当前用户；由内核按这些
-//!   查权限（`default_permissions`）。主机是 Windows 时目录的只读属性不算（「文档」这些文件夹都
-//!   带着它，里面照样能写）。改权限、属主当作改好了，主机上不变。
-//! - 删除是马上做的：没删成（没权限）的错误直接交给删的程序。
+//!   才扔。改名时这个路径下面记着的跟着换。删掉的、被盖掉的不再按路径认（再问它报不存在），同名
+//!   新建的发新的 inode。
+//! - 权限：Linux 主机上用文件实际的权限位，Windows 主机上文件 0644、目录 0755；主机上这个用户写不了
+//!   的（只读）去掉写权限，写得了的属主有写权限，属主是当前用户；由内核按这些查权限
+//!   （`default_permissions`）。主机是 Windows 时目录的只读属性不算（「文档」这些文件夹都带着它，
+//!   里面照样能写）。chmod 在主机上真的改；改属主、组改不了，报 EPERM。
+//! - 删除是马上做的：没删成（没权限）的错误直接交给删的程序。删的、改名盖掉的文件还开着时主机上先
+//!   藏起来，最后一个句柄关掉时再删（[`Mount::hide`]）。
 //! - 每次请求在 fuser 的几个线程上做，等主机回音时别的请求照样进来。回调里崩了答 EIO。
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -34,6 +38,8 @@ struct Inodes {
     paths: HashMap<u64, (String, u64)>,
     /// 路径（按 [`Mount::key`] 认）→ inode
     by_key: HashMap<String, u64>,
+    /// 删掉了、被改名盖掉了的：内核忘了它以前再问它报不存在，不会按原来的路径找到同名新建的
+    gone: HashSet<u64>,
     next: u64,
 }
 
@@ -42,6 +48,8 @@ struct Handle {
     node: Arc<Node>,
     /// 是文件：算在「开着的文件」里
     file: bool,
+    /// 打开来写的：只有它关的时候等写入落地、领走没写成的错（读的句柄先关不领走写的程序的错）
+    writing: bool,
     /// 列目录：从头列（offset 0）时取一份，往后翻都用它，前后一致
     listing: Mutex<Option<Arc<Vec<FsEntry>>>>,
 }
@@ -53,6 +61,8 @@ pub(crate) struct Fuse {
     next_handle: AtomicU64,
     uid: u32,
     gid: u32,
+    /// 会话结束（卸载了，不管是谁卸的）时发一下：[`crate::Mounted::ended`]
+    ended: Option<futures::channel::oneshot::Sender<()>>,
 }
 
 /// 回调里出了错、崩了，都变成一个错误码：不能让崩溃把接请求的线程带走。
@@ -82,7 +92,7 @@ fn millis_of(time: SystemTime) -> u64 {
 }
 
 impl Fuse {
-    pub(crate) fn new(mount: Arc<Mount>) -> Fuse {
+    pub(crate) fn new(mount: Arc<Mount>, ended: futures::channel::oneshot::Sender<()>) -> Fuse {
         let mut paths = HashMap::new();
         paths.insert(ROOT, (String::new(), 1));
         let mut by_key = HashMap::new();
@@ -94,17 +104,23 @@ impl Fuse {
             inodes: Mutex::new(Inodes {
                 paths,
                 by_key,
+                gone: HashSet::new(),
                 next: ROOT + 1,
             }),
             handles: Mutex::default(),
             next_handle: AtomicU64::new(1),
             uid,
             gid,
+            ended: Some(ended),
         }
     }
 
     fn path(&self, ino: INodeNo) -> Nt<String> {
-        lock(&self.inodes)
+        let inodes = lock(&self.inodes);
+        if inodes.gone.contains(&ino.0) {
+            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+        }
+        inodes
             .paths
             .get(&ino.0)
             .map(|(path, _)| path.clone())
@@ -160,8 +176,19 @@ impl Fuse {
         }
         let key = self.mount.key(path);
         inodes.paths.remove(&ino);
+        inodes.gone.remove(&ino);
         if inodes.by_key.get(&key) == Some(&ino) {
             inodes.by_key.remove(&key);
+        }
+    }
+
+    /// 这个路径上的删掉了：它的 inode 不再按路径认（内核可能还记着它，再问报不存在），同名新建的
+    /// 发新的。原来接着用：同名新建的拿到删掉的那个 inode，内核忘了旧的时候新的也跟着没了。
+    fn forget_path(&self, path: &str) {
+        let key = self.mount.key(path);
+        let mut inodes = lock(&self.inodes);
+        if let Some(ino) = inodes.by_key.remove(&key) {
+            inodes.gone.insert(ino);
         }
     }
 
@@ -171,9 +198,11 @@ impl Fuse {
         let (old, new) = (self.mount.key(from), self.mount.key(to));
         let inside = format!("{old}/");
         let mut inodes = lock(&self.inodes);
-        // 只是改了大小写（主机是 Windows）时新旧是同一个
-        if new != old {
-            inodes.by_key.remove(&new);
+        // 只是改了大小写（主机是 Windows）时新旧是同一个。被盖掉的不再按路径认（见 `forget_path`）
+        if new != old
+            && let Some(replaced) = inodes.by_key.remove(&new)
+        {
+            inodes.gone.insert(replaced);
         }
         let moving: Vec<(String, u64)> = inodes
             .by_key
@@ -204,8 +233,8 @@ impl Fuse {
             .ok_or(STATUS_UNEXPECTED_IO_ERROR)
     }
 
-    /// 交出去一次打开：文件记在「开着的文件」里。
-    fn hand_out(&self, node: Arc<Node>) -> FileHandle {
+    /// 交出去一次打开：文件记在「开着的文件」里。`writing`：打开来写的。
+    fn hand_out(&self, node: Arc<Node>, writing: bool) -> FileHandle {
         let file = !lock(&node.state).stat.dir;
         if file {
             self.mount.open_files.fetch_add(1, Relaxed);
@@ -214,6 +243,7 @@ impl Fuse {
         let handle = Arc::new(Handle {
             node,
             file,
+            writing,
             listing: Mutex::default(),
         });
         lock(&self.handles).insert(fh, handle);
@@ -227,18 +257,23 @@ impl Fuse {
         if handle.file {
             self.mount.open_files.fetch_sub(1, Relaxed);
         }
-        let node = handle.node.clone();
+        let (node, writing) = (handle.node.clone(), handle.writing);
         drop(handle);
-        self.mount.close(node);
+        self.mount.close(node, writing);
     }
 
-    /// 这个路径现在的情况：开着的用开着的那份（写着的大小比主机上的新），没开的查。
+    /// 这个节点有没有开着的句柄。
+    fn is_open(&self, node: &Arc<Node>) -> bool {
+        lock(&self.handles)
+            .values()
+            .any(|handle| Arc::ptr_eq(&handle.node, node))
+    }
+
+    /// 这个路径现在的情况：开着的用开着的那份（写着的大小比主机上的新，过了留存的时间再和主机对一次，
+    /// 见 [`Mount::refresh`]），没开的查。
     fn current(&self, path: &str) -> Nt<FsStat> {
-        let open = lock(&self.mount.nodes)
-            .get(&self.mount.key(path))
-            .and_then(Weak::upgrade);
-        match open {
-            Some(node) => Ok(lock(&node.state).stat),
+        match self.mount.opened(path) {
+            Some(node) => Ok(self.mount.refresh(&node)),
             None => self.mount.lookup(path),
         }
     }
@@ -253,9 +288,23 @@ impl Fuse {
             true => (FileType::Directory, 0o755),
             false => (FileType::RegularFile, 0o644),
         };
+        // Linux 主机给了权限位就用它的：可执行的脚本在映射里也能直接运行（原来一律 0644）
+        let mut perm = match stat.mode {
+            0 => perm,
+            mode => (mode & 0o7777) as u16,
+        };
         // Windows 主机上目录的只读属性不管里面能不能写
         let readonly = self.mount.read_only || (stat.readonly && !(stat.dir && self.mount.windows));
-        let perm = if readonly { perm & !0o222 } else { perm };
+        // 属主算成当前用户，内核按属主那一组查权限：那一组照这个用户在主机上实际能做的来（主机上的
+        // 文件可能是别人的、经组能写）。能读、目录能进；写看只读；有人能执行的属主也能
+        perm |= if stat.dir { 0o500 } else { 0o400 };
+        perm = match readonly {
+            true => perm & !0o222,
+            false => perm | 0o200,
+        };
+        if perm & 0o111 != 0 {
+            perm |= 0o100;
+        }
         let size = if stat.dir { 0 } else { stat.size };
         FileAttr {
             ino: INodeNo(ino),
@@ -289,7 +338,8 @@ impl Fuse {
         }
     }
 
-    /// 删文件（`dir` 为假）或目录。
+    /// 删文件（`dir` 为假）或目录。还开着的文件藏起来（[`Mount::hide`]）；删的时候让主机只删
+    /// 这一种（看过是文件才 unlink，主机上换成了目录就不删）。
     fn delete(&self, parent: INodeNo, name: &OsStr, dir: bool) -> Nt<()> {
         let path = self.child(parent, name)?;
         let node = self.mount.open(&path)?;
@@ -300,9 +350,17 @@ impl Fuse {
                 _ => {}
             }
             self.mount.can_delete(&node)?;
-            self.mount.remove(&node, false)
+            if !dir && self.is_open(&node) {
+                let hidden = self.mount.hide(&node)?;
+                // inode 跟着到藏起来的名字上：开着的句柄、fstat 接着用
+                self.moved(&path, &hidden);
+                return Ok(());
+            }
+            self.mount.remove(&node, false, Some(dir))?;
+            self.forget_path(&path);
+            Ok(())
         })();
-        self.mount.close(node);
+        self.mount.close(node, false);
         result
     }
 
@@ -318,7 +376,7 @@ impl Fuse {
         }
         let node = self.mount.open(&self.path(ino)?)?;
         let result = run(&node);
-        self.mount.close(node);
+        self.mount.close(node, false);
         result
     }
 }
@@ -328,7 +386,16 @@ impl Filesystem for Fuse {
         // 一次读、写多些，请求少些（内核不肯就用它的）
         let _ = config.set_max_readahead((FETCH_UNITS * UNIT) as u32);
         let _ = config.set_max_write(CHUNK as u32);
+        // 查属性时发现大小、修改时间变了（主机上别人改了），内核扔掉它留着的那些页，不接着给旧内容
+        let _ = config.add_capabilities(fuser::InitFlags::FUSE_AUTO_INVAL_DATA);
         Ok(())
+    }
+
+    /// 会话结束：我们自己卸的，或者在外面卸掉了（文件管理器里点了卸载、`fusermount3 -u`）。
+    fn destroy(&mut self) {
+        if let Some(ended) = self.ended.take() {
+            let _ = ended.send(());
+        }
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
@@ -353,7 +420,7 @@ impl Filesystem for Fuse {
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         let stat = guarded(|| {
             if let Some(handle) = fh.and_then(|fh| self.handle(fh).ok()) {
-                return Ok(lock(&handle.node.state).stat);
+                return Ok(self.mount.refresh(&handle.node));
             }
             let stat = self.current(&self.path(ino)?)?;
             match stat.exists {
@@ -371,9 +438,9 @@ impl Filesystem for Fuse {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
         _atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
@@ -386,13 +453,20 @@ impl Filesystem for Fuse {
         reply: ReplyAttr,
     ) {
         let stat = guarded(|| {
+            // 属主、组都算当前用户的，主机上改不了：改成别人报 EPERM（和不是 root 时一样），原来当作改好了
+            if uid.is_some_and(|uid| uid != self.uid) || gid.is_some_and(|gid| gid != self.gid) {
+                return Err(STATUS_PRIVILEGE_NOT_HELD);
+            }
             self.with_node(ino, fh, |node| {
                 let mut stat = lock(&node.state).stat;
+                if let Some(mode) = mode {
+                    stat = self.mount.chmod(node, mode & 0o7777)?;
+                }
                 if let Some(size) = size {
                     stat = self.mount.resize(node, size, false)?;
                 }
                 if let Some(mtime) = mtime {
-                    stat = self.mount.set_mtime(node, Self::mtime_of(mtime))?;
+                    stat = self.mount.set_mtime(node, Some(Self::mtime_of(mtime)))?;
                 }
                 Ok(stat)
             })
@@ -416,7 +490,7 @@ impl Filesystem for Fuse {
             let path = self.child(parent, name)?;
             let node = self.mount.create(&path, true)?;
             let stat = lock(&node.state).stat;
-            self.mount.close(node);
+            self.mount.close(node, false);
             Ok((path, stat))
         });
         match made {
@@ -458,8 +532,20 @@ impl Filesystem for Fuse {
             let to = self.child(newparent, newname)?;
             let node = self.mount.open(&from)?;
             let replace = !flags.contains(RenameFlags::RENAME_NOREPLACE);
-            let result = self.mount.rename(&node, &to, replace);
-            self.mount.close(node);
+            // 要盖掉的是还开着的文件：先藏起来（见 `Mount::hide`），开着它的程序接着读写原来那个，
+            // 不会写到改名过来的这个上
+            let result = (|| {
+                if let Some(target) = self.mount.opened(&to).filter(|_| replace)
+                    && !Arc::ptr_eq(&target, &node)
+                    && !lock(&target.state).stat.dir
+                    && self.is_open(&target)
+                {
+                    let hidden = self.mount.hide(&target)?;
+                    self.moved(&to, &hidden);
+                }
+                self.mount.rename(&node, &to, replace)
+            })();
+            self.mount.close(node, false);
             result?;
             self.moved(&from, &to);
             Ok(())
@@ -481,9 +567,9 @@ impl Filesystem for Fuse {
                 }
             });
             match checked {
-                Ok(()) => Ok(self.hand_out(node)),
+                Ok(()) => Ok(self.hand_out(node, writing)),
                 Err(code) => {
-                    self.mount.close(node);
+                    self.mount.close(node, false);
                     Err(code)
                 }
             }
@@ -548,6 +634,7 @@ impl Filesystem for Fuse {
     }
 
     /// 每次 close 都来：等写入落地，没写成的在这里报给程序（和本机磁盘满了时 close 报错一样）。
+    /// 读的句柄不等、不领走（没写成的错是写的程序的）。
     fn flush(
         &self,
         _req: &Request,
@@ -556,8 +643,15 @@ impl Filesystem for Fuse {
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        match guarded(|| self.mount.commit(&self.handle(fh)?.node)) {
-            Ok(_) => reply.ok(),
+        let flushed = guarded(|| {
+            let handle = self.handle(fh)?;
+            match handle.writing {
+                true => self.mount.commit(&handle.node).map(|_| ()),
+                false => Ok(()),
+            }
+        });
+        match flushed {
+            Ok(()) => reply.ok(),
             Err(code) => reply.error(errno(code)),
         }
     }
@@ -597,10 +691,10 @@ impl Filesystem for Fuse {
         let opened = guarded(|| {
             let node = self.mount.open(&self.path(ino)?)?;
             if !lock(&node.state).stat.dir {
-                self.mount.close(node);
+                self.mount.close(node, false);
                 return Err(STATUS_NOT_A_DIRECTORY);
             }
-            Ok(self.hand_out(node))
+            Ok(self.hand_out(node, false))
         });
         match opened {
             Ok(fh) => reply.opened(fh, FopenFlags::empty()),
@@ -690,19 +784,25 @@ impl Filesystem for Fuse {
     ) {
         let created = guarded(|| {
             let path = self.child(parent, name)?;
+            let writing = flags & libc::O_ACCMODE != libc::O_RDONLY;
             let node = match self.mount.create(&path, false) {
                 Ok(node) => node,
-                // 内核以为没有、主机上其实有（别处刚建的）：不是 O_EXCL 就当作打开它
+                // 内核以为没有、主机上其实有（别处刚建的）：不是 O_EXCL 就当作打开它，和 open 一样：
+                // 打开来写的才看写不写得了、才截断；是目录的报 EISDIR（原来当成新建的文件交出去）
                 Err(STATUS_OBJECT_NAME_COLLISION) if flags & libc::O_EXCL == 0 => {
                     let node = self.mount.open(&path)?;
-                    let checked = self.mount.check_write(&node, true).and_then(|()| {
-                        match flags & libc::O_TRUNC != 0 {
+                    let checked = (|| {
+                        if lock(&node.state).stat.dir {
+                            return Err(STATUS_FILE_IS_A_DIRECTORY);
+                        }
+                        self.mount.check_write(&node, writing)?;
+                        match writing && flags & libc::O_TRUNC != 0 {
                             true => self.mount.resize(&node, 0, false).map(|_| ()),
                             false => Ok(()),
                         }
-                    });
+                    })();
                     if let Err(code) = checked {
-                        self.mount.close(node);
+                        self.mount.close(node, false);
                         return Err(code);
                     }
                     node
@@ -710,7 +810,7 @@ impl Filesystem for Fuse {
                 Err(code) => return Err(code),
             };
             let stat = lock(&node.state).stat;
-            Ok((path, stat, self.hand_out(node)))
+            Ok((path, stat, self.hand_out(node, writing)))
         });
         match created {
             Ok((path, stat, fh)) => {

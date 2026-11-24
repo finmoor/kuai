@@ -51,7 +51,7 @@ mod sweep;
 mod terminals;
 mod worktrees;
 
-pub(crate) use files::local_file_name;
+pub(crate) use files::{local_file_name, same_version};
 pub(crate) use files_ops::new_copy_dir;
 pub(crate) use layout::sidebar_open;
 pub(crate) use ops::explain;
