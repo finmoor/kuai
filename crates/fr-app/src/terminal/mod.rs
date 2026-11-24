@@ -2587,9 +2587,13 @@ fn snapshot(
                 ch: cell.c,
             });
         }
-        let underline = flags.intersects(Flags::ALL_UNDERLINES)
-            || link.is_some_and(|(start, end)| start <= point && point <= end);
-        if dashed.is_some_and(|(start, end)| start <= point && point <= end) {
+        // 程序把路径折成几行时，行尾的留白和下一行的缩进不画线；OSC 8 链接的文字可以有空格。
+        let in_link = |span: Option<links::Span>| {
+            span.is_some_and(|(start, end)| start <= point && point <= end)
+                && (!cell.c.is_whitespace() || cell.hyperlink().is_some())
+        };
+        let underline = flags.intersects(Flags::ALL_UNDERLINES) || in_link(link);
+        if in_link(dashed) {
             match dashes.last_mut() {
                 Some((r, c, n)) if *r == row && *c + *n == col => *n += width,
                 _ => dashes.push((row, col, width)),

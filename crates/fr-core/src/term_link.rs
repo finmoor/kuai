@@ -316,10 +316,15 @@ pub enum Place {
 
 /// 终端里写的路径 `path` 在哪。相对路径从终端开在的目录（仓库根下的 `sub`，`/` 分隔，空的是仓库根）
 /// 算起，`..` 能跳出仓库。`root` 是仓库根（本机、Windows 服务器上是 `C:\…` 或 `C:/…`，Linux 服务器
-/// 上是 `/…`）：Windows 的不分大小写，两种斜杠都认。认不了的是 `None`：`~/…`，Windows 上 `/`
-/// 开头的（Git Bash 的 `/c/…`）。
+/// 上是 `/…`）：Windows 的不分大小写，两种斜杠都认，也认 `/C:/…`。认不了的是 `None`：`~/…`，
+/// Windows 上没有盘符、以单个斜杠开头的（Git Bash 的 `/c/…`）。
 pub fn resolve(root: &str, sub: &str, path: &str) -> Option<Place> {
     let windows = is_windows_path(root);
+    let path = if windows {
+        strip_drive_slash(path)
+    } else {
+        path
+    };
     let split = |text: &str| -> Vec<String> {
         text.split(|c| c == '/' || (windows && c == '\\'))
             .filter(|part| !part.is_empty())
@@ -387,7 +392,11 @@ pub fn resolve_at(root: &str, dir: &str, home: Option<&str>, path: &str) -> Opti
     let path = expand(path)?.unwrap_or_else(|| path.to_string());
     let windows = is_windows_path(root);
     let absolute = match windows {
-        true => drive_absolute(&path) || path.starts_with("\\\\") || path.starts_with("//"),
+        true => {
+            drive_absolute(strip_drive_slash(&path))
+                || path.starts_with("\\\\")
+                || path.starts_with("//")
+        }
         false => path.starts_with('/'),
     };
     if absolute {
@@ -408,6 +417,13 @@ fn is_windows_path(path: &str) -> bool {
 fn drive_absolute(path: &str) -> bool {
     let b = path.as_bytes();
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
+/// Codex 在 Windows 上也会把绝对路径显示成 `/C:/…`。
+fn strip_drive_slash(path: &str) -> &str {
+    path.strip_prefix('/')
+        .filter(|rest| drive_absolute(rest))
+        .unwrap_or(path)
 }
 
 /// 照原样找不到时再试的写法：git 的改动里文件写成 `a/src/x.rs`、`b/src/x.rs`。
@@ -582,7 +598,7 @@ mod tests {
             resolve(root, "", r"D:\tmp\a.txt"),
             Some(Place::Outside(r"D:\tmp\a.txt".into()))
         );
-        // Windows 上 `/` 开头的、`~` 开头的认不了
+        // Windows 上没有盘符的 `/` 路径和 `~` 开头的认不了
         assert_eq!(resolve(root, "", "/c/Users/me/repo/x"), None);
         assert_eq!(resolve(root, "", "~/x"), None);
         // Linux 服务器：分大小写
@@ -610,6 +626,27 @@ mod tests {
     fn git_改动里的_a_b_前缀() {
         assert_eq!(alternatives("a/src/x.rs"), ["a/src/x.rs", "src/x.rs"]);
         assert_eq!(alternatives("src/x.rs"), ["src/x.rs"]);
+    }
+
+    #[test]
+    fn windows_绝对路径盘符前有斜杠() {
+        let root = r"C:\Users\me\repo";
+        let raw = "/c:/Users/me/repo/src/main.rs";
+        assert_eq!(
+            at(&format!("文件位置 ({raw}:494:2)"), "main.rs"),
+            Some((format!("{raw}:494:2"), path(raw, Some(494), Some(2))))
+        );
+        let expected = Some(Place::Repo("src/main.rs".into()));
+        assert_eq!(resolve(root, "docs", raw), expected);
+        assert_eq!(super::resolve_at(root, r"D:\other", None, raw), expected);
+        assert_eq!(
+            resolve(root, "", "/D:/docs/"),
+            Some(Place::Outside(r"D:\docs".into()))
+        );
+        assert_eq!(
+            resolve("/c:/Users/me/repo", "", raw),
+            Some(Place::Repo("src/main.rs".into()))
+        );
     }
 
     #[test]

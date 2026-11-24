@@ -16,6 +16,7 @@
 //! 问过的记一会儿：鼠标挪来挪去不用每次都问。
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -45,6 +46,8 @@ pub(super) const REST: Duration = Duration::from_millis(500);
 const SHOWN_MAX: usize = 60;
 /// 找提示符时往上最多看这么多行
 const PROMPT_SCAN: i32 = 5000;
+/// 程序主动折行时，只在鼠标所在行附近找括号里的路径。
+const PATH_WRAP_ROWS: i32 = 8;
 
 /// 认链接里的路径用的：终端开在哪个仓库、哪个目录，怎么去问文件在不在。
 #[derive(Clone)]
@@ -287,6 +290,81 @@ fn prompt_dir_above(term: &Term<Proxy>, point: GridPoint) -> Option<String> {
     }
 }
 
+/// 括号里的一段路径，到右括号或行尾为止；折行之间的空白是程序排版留的。
+fn path_part(chars: &[char], start: usize) -> Option<(Range<usize>, bool)> {
+    let end = start
+        + chars[start..]
+            .iter()
+            .take_while(|&&ch| ch != ')' && !ch.is_whitespace())
+            .count();
+    let closed = chars.get(end) == Some(&')');
+    (end > start && (closed || chars[end..].iter().all(|ch| ch.is_whitespace())))
+        .then_some((start..end, closed))
+}
+
+fn wrapped_path_start(chars: &[char]) -> Option<Range<usize>> {
+    let open = chars.windows(2).rposition(|pair| pair == ['(', '/'])?;
+    let (part, closed) = path_part(chars, open + 1)?;
+    (!closed).then_some(part)
+}
+
+fn wrapped_path_continuation(chars: &[char]) -> Option<(Range<usize>, bool)> {
+    let start = chars.iter().position(|ch| !ch.is_whitespace())?;
+    if start == 0 {
+        return None;
+    }
+    path_part(chars, start)
+}
+
+/// Codex 排版时会把 `标签 (/C:/…/文件:行)` 里的路径拆到后面的缩进行。
+/// 只有括号闭合且连起来仍是完整的路径才认，普通的终端换行各算各的。
+fn wrapped_path_at(
+    term: &Term<Proxy>,
+    point: GridPoint,
+    chars: &[char],
+    at: usize,
+) -> Option<(GridPoint, GridPoint, Target)> {
+    if !wrapped_path_start(chars).is_some_and(|part| part.contains(&at))
+        && !wrapped_path_continuation(chars).is_some_and(|(part, _)| part.contains(&at))
+    {
+        return None;
+    }
+
+    let grid = term.grid();
+    let mut row = (point.line.0 - PATH_WRAP_ROWS).max(-(grid.history_size() as i32));
+    let last = (point.line.0 + PATH_WRAP_ROWS).min(grid.screen_lines() as i32 - 1);
+    let mut candidate: Option<(GridPoint, String)> = None;
+    while row <= last {
+        let (chars, cells) = line_at(term, GridPoint::new(GridLine(row), GridColumn(0)));
+        row = cells.last()?.line.0 + 1;
+        if let Some((start, mut path)) = candidate.take()
+            && let Some((part, closed)) = wrapped_path_continuation(&chars)
+        {
+            let end = cells[part.end - 1];
+            path.extend(&chars[part]);
+            if !closed {
+                candidate = Some((start, path));
+                continue;
+            }
+            if start <= point
+                && point <= end
+                && let Some(link) = term_link::link_at(&path, 0)
+                && link.span == (0..path.chars().count())
+                && matches!(link.target, Target::Path { .. })
+            {
+                return Some((start, end, link.target));
+            }
+        }
+        if let Some(part) = wrapped_path_start(&chars) {
+            let start = cells[part.start];
+            if start <= point {
+                candidate = Some((start, chars[part].iter().collect()));
+            }
+        }
+    }
+    None
+}
+
 /// 网格上 `point` 那里的链接：从哪一格到哪一格、指向哪。程序用 OSC 8 写的超链接优先。
 fn find(term: &Term<Proxy>, point: GridPoint) -> Option<(GridPoint, GridPoint, Target)> {
     let (chars, cells) = line_at(term, point);
@@ -312,6 +390,9 @@ fn find(term: &Term<Proxy>, point: GridPoint) -> Option<(GridPoint, GridPoint, T
             None => return None,
         };
         return Some((cells[start], cells[end], target));
+    }
+    if let Some(link) = wrapped_path_at(term, cells[at], &chars, at) {
+        return Some(link);
     }
     let text: String = chars.iter().collect();
     let link = term_link::link_at(&text, at)?;
@@ -1105,6 +1186,43 @@ mod tests {
         // 上面没有提示符
         let plain = term(20, 3, b"a\r\nb@c d\r\ne");
         assert_eq!(prompt_dir_above(&plain, at(2, 0)), None);
+    }
+
+    #[test]
+    fn 括号里的绝对路径被程序折成几行() {
+        let term = term(
+            60,
+            6,
+            b"see label (/C:/repo/crates/fr-app/src/\r\n  terminal/\r\n  links.rs:826:5) after",
+        );
+        for point in [at(0, 11), at(1, 3), at(2, 10)] {
+            let (start, end, target) = find(&term, point).expect("link");
+            assert_eq!((start, end), (at(0, 11), at(2, 15)));
+            assert_eq!(
+                target,
+                Target::Path {
+                    path: "/C:/repo/crates/fr-app/src/terminal/links.rs".into(),
+                    line: Some(826),
+                    col: Some(5),
+                }
+            );
+        }
+        assert!(find(&term, at(1, 1)).is_none());
+    }
+
+    #[test]
+    fn 分开输出的路径各自识别() {
+        let term = term(60, 6, b"see (/C:/repo/src/)\r\n  links.rs:826) after");
+        let (start, end, target) = find(&term, at(1, 5)).expect("link");
+        assert_eq!((start, end), (at(1, 2), at(1, 13)));
+        assert_eq!(
+            target,
+            Target::Path {
+                path: "links.rs".into(),
+                line: Some(826),
+                col: None,
+            }
+        );
     }
 
     #[test]
