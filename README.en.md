@@ -21,7 +21,7 @@ Terminals that survive disconnects, line-by-line review, in-place file editing, 
 <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square" alt="Windows 10 | 11">
 <img src="https://img.shields.io/badge/Linux-x86__64-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux x86_64">
 <img src="https://img.shields.io/badge/Rust-GPUI-DEA584?style=flat-square&logo=rust&logoColor=white" alt="Rust + GPUI">
-<a href="#license"><img src="https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-22c55e?style=flat-square" alt="MIT or Apache-2.0"></a>
+<a href="#license"><img src="https://img.shields.io/badge/license-GPL--3.0-22c55e?style=flat-square" alt="GPL-3.0"></a>
 </p>
 
 <p>
@@ -311,6 +311,6 @@ The "开发" section of the [Chinese README](README.md#开发) has the full note
 
 ## License
 
-MIT or Apache-2.0, at your option: see [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE). The UI icons are [Lucide](https://lucide.dev) (ISC license), brought in by gpui-kit. Third-party libraries and their licenses are listed in `THIRD-PARTY-LICENSES.txt` in the release package.
+Copyright © 2026 Feng. Licensed under the [GNU General Public License v3.0](LICENSE) or later: you may use, modify and redistribute it freely, but anything you distribute that is modified from or built on Kuai must also be released under the GPL, with its source code. The UI icons are [Lucide](https://lucide.dev) (ISC license), brought in by gpui-kit. Third-party libraries and their licenses are listed in `THIRD-PARTY-LICENSES.txt` in the release package.
 
 Claude Code, Codex, Fork, VS Code and other names belong to their respective owners; Kuai is not affiliated with them.

@@ -21,7 +21,7 @@
 <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square" alt="Windows 10 | 11">
 <img src="https://img.shields.io/badge/Linux-x86__64-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux x86_64">
 <img src="https://img.shields.io/badge/Rust-GPUI-DEA584?style=flat-square&logo=rust&logoColor=white" alt="Rust + GPUI">
-<a href="#许可证"><img src="https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-22c55e?style=flat-square" alt="MIT 或 Apache-2.0"></a>
+<a href="#许可证"><img src="https://img.shields.io/badge/license-GPL--3.0-22c55e?style=flat-square" alt="GPL-3.0"></a>
 </p>
 
 <p>
@@ -359,6 +359,6 @@ pwsh tools/package.ps1
 
 ## 许可证
 
-MIT 或 Apache-2.0，任选其一，见 [LICENSE-MIT](LICENSE-MIT)、[LICENSE-APACHE](LICENSE-APACHE)。界面图标是 [Lucide](https://lucide.dev)（ISC 许可），经 gpui-kit 带进来。用到的第三方库和它们的许可证在发布包的 `THIRD-PARTY-LICENSES.txt` 里。
+Copyright © 2026 Feng。按 [GNU GPL 3.0](LICENSE) 或更高版本发布：可以自由使用、修改和再分发；分发修改过的版本或基于它开发的软件时，必须同样以 GPL 开源并提供源代码。界面图标是 [Lucide](https://lucide.dev)（ISC 许可），经 gpui-kit 带进来。用到的第三方库和它们的许可证在发布包的 `THIRD-PARTY-LICENSES.txt` 里。
 
 Claude Code、Codex、Fork、VS Code 等名称归各自的所有者所有，Kuai 与它们没有隶属关系。

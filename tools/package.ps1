@@ -57,7 +57,7 @@ Copy-Item target\release\kuaid.exe $windows
 # kuaid 开终端用的新版 ConPTY，只认 kuaid.exe 旁边的
 Copy-Item vendor\conpty\x64\conpty.dll, vendor\conpty\x64\OpenConsole.exe $windows
 Copy-Item tools\package-readme.txt (Join-Path $out '使用说明.txt')
-Copy-Item LICENSE-MIT, LICENSE-APACHE $out
+Copy-Item LICENSE $out
 # 编进去的第三方库的许可证（MIT、Apache-2.0 这些要求随程序附上），要 Python 3
 python tools\third-party-licenses.py (Join-Path $out 'THIRD-PARTY-LICENSES.txt')
 if ($LASTEXITCODE -ne 0) { throw '第三方许可证清单生成失败' }

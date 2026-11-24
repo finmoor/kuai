@@ -267,6 +267,7 @@ impl Updater {
         };
         if updated_from.is_some() {
             clean_old_downloads();
+            remove_obsolete_files();
         }
         // 启动时换上暂存的新版本没成：那一份已经删了，不再自动重试；告诉人，重新下载就是重试
         if let Some((version, err)) = take_startup_failure() {
@@ -1346,6 +1347,29 @@ fn discard_staged() {
         if Version::parse(&entry.file_name().to_string_lossy()).is_ok() {
             let _ = fs::remove_dir_all(entry.path());
         }
+    }
+}
+
+/// 旧版本装进程序文件夹、新版本不再带的文件。解压版换文件时只覆盖不删，而换文件的是旧版本的
+/// 代码，所以由升级后的新版本在启动时删（[`remove_obsolete_files`]）；安装版另由 kuai.iss 的
+/// `[InstallDelete]` 删，.deb 由 dpkg 删
+const OBSOLETE_FILES: &[&str] = &[
+    // 1.23.0 及以前是 MIT 或 Apache-2.0 双许可，之后改成 GPL-3.0（LICENSE）
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+];
+
+/// 升级完了：删掉程序文件夹里旧版本留下的 [`OBSOLETE_FILES`]。文件夹不可写（.deb 装在 /opt、
+/// AppImage 是只读挂载）时删不掉也不要紧，那两种本来就不会留下
+fn remove_obsolete_files() {
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    else {
+        return;
+    };
+    for name in OBSOLETE_FILES {
+        let _ = fs::remove_file(dir.join(name));
     }
 }
 

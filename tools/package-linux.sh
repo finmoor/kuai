@@ -91,11 +91,9 @@ else
 fi
 # 文本用 LF（在 Windows 的工作副本里拷过来的可能是 CRLF）
 tr -d '\r' < tools/package-readme-linux.txt > "$out/使用说明.txt"
-for file in LICENSE-MIT LICENSE-APACHE; do
-  tr -d '\r' < "$file" > "$out/$file"
-done
+tr -d '\r' < LICENSE > "$out/LICENSE"
 python3 tools/third-party-licenses.py "$out/THIRD-PARTY-LICENSES.txt" linux
-chmod 644 "$out"/*.txt "$out"/LICENSE-*
+chmod 644 "$out"/*.txt "$out"/LICENSE
 
 archive="$dist/$name.tar.gz"
 rm -f "$archive"
@@ -135,7 +133,29 @@ if [ "$deb" = 1 ]; then
   ln -s /opt/kuai/kuai "$pkg/usr/bin/kuai"
   desktop_entry /opt/kuai/kuai > "$pkg/usr/share/applications/kuai.desktop"
   install -m 644 crates/fr-app/assets/icon.png "$pkg/usr/share/icons/hicolor/256x256/apps/kuai.png"
-  tr -d '\r' < LICENSE-MIT > "$pkg/usr/share/doc/kuai/copyright"
+  # Debian 的写法：GPL 全文不抄进来，指向系统自带的 /usr/share/common-licenses/GPL-3
+  cat > "$pkg/usr/share/doc/kuai/copyright" <<'EOF'
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Kuai
+Source: https://github.com/finmoor/kuai
+
+Files: *
+Copyright: 2026 Feng
+License: GPL-3.0+
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ .
+ On Debian systems, the full text of the GNU General Public License
+ version 3 can be found in /usr/share/common-licenses/GPL-3.
+ Third-party libraries and their licenses: /opt/kuai/THIRD-PARTY-LICENSES.txt
+EOF
   find "$pkg" -type d -exec chmod 755 {} +
   # 依赖：程序直接链接的库（objdump -p 的 NEEDED：libc、libgcc_s、libxcb、xkbcommon）所在的包，
   # 加上 GPUI 运行时才加载的 Vulkan、Wayland。glibc 和发版用的 ubuntu-22.04 一样

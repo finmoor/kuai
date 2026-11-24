@@ -90,6 +90,11 @@ zh.SelectTasksLabel2=选择安装 [name] 时要执行的附加任务，然后点
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
+[InstallDelete]
+; 1.23.0 及以前是 MIT 或 Apache-2.0 双许可，之后改成 GPL-3.0（LICENSE）：升级时删掉旧的许可证
+Type: files; Name: "{app}\LICENSE-MIT"
+Type: files; Name: "{app}\LICENSE-APACHE"
+
 [Files]
 Source: "{#PackageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
