@@ -715,6 +715,26 @@ impl SettingsPage {
                 .trim_start_matches("https://")
                 .to_string(),
         );
+        // GPL-3.0 要求的「适当的法律声明」：版权、不提供担保、可以按 GPL 再分发、在哪看全文。
+        // 原版界面上显示了，改版也必须保留（第 5 条 d 款）
+        let license = SettingItem::new(
+            tr("许可证"),
+            SettingField::render(|_, _, _| {
+                Button::new("open-license")
+                    .small()
+                    .icon(Icon::new(IconName::ExternalLink))
+                    .label(tr("打开"))
+                    .on_click(|_, window, cx| {
+                        let url = format!("{}/blob/main/LICENSE", update::repo_url());
+                        let result = crate::shell::open_url(&url);
+                        crate::shell::report(result, window, cx);
+                    })
+            }),
+        )
+        .description(format!(
+            "Copyright © 2026 Feng\n{}",
+            tr("按 GNU GPL 3.0 或更高版本发布，可自由使用、修改和再分发，不提供任何担保。")
+        ));
         // 把服务器目录映射到本机用的是 WinFsp：不随 Kuai 分发，用的时候才装。照它的许可写明出处
         let winfsp = SettingItem::new(
             tr("目录映射"),
@@ -765,6 +785,7 @@ impl SettingsPage {
                     .item(version)
                     .item(check_updates)
                     .item(source)
+                    .item(license)
                     // WinFsp 只有 Windows 上用；Linux 上映射用系统的 fuse3，不随 Kuai 分发
                     .items(cfg!(windows).then_some(winfsp))
                     .item(diagnose)

@@ -907,6 +907,8 @@
   "检查更新失败": "Update check failed",
   "浏览器": "the browser",
   "源代码": "Source code",
+  "许可证": "License",
+  "按 GNU GPL 3.0 或更高版本发布，可自由使用、修改和再分发，不提供任何担保。": "Licensed under the GNU GPL v3.0 or later. Free to use, modify and redistribute, with no warranty.",
   "查看更新内容": "What's new",
   "自动检查更新": "Check for updates automatically",
   "无法安装": "Cannot install",
