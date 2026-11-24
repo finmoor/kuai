@@ -34,9 +34,9 @@
 <a href="README.en.md">English</a>
 </p>
 
-<img src="assets/screenshots/zh-CN/hero.png" alt="同一个窗口中的三页：终端页中运行的 Claude Code，Git 页的提交图和改动，文件页的目录树和编辑器">
+<img src="assets/screenshots/zh-CN/hero.png" alt="同一个窗口中的三页：「会话」页中运行的 Claude Code，Git 页的提交图和改动，文件页的目录树和编辑器">
 
-<sub>同一个窗口中的三页：终端、Git、文件，仓库位于远程主机 dev-server。截图中的项目与人名均为演示数据。</sub>
+<sub>同一个窗口中的三页：会话、Git、文件，仓库位于远程主机 dev-server。截图中的项目与人名均为演示数据。</sub>
 
 <br><br>
 

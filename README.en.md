@@ -34,9 +34,9 @@ Terminals that survive disconnects, line-by-line review, in-place file editing, 
 <a href="README.md">简体中文</a>
 </p>
 
-<img src="assets/screenshots/en/hero.png" alt="Three pages of the same window: Claude Code running on the Terminals page, the commit graph and diff on the Git page, and the file tree and editor on the Files page">
+<img src="assets/screenshots/en/hero.png" alt="Three pages of the same window: Claude Code running on the Sessions page, the commit graph and diff on the Git page, and the file tree and editor on the Files page">
 
-<sub>Three pages of one window: Terminals, Git and Files, on the remote host dev-server. Projects and people shown are demo data.</sub>
+<sub>Three pages of one window: Sessions, Git and Files, on the remote host dev-server. Projects and people shown are demo data.</sub>
 
 <br><br>
 
