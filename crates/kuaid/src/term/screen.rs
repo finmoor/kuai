@@ -492,7 +492,13 @@ fn push_color(
 fn shade(cell: &Cell, after: bool) -> Shade {
     let gray = matches!(
         cell.fg,
-        Color::Named(NamedColor::BrightBlack) | Color::Indexed(8)
+        Color::Named(NamedColor::BrightBlack)
+            | Color::Indexed(8)
+            | Color::Spec(Rgb {
+                r: 128,
+                g: 128,
+                b: 128
+            })
     );
     Shade::of(
         cell.flags.contains(Flags::INVERSE),
@@ -1180,6 +1186,11 @@ mod tests {
         assert_eq!(
             message(b"me@box:~$ git\x1b[38;5;8m log --oneline\x1b[0m\x1b[13D").as_deref(),
             Some("git")
+        );
+        // OpenCode mini：占位提示用 RGB 灰色，光标在它前面。
+        assert_eq!(
+            message("┃ \x1b[38;2;128;128;128mAsk anything\x1b[0m\x1b[12D".as_bytes()),
+            None
         );
         // 光标前面的灰色字是打的（PowerShell 把参数画成灰色）
         assert_eq!(

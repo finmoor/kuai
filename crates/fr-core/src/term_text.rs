@@ -21,7 +21,7 @@ pub struct Row {
     /// 这一行的字（宽字符只算一次）。行尾的空格去掉，写满折到下一行的留着：那是这一行的字（命令
     /// 正好在空格那里折开），接下一行时少了它，`1..60 | %` 就成了 `1..60| %`
     pub text: String,
-    /// 这一行写满了，接着写到下一行（不是程序换的行）
+    /// 这一行有字且写满了，接着写到下一行
     pub wraps: bool,
     /// 行尾这么多个字是淡色的（见 [`Shade::Faint`]），不是打的字
     pub faint: usize,
@@ -40,7 +40,7 @@ pub enum Shade {
 
 impl Shade {
     /// 一格字算什么：反色的是程序自己画的光标；淡色的（SGR 2，PowerShell 的建议、Claude Code 的占位
-    /// 提示），或者在光标后面（`after`）的 8 号灰色字（zsh、fish 的建议），是淡色字。光标前面的灰色字
+    /// 提示），或者在光标后面（`after`）的灰色字（zsh、fish 的建议、OpenCode mini 的占位提示）。光标前面的灰色字
     /// 不算：PowerShell 把 `-Format` 这类参数也画成灰色。
     pub fn of(inverse: bool, dim: bool, gray: bool, after: bool) -> Shade {
         match (inverse, dim || (after && gray)) {
@@ -63,6 +63,8 @@ impl Row {
             .into_iter()
             .map(|(c, shade)| (if c == '\u{a0}' { ' ' } else { c }, shade))
             .collect();
+        // ConPTY 会把 OpenCode mini 用空格填满的间隔行也标成折行，输入和历史里的提示符在空行后另起。
+        let wraps = wraps && cells.iter().any(|(c, _)| !c.is_whitespace());
         while !wraps && cells.last().is_some_and(|(c, _)| c.is_whitespace()) {
             cells.pop();
         }
@@ -359,10 +361,10 @@ fn is_pointer_menu(rows: &[Row], top: usize, end: usize) -> bool {
     (top > 0 && option(&rows[top - 1])) || rows.get(end + 1).is_some_and(option)
 }
 
-/// 去掉方框的左右两边（老版 Claude Code 的输入框是 `│ > 字 │`）。
+/// 去掉输入框的边（老版 Claude Code 的 `│ > 字 │`、OpenCode mini 的 `┃ 字`）。
 fn unbox(text: &str) -> &str {
     let text = text.trim_end();
-    let text = text.strip_prefix('│').unwrap_or(text);
+    let text = text.strip_prefix(['│', '┃']).unwrap_or(text);
     text.strip_suffix('│').unwrap_or(text).trim_end()
 }
 
@@ -680,6 +682,23 @@ mod tests {
         // 空着按回车
         screen[11] = Row::new(r"PS C:\Users\me\repo>");
         assert_eq!(message(&screen, 11, true), None);
+    }
+
+    #[test]
+    fn opencode_mini_输入与横幅和状态行分开() {
+        let mut screen = rows(&[""; 24]);
+        screen[1] = wrapped("▪ oc mini v2.3.2 · repo   ");
+        screen[2] = wrapped("                          ");
+        screen[3] = wrapped("┃ Render probe references ");
+        screen[4] = wrapped("                          ");
+        screen[5] = Row::new("Build · Fixture · ctrl+p menu");
+
+        assert_eq!(input_area(&screen, 3, true), Some(3..6));
+        let mark = message(&screen, 3, true).unwrap();
+        assert_eq!(mark, "Render probe references");
+
+        screen[3] = wrapped("› Render probe references ");
+        assert_eq!(locate_all(&screen, &[&mark]), vec![Some(3)]);
     }
 
     #[test]

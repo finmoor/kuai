@@ -20,7 +20,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color, NamedColor};
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use chrono::{Local, TimeZone as _};
 use fr_channel::TermMark;
 use fr_core::i18n::tr;
@@ -174,7 +174,13 @@ pub(super) fn read_rows(term: &Term<Proxy>, from: i32, to: i32) -> Vec<Row> {
                     let after = in_tail && (line > at.line.0 || col >= at.column.0);
                     let gray = matches!(
                         cell.fg,
-                        Color::Named(NamedColor::BrightBlack) | Color::Indexed(8)
+                        Color::Named(NamedColor::BrightBlack)
+                            | Color::Indexed(8)
+                            | Color::Spec(Rgb {
+                                r: 128,
+                                g: 128,
+                                b: 128
+                            })
                     );
                     let shade = Shade::of(
                         cell.flags.contains(Flags::INVERSE),

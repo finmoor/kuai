@@ -199,8 +199,34 @@ impl LinkUi {
     }
 }
 
-/// 网格上 `point` 所在的那一行，连同写满折下去的前后几行：每个字，和它在网格上的哪一格。宽字的后半格、
-/// 宽字放不下时留在行尾的那一格不算（见 [`term_text::padded`]）。
+/// 终端一行里的字和对应的格子，略过宽字的后半格和换行时留在行尾的占位格。
+fn line_cells(term: &Term<Proxy>, line: i32) -> impl Iterator<Item = (char, GridPoint)> + '_ {
+    let grid = term.grid();
+    let cols = grid.columns();
+    let row = &grid[GridLine(line)];
+    let last = &row[GridColumn(cols - 1)];
+    let padded = last.flags.contains(Flags::WRAPLINE)
+        && line + 1 < grid.screen_lines() as i32
+        && term_text::padded(
+            last.c,
+            grid[GridLine(line + 1)][GridColumn(0)]
+                .flags
+                .contains(Flags::WIDE_CHAR),
+        );
+    (0..cols).filter_map(move |col| {
+        let cell = &row[GridColumn(col)];
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            || (padded && col == cols - 1)
+        {
+            return None;
+        }
+        Some((cell.c, GridPoint::new(GridLine(line), GridColumn(col))))
+    })
+}
+
+/// 网格上 `point` 所在的那一行，连同写满折下去的前后几行。
 fn line_at(term: &Term<Proxy>, point: GridPoint) -> (Vec<char>, Vec<GridPoint>) {
     let grid = term.grid();
     let (cols, top) = (grid.columns(), -(grid.history_size() as i32));
@@ -218,32 +244,9 @@ fn line_at(term: &Term<Proxy>, point: GridPoint) -> (Vec<char>, Vec<GridPoint>) 
     while last < bottom && wraps(last) && last - point.line.0 < 50 {
         last += 1;
     }
-    let mut chars = Vec::new();
-    let mut cells = Vec::new();
-    for line in first..=last {
-        let row = &grid[GridLine(line)];
-        let padded = wraps(line)
-            && line < bottom
-            && term_text::padded(
-                row[GridColumn(cols - 1)].c,
-                grid[GridLine(line + 1)][GridColumn(0)]
-                    .flags
-                    .contains(Flags::WIDE_CHAR),
-            );
-        for col in 0..cols {
-            let cell = &row[GridColumn(col)];
-            if cell
-                .flags
-                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-                || (padded && col == cols - 1)
-            {
-                continue;
-            }
-            chars.push(cell.c);
-            cells.push(GridPoint::new(GridLine(line), GridColumn(col)));
-        }
-    }
-    (chars, cells)
+    (first..=last)
+        .flat_map(|line| line_cells(term, line))
+        .unzip()
 }
 
 /// 问一个路径时记的名字：提示符里的目录（没有是空的）和路径的写法。
@@ -310,33 +313,26 @@ fn wrapped_path_start(chars: &[char]) -> Option<Range<usize>> {
 
 fn wrapped_path_continuation(chars: &[char]) -> Option<(Range<usize>, bool)> {
     let start = chars.iter().position(|ch| !ch.is_whitespace())?;
-    if start == 0 {
-        return None;
-    }
     path_part(chars, start)
 }
 
-/// Codex 排版时会把 `标签 (/C:/…/文件:行)` 里的路径拆到后面的缩进行。
-/// 只有括号闭合且连起来仍是完整的路径才认，普通的终端换行各算各的。
-fn wrapped_path_at(
-    term: &Term<Proxy>,
-    point: GridPoint,
-    chars: &[char],
-    at: usize,
-) -> Option<(GridPoint, GridPoint, Target)> {
-    if !wrapped_path_start(chars).is_some_and(|part| part.contains(&at))
-        && !wrapped_path_continuation(chars).is_some_and(|(part, _)| part.contains(&at))
+/// Codex 和 OpenCode 会把 `标签 (/C:/…/文件:行)` 里的路径拆到后几行。
+/// 按网格行找闭合的路径。OpenCode mini 的续行可能顶格，默认界面填满的行也可能带折行标记。
+fn wrapped_path_at(term: &Term<Proxy>, point: GridPoint) -> Option<(GridPoint, GridPoint, Target)> {
+    let (chars, cells): (Vec<_>, Vec<_>) = line_cells(term, point.line.0).unzip();
+    let at = cells.iter().position(|&cell| cell == point)?;
+    if !wrapped_path_start(&chars).is_some_and(|part| part.contains(&at))
+        && !wrapped_path_continuation(&chars).is_some_and(|(part, _)| part.contains(&at))
     {
         return None;
     }
 
     let grid = term.grid();
-    let mut row = (point.line.0 - PATH_WRAP_ROWS).max(-(grid.history_size() as i32));
+    let first = (point.line.0 - PATH_WRAP_ROWS).max(-(grid.history_size() as i32));
     let last = (point.line.0 + PATH_WRAP_ROWS).min(grid.screen_lines() as i32 - 1);
     let mut candidate: Option<(GridPoint, String)> = None;
-    while row <= last {
-        let (chars, cells) = line_at(term, GridPoint::new(GridLine(row), GridColumn(0)));
-        row = cells.last()?.line.0 + 1;
+    for row in first..=last {
+        let (chars, cells): (Vec<_>, Vec<_>) = line_cells(term, row).unzip();
         if let Some((start, mut path)) = candidate.take()
             && let Some((part, closed)) = wrapped_path_continuation(&chars)
         {
@@ -391,7 +387,7 @@ fn find(term: &Term<Proxy>, point: GridPoint) -> Option<(GridPoint, GridPoint, T
         };
         return Some((cells[start], cells[end], target));
     }
-    if let Some(link) = wrapped_path_at(term, cells[at], &chars, at) {
+    if let Some(link) = wrapped_path_at(term, cells[at]) {
         return Some(link);
     }
     let text: String = chars.iter().collect();
@@ -1223,6 +1219,32 @@ mod tests {
                 col: None,
             }
         );
+    }
+
+    #[test]
+    fn opencode_的顶格续行和满宽排版都能接成路径() {
+        let head = "Probe file (/C:/repo/opencode-";
+        let tail = "mini/src/probe.rs:2:3)";
+        let indented = format!("     {tail}");
+        let output = [
+            format!("{head}\r\n{tail}"),
+            format!("{head:60}{indented:60}other output"),
+        ];
+        for output in output {
+            let term = term(60, 6, output.as_bytes());
+            for point in [at(0, 16), at(1, 10)] {
+                let (start, end, target) = find(&term, point).expect("link");
+                assert_eq!((start, end.line.0), (at(0, 12), 1));
+                assert_eq!(
+                    target,
+                    Target::Path {
+                        path: "/C:/repo/opencode-mini/src/probe.rs".into(),
+                        line: Some(2),
+                        col: Some(3),
+                    }
+                );
+            }
+        }
     }
 
     #[test]
