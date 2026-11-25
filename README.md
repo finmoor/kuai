@@ -328,7 +328,7 @@ Kuai 不自建连接和认证，全部交给 SSH。思路与 VS Code 的 Remote 
 | `tools/package-linux.sh` | 打 Linux 版的发布包（tar.gz、.deb、AppImage）：Linux 客户端加 Windows 版的包里那一批 kuaid |
 | `tools/installer/` | 安装程序的脚本（Inno Setup 6，`kuai.iss`）和简体中文的界面文字 |
 | `tools/release-notes.ps1`、`CHANGELOG.md` | 发版时的发布说明：取 `CHANGELOG.md` 里这个版本的那一节 |
-| `.github/workflows/` | 推代码时在 Windows、Linux 上各跑一遍全部测试（`ci.yml`）；推 `v*` 标签时打包发版（`release.yml`：先打 Windows 版，Linux 版用它的 kuaid，都打好了再建 Release） |
+| `.github/workflows/` | 推代码时在 Windows、Linux 上各跑一遍全部测试（`ci.yml`）；推 `v*` 标签时打包发版（`release.yml`：等这个提交的 CI 通过；kuaid 先编一份，Windows、Linux 两个包同时打，都打好了再建 Release） |
 | `tools/make-icon.py` | 画应用图标，输出 `crates/fr-app/assets/icon.ico` |
 
 ### 构建与运行
@@ -372,7 +372,7 @@ cargo build --release -p kuaid
 pwsh tools/package.ps1
 ```
 
-发版：改 `Cargo.toml` 的版本号，在 `CHANGELOG.md` 加上这个版本的一节（每条一句话，会显示在 Kuai 的更新提示中），提交后打标签 `v<版本>` 推上去，`release.yml` 测试、打包、建 GitHub Release。Kuai 检查更新时按装法认附件：Windows 安装版 `kuai-*-windows-x64-setup.exe`、Windows 解压版 `kuai-*-windows-x64.zip`、Linux 解压版 `kuai-*-linux-x64.tar.gz`、.deb `kuai_*_amd64.deb`、AppImage `kuai-*-linux-x64.AppImage`（见 `crates/fr-app/src/update.rs` 的 `parse_release`），附件改名要两边一起改。
+发版：改 `Cargo.toml` 的版本号，在 `CHANGELOG.md` 加上这个版本的一节（每条一句话，会显示在 Kuai 的更新提示中），提交推到 main 后打标签 `v<版本>` 推上去，`release.yml` 等这个提交的 CI 通过后打包、建 GitHub Release（改了 `release.yml` 或打包脚本时，可以先在 Actions 页手动运行一次，只打包、不发布）。Kuai 检查更新时按装法认附件：Windows 安装版 `kuai-*-windows-x64-setup.exe`、Windows 解压版 `kuai-*-windows-x64.zip`、Linux 解压版 `kuai-*-linux-x64.tar.gz`、.deb `kuai_*_amd64.deb`、AppImage `kuai-*-linux-x64.AppImage`（见 `crates/fr-app/src/update.rs` 的 `parse_release`），附件改名要两边一起改。
 
 设置存在 `%APPDATA%\kuai\settings.json`；环境变量 `FR_SETTINGS` 可以换成别的文件，测试时不碰自己的设置（开机自启写的是注册表，测试时用 `FR_AUTOSTART_KEY` 换一个键，任务管理器里的「禁用」记在它后面加 `-approved` 的键里）。
 
