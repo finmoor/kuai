@@ -1,8 +1,12 @@
 # 推 v1.8.0 这样的标签就发版：测试、打包，把 Windows 的安装程序 kuai-<版本>-windows-x64-setup.exe、
 # 解压版 kuai-<版本>-windows-x64.zip 和 Linux 版（kuai_<版本>_amd64.deb、kuai-<版本>-linux-x64.AppImage、
 # 解压版 kuai-<版本>-linux-x64.tar.gz）传到 GitHub Releases。
-# 先编 Windows 版，Linux 版拿它打好的 kuaid 文件夹（两个平台的包里带一模一样的 kuaid，见
-# tools/package-linux.sh），两边都打好了才建 Release，不会出现只有一半附件的版本。
+# kuaid 先单独编一份（windows 上编：要出 kuaid.exe），Windows、Linux 两个包都用这一份、同时打包
+# （两个平台的包里要带一模一样的 kuaid，见 tools/package-linux.sh），两边都打好了才建 Release，
+# 不会出现只有一半附件的版本。
+# 不重跑测试：发版的提交推 main 时 CI 已经在两个平台上测过（ci.yml），这里等那次 CI 跑完，没过就不
+# 发布；标签可以推 main 以后马上打，CI 和打包同时跑。
+# 手动运行（workflow_dispatch）只编、只打包，不建 Release：改了这个文件、打包脚本以后先这样试一遍。
 # 发布说明取自 CHANGELOG.md 里这个版本的那一节。GitHub 会给附件算 SHA-256（API 的 assets[].digest），
 # Kuai 升级时拿它核对下载的文件，所以不另传校验文件。
 name: Release
@@ -10,13 +14,37 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 # 默认只读：测试、打包的两个任务跑第三方的工具和脚本，用不着改仓库、建 Release；只有 publish 要写
 permissions:
   contents: read
 
 jobs:
-  windows:
+  # 等这个提交在 CI 里的那次运行（推 main 时触发的）跑完：过了才发布
+  ci:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: 等这个提交的 CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for i in $(seq 1 80); do
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&per_page=1" \
+              --jq '.workflow_runs[0] // {} | "\(.status // "none") \(.conclusion // "")"')
+            echo "CI：$run"
+            case "$run" in
+              "completed success") exit 0 ;;
+              completed*) echo "这个提交的 CI 没过，不发布"; exit 1 ;;
+            esac
+            sleep 30
+          done
+          echo "等了 40 分钟，这个提交的 CI 还没跑完（提交推到 main 了吗）"
+          exit 1
+
+  kuaid:
     runs-on: windows-latest
     env:
       TAG: ${{ github.ref_name }}
@@ -30,13 +58,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: 标签和 Cargo.toml 的版本号要一致
+        if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           if ("v$version" -ne $env:TAG) { throw "Cargo.toml 是 $version，标签是 $env:TAG" }
 
-      - name: 测试
-        run: cargo test --workspace
+      - name: 编 kuaid
+        shell: pwsh
+        run: ./tools/package.ps1 -KuaidOnly kuaid-out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kuaid
+          path: kuaid-out/
+          if-no-files-found: error
+
+  windows:
+    needs: kuaid
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
       # 编安装程序用。直接下官方 GitHub 上的安装包，和本机用的同一版，核对 SHA-256
       # （和 winget 清单 JRSoftware.InnoSetup 6.7.3 里记的一样）
@@ -55,13 +101,14 @@ jobs:
           if (-not (Test-Path $iscc)) { throw "没装上：$iscc" }
           "ISCC=$iscc" >> $env:GITHUB_ENV
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: kuaid
+          path: kuaid-prebuilt
+
       - name: 打包
         shell: pwsh
-        run: |
-          ./tools/package.ps1
-          # Linux 版的包要同一批 kuaid：拷到固定的位置再交出去
-          $version = $env:TAG.TrimStart('v')
-          Copy-Item -Recurse "dist\kuai-$version-windows-x64\Kuai\kuaid" kuaid-for-linux
+        run: ./tools/package.ps1 -Kuaid kuaid-prebuilt
 
       - uses: actions/upload-artifact@v4
         with:
@@ -71,15 +118,9 @@ jobs:
             dist/kuai-*-windows-x64.zip
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: kuaid
-          path: kuaid-for-linux/
-          if-no-files-found: error
-
   # 在 22.04 上编：在哪个系统上编，就要那个版本及以上的 glibc（22.04 是 2.35）
   linux:
-    needs: windows
+    needs: kuaid
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -94,9 +135,6 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libasound2-dev libfontconfig-dev libfreetype-dev libwayland-dev libx11-xcb-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libvulkan-dev libzstd-dev
-
-      - name: 测试
-        run: cargo test --workspace
 
       - uses: actions/download-artifact@v4
         with:
@@ -130,7 +168,9 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [windows, linux]
+    needs: [ci, windows, linux]
+    # 手动运行的不发布
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     # 建 Release、传附件
     permissions:
