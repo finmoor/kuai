@@ -50,6 +50,8 @@ pub enum ManagerEvent {
     ShowWorkspaces(String),
     /// 到会话页看这个仓库的终端（点了仓库那一行的终端个数）
     Terminals(RepoEntry),
+    /// 在这个仓库里新开一个终端，运行选的这个（None 是只开 shell），到会话页显示
+    RunInTerminal(RepoEntry, Option<crate::presets::Start>),
 }
 
 pub struct ManagerView {
@@ -1861,7 +1863,7 @@ impl ManagerView {
         let menu: MenuFor = Rc::new(
             move |menu: PopupMenu, entry: RepoEntry, sub: bool, window, cx| {
                 let at = |this: &WeakEntity<ManagerView>| (this.clone(), entry.clone());
-                let (open, rename, remove) = (at(&this), at(&this), at(&this));
+                let (open, rename, remove, term) = (at(&this), at(&this), at(&this), at(&this));
                 let path = entry.path.clone();
                 let menu = menu.item(PopupMenuItem::new(tr("在标签页中打开")).on_click(
                     move |_, _, cx| {
@@ -1870,6 +1872,22 @@ impl ManagerView {
                             .ok();
                     },
                 ));
+                // 新建终端（和工作区页、会话页的仓库右键一样）：到会话页显示
+                let place = menu_app.read(cx).repo_name(&entry);
+                let on_start: crate::presets::OnStart = Rc::new(move |start, _, cx| {
+                    let entry = term.1.clone();
+                    term.0
+                        .update(cx, |_, cx| {
+                            cx.emit(ManagerEvent::RunInTerminal(entry, start))
+                        })
+                        .ok();
+                });
+                let menu = menu.submenu(
+                    tr("新建终端"),
+                    window,
+                    cx,
+                    crate::presets::menu_builder(place, on_start),
+                );
                 // 不在任何工作区里是「添加到工作区 ▸」；在的话是「打开工作区」，后面跟「添加到其他工作区 ▸」
                 let add = crate::ws_links::plain_add(&menu_app);
                 let menu = crate::ws_links::context_items(

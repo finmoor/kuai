@@ -524,7 +524,11 @@ impl RepoView {
         let remote = self.entry.server.is_some();
         vec![
             rail_button("rail-tree", IconName::FolderTree, false)
-                .tooltip(tr("展开侧栏以查看目录树（Ctrl+Shift+B）"))
+                .tooltip(crate::keymap::with_key(
+                    tr("展开侧栏以查看目录树（Ctrl+Shift+B）"),
+                    "sidebar",
+                    cx,
+                ))
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx)))
                 .into_any_element(),
             rail_button("rail-new-file", IconName::FilePlus, false)
@@ -730,7 +734,7 @@ impl RepoView {
                     "file-save",
                     IconName::Save,
                     tr("保存"),
-                    tr("保存（Ctrl+S）"),
+                    crate::keymap::with_key(tr("保存（Ctrl+S）"), "file.save", cx),
                     saving,
                     can_save,
                     0,
@@ -779,6 +783,7 @@ impl RepoView {
                 })),
             )
             .child(
+                // 只有图标的按钮：点了弹新建终端的菜单，开在这个文件所在的目录
                 tool_button(
                     "file-terminal",
                     IconName::SquareTerminal,
@@ -789,13 +794,15 @@ impl RepoView {
                     0,
                     cx,
                 )
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    let dir = term_path
-                        .as_deref()
-                        .map(|path| super::files::split(path).0.to_string())
-                        .unwrap_or_default();
-                    this.new_terminal_in(dir, window, cx);
-                })),
+                .dropdown_menu(
+                    self.presets_menu_in(
+                        term_path
+                            .as_deref()
+                            .map(|path| super::files::split(path).0.to_string())
+                            .unwrap_or_default(),
+                        cx,
+                    ),
+                ),
             )
             .when_some(web, |bar, web| {
                 bar.child(
@@ -820,11 +827,15 @@ impl RepoView {
                         "file-preview",
                         IconName::Eye,
                         tr("预览"),
-                        if rendered {
-                            tr("回到源文件（Ctrl+Shift+V）")
-                        } else {
-                            tr("预览 Markdown（Ctrl+Shift+V）")
-                        },
+                        crate::keymap::with_key(
+                            if rendered {
+                                tr("回到源文件（Ctrl+Shift+V）")
+                            } else {
+                                tr("预览 Markdown（Ctrl+Shift+V）")
+                            },
+                            "file.preview",
+                            cx,
+                        ),
                         false,
                         true,
                         0,
@@ -1014,7 +1025,10 @@ impl RepoView {
                         close.invisible().group_hover("file-tab", |s| s.visible())
                     }),
                 })
-                .tooltip(|window, cx| ui::tip(tr("关闭（Ctrl+W）"), window, cx))
+                .tooltip(|window, cx| {
+                    let tip = crate::keymap::with_key(tr("关闭（Ctrl+W）"), "tab.close", cx);
+                    ui::tip(tip, window, cx)
+                })
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
                     this.close_file_tab(id, window, cx);
@@ -1430,19 +1444,23 @@ impl RepoView {
         let theme = cx.theme();
         let (muted, fg) = (theme.muted_foreground, theme.foreground);
         let remote = self.entry.server.is_some();
-        let hint = |keys: &'static str, text: &'static str| {
-            h_flex()
-                .gap(px(10.))
-                .child(
-                    div()
-                        .w(px(96.))
-                        .text_right()
-                        .font_family(cx.theme().mono_font_family.clone())
-                        .text_size(px(11.))
-                        .text_color(muted)
-                        .child(keys),
-                )
-                .child(div().text_xs().text_color(muted).child(text))
+        // 写现在的键（设置 → 快捷键里改过的跟着变）；去掉了的不写
+        let hint = |id: &str, text: &'static str| {
+            let keys = crate::keymap::label(id, cx)?;
+            Some(
+                h_flex()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .w(px(96.))
+                            .text_right()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(px(11.))
+                            .text_color(muted)
+                            .child(keys),
+                    )
+                    .child(div().text_xs().text_color(muted).child(text)),
+            )
         };
         v_flex()
             .size_full()
@@ -1478,10 +1496,10 @@ impl RepoView {
                 v_flex()
                     .mt(px(6.))
                     .gap(px(6.))
-                    .child(hint("Ctrl+S", tr("保存")))
-                    .child(hint("Ctrl+F", tr("在文件中查找")))
-                    .child(hint("Ctrl+W", tr("关闭文件")))
-                    .child(hint("Ctrl+Shift+E", tr("切换到文件页面"))),
+                    .children(hint("file.save", tr("保存")))
+                    .children(hint("git.find", tr("在文件中查找")))
+                    .children(hint("tab.close", tr("关闭文件")))
+                    .children(hint("page.files", tr("切换到文件页面"))),
             )
             .into_any_element()
     }

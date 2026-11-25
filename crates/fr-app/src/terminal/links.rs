@@ -48,6 +48,10 @@ const SHOWN_MAX: usize = 60;
 const PROMPT_SCAN: i32 = 5000;
 /// 程序主动折行时，只在鼠标所在行附近找括号里的路径。
 const PATH_WRAP_ROWS: i32 = 8;
+/// 程序自己换行（见 [`hard_wrapped`]）：一行最后一个字离右边不超过这么多格，才算写到了头
+const EDGE_SLACK: usize = 2;
+/// 程序自己换行的一段最多接这么多行
+const HARD_WRAP_ROWS: usize = 8;
 
 /// 认链接里的路径用的：终端开在哪个仓库、哪个目录，怎么去问文件在不在。
 #[derive(Clone)]
@@ -80,6 +84,16 @@ pub(super) struct Hover {
 /// 网格上的一段：从哪一格到哪一格（含）。
 pub(super) type Span = (GridPoint, GridPoint);
 
+/// 鼠标那里可能的一个链接（见 [`candidates`]）：从哪一格到哪一格（含）、指向哪；路径的话还有提示符里
+/// 的目录（见 [`prompt_dir_above`]）。
+#[derive(Clone)]
+struct Candidate {
+    start: GridPoint,
+    end: GridPoint,
+    target: Target,
+    dir: Option<String>,
+}
+
 /// 右键点在网址、路径上：菜单列它的几项（见 [`fill_menu`]）。
 pub(super) struct LinkMenu {
     pub start: GridPoint,
@@ -87,6 +101,8 @@ pub(super) struct LinkMenu {
     /// 菜单顶上那一行：认出来的写法（路径带着行号）
     shown: String,
     state: MenuState,
+    /// 排在后面的写法：正在问的这个问到不在时接着看（见 [`TerminalView::menu_answered`]）
+    rest: Vec<Candidate>,
 }
 
 #[derive(Clone)]
@@ -361,42 +377,172 @@ fn wrapped_path_at(term: &Term<Proxy>, point: GridPoint) -> Option<(GridPoint, G
     None
 }
 
-/// 网格上 `point` 那里的链接：从哪一格到哪一格、指向哪。程序用 OSC 8 写的超链接优先。
-fn find(term: &Term<Proxy>, point: GridPoint) -> Option<(GridPoint, GridPoint, Target)> {
+/// 网址里常见、普通的词里少见的字：程序换行接上的一截像不像网址的一部分（见 [`hard_wrapped`]）。
+fn urlish(c: char) -> bool {
+    matches!(
+        c,
+        '/' | '.' | '?' | '=' | '&' | '#' | '%' | '-' | '_' | '~' | '+' | ':'
+    )
+}
+
+/// 程序自己换行接着写的一段：Claude Code 这类自己排版的程序把放不下的长路径、长网址直接断到下一行，
+/// 下一行还按段落缩进，行尾没有终端的折行标记，[`line_at`] 接不起来。一行最后一段字写到了最右边
+/// （离右边不超过 [`EDGE_SLACK`] 格）、下一行去掉开头的空白紧接着又是一段字，就当成同一段接起来，
+/// 最多接 [`HARD_WRAP_ROWS`] 行。鼠标那里的链接没有跨行时是 None。
+///
+/// 也会接错：一行字正好写满、路径后面的词换到了下一行。路径要问过在不在才算，接错的查不到，退回只看
+/// 这一行的（见 [`candidates`]）；网址不问，所以每处接口都要像网址里的（前一截以 `/`、`.` 这些结尾，
+/// 或者后一截里有）才接。
+fn hard_wrapped(term: &Term<Proxy>, point: GridPoint) -> Option<(GridPoint, GridPoint, Target)> {
+    let grid = term.grid();
+    let cols = grid.columns();
+    let (top, bottom) = (
+        -(grid.history_size() as i32),
+        grid.screen_lines() as i32 - 1,
+    );
+    // 终端自己折的行由 `line_at` 接，这里不管
+    let soft = |line: i32| {
+        grid[GridLine(line)][GridColumn(cols - 1)]
+            .flags
+            .contains(Flags::WRAPLINE)
+    };
+    let row = |line: i32| -> (Vec<char>, Vec<GridPoint>) { line_cells(term, line).unzip() };
+    let is_path = |c: &char| term_link::path_char(*c);
+    // 这一行最后一段字，写到了最右边才算
+    let tail = |chars: &[char], cells: &[GridPoint]| {
+        let end = chars.iter().rposition(|c| !c.is_whitespace())? + 1;
+        if cells[end - 1].column.0 + 1 + EDGE_SLACK < cols {
+            return None;
+        }
+        let start = end - chars[..end].iter().rev().take_while(|c| is_path(c)).count();
+        (start < end).then_some(start..end)
+    };
+    // 这一行开头的一段字（去掉缩进）
+    let head = |chars: &[char]| {
+        let start = chars.iter().position(|c| !c.is_whitespace())?;
+        let len = chars[start..].iter().take_while(|c| is_path(c)).count();
+        (len > 0).then_some(start..start + len)
+    };
+    let url_join = |before: &[char], after: &[char]| {
+        before.last().is_some_and(|&c| urlish(c)) || after.iter().any(|&c| urlish(c))
+    };
+
+    let (chars, cells) = row(point.line.0);
+    let at = cells.iter().position(|cell| *cell == point)?;
+    if !is_path(&chars[at]) {
+        return None;
+    }
+    let start = at - chars[..at].iter().rev().take_while(|c| is_path(c)).count();
+    let end = at + chars[at..].iter().take_while(|c| is_path(c)).count();
+    let mut text: Vec<char> = chars[start..end].to_vec();
+    let mut places: Vec<GridPoint> = cells[start..end].to_vec();
+    // 鼠标那一格在接起来的字里是第几个
+    let mut index = at - start;
+    let (mut joins, mut url_ok) = (0, true);
+    // 往上接：鼠标那一段在行首（前面只有缩进），上一行最后一段写到了最右边
+    let (mut line, mut at_head) = (
+        point.line.0,
+        chars[..start].iter().all(|c| c.is_whitespace()),
+    );
+    while at_head && line > top && joins < HARD_WRAP_ROWS && !soft(line - 1) {
+        let (above, above_cells) = row(line - 1);
+        let Some(piece) = tail(&above, &above_cells) else {
+            break;
+        };
+        url_ok &= url_join(&above[piece.clone()], &text);
+        index += piece.len();
+        text.splice(0..0, above[piece.clone()].iter().copied());
+        places.splice(0..0, above_cells[piece.clone()].iter().copied());
+        at_head = above[..piece.start].iter().all(|c| c.is_whitespace());
+        line -= 1;
+        joins += 1;
+    }
+    // 往下接：鼠标那一段写到了最右边，下一行开头接着一段
+    let mut line = point.line.0;
+    let mut at_edge = tail(&chars, &cells).is_some_and(|piece| piece.end == end);
+    while at_edge && line < bottom && joins < HARD_WRAP_ROWS && !soft(line) {
+        let (below, below_cells) = row(line + 1);
+        let Some(piece) = head(&below) else {
+            break;
+        };
+        url_ok &= url_join(&text, &below[piece.clone()]);
+        text.extend_from_slice(&below[piece.clone()]);
+        places.extend_from_slice(&below_cells[piece.clone()]);
+        // 下一行整行就是这一段、又写到了头：再往下接
+        at_edge = tail(&below, &below_cells).is_some_and(|whole| whole == piece);
+        line += 1;
+        joins += 1;
+    }
+    if joins == 0 {
+        return None;
+    }
+    let joined: String = text.iter().collect();
+    let link = term_link::link_at(&joined, index)?;
+    let (first, last) = (places[link.span.start], places[link.span.end - 1]);
+    // 认出来的没跨行（行尾的标点去掉以后只剩这一行的）：和只看这一行的一样
+    if first.line == last.line || (matches!(link.target, Target::Url(_)) && !url_ok) {
+        return None;
+    }
+    Some((first, last, link.target))
+}
+
+/// 网格上 `point` 那里可能的链接，按先后：从哪一格到哪一格、指向哪。程序用 OSC 8 写的超链接、Codex
+/// 和 OpenCode 括号里折开的路径各只有一个；程序自己换行接起来的（见 [`hard_wrapped`]）排在只看这一行
+/// 的前面，路径问过不在再看下一个（见 [`TerminalView::link_under`]）。
+fn candidates(term: &Term<Proxy>, point: GridPoint) -> Vec<(GridPoint, GridPoint, Target)> {
     let (chars, cells) = line_at(term, point);
     // 宽字的后半格：算前半格那个字
-    let at = cells.iter().position(|cell| *cell == point).or_else(|| {
+    let Some(at) = cells.iter().position(|cell| *cell == point).or_else(|| {
         let left = GridPoint::new(point.line, GridColumn(point.column.0.checked_sub(1)?));
         cells.iter().position(|cell| *cell == left)
-    })?;
-    let grid = term.grid();
-    if let Some(link) = grid[cells[at]].hyperlink() {
-        let same = |cell: &GridPoint| grid[*cell].hyperlink().is_some_and(|other| other == link);
-        let start = (0..=at).rev().take_while(|&i| same(&cells[i])).last()?;
-        let end = (at..cells.len()).take_while(|&i| same(&cells[i])).last()?;
-        let uri = link.uri();
-        let target = match uri.strip_prefix("file://") {
-            Some(_) => match term_link::link_at(uri, 0)?.target {
-                path @ Target::Path { .. } => path,
-                Target::Url(_) => return None,
-            },
-            None if uri.starts_with("https://") || uri.starts_with("http://") => {
-                Target::Url(uri.to_string())
-            }
-            None => return None,
-        };
-        return Some((cells[start], cells[end], target));
+    }) else {
+        return Vec::new();
+    };
+    if term.grid()[cells[at]].hyperlink().is_some() {
+        return hyperlink_at(term, &cells, at).into_iter().collect();
     }
     if let Some(link) = wrapped_path_at(term, cells[at]) {
-        return Some(link);
+        return vec![link];
     }
+    let mut found: Vec<(GridPoint, GridPoint, Target)> =
+        hard_wrapped(term, cells[at]).into_iter().collect();
     let text: String = chars.iter().collect();
-    let link = term_link::link_at(&text, at)?;
-    Some((
-        cells[link.span.start],
-        cells[link.span.end - 1],
-        link.target,
-    ))
+    if let Some(link) = term_link::link_at(&text, at) {
+        let single = (
+            cells[link.span.start],
+            cells[link.span.end - 1],
+            link.target,
+        );
+        if !found.contains(&single) {
+            found.push(single);
+        }
+    }
+    found
+}
+
+/// 程序用 OSC 8 写的超链接：同一个链接的格子连成的一段。只认 http、https 和 `file://` 的路径。
+fn hyperlink_at(
+    term: &Term<Proxy>,
+    cells: &[GridPoint],
+    at: usize,
+) -> Option<(GridPoint, GridPoint, Target)> {
+    let grid = term.grid();
+    let link = grid[cells[at]].hyperlink()?;
+    let uri = link.uri();
+    let same = |cell: &GridPoint| grid[*cell].hyperlink().is_some_and(|other| other == link);
+    let start = (0..=at).rev().take_while(|&i| same(&cells[i])).last()?;
+    let end = (at..cells.len()).take_while(|&i| same(&cells[i])).last()?;
+    let target = match uri.strip_prefix("file://") {
+        Some(_) => match term_link::link_at(uri, 0)?.target {
+            path @ Target::Path { .. } => path,
+            Target::Url(_) => return None,
+        },
+        None if uri.starts_with("https://") || uri.starts_with("http://") => {
+            Target::Url(uri.to_string())
+        }
+        None => return None,
+    };
+    Some((cells[start], cells[end], target))
 }
 
 /// 网络路径（`\\主机\共享\…`、`//主机/共享/…`）：看它在不在要连那台主机。
@@ -500,53 +646,82 @@ impl TerminalView {
         }
     }
 
-    /// 网格上 `position` 那里的链接：从哪一格到哪一格、指向哪，路径的话还有提示符里的目录。
-    fn target_at(
-        &self,
-        position: Point<Pixels>,
-    ) -> Option<(GridPoint, GridPoint, Target, Option<String>)> {
-        let (point, _) = self.grid_point(position)?;
-        let session = self.session.as_ref()?;
-        let term = session.term.lock();
-        let (start, end, target) = find(&term, point)?;
-        let dir = match target {
-            Target::Path { .. } => prompt_dir_above(&term, start),
-            Target::Url(_) => None,
+    /// 网格上 `position` 那里可能的链接，按先后（见 [`candidates`]）：从哪一格到哪一格、指向哪，路径的
+    /// 话还有提示符里的目录。
+    fn targets_at(&self, position: Point<Pixels>) -> Vec<Candidate> {
+        let Some((point, _)) = self.grid_point(position) else {
+            return Vec::new();
         };
-        Some((start, end, target, dir))
+        let Some(session) = self.session.as_ref() else {
+            return Vec::new();
+        };
+        let term = session.term.lock();
+        // 往上找提示符要看很多行：几个写法从同一行起的只找一次
+        let mut dirs: HashMap<i32, Option<String>> = HashMap::new();
+        candidates(&term, point)
+            .into_iter()
+            .map(|(start, end, target)| {
+                let dir = match target {
+                    Target::Path { .. } => dirs
+                        .entry(start.line.0)
+                        .or_insert_with(|| prompt_dir_above(&term, start))
+                        .clone(),
+                    Target::Url(_) => None,
+                };
+                Candidate {
+                    start,
+                    end,
+                    target,
+                    dir,
+                }
+            })
+            .collect()
     }
 
+    /// 鼠标底下的链接：几个写法按先后看，路径问过不在的看下一个；有正在问的就先等它（问到了重新看）。
     fn link_under(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> Option<Hover> {
-        let (start, end, target, dir) = self.target_at(position)?;
-        let open = match target {
-            Target::Url(url) => Open::Url(url),
-            Target::Path { path, line, col } => {
-                let at = line.map(|line| (line, col.unwrap_or(1)));
-                let key = ask_key(dir.as_deref(), &path);
-                match self.links.checked.get(&key) {
-                    _ if self.links.asking.contains(&key) => {
-                        self.links.waiting = Some((key, at));
-                        return None;
-                    }
-                    Some(checked) if checked.at.elapsed() < CHECKED_FOR => {
-                        opening(checked.found.clone()?, at)
-                    }
-                    _ => {
-                        let passive = !self.links.ctrl;
-                        if self.check_path(path, dir, key.clone(), passive, cx) {
-                            self.links.waiting = Some((key, at));
-                        }
-                        return None;
-                    }
-                }
-            }
-        };
-        Some(Hover {
+        for Candidate {
             start,
             end,
-            soft: false,
-            open,
-        })
+            target,
+            dir,
+        } in self.targets_at(position)
+        {
+            let open = match target {
+                Target::Url(url) => Open::Url(url),
+                Target::Path { path, line, col } => {
+                    let at = line.map(|line| (line, col.unwrap_or(1)));
+                    let key = ask_key(dir.as_deref(), &path);
+                    match self.links.checked.get(&key) {
+                        _ if self.links.asking.contains(&key) => {
+                            self.links.waiting = Some((key, at));
+                            return None;
+                        }
+                        Some(checked) if checked.at.elapsed() < CHECKED_FOR => {
+                            match checked.found.clone() {
+                                Some(found) => opening(found, at),
+                                None => continue,
+                            }
+                        }
+                        _ => {
+                            let passive = !self.links.ctrl;
+                            if self.check_path(path, dir, key.clone(), passive, cx) {
+                                self.links.waiting = Some((key, at));
+                                return None;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            };
+            return Some(Hover {
+                start,
+                end,
+                soft: false,
+                open,
+            });
+        }
+        None
     }
 
     /// 路径 `raw` 可能指的几处，挨个问；还有问的时候用的通道。`dir` 是提示符里写的目录（见
@@ -685,13 +860,13 @@ impl TerminalView {
                         this.hover_link(position, ctrl, cx);
                     }
                     let menu = this.menu_answered(&key, &found, cx);
-                    let clicked = this
-                        .links
-                        .pending
-                        .take_if(|pending| pending.key == key)
-                        .and_then(|pending| {
-                            Some((opening(found.clone()?, pending.at), pending.window))
-                        });
+                    let clicked = match this.links.pending.take_if(|pending| pending.key == key) {
+                        Some(pending) => match found.clone() {
+                            Some(found) => Some((opening(found, pending.at), pending.window)),
+                            None => this.pending_next(pending),
+                        },
+                        None => None,
+                    };
                     (clicked, menu)
                 })
                 .unwrap_or_default();
@@ -715,6 +890,23 @@ impl TerminalView {
         })
         .detach();
         true
+    }
+
+    /// 按住 Ctrl 单击时等着的写法问到不在：鼠标底下已经认出了别的写法（问到的时候重新看过）就开它，
+    /// 别的写法还在问就接着等它。
+    fn pending_next(&mut self, pending: Pending) -> Option<(Open, AnyWindowHandle)> {
+        if let Some(hover) = &self.links.hover {
+            return Some((hover.open.clone(), pending.window));
+        }
+        let (key, at) = self.links.waiting.clone()?;
+        if key != pending.key {
+            self.links.pending = Some(Pending {
+                key,
+                at,
+                window: pending.window,
+            });
+        }
+        None
     }
 
     /// 本机的仓库：当场看路径 `raw` 在不在（右键菜单要马上列出来），结果记下。看不了（不是本机的
@@ -752,10 +944,22 @@ impl TerminalView {
         if asked != key {
             return None;
         }
-        menu.state = match found {
-            Some(found) => MenuState::Ready(opening(found.clone(), *at)),
-            None => MenuState::Missing,
-        };
+        let at = *at;
+        match found {
+            Some(found) => menu.state = MenuState::Ready(opening(found.clone(), at)),
+            // 不在：后面还有写法的接着看（程序换行接起来的不在，退回只看这一行的）
+            None => {
+                let rest = std::mem::take(&mut menu.rest);
+                match self.menu_for(rest, cx) {
+                    Some(next) => self.links.menu = Some(next),
+                    None => {
+                        if let Some(menu) = self.links.menu.as_mut() {
+                            menu.state = MenuState::Missing;
+                        }
+                    }
+                }
+            }
+        }
         cx.notify();
         let (view, window) = self.links.menu_view.clone()?;
         Some((view.upgrade()?, window))
@@ -814,50 +1018,70 @@ impl TerminalView {
         self.links.menu = None;
         self.links.menu_view = None;
         self.hide_link_tip(cx);
-        let Some((start, end, target, dir)) = self.target_at(position) else {
+        let mut rest = self.targets_at(position);
+        rest.reverse();
+        let Some(menu) = self.menu_for(rest, cx) else {
             return false;
         };
-        let (shown, state) = match target {
-            Target::Url(url) => (url.clone(), MenuState::Ready(Open::Url(url))),
-            Target::Path { path, line, col } => {
-                let at = line.map(|line| (line, col.unwrap_or(1)));
-                let shown = match line {
-                    Some(line) => format!("{path}:{line}"),
-                    None => path.clone(),
-                };
-                let key = ask_key(dir.as_deref(), &path);
-                let fresh = self
-                    .links
-                    .checked
-                    .get(&key)
-                    .is_some_and(|checked| checked.at.elapsed() < CHECKED_FOR);
-                // 没问过的：本机的当场看；主机上的去问，菜单先列「正在查找…」
-                if !fresh
-                    && !self.links.asking.contains(&key)
-                    && self.check_now(&path, dir.as_deref(), &key, cx).is_none()
-                    && !self.check_path(path.clone(), dir.clone(), key.clone(), false, cx)
-                {
-                    return false;
-                }
-                let state = match self.links.checked.get(&key) {
-                    _ if self.links.asking.contains(&key) => MenuState::Asking(key, at),
-                    Some(Checked {
-                        found: Some(found), ..
-                    }) => MenuState::Ready(opening(found.clone(), at)),
-                    _ => return false,
-                };
-                (shown, state)
-            }
-        };
-        log::info!("右键点在终端里的链接上：{}", middle_cut(&shown, SHOWN_MAX));
-        self.links.menu = Some(LinkMenu {
-            start,
-            end,
-            shown,
-            state,
-        });
+        log::info!(
+            "右键点在终端里的链接上：{}",
+            middle_cut(&menu.shown, SHOWN_MAX)
+        );
+        self.links.menu = Some(menu);
         cx.notify();
         true
+    }
+
+    /// 链接菜单说哪个：`rest`（倒着放，最后一个先看）里第一个认得出的。路径没问过的本机的当场看，
+    /// 主机上的去问、菜单先列「正在查找…」；问过了、不在的看下一个。都不算链接时是 None。
+    fn menu_for(&mut self, mut rest: Vec<Candidate>, cx: &mut Context<Self>) -> Option<LinkMenu> {
+        while let Some(Candidate {
+            start,
+            end,
+            target,
+            dir,
+        }) = rest.pop()
+        {
+            let (shown, state) = match target {
+                Target::Url(url) => (url.clone(), MenuState::Ready(Open::Url(url))),
+                Target::Path { path, line, col } => {
+                    let at = line.map(|line| (line, col.unwrap_or(1)));
+                    let shown = match line {
+                        Some(line) => format!("{path}:{line}"),
+                        None => path.clone(),
+                    };
+                    let key = ask_key(dir.as_deref(), &path);
+                    let fresh = self
+                        .links
+                        .checked
+                        .get(&key)
+                        .is_some_and(|checked| checked.at.elapsed() < CHECKED_FOR);
+                    if !fresh
+                        && !self.links.asking.contains(&key)
+                        && self.check_now(&path, dir.as_deref(), &key, cx).is_none()
+                        && !self.check_path(path.clone(), dir.clone(), key.clone(), false, cx)
+                    {
+                        continue;
+                    }
+                    let state = match self.links.checked.get(&key) {
+                        _ if self.links.asking.contains(&key) => MenuState::Asking(key, at),
+                        Some(Checked {
+                            found: Some(found), ..
+                        }) => MenuState::Ready(opening(found.clone(), at)),
+                        _ => continue,
+                    };
+                    (shown, state)
+                }
+            };
+            return Some(LinkMenu {
+                start,
+                end,
+                shown,
+                state,
+                rest,
+            });
+        }
+        None
     }
 
     /// 链接菜单里点了一项。
@@ -1132,7 +1356,7 @@ fn opening((place, dir): (Place, bool), at: Option<(u32, u32)>) -> Open {
 
 #[cfg(test)]
 mod tests {
-    use super::{GridColumn, GridLine, GridPoint, Target, Term, find, prompt_dir_above};
+    use super::{GridColumn, GridLine, GridPoint, Target, Term, candidates, prompt_dir_above};
     use crate::terminal::{Grid, Proxy};
     use alacritty_terminal::vte::ansi::Processor;
 
@@ -1146,6 +1370,109 @@ mod tests {
 
     fn at(line: i32, col: usize) -> GridPoint {
         GridPoint::new(GridLine(line), GridColumn(col))
+    }
+
+    /// 排在最前面的那个写法
+    fn find(term: &Term<Proxy>, point: GridPoint) -> Option<(GridPoint, GridPoint, Target)> {
+        candidates(term, point).into_iter().next()
+    }
+
+    fn path(path: &str) -> Target {
+        Target::Path {
+            path: path.into(),
+            line: None,
+            col: None,
+        }
+    }
+
+    #[test]
+    fn 程序自己换行的长路径接起来() {
+        // Claude Code 的回复：路径写到行尾就断开，下一行按段落缩进两格接着写（中间是 `\r\n`，没有
+        // 终端的折行标记）。30 列：两行都正好写满
+        let first = r"  open C:\work\kuai\docs\desig";
+        assert_eq!(first.len(), 30);
+        let output = format!("{first}\r\n  n\\terminal-launcher.html. ok");
+        let t = term(30, 4, output.as_bytes());
+        let joined = r"C:\work\kuai\docs\design\terminal-launcher.html";
+        // 鼠标在前一截、后一截都一样；句末的点不算
+        for point in [at(0, 10), at(0, 29), at(1, 2), at(1, 20)] {
+            let found = candidates(&t, point);
+            assert_eq!(found[0], (at(0, 7), at(1, 25), path(joined)), "{point:?}");
+        }
+        // 接起来的问过不在时退回只看这一行的
+        assert_eq!(
+            candidates(&t, at(0, 10))[1],
+            (at(0, 7), at(0, 29), path(r"C:\work\kuai\docs\desig"))
+        );
+        // 后面的字、缩进上没有
+        assert!(find(&t, at(1, 28)).is_none());
+        assert!(find(&t, at(1, 0)).is_none());
+
+        // 接三行：中间一行整行都是路径
+        let long = term(
+            20,
+            5,
+            b"  see src/aaaaaaaaaa\r\n  bbbbbbbbbbbbbbbbbb\r\n  cc.rs:12 ok",
+        );
+        for point in [at(0, 8), at(1, 9), at(2, 3)] {
+            let (start, end, target) = find(&long, point).expect("link");
+            assert_eq!((start, end), (at(0, 6), at(2, 9)), "{point:?}");
+            assert_eq!(
+                target,
+                Target::Path {
+                    path: "src/aaaaaaaaaabbbbbbbbbbbbbbbbbbcc.rs".into(),
+                    line: Some(12),
+                    col: None,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn 没写满的行不接_写满的退回只看这一行() {
+        // 行尾留着空：下一行的字不是接着写的
+        let short = term(30, 3, b"  see src/main.rs\r\n  for details");
+        assert_eq!(
+            candidates(&short, at(0, 8)),
+            vec![(at(0, 6), at(0, 16), path("src/main.rs"))]
+        );
+        // 正好写满、下一个词换到了下一行：先试接起来的，查不到再用这一行的
+        let first = "  see this file: src/main.rs";
+        let full = term(
+            first.len(),
+            3,
+            format!("{first}\r\n  for details").as_bytes(),
+        );
+        let found = candidates(&full, at(0, 20));
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[1], (at(0, 17), at(0, 27), path("src/main.rs")));
+    }
+
+    #[test]
+    fn 程序换行的网址_接上的一截像网址才接() {
+        let first = "  see https://example.com/docs/ver";
+        let wrapped = term(
+            first.len(),
+            3,
+            format!("{first}\r\n  sion/guide.html for more").as_bytes(),
+        );
+        let (start, end, target) = find(&wrapped, at(1, 4)).expect("link");
+        assert_eq!((start, end), (at(0, 6), at(1, 16)));
+        assert_eq!(
+            target,
+            Target::Url("https://example.com/docs/version/guide.html".into())
+        );
+        // 下一行是普通的词：网址不问在不在，不接
+        let first = "  see https://example.com/docs";
+        let plain = term(first.len(), 3, format!("{first}\r\n  for more").as_bytes());
+        assert_eq!(
+            candidates(&plain, at(0, 10)),
+            vec![(
+                at(0, 6),
+                at(0, 29),
+                Target::Url("https://example.com/docs".into())
+            )]
+        );
     }
 
     #[test]

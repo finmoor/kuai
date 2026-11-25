@@ -440,6 +440,14 @@ pub struct Settings {
     /// 「新终端」按钮、Ctrl+Shift+` 开哪个预设（它的 id）；空着是只开 shell
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub terminal_default: String,
+    /// 从预设开的、还开着的终端（见 `presets.rs` 的 `Started`）：重开 Kuai 以后接回来的终端还叫
+    /// 预设的名字、画它的图标，重启时再输入它的命令。只记这台电脑上开的
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub started_terms: Vec<crate::presets::StartedRecord>,
+    /// 改过的快捷键：操作（`keymap.rs` 里的 id）→ 现在的键（GPUI 的写法，空的是去掉了）。没改过的
+    /// 不存，用默认的
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub keymap: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub layout: Layout,
     // 1.16 以前仓库页「全部仓库」里卡片的收起、展开记在 collapsed_cards、expanded_cards 里；
@@ -704,6 +712,8 @@ impl Default for Settings {
             terminal: TerminalSettings::default(),
             terminal_presets: None,
             terminal_default: String::new(),
+            started_terms: Vec::new(),
+            keymap: std::collections::BTreeMap::new(),
             layout: Layout::default(),
             folded_subs: Vec::new(),
             unfolded_subs: Vec::new(),
@@ -765,6 +775,13 @@ impl Settings {
                 .unwrap_or(0);
         }
         self.terminal.normalize();
+        // 预设列表里内置预设以前的命令换成现在的；换完和内置的一样就不存列表（同 `presets::edit`）
+        if let Some(list) = &mut self.terminal_presets {
+            crate::presets::upgrade_builtins(list);
+            if *list == crate::presets::builtins() {
+                self.terminal_presets = None;
+            }
+        }
         // 跳板机：指向不存在的服务器、绕回自己的（手改设置文件才会有）都去掉
         for index in 0..self.servers.len() {
             let Some(jump) = self.servers[index].jump.clone() else {
@@ -784,6 +801,8 @@ impl Settings {
         // 仓库记的东西：空的不留，服务器移除了它上面的仓库的也不留。仓库从列表里移除时另外清掉
         self.repo_memos
             .retain(|memo| !memo.is_empty() && memo.repo.server.as_deref().is_none_or(known));
+        self.started_terms
+            .retain(|record| record.slot.entry.server.as_deref().is_none_or(known));
         let mut seen = std::collections::HashSet::new();
         self.folded_subs
             .retain(|e| e.server.as_deref().is_none_or(known) && seen.insert(e.clone()));

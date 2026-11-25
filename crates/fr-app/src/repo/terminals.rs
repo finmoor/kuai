@@ -66,6 +66,8 @@ struct Waiting {
     alive: bool,
     /// kuaid 给它的编号：接上时按编号接（见 [`TerminalView::attach_to`]）
     term: String,
+    /// 开了多久（秒，问到的那一刻）：认上次存下的从预设开的终端用（见 `presets::confirm`）
+    age: u64,
 }
 
 /// 一个仓库的终端们。
@@ -158,13 +160,40 @@ pub fn end_parked_terminals(entry: &RepoEntry, cx: &mut App) {
 }
 
 /// 一个终端的右键菜单：发送文件、重启、结束。侧栏里那一行、图标栏上的序号都用它。
+/// 在 `view` 这个仓库里的 `dir` 目录（相对仓库根，空的是仓库根）新建终端的菜单（见 [`presets::menu`]），
+/// 选了就在那里开；`place` 写在「运行命令」对话框的标题里（见 [`RepoView::launch_place`]）。
+pub(super) fn launch_menu(
+    view: WeakEntity<RepoView>,
+    place: SharedString,
+    dir: String,
+) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+    let on_start: presets::OnStart = Rc::new(move |start, window, cx| {
+        view.update(cx, |this, cx| {
+            this.new_terminal_with(dir.clone(), start, window, cx)
+        })
+        .ok();
+    });
+    presets::menu_builder(place, on_start)
+}
+
 fn terminal_menu(
     view: WeakEntity<RepoView>,
     index: usize,
 ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
-    move |menu, _, _| {
+    move |menu, window, cx| {
         let (attach, restart, end) = (view.clone(), view.clone(), view.clone());
-        menu.item(
+        // 和会话页终端行的右键一样，先是「新建终端 ▸」（在这个仓库里）
+        let place = view
+            .upgrade()
+            .map(|this| this.read(cx).launch_place("", cx))
+            .unwrap_or_default();
+        menu.submenu(
+            tr("新建终端"),
+            window,
+            cx,
+            launch_menu(view.clone(), place, String::new()),
+        )
+        .item(
             PopupMenuItem::new(tr("发送图片或文件…")).on_click(move |_, window, cx| {
                 attach
                     .update(cx, |this, cx| this.attach_to_terminal(index, window, cx))
@@ -330,6 +359,8 @@ impl RepoView {
                 number: row.number,
                 alive: row.alive,
                 term: row.id.term.clone(),
+                // 实时列表到的时候已经对过存下的预设了（`TermBoard::arrived`），用不着
+                age: 0,
             })
             .collect();
         if waiting != self.terminals.waiting {
@@ -430,6 +461,7 @@ impl RepoView {
                         number: terminal::session_number(&repo, &term.key)?,
                         alive: term.alive,
                         term: term.term.clone(),
+                        age: term.age,
                     })
                 })
                 .collect();
@@ -442,6 +474,14 @@ impl RepoView {
     /// 记下问到的留着的终端（[`Self::waiting_list`]），到终端页时接上。
     fn set_waiting(&mut self, mut found: Vec<Waiting>, cx: &mut Context<Self>) {
         self.terminals.listed = true;
+        // 上次运行时存下的从预设开的终端：对上了，接回来时叫预设的名字
+        for waiting in &found {
+            let slot = TermSlot {
+                entry: self.entry.clone(),
+                number: waiting.number,
+            };
+            presets::confirm(&slot, &waiting.term, waiting.age, cx);
+        }
         // 实时列表读到了就以它为准（它一直跟着变，这里问到的只是这一刻的）
         if self.board_rows(cx).is_some() {
             return;
@@ -651,19 +691,8 @@ impl RepoView {
         self.show_page(Page::Files, window, cx);
     }
 
-    /// 再开一个终端，开在仓库里的 `dir` 目录（相对仓库根；文件页的「在此新建终端」），切到终端页
-    /// 显示它。运行「默认运行」的那个预设。
-    pub(super) fn new_terminal_in(
-        &mut self,
-        dir: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let start = presets::default_start(cx);
-        self.new_terminal_with(dir, start, window, cx);
-    }
-
-    /// 同 [`Self::new_terminal_in`]，在新开的 shell 里输入 `start`（None 是只开 shell）。
+    /// 再开一个终端，开在仓库里的 `dir` 目录（相对仓库根，空的是仓库根；文件页的「终端」、目录树的
+    /// 「在此新建终端」），切到终端页显示它，在新开的 shell 里输入 `start`（None 是只开 shell）。
     ///
     /// 终端按名字（第几个）开，kuaid 里正好留着同名的就是接上它。还不知道留着哪几个时（还在连、
     /// 刚连上，实时列表和问的那一次都还没回来）先问一遍：留着的先接回来，新的用空着的序号。
@@ -745,22 +774,44 @@ impl RepoView {
 
     /// 再开一个终端（侧栏的「新终端」、Ctrl+Shift+`），切到终端页显示它。运行「默认运行」的那个预设。
     pub fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_terminal_in(String::new(), window, cx);
+        let start = presets::default_start(cx);
+        self.new_terminal_with(String::new(), start, window, cx);
     }
 
-    /// 新建终端的菜单（「新终端」的 ⌄、图标栏上 + 的右键、没有终端时的 ⌄）：选了就在这个仓库里开。
+    /// 在仓库根新开一个终端，输入 `start`（None 是只开 shell）：给预设设的快捷键。
+    pub fn new_terminal_running(
+        &mut self,
+        start: Option<Start>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_terminal_with(String::new(), start, window, cx);
+    }
+
+    /// 新建终端的菜单（「新终端」的 ⌄、图标栏上的 +、没有终端时的 ⌄）：选了就在这个仓库里开。
     fn presets_menu(
         &self,
         cx: &mut Context<Self>,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
-        let view = cx.entity().downgrade();
-        let on_start: presets::OnStart = Rc::new(move |start, window, cx| {
-            view.update(cx, |this, cx| {
-                this.new_terminal_with(String::new(), start, window, cx)
-            })
-            .ok();
-        });
-        presets::menu_builder(self.app.read(cx).repo_name(&self.entry), on_start)
+        self.presets_menu_in(String::new(), cx)
+    }
+
+    /// 在仓库里的 `dir` 目录（相对仓库根，空的是仓库根）新建终端的菜单：文件页工具栏的「终端」、目录树
+    /// 右键的「在此新建终端」也用它。「运行命令」对话框的标题写这个目录。
+    pub(super) fn presets_menu_in(
+        &self,
+        dir: String,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        launch_menu(cx.entity().downgrade(), self.launch_place(&dir, cx), dir)
+    }
+
+    /// 「运行命令」对话框的标题里写的开在哪：仓库根是仓库名，子目录是它相对仓库根的路径。
+    pub(super) fn launch_place(&self, dir: &str, cx: &App) -> SharedString {
+        match dir.is_empty() {
+            true => self.app.read(cx).repo_name(&self.entry),
+            false => dir.to_string().into(),
+        }
     }
 
     /// 终端页上正显示着的是第几个终端；不在终端页、这一页没显示出来时是 None。
@@ -1017,18 +1068,22 @@ impl RepoView {
                     .size_3p5()
                     .text_color(presets::color(&preset.icon, preset.hue, cx)),
                 preset.name.clone().into(),
-                tf!(
-                    "新建终端并运行 {command}（Ctrl+Shift+`）",
-                    command = preset.command.clone()
-                )
-                .into(),
+                crate::keymap::with_key(
+                    &tf!(
+                        "新建终端并运行 {name}（Ctrl+Shift+`）",
+                        name = preset.name.clone()
+                    ),
+                    "new.default",
+                    cx,
+                ),
             ),
             None => (
                 ui::icon(IconName::Plus).text_color(muted),
                 tr("新终端").into(),
-                tr("新建终端（Ctrl+Shift+`）").into(),
+                crate::keymap::with_key(tr("新建终端（Ctrl+Shift+`）"), "new.default", cx),
             ),
         };
+        let shortcut = crate::keymap::label("new.default", cx);
         let new_button = h_flex()
             .h(px(24.))
             .rounded(px(ui::RADIUS))
@@ -1051,13 +1106,15 @@ impl RepoView {
                     .hover(|s| s.bg(hover))
                     .child(icon.flex_none())
                     .child(div().flex_1().min_w_0().truncate().child(label))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(11.))
-                            .text_color(muted)
-                            .child("Ctrl+Shift+`"),
-                    )
+                    .when_some(shortcut, |row, keys| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.))
+                                .text_color(muted)
+                                .child(keys),
+                        )
+                    })
                     .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
                     .on_click(cx.listener(|this, _, window, cx| this.new_terminal(window, cx))),
             )
@@ -1246,12 +1303,12 @@ impl RepoView {
                     .into_any_element()
             })
             .collect();
+        // 最后的 +：只有图标，点了弹新建终端的菜单（和侧栏的「新终端」不同，那里一下开默认运行的）
         let menu = self.presets_menu(cx);
         items.push(
             super::rail::rail_button("rail-term-new", IconName::Plus, false)
-                .tooltip(tr("新终端（Ctrl+Shift+`），右键选择要运行的程序"))
-                .on_click(cx.listener(|this, _, window, cx| this.new_terminal(window, cx)))
-                .context_menu(menu)
+                .tooltip(tr("新建终端"))
+                .dropdown_menu_with_anchor(Anchor::LeftCenter, menu)
                 .into_any_element(),
         );
         items

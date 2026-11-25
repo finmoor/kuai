@@ -372,6 +372,8 @@ impl TermBoard {
 
     /// 一台电脑推来一份终端列表。`first`：这次订阅的第一份。
     fn arrived(&mut self, machine: &str, list: Vec<TermInfo>, first: bool, cx: &mut Context<Self>) {
+        // 上次运行时存下的从预设开的终端，趁「开了多久」还是这一刻的对一遍
+        crate::presets::reconcile(machine, &list, cx);
         let now = Instant::now();
         let old = self.lists.remove(machine).unwrap_or_default();
         let app = self.app.read(cx);

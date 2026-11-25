@@ -53,10 +53,17 @@ pub enum PageEvent {
     Rename(RepoEntry),
     /// 到会话页看这个仓库的终端
     Terminals(RepoEntry),
-    /// 在这个仓库里新开一个终端，运行「默认运行」的那个预设
-    NewTerminal(RepoEntry),
     /// 在这个仓库里新开一个终端，运行选的这个（None 是只开 shell）
     RunInTerminal(RepoEntry, Option<crate::presets::Start>),
+}
+
+/// 新建终端的菜单里选了：让主窗口在 `entry` 里新开一个终端（到会话页显示）。
+fn run_in(page: WeakEntity<WorkspacePage>, entry: RepoEntry) -> crate::presets::OnStart {
+    Rc::new(move |start, _, cx| {
+        let entry = entry.clone();
+        page.update(cx, |_, cx| cx.emit(PageEvent::RunInTerminal(entry, start)))
+            .ok();
+    })
 }
 
 pub struct WorkspacePage {
@@ -1069,29 +1076,23 @@ impl WorkspacePage {
                             .ok();
                     },
                 ));
+                // 新建终端：子仓库的行也有（开在子仓库里）
+                let place = term
+                    .0
+                    .upgrade()
+                    .map(|page| page.read(cx).app.read(cx).repo_name(&term.1))
+                    .unwrap_or_default();
+                let menu = menu.submenu(
+                    tr("新建终端"),
+                    window,
+                    cx,
+                    crate::presets::menu_builder(place, run_in(term.0, term.1)),
+                );
                 let menu = match sub {
                     true => menu,
                     false => {
                         let leave_key = menu_key.clone();
-                        let place = term
-                            .0
-                            .upgrade()
-                            .map(|page| page.read(cx).app.read(cx).repo_name(&term.1))
-                            .unwrap_or_default();
-                        let on_start: crate::presets::OnStart = Rc::new(move |start, _, cx| {
-                            let (entry, start) = (term.1.clone(), start);
-                            term.0
-                                .update(cx, |_, cx| cx.emit(PageEvent::RunInTerminal(entry, start)))
-                                .ok();
-                        });
-                        menu.submenu(
-                            tr("新建终端"),
-                            window,
-                            cx,
-                            crate::presets::menu_builder(place, on_start),
-                        )
-                        .separator()
-                        .item(
+                        menu.separator().item(
                             PopupMenuItem::new(tr("移出工作区"))
                                 .disabled(!writable)
                                 .on_click(move |_, window, cx| {
@@ -1162,16 +1163,20 @@ impl WorkspacePage {
                 }
             };
             let (term_entry, leave_entry, leave_key) = (entry.clone(), entry.clone(), key.clone());
+            let place = self.app.read(cx).repo_name(entry);
             let actions = vec![
+                // 只有图标：点了弹新建终端的菜单
                 Button::new(("ws-term", ix))
                     .ghost()
                     .xsmall()
                     .icon(ui::icon(IconName::SquareTerminal))
                     .tooltip(tr("新建终端"))
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.stop_propagation();
-                        cx.emit(PageEvent::NewTerminal(term_entry.clone()));
-                    }))
+                    // 不当作点了这一行
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .dropdown_menu(crate::presets::menu_builder(
+                        place,
+                        run_in(cx.entity().downgrade(), term_entry),
+                    ))
                     .into_any_element(),
                 Button::new(("ws-leave", ix))
                     .ghost()

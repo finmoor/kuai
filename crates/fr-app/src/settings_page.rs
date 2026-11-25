@@ -1,5 +1,5 @@
 //! 设置页：常规（语言、开机自启、托盘）、外观（深色浅色、配色）、终端（新建终端的预设、字体、光标、
-//! 滚动和复制）、关于（版本、检查更新、源代码）。
+//! 滚动和复制）、快捷键（见 `keys_page.rs`）、关于（版本、检查更新、源代码）。
 //!
 //! 每一项改了马上生效、马上存盘，没有「确定」「应用」。这里只改 [`AppState`] 里的设置；
 //! 换主题、换语言、建托盘图标这些要动窗口的事，由主窗口（`workspace.rs`）看到设置变了再去做。
@@ -36,6 +36,8 @@ pub struct SettingsPage {
     /// 别处要打开设置的某一页时用（界面库的设置页只认第一次画时给的页）
     generation: usize,
     start_page: usize,
+    /// 快捷键那一页：第一次画的时候建（里面的搜索框要窗口）
+    keys: Option<Entity<crate::keys_page::KeysPage>>,
     _observe: [Subscription; 2],
 }
 
@@ -51,6 +53,7 @@ impl SettingsPage {
             updater,
             generation: 0,
             start_page: 0,
+            keys: None,
             _observe: observe,
         }
     }
@@ -62,7 +65,22 @@ impl SettingsPage {
         cx.notify();
     }
 
-    fn general(&self) -> SettingPage {
+    /// 快捷键：上面键盘图、下面分组列出，整页由 [`crate::keys_page::KeysPage`] 画。
+    fn shortcuts(&self, keys: Entity<crate::keys_page::KeysPage>) -> SettingPage {
+        SettingPage::new(tr("快捷键"))
+            .icon(Icon::new(IconName::Keyboard))
+            .resettable(false)
+            .description(tr(
+                "焦点在终端中时，只有终端中可用的快捷键由 Kuai 处理，其余按键交给终端中的程序。",
+            ))
+            .group(
+                SettingGroup::new()
+                    .variant(GroupBoxVariant::Normal)
+                    .item(SettingItem::render(move |_, _, _| keys.clone())),
+            )
+    }
+
+    fn general(&self, cx: &App) -> SettingPage {
         let app = self.app.clone();
         let language = {
             let (get, set) = (app.clone(), app.clone());
@@ -190,9 +208,32 @@ impl SettingsPage {
                     },
                 ),
             )
-            .description(tr(
-                "关闭可避免误关；仍可用中键、Ctrl+W 或右键菜单关闭，Ctrl+Shift+T 恢复。",
-            ))
+            // 键写现在的。键夹在句子中间，去掉了不能只删键（会剩「， 恢复」），按有没有键换整句
+            .description(
+                match (
+                    crate::keymap::label("tab.close", cx),
+                    crate::keymap::label("tab.reopen", cx),
+                ) {
+                    (Some(close), Some(reopen)) => tf!(
+                        "关闭可避免误关；仍可用中键、{close} 或右键菜单关闭，{reopen} 恢复。",
+                        close,
+                        reopen
+                    ),
+                    (None, Some(reopen)) => {
+                        tf!(
+                            "关闭可避免误关；仍可用中键或右键菜单关闭，{reopen} 恢复。",
+                            reopen
+                        )
+                    }
+                    (Some(close), None) => {
+                        tf!(
+                            "关闭可避免误关；仍可用中键、{close} 或右键菜单关闭。",
+                            close
+                        )
+                    }
+                    (None, None) => tr("关闭可避免误关；仍可用中键或右键菜单关闭。").to_string(),
+                },
+            )
         };
         SettingPage::new(tr("常规"))
             .icon(Icon::new(IconName::Settings2))
@@ -1019,8 +1060,13 @@ fn report(text: String, cx: &mut App) {
 }
 
 impl Render for SettingsPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let bg = cx.theme().background;
+        let app = self.app.clone();
+        let keys = self
+            .keys
+            .get_or_insert_with(|| cx.new(|cx| crate::keys_page::KeysPage::new(app, window, cx)))
+            .clone();
         div()
             .id(("settings-page", self.generation))
             .size_full()
@@ -1034,9 +1080,10 @@ impl Render for SettingsPage {
                         group_ix: None,
                     })
                     .pages([
-                        self.general(),
+                        self.general(cx),
                         self.appearance(),
                         self.terminal(cx),
+                        self.shortcuts(keys),
                         self.about(),
                     ]),
             )

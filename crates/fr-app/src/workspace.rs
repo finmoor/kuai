@@ -300,6 +300,9 @@ impl Workspace {
                     this.show_workspaces_of(machine.clone(), window, cx)
                 }
                 ManagerEvent::Terminals(entry) => this.show_terminals_of(entry, window, cx),
+                ManagerEvent::RunInTerminal(entry, start) => {
+                    this.new_terminal_for(entry.clone(), start.clone(), window, cx)
+                }
             }),
             cx.subscribe_in(
                 &workspaces,
@@ -318,10 +321,6 @@ impl Workspace {
                     } => this.open_all(entries.clone(), *show, home.clone(), window, cx),
                     PageEvent::Rename(entry) => this.rename_repo(entry.clone(), window, cx),
                     PageEvent::Terminals(entry) => this.show_terminals_of(entry, window, cx),
-                    PageEvent::NewTerminal(entry) => {
-                        let start = crate::presets::default_start(cx);
-                        this.new_terminal_for(entry.clone(), start, window, cx)
-                    }
                     PageEvent::RunInTerminal(entry, start) => {
                         this.new_terminal_for(entry.clone(), start.clone(), window, cx)
                     }
@@ -1118,7 +1117,7 @@ impl Workspace {
         }
     }
 
-    /// 工作区页上点了一个仓库的「新建终端」：到会话页，在这个仓库里新开一个，输入 `start`。
+    /// 工作区页、主机页上选了一个仓库的「新建终端」：到会话页，在这个仓库里新开一个，输入 `start`。
     fn new_terminal_for(
         &mut self,
         entry: RepoEntry,
@@ -1902,15 +1901,45 @@ impl Workspace {
 
     /// Ctrl+Shift+`：当前仓库再开一个终端，切到它的终端页显示它（在会话页上时开在那里）。
     pub fn new_terminal_in_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // 会话页上：开在那里选中的仓库里
+        let start = crate::presets::default_start(cx);
+        self.start_terminal_in_active(start, window, cx);
+    }
+
+    /// 给预设设的快捷键（设置 → 快捷键）：新开一个终端运行它。`preset` 是预设的 id，空的是只开
+    /// shell；预设已经删了就不开。
+    pub fn run_preset_in_active(
+        &mut self,
+        preset: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let start = match preset.is_empty() {
+            true => None,
+            false => match crate::presets::all(cx).into_iter().find(|p| p.id == preset) {
+                Some(found) => Some(crate::presets::Start::of(&found)),
+                None => return,
+            },
+        };
+        self.start_terminal_in_active(start, window, cx);
+    }
+
+    /// 新开一个终端，输入 `start`（None 是只开 shell）：会话页上开在那里选中的仓库里，别处开在
+    /// 当前仓库里。
+    fn start_terminal_in_active(
+        &mut self,
+        start: Option<crate::presets::Start>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.page == Page::Terms && !self.showing_settings {
-            self.overview
-                .update(cx, |overview, cx| overview.new_terminal_here(window, cx));
+            self.overview.update(cx, |overview, cx| {
+                overview.new_terminal_here(start, window, cx)
+            });
             return;
         }
         if let Some(tab) = self.active_repo() {
             tab.shown(cx)
-                .update(cx, |view, cx| view.new_terminal(window, cx));
+                .update(cx, |view, cx| view.new_terminal_running(start, window, cx));
         }
     }
 
@@ -2346,7 +2375,7 @@ impl Workspace {
                         n = n.to_string()
                     ),
                 };
-                ui::tip(text, window, cx)
+                ui::tip(crate::keymap::with_key(&text, "page.hub", cx), window, cx)
             });
         let workspaces_label = trc("页面", "工作区");
         let workspaces = self
@@ -2365,8 +2394,14 @@ impl Workspace {
         let travel = |back: bool, cx: &mut Context<Self>| {
             let target = self.travel_target(back, cx);
             let tip: SharedString = match (&target, back) {
-                (Some(to), true) => tf!("返回：{to}（Alt+←）", to = to.clone()).into(),
-                (Some(to), false) => tf!("前进：{to}（Alt+→）", to = to.clone()).into(),
+                (Some(to), true) => {
+                    let tip = tf!("返回：{to}（Alt+←）", to = to.clone());
+                    crate::keymap::with_key(&tip, "back", cx)
+                }
+                (Some(to), false) => {
+                    let tip = tf!("前进：{to}（Alt+→）", to = to.clone());
+                    crate::keymap::with_key(&tip, "forward", cx)
+                }
                 (None, true) => tr("没有可返回的页面").into(),
                 (None, false) => tr("没有可前进的页面").into(),
             };
@@ -2469,7 +2504,11 @@ impl Workspace {
                         .ghost()
                         .xsmall()
                         .icon(ui::icon(IconName::Plus))
-                        .tooltip(tr("打开仓库（Ctrl+P）"))
+                        .tooltip(crate::keymap::with_key(
+                            tr("打开仓库（Ctrl+P）"),
+                            "quick",
+                            cx,
+                        ))
                         .on_click(cx.listener(|this, _, window, cx| this.quick_open(window, cx))),
                 ),
             )
@@ -2526,7 +2565,11 @@ impl Workspace {
                                 .ghost()
                                 .small()
                                 .icon(ui::icon(IconName::Settings))
-                                .tooltip(tr("设置（Ctrl+,）"))
+                                .tooltip(crate::keymap::with_key(
+                                    tr("设置（Ctrl+,）"),
+                                    "settings",
+                                    cx,
+                                ))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.toggle_settings(window, cx)
                                 })),
@@ -2716,13 +2759,17 @@ fn tab_menu(
             }),
         )
         .item(
-            PopupMenuItem::new(tr("重新打开已关闭的标签页（Ctrl+Shift+T）"))
-                .disabled(!can_reopen)
-                .on_click(move |_, window, cx| {
-                    reopen
-                        .update(cx, |this, cx| this.reopen_closed(window, cx))
-                        .ok();
-                }),
+            PopupMenuItem::new(crate::keymap::with_key(
+                tr("重新打开已关闭的标签页（Ctrl+Shift+T）"),
+                "tab.reopen",
+                cx,
+            ))
+            .disabled(!can_reopen)
+            .on_click(move |_, window, cx| {
+                reopen
+                    .update(cx, |this, cx| this.reopen_closed(window, cx))
+                    .ok();
+            }),
         )
         .separator();
     let add = crate::ws_links::plain_add(app);

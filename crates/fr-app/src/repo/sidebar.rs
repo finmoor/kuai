@@ -640,7 +640,11 @@ impl RepoView {
                         .xsmall()
                         .flex_none()
                         .icon(ui::icon(IconName::PanelLeftClose).text_color(muted))
-                        .tooltip(tr("收起侧栏（Ctrl+Shift+B）"))
+                        .tooltip(crate::keymap::with_key(
+                            tr("收起侧栏（Ctrl+Shift+B）"),
+                            "sidebar",
+                            cx,
+                        ))
                         .on_click(
                             cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx)),
                         ),
@@ -800,9 +804,18 @@ impl RepoView {
                         cell.child(div().flex_none().size(px(6.)).rounded_full().bg(accent))
                     }
                 })
-                .tooltip(move |window, cx| match cut {
-                    true => ui::two_line_tip(label.into(), tip.into(), window, cx),
-                    false => ui::tip(tip, window, cx),
+                .tooltip(move |window, cx| {
+                    // 快捷键写现在的（设置 → 快捷键里改过的跟着变）
+                    let keys: &[&str] = match page {
+                        Page::Git => &["page.changes", "page.history"],
+                        Page::Terminal => &["page.terminal"],
+                        Page::Files => &["page.files"],
+                    };
+                    let tip = crate::keymap::with_keys(tip, keys, cx);
+                    match cut {
+                        true => ui::two_line_tip(label.into(), tip, window, cx),
+                        false => ui::tip(tip, window, cx),
+                    }
                 })
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if this.page != page {

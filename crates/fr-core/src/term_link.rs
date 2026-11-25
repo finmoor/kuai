@@ -146,8 +146,9 @@ fn file_url_path(rest: &str) -> String {
 }
 
 /// 路径里能有的字：空白、引号、括号、逗号这些常拿来把路径括起来、隔开的不算（带空格的路径认不了）；
-/// 中文、全角标点里只有标点、制表线不算，`docs/架构.md` 这样的照样认。
-fn path_char(c: char) -> bool {
+/// 中文、全角标点里只有标点、制表线不算，`docs/架构.md` 这样的照样认。终端那边接程序折开的路径时
+/// 也按它找一段的头尾。
+pub fn path_char(c: char) -> bool {
     !c.is_whitespace()
         && !matches!(
             c,

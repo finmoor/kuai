@@ -631,6 +631,8 @@ impl AppState {
         // 终端的设置：开着的终端马上跟着变
         crate::terminal::set_prefs(&self.settings.terminal, cx);
         crate::presets::sync(&self.settings, cx);
+        // 快捷键跟着预设走（删了的预设、新加的预设），所以在它后面
+        crate::keymap::sync(&self.settings, cx);
         self.save();
         cx.notify();
     }

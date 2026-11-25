@@ -14,6 +14,7 @@
 //! 子仓库里还能再进它自己的工作树，所以最多两层，返回一次退一层。
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use fr_channel::{Channel, GitOutput};
 use fr_core::i18n::tr;
@@ -23,8 +24,7 @@ use futures::StreamExt as _;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::ContextMenuExt as _;
-use gpui_kit::component::menu::PopupMenuItem;
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, WindowExt as _, h_flex,
@@ -35,6 +35,7 @@ use gpui_kit::*;
 
 use super::sidebar::SideItem;
 use super::{Mode, Page, RepoEvent, RepoView};
+use crate::presets::{self, Start};
 use crate::settings::RepoEntry;
 use crate::ui;
 
@@ -87,12 +88,31 @@ pub(crate) struct Summary {
 }
 
 /// 进到子仓库以后做什么。
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) enum Then {
     /// 留在它上次的那一页
     Stay,
-    NewTerminal,
+    /// 新建终端，在 shell 里输入这个（None 是只开 shell）
+    NewTerminal(Option<Start>),
     Files,
+}
+
+/// 在子仓库、工作树里新建终端的菜单（见 [`presets::menu`]）：选了就进到它里面、在它的终端页开。
+/// `enter` 是进去的那一步（子仓库、工作树各自的）；`place` 是它的名字，写在「运行命令」对话框的标题里。
+pub(super) fn child_launch(
+    view: WeakEntity<RepoView>,
+    place: SharedString,
+    enter: impl Fn(&mut RepoView, Then, &mut Window, &mut Context<RepoView>) + 'static,
+) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+    let enter = Rc::new(enter);
+    let on_start: presets::OnStart = Rc::new(move |start, window, cx| {
+        let enter = enter.clone();
+        view.update(cx, |this, cx| {
+            enter(this, Then::NewTerminal(start), window, cx)
+        })
+        .ok();
+    });
+    presets::menu_builder(place, on_start)
 }
 
 /// 批量操作里一个子仓库的结果：没做成的写原因。
@@ -519,7 +539,7 @@ impl RepoView {
         self.apply_visibility(cx);
         view.update(cx, |view, cx| match then {
             Then::Stay => {}
-            Then::NewTerminal => view.new_terminal(window, cx),
+            Then::NewTerminal(start) => view.new_terminal_with(String::new(), start, window, cx),
             Then::Files => view.show_files(window, cx),
         });
         cx.notify();
@@ -626,21 +646,23 @@ impl RepoView {
                                 .truncate()
                                 .child(tf!("返回 {name}", name)),
                         )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(px(11.))
-                                .font_weight(FontWeight::NORMAL)
-                                .opacity(0.75)
-                                .child("Alt+←"),
-                        )
+                        .when_some(crate::keymap::label("back", cx), |row, keys| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::NORMAL)
+                                    .opacity(0.75)
+                                    .child(keys),
+                            )
+                        })
                         .tooltip(move |window, cx| {
                             let name = tip.clone();
                             let text = match worktree {
                                 true => tf!("返回 {name} 的工作树总览（Alt+←）", name),
                                 false => tf!("返回 {name} 的子仓库总览（Alt+←）", name),
                             };
-                            ui::tip(text, window, cx)
+                            ui::tip(crate::keymap::with_key(&text, "back", cx), window, cx)
                         })
                         .on_click(
                             cx.listener(|this, _, window, cx| this.leave_to_root(window, cx)),
@@ -676,7 +698,7 @@ impl RepoView {
                         true => tf!("返回 {name} 的工作树总览（Alt+←）", name),
                         false => tf!("返回 {name} 的子仓库总览（Alt+←）", name),
                     };
-                    ui::tip(text, window, cx)
+                    ui::tip(crate::keymap::with_key(&text, "back", cx), window, cx)
                 })
                 .on_click(cx.listener(|this, _, window, cx| this.leave_to_root(window, cx)))
                 .into_any_element(),
@@ -1159,20 +1181,25 @@ impl RepoView {
                 }
             };
         let (a, b, c) = (path.to_string(), path.to_string(), path.to_string());
+        let launch = child_launch(
+            cx.entity().downgrade(),
+            path.to_string().into(),
+            move |this, then, window, cx| this.enter_sub(&a, then, window, cx),
+        );
         let actions = h_flex()
             .w(px(56.))
             .flex_none()
             .gap(px(2.))
             .child(
+                // 只有图标：点了弹新建终端的菜单
                 Button::new(("sub-terminal", ix))
                     .ghost()
                     .xsmall()
                     .icon(ui::icon(IconName::SquareTerminal).text_color(muted))
                     .tooltip(tr("在此新建终端"))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.enter_sub(&a, Then::NewTerminal, window, cx);
-                    })),
+                    // 不当作点了这一行（点行是进到子仓库里）
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .dropdown_menu(launch),
             )
             .child(
                 Button::new(("sub-files", ix))
@@ -1214,19 +1241,29 @@ impl RepoView {
         let entry = self.sub_entry(path);
         let path = path.to_string();
         let app = self.app.clone();
-        Box::new(move |menu, _, cx| {
+        Box::new(move |menu, window, cx| {
             let go = |label: &'static str, then: Then| {
                 let (view, path) = (view.clone(), path.clone());
                 PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                    view.update(cx, |this, cx| this.enter_sub(&path, then, window, cx))
-                        .ok();
+                    view.update(cx, |this, cx| {
+                        this.enter_sub(&path, then.clone(), window, cx)
+                    })
+                    .ok();
                 })
+            };
+            let launch = {
+                let path = path.clone();
+                child_launch(
+                    view.clone(),
+                    path.clone().into(),
+                    move |this, then, window, cx| this.enter_sub(&path, then, window, cx),
+                )
             };
             let mapped = entry.clone();
             let (view, entry, full) = (view.clone(), entry.clone(), entry.path.clone());
             let menu = menu
                 .item(go(tr("进入此仓库"), Then::Stay))
-                .item(go(tr("在此新建终端"), Then::NewTerminal))
+                .submenu(tr("在此新建终端"), window, cx, launch)
                 .item(go(tr("在文件页中打开"), Then::Files))
                 .separator()
                 .item(

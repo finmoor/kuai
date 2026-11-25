@@ -602,8 +602,8 @@ impl RepoView {
     pub(super) fn search_toggle(&self, at: Where, cx: &mut Context<Self>) -> Button {
         let tip = match at {
             // 提交历史里 Ctrl+F 是搜提交
-            Where::History => tr("在改动中搜索"),
-            _ => tr("在改动中搜索（Ctrl+F）"),
+            Where::History => tr("在改动中搜索").into(),
+            _ => crate::keymap::with_key(tr("在改动中搜索（Ctrl+F）"), "git.find", cx),
         };
         Button::new(("diff-search-toggle", at as usize))
             .xsmall()

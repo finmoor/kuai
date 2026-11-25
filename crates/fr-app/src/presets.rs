@@ -3,11 +3,13 @@
 //!
 //! - 预设存在设置里（[`Settings::terminal_presets`]；没改过是 None，用 [`builtins`]），「新终端」按钮、
 //!   Ctrl+Shift+` 开哪个看 [`Settings::terminal_default`]。界面各处读全局的一份（[`sync`]）。
-//! - 哪个仓库的第几个终端是从哪个预设开的，记在内存里（[`remember`]）：重启这个终端时再输入一遍，
-//!   程序没设标题时终端叫预设的名字。接上已有的会话（重开 Kuai、在别处开着的）不再输入。
+//! - 哪个仓库的第几个终端是从哪个预设开的，记下来（[`remember`]），开好的存进设置：重启这个终端时
+//!   再输入一遍，程序没设标题时终端叫预设的名字，重开 Kuai 以后接回来的也是（存下的要和终端列表
+//!   对上才算，见 [`Started`]）。接上已有的会话（重开 Kuai、在别处开着的）不再输入。
 //! - 内置的四个用各家的图标（`assets/logos/`，单色，画的时候填颜色）；自己加的从一组线条图标里挑。
 //! - 内置的命令都不用备用屏（`CSI ?1049h`）：用了的话程序的画面不进往回翻的记录，往回翻、消息刻度、
-//!   固定输入区都用不上。所以 Codex 带 `--no-alt-screen`，OpenCode 用 `opencode mini`。
+//!   固定输入区都用不上。所以 Codex 带 `--no-alt-screen`。OpenCode 例外，用完整的界面：不占满屏幕的
+//!   `opencode mini` 进去以后换不了模型（2026-11-25 改回来的，旧设置里存着的见 [`upgrade_builtins`]）。
 //!
 //! 先开 shell、再输入命令（而不是让程序当终端里唯一的进程）：这些工具多半装在靠 `.bashrc` 加进 PATH
 //! 的地方，只有交互式的 shell 找得到；程序退出后终端还在；也不用改 kuaid 和协议。
@@ -37,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use crate::app_state::AppState;
 use crate::settings::TermSlot;
 use crate::ui;
+use fr_channel::TermInfo;
 
 /// 一个预设。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,25 +97,55 @@ pub fn builtins() -> Vec<Preset> {
             "codex resume --last --no-alt-screen",
             "openai",
         ),
+        // 完整的界面（用备用屏）：`opencode mini` 不占满屏幕，可是进去以后换不了模型
         preset(
             "opencode",
             "OpenCode",
-            "opencode mini",
-            "opencode mini -c",
+            "opencode",
+            "opencode -c",
             "opencode",
         ),
         preset("agy", "Antigravity CLI", "agy", "agy -c", "antigravity"),
     ]
 }
 
-/// 新开的终端要替用户输入的命令：从预设开的，或者「运行其他命令」当场敲的。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 内置预设换过的命令：(id, 以前的命令, 以前的继续命令, 现在的命令, 现在的继续命令)。
+const RETIRED: [(&str, &str, &str, &str, &str); 1] = [(
+    "opencode",
+    "opencode mini",
+    "opencode mini -c",
+    "opencode",
+    "opencode -c",
+)];
+
+/// 改过预设列表的设置里还存着内置预设以前的命令（[`RETIRED`]）：还是原样的换成现在的，自己改过的
+/// 不动。读设置时调用。
+pub fn upgrade_builtins(list: &mut [Preset]) {
+    for preset in list {
+        for (id, command, resume, new_command, new_resume) in RETIRED {
+            if preset.id != id {
+                continue;
+            }
+            if preset.command == command {
+                preset.command = new_command.to_string();
+            }
+            if preset.resume == resume {
+                preset.resume = new_resume.to_string();
+            }
+        }
+    }
+}
+
+/// 新开的终端要替用户输入的命令：从预设开的，或者「运行命令」当场敲的。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Start {
     /// 终端叫什么（程序自己没设标题时）
     pub name: String,
     /// 在 shell 里输入的命令
     pub command: String,
+    #[serde(default)]
     pub icon: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hue: Option<usize>,
 }
 
@@ -213,8 +246,10 @@ struct Store(WeakEntity<AppState>);
 
 impl Global for Store {}
 
-/// 程序启动时调用一次。
+/// 程序启动时调用一次：上次存下的从预设开的终端先读进来（对上终端列表以前不算，见 [`Started`]）。
 pub fn init(app: &Entity<AppState>, cx: &mut App) {
+    let started = Started::load(&app.read(cx).settings.started_terms);
+    cx.set_global(started);
     cx.set_global(Store(app.downgrade()));
 }
 
@@ -279,9 +314,13 @@ fn free_id(list: &[Preset]) -> String {
 
 // ---------- 哪个终端是从哪个预设开的 ----------
 
-/// 仓库的第几个终端是从哪个预设开的（只在内存里，见模块说明）。按序号记，再记下开出来的是 kuaid
-/// 里的哪个会话：序号会被重用（这个结束了，别的 Kuai 在同一个仓库又开了一个，拿到同一个序号），
-/// 别人的那个不按这个预设显示，重启它时也不输入这条命令。
+/// 仓库的第几个终端是从哪个预设开的。按序号记，再记下开出来的是 kuaid 里的哪个会话：序号会被重用
+/// （这个结束了，别的 Kuai 在同一个仓库又开了一个，拿到同一个序号），别人的那个不按这个预设显示，
+/// 重启它时也不输入这条命令。
+///
+/// 开好了的存进设置（[`StartedRecord`]）：重开 Kuai 以后接回来的终端还叫预设的名字、画它的图标，
+/// 重启时还输入它的命令。存下的先不算，等那台电脑的终端列表到了，会话编号和开出来的时刻都对上了
+/// 才算（[`reconcile`]、[`confirm`]）：kuaid 重新启动以后编号从 t1 重新数，光看编号会认错。
 #[derive(Default)]
 struct Started(HashMap<TermSlot, Launched>);
 
@@ -289,15 +328,85 @@ struct Launched {
     start: Start,
     /// 开出来的会话（kuaid 给的编号）；刚开、还没回话，或者正在重启，是 None
     term: Option<String>,
+    /// 会话开出来的时刻（这台电脑的 Unix 秒）；还没开好是 0
+    born: u64,
+    /// 上次运行时存下的，还没和终端列表对上：对上以前不算
+    pending: bool,
 }
 
 impl Global for Started {}
 
+/// 存在设置里的一条：哪个仓库的第几个终端，是 kuaid 里的哪个会话、什么时候开的，从哪个预设开的。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartedRecord {
+    pub slot: TermSlot,
+    pub term: String,
+    pub born: u64,
+    pub start: Start,
+}
+
+/// 存下的开出来的时刻和终端列表里倒推的差这么多秒以内算同一个会话：列表里的「开了多久」按整秒
+/// 给，两台电脑的钟也可能差一点。编号重用的是 kuaid 重新启动以后新开的，差得远
+const BORN_SLACK: u64 = 30;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 impl Started {
+    fn load(records: &[StartedRecord]) -> Started {
+        Started(
+            records
+                .iter()
+                .map(|record| {
+                    let launched = Launched {
+                        start: record.start.clone(),
+                        term: Some(record.term.clone()),
+                        born: record.born,
+                        pending: true,
+                    };
+                    (record.slot.clone(), launched)
+                })
+                .collect(),
+        )
+    }
+
+    /// 要存的：开好了的（还没对上的也留着，那台电脑可能还没连上）。按仓库、序号排，设置文件不乱跳。
+    fn records(&self) -> Vec<StartedRecord> {
+        let mut records: Vec<StartedRecord> = self
+            .0
+            .iter()
+            .filter_map(|(slot, found)| {
+                Some(StartedRecord {
+                    slot: slot.clone(),
+                    term: found.term.clone()?,
+                    born: found.born,
+                    start: found.start.clone(),
+                })
+            })
+            .collect();
+        records.sort_by(|a, b| {
+            (&a.slot.entry.server, &a.slot.entry.path, a.slot.number).cmp(&(
+                &b.slot.entry.server,
+                &b.slot.entry.path,
+                b.slot.number,
+            ))
+        });
+        records
+    }
+
     fn remember(&mut self, slot: TermSlot, start: Option<Start>) {
         match start {
             Some(start) => {
-                self.0.insert(slot, Launched { start, term: None });
+                let launched = Launched {
+                    start,
+                    term: None,
+                    born: 0,
+                    pending: false,
+                };
+                self.0.insert(slot, launched);
             }
             None => {
                 self.0.remove(&slot);
@@ -306,7 +415,7 @@ impl Started {
     }
 
     fn get(&self, slot: &TermSlot, term: Option<&str>) -> Option<Start> {
-        let found = self.0.get(slot)?;
+        let found = self.0.get(slot).filter(|found| !found.pending)?;
         match (&found.term, term) {
             (Some(bound), Some(term)) if bound != term => None,
             _ => Some(found.start.clone()),
@@ -318,12 +427,61 @@ impl Started {
             return;
         };
         match (&found.term, created) {
-            (None, true) => found.term = Some(term.to_string()),
+            (None, true) => {
+                found.term = Some(term.to_string());
+                found.born = now_secs();
+            }
             (None, false) => {
                 self.0.remove(slot);
             }
             // 断线后接回自己的那个；别的会话不动它
             (Some(_), _) => {}
+        }
+    }
+
+    /// 开了 `age` 秒的会话和存下的这一条开出来的时刻差不多。
+    fn same_birth(found: &Launched, age: u64, now: u64) -> bool {
+        now.saturating_sub(age).abs_diff(found.born) <= BORN_SLACK
+    }
+
+    /// 存下的这一条和列表里的会话 `info` 对得上：同一个仓库的同一个序号、开出来的时刻差不多。
+    fn matches(slot: &TermSlot, found: &Launched, info: &TermInfo, now: u64) -> bool {
+        crate::terminal::session_number(&slot.entry.path, &info.key) == Some(slot.number)
+            && Self::same_birth(found, info.age, now)
+    }
+
+    /// 一台电脑的完整终端列表到了：这台电脑上还没对上的，对上了算数，编号对上了别的对不上、列表里
+    /// 没有了的去掉。列表是空的不动：kuaid 刚起来时可能先推一份空的。返回去掉了没有。
+    fn reconcile(&mut self, machine: &str, list: &[TermInfo], now: u64) -> bool {
+        let before = self.0.len();
+        self.0.retain(|slot, found| {
+            if !found.pending || crate::machines::machine_of(&slot.entry) != machine {
+                return true;
+            }
+            let Some(term) = found.term.clone() else {
+                return false;
+            };
+            match list.iter().find(|info| info.term == term) {
+                Some(info) if Self::matches(slot, found, info, now) => {
+                    found.pending = false;
+                    true
+                }
+                Some(_) => false,
+                None => list.is_empty(),
+            }
+        });
+        self.0.len() != before
+    }
+
+    /// 仓库终端页问到了这个仓库第几个终端是会话 `term`、开了 `age` 秒：存下的那一条对得上就算数
+    /// （对不上的留给完整的列表去掉）。
+    fn confirm(&mut self, slot: &TermSlot, term: &str, age: u64, now: u64) {
+        if let Some(found) = self.0.get_mut(slot)
+            && found.pending
+            && found.term.as_deref() == Some(term)
+            && Self::same_birth(found, age, now)
+        {
+            found.pending = false;
         }
     }
 
@@ -354,9 +512,43 @@ impl Started {
     }
 }
 
+/// 存下的从预设开的终端有变化：写回设置。推迟到这一轮处理完再写，调用的地方可能正在改别的实体。
+fn save_started(cx: &mut App) {
+    let Some(app) = cx.try_global::<Store>().and_then(|store| store.0.upgrade()) else {
+        return;
+    };
+    let records = cx.default_global::<Started>().records();
+    cx.defer(move |cx| {
+        app.update(cx, |app, cx| {
+            if app.settings.started_terms != records {
+                app.update_settings(cx, |settings| settings.started_terms = records);
+            }
+        });
+    });
+}
+
 /// 新开了一个终端：记下它要输入什么（只开 shell 的是 None，把这个编号以前记的去掉）。
 pub fn remember(slot: TermSlot, start: Option<Start>, cx: &mut App) {
     cx.default_global::<Started>().remember(slot, start);
+    save_started(cx);
+}
+
+/// 一台电脑（`machine`，见 [`crate::machines::machine_of`]）推来了完整的终端列表：上次运行时存下的
+/// 这台电脑上的从预设开的终端，对上了算数，对不上、已经不在了的去掉。列表一到就调（「开了多久」
+/// 是推来的那一刻的）。
+pub fn reconcile(machine: &str, list: &[TermInfo], cx: &mut App) {
+    if cx
+        .default_global::<Started>()
+        .reconcile(machine, list, now_secs())
+    {
+        save_started(cx);
+    }
+}
+
+/// 仓库终端页问到 `slot` 是会话 `term`、开了 `age` 秒：上次运行时存下的这一条对得上就算数。
+pub fn confirm(slot: &TermSlot, term: &str, age: u64, cx: &mut App) {
+    cx.default_global::<Started>()
+        .confirm(slot, term, age, now_secs());
 }
 
 /// 这个终端是从哪个预设开的。`term`：问的是 kuaid 里的哪个会话，不知道是 None；记着的是别的会话的
@@ -369,17 +561,20 @@ pub fn started(slot: &TermSlot, term: Option<&str>, cx: &App) -> Option<Start> {
 /// 是已有的（不是这次开的，比如别处刚用这个序号开了一个）就不算这个预设的。
 pub fn opened(slot: &TermSlot, term: &str, created: bool, cx: &mut App) {
     cx.default_global::<Started>().opened(slot, term, created);
+    save_started(cx);
 }
 
 /// 要重启 kuaid 里的 `term` 这个终端：记着的是它的，重启以后新开的接着算这个预设的（再输入一遍）；
 /// 不是它的就去掉。
 pub fn restarting(slot: &TermSlot, term: &str, cx: &mut App) {
     cx.default_global::<Started>().restarting(slot, term);
+    save_started(cx);
 }
 
 /// kuaid 里的 `term` 这个终端结束了：记着的是它的就去掉。
 pub fn ended(slot: &TermSlot, term: &str, cx: &mut App) {
     cx.default_global::<Started>().ended(slot, term);
+    save_started(cx);
 }
 
 /// 终端叫什么：从预设开的，标题还是 shell 自己的（见 [`shell_title`]）或者没有标题时叫预设的名字；
@@ -556,8 +751,10 @@ type Submit = Rc<dyn Fn(&mut Window, &mut App)>;
 /// 选好了：开一个终端，替用户输入这个（None 是只开 shell）。
 pub type OnStart = Rc<dyn Fn(Option<Start>, &mut Window, &mut App)>;
 
-/// 新建终端的菜单（分体按钮的 ⌄、右键菜单里「新建终端」的子菜单）：只开 shell、各个预设、继续上次
-/// 的会话、运行其他命令、管理预设。`place` 是仓库名，写在「运行其他命令」对话框的标题里。
+/// 新建终端的菜单，各处都是这一个：分体按钮的 ⌄、只有图标的「新建终端」按钮（会话页仓库行的 +、
+/// 工作区页和子仓库、工作树总览的行尾、文件页工具栏、图标栏的 +，点了就弹它）、右键菜单里「新建终端」
+/// 的子菜单。列只开 shell、各个预设（只写名字）、继续上次的会话、运行命令、管理预设。`place` 是开在
+/// 哪（仓库名或者仓库里的目录），写在「运行命令」对话框的标题里。
 pub fn menu(
     mut menu: PopupMenu,
     place: SharedString,
@@ -567,10 +764,32 @@ pub fn menu(
 ) -> PopupMenu {
     let presets = all(cx);
     let default = default_preset(cx).map(|preset| preset.id);
-    menu = menu.item(menu_row(None, default.is_none(), &on_start, cx));
-    for preset in presets.iter().filter(|preset| preset.shown) {
+    // 行尾写快捷键：「默认运行」的那个写新建终端的键，别的写给它设的键（设置 → 快捷键）
+    let key = |own: String, is_default: bool, cx: &App| {
+        let default_key = is_default
+            .then(|| crate::keymap::label("new.default", cx))
+            .flatten();
+        default_key.or_else(|| crate::keymap::label(&own, cx))
+    };
+    let shell_key = key("new.shell".to_string(), default.is_none(), cx);
+    menu = menu.item(menu_row(
+        ("menu-run", 0usize),
+        None,
+        shell_key,
+        &on_start,
+        cx,
+    ));
+    for (ix, preset) in presets.iter().filter(|preset| preset.shown).enumerate() {
         let is_default = default.as_deref() == Some(preset.id.as_str());
-        menu = menu.item(menu_row(Some(Start::of(preset)), is_default, &on_start, cx));
+        let shortcut = key(crate::keymap::preset_id(&preset.id), is_default, cx);
+        let row = menu_row(
+            ("menu-run", ix + 1),
+            Some(Start::of(preset)),
+            shortcut,
+            &on_start,
+            cx,
+        );
+        menu = menu.item(row);
     }
     let resumable: Vec<Start> = presets
         .iter()
@@ -585,8 +804,9 @@ pub fn menu(
             window,
             cx,
             move |mut sub, _, cx| {
-                for start in &resumable {
-                    sub = sub.item(menu_row(Some(start.clone()), false, &on, cx));
+                for (ix, start) in resumable.iter().enumerate() {
+                    let row = menu_row(("menu-resume", ix), Some(start.clone()), None, &on, cx);
+                    sub = sub.item(row);
                 }
                 sub
             },
@@ -595,7 +815,7 @@ pub fn menu(
     let run = on_start.clone();
     menu.separator()
         .item(
-            PopupMenuItem::new(tr("运行其他命令…"))
+            PopupMenuItem::new(tr("运行命令…"))
                 .on_click(move |_, window, cx| run_dialog(place.clone(), run.clone(), window, cx)),
         )
         .item(
@@ -603,53 +823,53 @@ pub fn menu(
         )
 }
 
-/// 菜单里的一行：图标、名字、命令（次要文字），「默认运行」的那个行尾写快捷键。
-fn menu_row(start: Option<Start>, default: bool, on_start: &OnStart, cx: &App) -> PopupMenuItem {
+/// 菜单里预设的名字最宽这么多，再长省略（全称在设置的预设表里看，那里悬停显示）。界面库的菜单项外层
+/// 不会收窄，只给省略不够：不换行的字最窄也是全长，会把菜单撑出去。弹出菜单里出不了悬停提示，所以给
+/// 宽一点，正常的名字都写得下。
+const MENU_NAME_MAX: f32 = 360.;
+
+/// 菜单里的一行：图标、名字（只写名字，命令在设置里看），有快捷键的行尾写上（界面上的写法）。
+fn menu_row(
+    id: impl Into<ElementId>,
+    start: Option<Start>,
+    shortcut: Option<String>,
+    on_start: &OnStart,
+    cx: &App,
+) -> PopupMenuItem {
     let theme = cx.theme();
-    let (name, command, icon): (SharedString, SharedString, Icon) = match &start {
+    let (name, icon): (SharedString, Icon) = match &start {
         Some(start) => (
             start.name.clone().into(),
-            start.command.clone().into(),
             icon(&start.icon).text_color(color(&start.icon, start.hue, cx)),
         ),
         None => (
             tr("终端").into(),
-            SharedString::default(),
             Icon::new(IconName::SquareTerminal).text_color(theme.muted_foreground),
         ),
     };
-    let on = on_start.clone();
+    let (id, on) = (id.into(), on_start.clone());
     PopupMenuItem::element(move |_, cx| {
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
-        let hint: SharedString = match command.is_empty() {
-            true => tr("只开 shell").into(),
-            false => command.clone(),
-        };
+        let muted = cx.theme().muted_foreground;
         h_flex()
             .w_full()
-            .min_w(px(260.))
+            .min_w(px(180.))
             .gap_3()
-            .child(div().flex_none().child(name.clone()))
             .child(
                 div()
-                    .flex_1()
+                    .id(id.clone())
                     .min_w_0()
+                    .max_w(px(MENU_NAME_MAX))
                     .truncate()
-                    .text_xs()
-                    .text_color(muted)
-                    .when(!command.is_empty(), |text| {
-                        text.font_family(theme.mono_font_family.clone())
-                    })
-                    .child(hint),
+                    .child(name.clone()),
             )
-            .when(default, |row| {
+            .when_some(shortcut.clone(), |row, shortcut| {
                 row.child(
                     div()
                         .flex_none()
+                        .ml_auto()
                         .text_xs()
                         .text_color(muted)
-                        .child("Ctrl+Shift+`"),
+                        .child(shortcut),
                 )
             })
     })
@@ -678,14 +898,15 @@ pub fn first_buttons(place: SharedString, on_start: OnStart, cx: &App) -> impl I
         None => (ui::icon(IconName::Plus), tr("打开终端").into()),
     };
     let default_id = default.as_ref().map(|preset| preset.id.clone());
-    // 「或者直接运行」：默认运行的那个已经在按钮上了，不再列；默认的是预设时列上只开 shell
-    let mut others: Vec<(Option<Start>, Icon, SharedString, SharedString)> = Vec::new();
+    // 「或者直接运行」：默认运行的那个已经在按钮上了，不再列；默认的是预设时列上只开 shell。
+    // 只写名字，不提示命令（命令在设置里看）
+    let mut others: Vec<(Option<Start>, Icon, SharedString, Option<SharedString>)> = Vec::new();
     if default.is_some() {
         others.push((
             None,
             ui::icon(IconName::SquareTerminal).text_color(muted),
             tr("只开 shell").into(),
-            tr("新建终端，不运行程序").into(),
+            Some(tr("新建终端，不运行程序").into()),
         ));
     }
     for preset in all(cx)
@@ -698,7 +919,7 @@ pub fn first_buttons(place: SharedString, on_start: OnStart, cx: &App) -> impl I
                 .size_3p5()
                 .text_color(color(&preset.icon, preset.hue, cx)),
             preset.name.clone().into(),
-            preset.command.clone().into(),
+            None,
         ));
     }
     let links: Vec<Button> = others
@@ -711,7 +932,7 @@ pub fn first_buttons(place: SharedString, on_start: OnStart, cx: &App) -> impl I
                 .xsmall()
                 .icon(glyph)
                 .label(name)
-                .tooltip(tip)
+                .when_some(tip, |button, tip| button.tooltip(tip))
                 .on_click(move |_, window, cx| on(start.clone(), window, cx))
         })
         .collect();
@@ -760,7 +981,7 @@ fn open_settings(_: &mut Window, cx: &mut App) {
     });
 }
 
-/// 「运行其他命令…」：问一条命令，开一个终端输入它；勾了「同时存为预设」的另外存一个预设。
+/// 「运行命令…」：问一条命令，开一个终端输入它；勾了「同时存为预设」的另外存一个预设。
 pub fn run_dialog(place: SharedString, on_start: OnStart, window: &mut Window, cx: &mut App) {
     ui::cancel_pending_tip(window, cx);
     let input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("例如 npm run dev")));
@@ -878,8 +1099,10 @@ pub fn settings_group(app: &Entity<AppState>, cx: &App) -> SettingGroup {
             },
         ),
     )
-    .description(tr(
-        "侧栏的「新终端」、会话页仓库行上的 +、Ctrl+Shift+` 开的是它。",
+    .description(crate::keymap::with_key(
+        tr("侧栏的「新终端」和会话页标签栏的 + 开的是它（Ctrl+Shift+`）。"),
+        "new.default",
+        cx,
     ));
     SettingGroup::new()
         .title(tr("新建终端"))
@@ -1311,7 +1534,7 @@ mod tests {
     // 不用 `super::*`：那样会把界面库的 `test` 宏也带进来，盖掉标准的 `#[test]`
     use super::{
         Preset, Start, Started, builtins, display_name, drop_index, free_id, logo, program_of,
-        restore_builtins,
+        restore_builtins, upgrade_builtins,
     };
 
     #[test]
@@ -1371,6 +1594,74 @@ mod tests {
     }
 
     #[test]
+    fn 重开以后_存下的从预设开的终端对上列表才算() {
+        use fr_channel::TermInfo;
+        let slot = |path: &str, number: u32| crate::settings::TermSlot {
+            entry: crate::settings::RepoEntry {
+                server: None,
+                path: path.into(),
+            },
+            number,
+        };
+        let info = |term: &str, path: &str, number: u32, age: u64| TermInfo {
+            term: term.into(),
+            key: crate::terminal::session_key(path, number),
+            age,
+            ..TermInfo::default()
+        };
+        let now = 10_000;
+        // 开好了才存；存的按仓库、序号排
+        let mut started = Started::default();
+        started.remember(slot("/b", 1), Some(Start::command("codex")));
+        started.remember(slot("/a", 2), Some(Start::command("claude")));
+        started.remember(slot("/a", 3), Some(Start::command("agy")));
+        assert!(started.records().is_empty());
+        started.opened(&slot("/b", 1), "t1", true);
+        started.opened(&slot("/a", 2), "t2", true);
+        started.opened(&slot("/a", 3), "t3", true);
+        let mut records = started.records();
+        assert_eq!(
+            records.iter().map(|r| r.term.as_str()).collect::<Vec<_>>(),
+            ["t2", "t3", "t1"]
+        );
+        for record in &mut records {
+            record.born = now - 600;
+        }
+        // 重开 Kuai：读进来的先不算
+        let mut loaded = Started::load(&records);
+        assert!(loaded.get(&slot("/a", 2), Some("t2")).is_none());
+        // 空的列表不动
+        assert!(!loaded.reconcile("", &[], now));
+        // 同一个编号、开出来的时刻对得上：算；编号对上但是新开的（kuaid 重新启动过）：去掉；
+        // 列表里没有了：去掉
+        let list = [info("t2", "/a", 2, 600), info("t1", "/b", 1, 5)];
+        assert!(loaded.reconcile("", &list, now));
+        assert_eq!(
+            loaded.get(&slot("/a", 2), Some("t2")).map(|s| s.command),
+            Some("claude".into())
+        );
+        assert!(!loaded.0.contains_key(&slot("/b", 1)));
+        assert!(!loaded.0.contains_key(&slot("/a", 3)));
+        // 别的电脑上的不动
+        let mut remote = records.clone();
+        remote[0].slot.entry.server = Some("s1".into());
+        let mut loaded = Started::load(&remote);
+        loaded.reconcile("", &list, now);
+        assert!(
+            loaded
+                .0
+                .get(&remote[0].slot)
+                .is_some_and(|found| found.pending)
+        );
+        // 仓库终端页问到的：对得上的算，对不上的不动
+        let mut loaded = Started::load(&records);
+        loaded.confirm(&slot("/b", 1), "t1", 5, now);
+        assert!(loaded.get(&slot("/b", 1), Some("t1")).is_none());
+        loaded.confirm(&slot("/a", 2), "t2", 590, now);
+        assert!(loaded.get(&slot("/a", 2), Some("t2")).is_some());
+    }
+
+    #[test]
     fn 程序名取命令的第一个词() {
         assert_eq!(program_of("npm run dev"), "npm");
         assert_eq!(program_of("codex --no-alt-screen"), "codex");
@@ -1413,12 +1704,43 @@ mod tests {
         };
         let (codex, codex_resume) = command("codex");
         assert!(codex.contains("--no-alt-screen") && codex_resume.contains("--no-alt-screen"));
-        assert_eq!(command("opencode").0, "opencode mini");
+        // OpenCode 例外：`opencode mini` 换不了模型，用完整的界面
+        assert_eq!(
+            command("opencode"),
+            ("opencode".into(), "opencode -c".into())
+        );
         // 内置的 id 不重复，图标都是各家的
         let mut ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
         ids.dedup();
         assert_eq!(ids.len(), 4);
         assert!(all.iter().all(|p| logo(&p.icon).is_some()));
+    }
+
+    #[test]
+    fn 存着的内置预设旧命令_原样的换成现在的() {
+        let old = |command: &str, resume: &str| Preset {
+            command: command.into(),
+            resume: resume.into(),
+            ..builtins().into_iter().find(|p| p.id == "opencode").unwrap()
+        };
+        let mut list = vec![old("opencode mini", "opencode mini -c")];
+        upgrade_builtins(&mut list);
+        assert_eq!(
+            (list[0].command.as_str(), list[0].resume.as_str()),
+            ("opencode", "opencode -c")
+        );
+        // 自己改过的不动；别的预设的同样命令也不动
+        let mut list = vec![old("opencode mini --model x/y", "opencode mini -c")];
+        upgrade_builtins(&mut list);
+        assert_eq!(
+            (list[0].command.as_str(), list[0].resume.as_str()),
+            ("opencode mini --model x/y", "opencode -c")
+        );
+        let mut mine = old("opencode mini", "");
+        mine.id = "custom-1".into();
+        let mut list = vec![mine];
+        upgrade_builtins(&mut list);
+        assert_eq!(list[0].command, "opencode mini");
     }
 
     #[test]

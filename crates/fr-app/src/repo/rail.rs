@@ -202,7 +202,11 @@ impl RepoView {
                     .child(self.render_rail_home(cx))
                     .child(
                         rail_button("rail-expand", IconName::PanelLeftOpen, false)
-                            .tooltip(tr("展开侧栏（Ctrl+Shift+B）"))
+                            .tooltip(crate::keymap::with_key(
+                                tr("展开侧栏（Ctrl+Shift+B）"),
+                                "sidebar",
+                                cx,
+                            ))
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx)),
                             ),
@@ -308,7 +312,13 @@ impl RepoView {
         };
         let running = self.terminals_running(cx);
         let unsaved = self.unsaved_files();
+        // 提示里的快捷键写现在的（设置 → 快捷键里改过的跟着变）
         let half = |id: &'static str, page: Page, icon: IconName, tip: &'static str| {
+            let key = match page {
+                Page::Terminal => Some("page.terminal"),
+                Page::Files => Some("page.files"),
+                _ => None,
+            };
             let on = self.page == page;
             div()
                 .id(id)
@@ -326,7 +336,13 @@ impl RepoView {
                     half.cursor_pointer().hover(|s| s.text_color(fg))
                 })
                 .child(Icon::new(icon).size_4())
-                .tooltip(move |window, cx| ui::tip(tip, window, cx))
+                .tooltip(move |window, cx| {
+                    let tip = match key {
+                        Some(key) => crate::keymap::with_key(tip, key, cx),
+                        None => tip.into(),
+                    };
+                    ui::tip(tip, window, cx)
+                })
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if this.page != page {
                         this.show_page(page, window, cx);
@@ -369,7 +385,11 @@ impl RepoView {
             IconName::FileDiff,
             selected == SideItem::Changes,
         )
-        .tooltip(tr("本地修改（Ctrl+1）"))
+        .tooltip(crate::keymap::with_key(
+            tr("本地修改（Ctrl+1）"),
+            "page.changes",
+            cx,
+        ))
         .on_click(
             cx.listener(|this, _, window, cx| this.click_sidebar(SideItem::Changes, 1, window, cx)),
         );
@@ -386,7 +406,11 @@ impl RepoView {
                 IconName::GitCommitHorizontal,
                 selected == SideItem::History,
             )
-            .tooltip(tr("所有提交（Ctrl+2）"))
+            .tooltip(crate::keymap::with_key(
+                tr("所有提交（Ctrl+2）"),
+                "page.history",
+                cx,
+            ))
             .on_click(cx.listener(|this, _, window, cx| {
                 this.click_sidebar(SideItem::History, 1, window, cx)
             }))

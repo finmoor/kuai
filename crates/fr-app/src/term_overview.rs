@@ -1289,10 +1289,15 @@ impl TermOverview {
         show_picker(picker, tr("新建终端").into(), window, cx);
     }
 
-    /// 在选中的仓库里新开一个终端（Ctrl+Shift+`）。
-    pub fn new_terminal_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 在选中的仓库里新开一个终端，输入 `start`（Ctrl+Shift+`、给预设设的快捷键）。
+    pub fn new_terminal_here(
+        &mut self,
+        start: Option<presets::Start>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(entry) = self.repo.clone() {
-            self.new_terminal(entry, window, cx);
+            self.new_terminal_with(entry, start, window, cx);
         }
     }
 
@@ -2125,23 +2130,15 @@ impl TermOverview {
             cx.stop_propagation();
             this.toggle_pin_repo(&for_pin, cx);
         }));
-        let new = Self::row_button(("hub-new", index), IconName::Plus, cx)
-            .tooltip(move |window, cx| ui::tip(new_tip.clone(), window, cx))
-            .on_click(cx.listener({
-                let entry = for_new.clone();
-                move |this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.new_terminal(entry.clone(), window, cx);
-                }
-            }));
-        // ⌄：选要运行的程序。菜单开着时这一行的按钮一直显示
+        // +：点了弹新建终端的菜单（原来点了直接开「默认运行」的那个、旁边另有 ⌄，⌄ 和分组的折叠箭头
+        // 长得一样，认不出是它的）。菜单开着时这一行的按钮一直显示
         let menu_open = self.menu_open.as_ref() == Some(&for_new);
         let view = cx.entity().downgrade();
-        let pick = Button::new(("hub-new-menu", index))
+        let new = Button::new(("hub-new", index))
             .ghost()
             .xsmall()
-            .icon(ui::icon_small(IconName::ChevronDown))
-            .tooltip(tr("选择要运行的程序"))
+            .icon(ui::icon_small(IconName::Plus))
+            .tooltip(new_tip)
             // 不当作点了这一行（选中它会把焦点拿走，菜单就关了）
             .on_click(|_, _, cx| cx.stop_propagation())
             .dropdown_menu(presets::menu_builder(
@@ -2204,8 +2201,7 @@ impl TermOverview {
                         Self::row_actions()
                             .when(menu_open, |actions| actions.visible())
                             .child(pin)
-                            .child(new)
-                            .child(pick),
+                            .child(new),
                     ),
             )
             .context_menu(repo_menu(cx.entity().downgrade(), entry.clone(), pinned))
@@ -2838,7 +2834,12 @@ impl TermOverview {
                             .hover(|s| s.bg(head_hover).text_color(head_fg))
                             .child(ui::icon(IconName::Plus))
                             .tooltip(|window, cx| {
-                                ui::tip(tr("新建终端…（Ctrl+Shift+N）"), window, cx)
+                                let tip = crate::keymap::with_key(
+                                    tr("新建终端…（Ctrl+Shift+N）"),
+                                    "new.pick",
+                                    cx,
+                                );
+                                ui::tip(tip, window, cx)
                             })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.pick_new_terminal(window, cx)
@@ -3048,25 +3049,63 @@ impl TermOverview {
             .as_ref()
             .filter(|_| shown.is_none())
             .map(|entry| format!("{} · {}", app.repo_name(entry), Self::place(app, entry)));
-        let plus = repo.clone().zip(repo_name).map(|(entry, name)| {
-            let tip = tf!("在 {repo} 中新建终端（Ctrl+Shift+`）", repo = name);
-            div()
-                .id("hub-new-tab")
+        // + 和 ⌄ 连成一组：悬停时一起有底色、中间一条分隔线，看得出 ⌄ 是 + 的。+ 开「默认运行」的
+        // 那个，⌄ 是新建终端的菜单
+        let program = presets::default_preset(cx).map(|preset| preset.name);
+        let view = cx.entity().downgrade();
+        let plus = repo.clone().zip(repo_name).map(|(entry, repo_name)| {
+            let tip = match program {
+                Some(program) => tf!(
+                    "在 {repo} 中新建终端并运行 {name}（Ctrl+Shift+`）",
+                    repo = repo_name.clone(),
+                    name = program
+                ),
+                None => tf!(
+                    "在 {repo} 中新建终端（Ctrl+Shift+`）",
+                    repo = repo_name.clone()
+                ),
+            };
+            let tip = crate::keymap::with_key(&tip, "new.default", cx);
+            h_flex()
+                .id("hub-new-split")
                 .flex_none()
-                .size(px(24.))
+                .h(px(24.))
                 .rounded(px(ui::RADIUS))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(muted)
-                .cursor_pointer()
-                .hover(|s| s.bg(hover).text_color(fg))
-                .child(ui::icon(IconName::Plus))
-                .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
-                .on_click(cx.listener({
-                    let entry = entry.clone();
-                    move |this, _, window, cx| this.new_terminal(entry.clone(), window, cx)
-                }))
+                .group("hub-new-split")
+                .hover(|s| s.bg(hover.opacity(0.6)))
+                .child(
+                    div()
+                        .id("hub-new-tab")
+                        .size(px(24.))
+                        .rounded_l(px(ui::RADIUS))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(muted)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(hover).text_color(fg))
+                        .child(ui::icon(IconName::Plus))
+                        .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
+                        .on_click(cx.listener({
+                            let entry = entry.clone();
+                            move |this, _, window, cx| this.new_terminal(entry.clone(), window, cx)
+                        })),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(1.))
+                        .h(px(14.))
+                        .group_hover("hub-new-split", |s| s.bg(border)),
+                )
+                .child(
+                    Button::new("hub-new-tab-menu")
+                        .ghost()
+                        .xsmall()
+                        .icon(ui::icon_small(IconName::ChevronDown))
+                        .tooltip(tr("选择要运行的程序"))
+                        .dropdown_menu(presets::menu_builder(repo_name, on_start_in(&view, entry))),
+                )
         });
         // 怎么开始往终端里输入；正在输入时不写，画面顶上那条细线就是
         let hint = shown
@@ -3097,18 +3136,6 @@ impl TermOverview {
                     .children(tabs),
             )
             .children(plus)
-            .children(self.repo.clone().map(|entry| {
-                let name = self.app.read(cx).repo_name(&entry);
-                Button::new("hub-new-tab-menu")
-                    .ghost()
-                    .xsmall()
-                    .icon(ui::icon_small(IconName::ChevronDown))
-                    .tooltip(tr("选择要运行的程序"))
-                    .dropdown_menu(presets::menu_builder(
-                        name,
-                        on_start_in(&cx.entity().downgrade(), entry),
-                    ))
-            }))
             .child(div().flex_1().min_w(px(4.)))
             .children(place.map(|place| {
                 ui::clipped("hub-place", place)

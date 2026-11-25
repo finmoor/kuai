@@ -148,7 +148,7 @@ pub(super) fn tree_menu(
     view: WeakEntity<RepoView>,
     row: Option<TreeRow>,
 ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
-    move |menu, _, cx| {
+    move |menu, window, cx| {
         let Some(this) = view.upgrade() else {
             return menu;
         };
@@ -201,6 +201,9 @@ pub(super) fn tree_menu(
                 .separator();
         }
         let (new_file, new_folder, upload) = (dir.clone(), dir.clone(), dir.clone());
+        // 在此新建终端：目录就开在它里面，文件开在它所在的目录，空白处开在仓库根
+        let place = this.read(cx).launch_place(&dir, cx);
+        let launch = super::terminals::launch_menu(view.clone(), place, dir.clone());
         menu = menu
             .item(item(
                 tr("新建文件…"),
@@ -214,6 +217,7 @@ pub(super) fn tree_menu(
                     this.new_folder_dialog(new_folder.clone(), window, cx)
                 }),
             ))
+            .submenu(tr("在此新建终端"), window, cx, launch)
             .item(item(
                 if remote {
                     tr("上传文件…")

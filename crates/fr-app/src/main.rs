@@ -12,6 +12,8 @@ mod fonts;
 mod graph_paint;
 mod history;
 mod instance;
+mod keymap;
+mod keys_page;
 mod machines;
 mod manager;
 mod mapping;
@@ -88,69 +90,53 @@ gpui_kit::actions!(
     ]
 );
 
-/// 焦点在终端里时仍然归 Kuai 的快捷键，其余的键全部交给终端里的程序。
-///
-/// 留下的都是终端里的程序本来就收不到、或者收到了也和不按 Shift 时没有区别的组合键。
-/// F5、Ctrl+W、Ctrl+F、Ctrl+P、Ctrl+S 不在里面：它们是 shell 和程序要用的
-/// （删一个词、往前搜、上一条命令……）。新加的全局快捷键要在终端里也生效，得加到这里。
-const TERMINAL_KEEPS: [&str; 15] = [
-    // 切仓库标签页、重新打开刚关的
-    "ctrl-tab",
-    "ctrl-shift-tab",
-    "ctrl-shift-t",
-    // 切页面：改动、历史、文件、终端，新开一个终端
-    "ctrl-1",
-    "ctrl-2",
-    "ctrl-0",
-    "ctrl-shift-e",
-    "ctrl-`",
-    "ctrl-shift-`",
-    "ctrl-~",
-    // 设置、侧栏、帧耗时浮层
-    "ctrl-,",
-    "ctrl-shift-b",
-    "ctrl-shift-f",
-    // 会话页：在终端里看着一个，要去看别的、在别的仓库里新开一个
-    "ctrl-shift-a",
-    "ctrl-shift-n",
-];
-
-/// 焦点在终端里时，键位表里出现过的键除了 [`TERMINAL_KEEPS`] 一律不当快捷键。
+/// 焦点在终端里时，键位表里出现过的键除了终端里也可用的快捷键（[`keymap::terminal_keeps`]，再加上
+/// Ctrl+Shift+F 帧耗时浮层）一律不当快捷键；设置页录快捷键时（[`keymap::RECORD_CONTEXT`]）全都不当。
 ///
 /// GPUI 收到按键先查键位表，查不到才轮到终端自己的按键处理。所以别处绑过的键终端收不到：
 /// 界面库在最外层绑了 Tab、Shift+Tab（切焦点）和 Ctrl+C（复制界面上选中的文字），补全、
 /// Claude Code 切模式、中断程序都会被它拦下。这里不一个个列「哪些键要让给终端」——漏一个就是
-/// 一个用不了的键，界面库升级多绑一个也发现不了——而是反过来只列留给 Kuai 的，其余的每一个
-/// 都在终端这一层绑成「什么都不做」，盖住外层的绑定。
+/// 一个用不了的键，界面库升级多绑一个也发现不了——而是反过来只留终端里也可用的，其余的每一个
+/// 都在终端这一层绑成「什么都不做」，盖住外层的绑定。之后在设置里改的键由 `keymap::sync` 跟着改。
 ///
 /// 要在所有快捷键都登记完以后调用：同一层里后登记的优先。
 fn release_keys_to_terminal(cx: &mut App) {
-    let os = cx.platform_info().os;
-    let unparse = |binding: &KeyBinding| {
-        let keys: Vec<String> = binding
-            .keystrokes()
-            .iter()
-            .map(|keystroke| keystroke.inner().unparse(os))
-            .collect();
-        keys.join(" ")
+    let mut keeps = keymap::terminal_keeps(cx);
+    keeps.push(keymap::canonical("ctrl-shift-f", cx));
+    let mut taken: Vec<String> = {
+        let bindings = cx.key_bindings();
+        let bindings = bindings.borrow();
+        bindings
+            .bindings()
+            .map(|binding| keymap::binding_keys(binding, cx))
+            .collect()
     };
-    let keeps = TERMINAL_KEEPS.map(|key| unparse(&KeyBinding::new(key, NoAction, None)));
-    let mut taken: Vec<String> = cx.key_bindings().borrow().bindings().map(unparse).collect();
     taken.sort();
     taken.dedup();
-    let terminal = std::rc::Rc::new(
-        KeyBindingContextPredicate::parse(terminal::KEY_CONTEXT).expect("合法的上下文名"),
+    let context = |name: &str| {
+        Some(std::rc::Rc::new(
+            KeyBindingContextPredicate::parse(name).expect("合法的上下文名"),
+        ))
+    };
+    let (terminal, record) = (
+        context(terminal::KEY_CONTEXT),
+        context(keymap::RECORD_CONTEXT),
     );
-    let masks: Vec<KeyBinding> = taken
-        .iter()
-        .filter(|keys| !keeps.contains(keys))
-        .filter_map(|keys| {
-            let context = Some(terminal.clone());
-            KeyBinding::load(keys, Box::new(NoAction), context, false, None, cx)
-                .inspect_err(|error| eprintln!("终端让不出这个键 {keys}：{error}"))
-                .ok()
-        })
-        .collect();
+    let mut masks: Vec<KeyBinding> = Vec::new();
+    for keys in &taken {
+        // Linux 上 Shift 加符号键按下时收到的是另一种写法，两种都让（`keymap::forms`）
+        for form in keymap::forms(keys) {
+            let mask = |context: &Option<std::rc::Rc<KeyBindingContextPredicate>>| {
+                KeyBinding::load(&form, Box::new(NoAction), context.clone(), false, None, cx)
+                    .inspect_err(|error| eprintln!("让不出这个键 {form}：{error}"))
+                    .ok()
+            };
+            if !keeps.contains(keys) {
+                masks.extend(mask(&terminal));
+            }
+            masks.extend(mask(&record));
+        }
+    }
     cx.bind_keys(masks);
 }
 
@@ -496,41 +482,9 @@ fn main() {
             fonts::init(cx);
             // 组件库自带的文字（输入框的右键菜单、对话框的关闭按钮等）跟着界面语言
             gpui_kit::component::set_locale(fr_core::i18n::lang().code());
-            // Ctrl+Shift+F：切换 GPUI 的帧耗时浮层（隐藏 → 简要 → 详细）
             cx.bind_keys([
+                // Ctrl+Shift+F：切换 GPUI 的帧耗时浮层（隐藏 → 简要 → 详细）
                 KeyBinding::new("ctrl-shift-f", ToggleFrameOverlay, None),
-                KeyBinding::new("f5", Refresh, None),
-                KeyBinding::new("ctrl-w", CloseTab, None),
-                KeyBinding::new("ctrl-tab", NextTab, None),
-                KeyBinding::new("ctrl-shift-tab", PrevTab, None),
-                KeyBinding::new("ctrl-f", FindCommit, None),
-                KeyBinding::new("ctrl-p", QuickOpen, None),
-                KeyBinding::new("ctrl-1", ShowChanges, None),
-                KeyBinding::new("ctrl-2", ShowHistory, None),
-                KeyBinding::new("ctrl-0", GoToHead, None),
-                KeyBinding::new("ctrl-,", OpenSettings, None),
-                KeyBinding::new("ctrl-shift-t", ReopenTab, None),
-                KeyBinding::new("ctrl-`", OpenTerminal, None),
-                KeyBinding::new("ctrl-shift-`", NewTerminal, None),
-                KeyBinding::new("ctrl-~", NewTerminal, None),
-                // 不用 Ctrl+B：焦点在终端里时它归里面的程序（Claude Code 把命令转到后台、tmux 的前缀键）
-                KeyBinding::new("ctrl-shift-b", ToggleSidebar, None),
-                // 和 VS Code 的资源管理器一样
-                KeyBinding::new("ctrl-shift-e", ShowFiles, None),
-                KeyBinding::new("ctrl-s", SaveFile, None),
-                // 文件页的 Markdown 在预览和源文件之间切换（和 VS Code 一样）。焦点在终端里时归终端（粘贴）
-                KeyBinding::new("ctrl-shift-v", TogglePreview, None),
-                // 后退、前进（标题栏最左边的两个按钮）；在子仓库、工作树里时后退先回到上一层。
-                // 焦点在终端、输入框里时归它们（往回、往后一个词）
-                KeyBinding::new("alt-left", GoBack, None),
-                KeyBinding::new("alt-right", GoForward, None),
-                // 上面两句对输入框要靠这两条才成立：没有上下文的绑定和输入框自己的一样深，后登记的
-                // 在前，不补的话输入框里按 Alt+← 也是后退。界面库的输入框和我们的全局键撞的一共
-                // 五个：Alt+←、Alt+→（让给输入框）、Ctrl+F（全局的接住以后按页面分派，文件页交给
-                // 编辑器的查找，见 `RepoView::find`）、Ctrl+Shift+A 和 Ctrl+Shift+E（界面库拿来选到
-                // 行首、行尾，Windows 上没人这么按，留给切页面）。界面库升级后重新对一遍。
-                KeyBinding::new("alt-left", MoveToPreviousWord, Some("Input")),
-                KeyBinding::new("alt-right", MoveToNextWord, Some("Input")),
                 // 新建终端的选仓库框里换要运行的程序。快捷键表先于按键监听，界面库在最外层把 Tab 绑成了
                 // 切焦点，所以要在框自己的上下文里绑
                 KeyBinding::new("tab", NextProgram, Some(workspace::QUICK_OPEN_CONTEXT)),
@@ -539,10 +493,20 @@ fn main() {
                     PrevProgram,
                     Some(workspace::QUICK_OPEN_CONTEXT),
                 ),
-                // 会话页：所有主机上各个仓库的终端。终端里的程序分不出它和 Ctrl+A，留给 Kuai
-                KeyBinding::new("ctrl-shift-a", ShowTerminals, None),
-                // 选一个仓库新建终端（New）。同上，程序分不出它和 Ctrl+N
-                KeyBinding::new("ctrl-shift-n", PickNewTerminal, None),
+            ]);
+            // 能在设置里改的快捷键（关标签页、切页面、新建终端……）按设置绑，见 keymap.rs。给预设设的
+            // 快捷键跟着预设走，所以先把预设定下来
+            presets::sync(&settings, cx);
+            keymap::sync(&settings, cx);
+            // 后退、前进默认是 Alt+←、Alt+→，焦点在输入框里时归输入框（往回、往后一个词）：没有上下文的
+            // 绑定和输入框自己的一样深，后登记的在前，所以在快捷键后面再绑一遍。界面库的输入框和默认的
+            // 快捷键撞的一共五个：Alt+←、Alt+→（让给输入框）、Ctrl+F（全局的接住以后按页面分派，文件页
+            // 交给编辑器的查找，见 `RepoView::find`）、Ctrl+Shift+A 和 Ctrl+Shift+E（界面库拿来选到行首、
+            // 行尾，Windows 上没人这么按，留给切页面）。界面库升级后重新对一遍。在设置里改了的键怎么和
+            // 输入框分，见 `keymap::sync`
+            cx.bind_keys([
+                KeyBinding::new("alt-left", MoveToPreviousWord, Some("Input")),
+                KeyBinding::new("alt-right", MoveToNextWord, Some("Input")),
             ]);
             release_keys_to_terminal(cx);
             workspace_action::<OpenSettings>(cx, |ws, window, cx| ws.toggle_settings(window, cx));
@@ -580,6 +544,24 @@ fn main() {
             });
             workspace_action::<GoBack>(cx, |ws, window, cx| ws.go_back(window, cx));
             workspace_action::<GoForward>(cx, |ws, window, cx| ws.go_forward(window, cx));
+            // 新建终端并运行某个预设（设置 → 快捷键里给预设设的键）。和上面一样推迟到这一轮处理完
+            cx.on_action(|action: &keymap::RunPreset, cx: &mut App| {
+                let preset = action.preset.clone();
+                cx.defer(move |cx| {
+                    let Some(MainWorkspace(workspace, handle)) = cx.try_global::<MainWorkspace>()
+                    else {
+                        return;
+                    };
+                    let (workspace, handle) = (workspace.clone(), *handle);
+                    handle
+                        .update(cx, |_, window, cx| {
+                            workspace
+                                .update(cx, |ws, cx| ws.run_preset_in_active(&preset, window, cx))
+                                .ok();
+                        })
+                        .ok();
+                });
+            });
             cx.on_action(|_: &ToggleFrameOverlay, cx: &mut App| {
                 for handle in cx.windows() {
                     handle
@@ -590,7 +572,6 @@ fn main() {
 
             let saved_window = settings.window;
             terminal::set_prefs(&settings.terminal, cx);
-            presets::sync(&settings, cx);
             let app = cx.new(|cx| AppState::new(settings, load_issue.clone(), cx));
             presets::init(&app, cx);
             // 在终端里按 Ctrl+加号、减号调了字号：存进设置

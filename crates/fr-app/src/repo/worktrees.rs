@@ -33,7 +33,7 @@ use gpui_kit::*;
 
 use super::dialogs::ref_name_error;
 use super::sidebar::SideItem;
-use super::subs::{Child, PARALLEL, ROW_HEIGHT, Summary, Then, summarize};
+use super::subs::{Child, PARALLEL, ROW_HEIGHT, Summary, Then, child_launch, summarize};
 use super::{Mode, RepoEvent, RepoView};
 use crate::settings::RepoEntry;
 use crate::ui;
@@ -199,7 +199,9 @@ impl RepoView {
         if self.is_own_tree(tree) {
             match then {
                 Then::Stay => self.click_sidebar(SideItem::History, 1, window, cx),
-                Then::NewTerminal => self.new_terminal(window, cx),
+                Then::NewTerminal(start) => {
+                    self.new_terminal_with(String::new(), start, window, cx)
+                }
                 Then::Files => self.show_files(window, cx),
             }
             return;
@@ -469,6 +471,11 @@ impl RepoView {
             }
         };
         let (a, b, c) = (tree.path.clone(), tree.path.clone(), tree.path.clone());
+        let launch = child_launch(
+            cx.entity().downgrade(),
+            tree.name().to_string().into(),
+            move |this, then, window, cx| this.enter_worktree(&a, then, window, cx),
+        );
         let actions = h_flex()
             .w(px(56.))
             .flex_none()
@@ -476,15 +483,15 @@ impl RepoView {
             .when(!gone, |actions| {
                 actions
                     .child(
+                        // 只有图标：点了弹新建终端的菜单
                         Button::new(("tree-terminal", ix))
                             .ghost()
                             .xsmall()
                             .icon(ui::icon(IconName::SquareTerminal).text_color(muted))
                             .tooltip(tr("在此新建终端"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.enter_worktree(&a, Then::NewTerminal, window, cx);
-                            })),
+                            // 不当作点了这一行（点行是进到工作树里）
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .dropdown_menu(launch),
                     )
                     .child(
                         Button::new(("tree-files", ix))
@@ -529,7 +536,8 @@ impl RepoView {
         let (path, own, main) = (tree.path.clone(), self.is_own_tree(tree), tree.main);
         let (gone, locked) = (tree.prunable.is_some(), tree.locked.is_some());
         let app = self.app.clone();
-        Box::new(move |menu, _, cx| {
+        let name = tree.name().to_string();
+        Box::new(move |menu, window, cx| {
             let copy = {
                 let full = entry.path.clone();
                 PopupMenuItem::new(tr("复制路径")).on_click(move |_, _, cx| {
@@ -551,16 +559,26 @@ impl RepoView {
             let go = |label: &'static str, then: Then| {
                 let (view, path) = (view.clone(), path.clone());
                 PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                    view.update(cx, |this, cx| this.enter_worktree(&path, then, window, cx))
-                        .ok();
+                    view.update(cx, |this, cx| {
+                        this.enter_worktree(&path, then.clone(), window, cx)
+                    })
+                    .ok();
                 })
+            };
+            let launch = {
+                let path = path.clone();
+                child_launch(
+                    view.clone(),
+                    name.clone().into(),
+                    move |this, then, window, cx| this.enter_worktree(&path, then, window, cx),
+                )
             };
             let menu = match own {
                 true => menu,
                 false => menu.item(go(tr("进入此工作树"), Then::Stay)),
             };
             let menu = menu
-                .item(go(tr("在此新建终端"), Then::NewTerminal))
+                .submenu(tr("在此新建终端"), window, cx, launch)
                 .item(go(tr("在文件页中打开"), Then::Files));
             let menu = match own {
                 true => menu,
