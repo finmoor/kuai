@@ -35,16 +35,16 @@ pub(super) enum Outcome {
 /// 一条记录：一次 git 命令。
 #[derive(Clone)]
 pub(super) struct Entry {
-    id: u64,
-    at: chrono::DateTime<chrono::Local>,
+    pub(super) id: u64,
+    pub(super) at: chrono::DateTime<chrono::Local>,
     /// 属于哪个操作：「拉取」「提交」「自动获取」……
-    label: SharedString,
+    pub(super) label: SharedString,
     /// 完整的命令行
-    command: SharedString,
-    outcome: Outcome,
-    elapsed: Option<Duration>,
-    /// git 的输出，标准错误在前、标准输出在后
-    output: SharedString,
+    pub(super) command: SharedString,
+    pub(super) outcome: Outcome,
+    pub(super) elapsed: Option<Duration>,
+    /// git 的输出，标准错误在前、标准输出在后；联网的命令执行中随进度更新（见 [`Log::live`]）
+    pub(super) output: SharedString,
 }
 
 impl Entry {
@@ -119,22 +119,56 @@ impl Log {
             }
             Err(err) => {
                 entry.outcome = Outcome::Failed;
-                entry.output = fr_core::git::redact_urls(&format!("{err:#}"))
-                    .into_owned()
-                    .into();
+                let err = fr_core::git::redact_urls(&format!("{err:#}")).into_owned();
+                // 连接断了这类：之前实时收到的输出（进度、远程 hook 说的话）留着，错误接在后面。
+                // 推送结果未知时要靠它看远程收到没有
+                let live = entry.output.trim();
+                entry.output = match live.is_empty() {
+                    true => err.into(),
+                    false => tail(&format!(
+                        "{live}
+{err}"
+                    ))
+                    .into(),
+                };
             }
         }
-        // 失败的记进诊断的「最近的错误」：哪个仓库、什么操作、git 说的第一句
+        // 失败的记进诊断的「最近的错误」：哪个仓库、什么操作、git 说的第一句（连接断了的是错误那一句）
         if entry.outcome == Outcome::Failed {
-            let said = entry
-                .output
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .unwrap_or_default();
+            let said = match result {
+                Err(err) => format!("{err:#}"),
+                Ok(_) => entry
+                    .output
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .unwrap_or_default()
+                    .to_string(),
+            };
+            let said =
+                fr_core::git::redact_urls(said.lines().next().unwrap_or_default()).into_owned();
             let text = format!("{}：{said}", entry.label);
             crate::diagnose::record_error(&self.name, &text);
         }
+    }
+
+    /// 联网的命令还在执行：git 到现在为止的标准错误（进度、`remote:` 开头的远程输出），给底部的
+    /// 「输出」实时显示（见 `output.rs`）。结束时 [`Self::end`] 换成完整的输出。
+    pub(super) fn live(&mut self, id: u64, stderr: &str) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == id && entry.outcome == Outcome::Running)
+        {
+            entry.output = fr_core::git::redact_urls(&clean_stderr(stderr))
+                .into_owned()
+                .into();
+        }
+    }
+
+    /// 编号是 `id` 的那条记录。
+    pub(super) fn get(&self, id: u64) -> Option<&Entry> {
+        self.entries.iter().find(|entry| entry.id == id)
     }
 
     /// 找回提交里认哪些记录是 Kuai 做的：从什么时候起记的，和每条执行完的命令开始、结束的时间
@@ -159,8 +193,19 @@ impl Log {
 
 /// 记录里放的输出：标准错误（去掉用回车刷新掉的进度）加标准输出，太长只留末尾。
 fn output_text(out: &GitOutput) -> String {
+    let mut text = clean_stderr(&out.stderr);
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    text.push_str(stdout.trim_end());
+    tail(text.trim_end())
+}
+
+/// 标准错误去掉用回车刷新掉的进度（每行只留最后一次刷新的样子）和空行。
+fn clean_stderr(stderr: &str) -> String {
     let mut text = String::new();
-    for line in out.stderr.lines() {
+    for line in stderr.lines() {
         let line = line.trim_end_matches('\r');
         let line = line.rsplit('\r').next().unwrap_or(line);
         if !line.trim().is_empty() {
@@ -168,9 +213,11 @@ fn output_text(out: &GitOutput) -> String {
             text.push('\n');
         }
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    text.push_str(stdout.trim_end());
-    let text = text.trim_end();
+    tail(text.trim_end())
+}
+
+/// 太长只留末尾 [`MAX_OUTPUT`] 字节。
+fn tail(text: &str) -> String {
     if text.len() <= MAX_OUTPUT {
         return text.to_string();
     }
@@ -442,6 +489,28 @@ mod tests {
         // 新的在前
         assert_eq!(log.entries[0].outcome, Outcome::Cancelled);
         assert_eq!(&*log.entries[1].label, "提交");
+    }
+
+    #[test]
+    fn 连接断了时实时收到的输出留着() {
+        let mut log = Log::default();
+        let id = log.begin("推送".into(), "git push --progress".into());
+        log.live(
+            id,
+            "remote: Checking push policy...
+",
+        );
+        log.end(id, &Err(anyhow::anyhow!("与主机的连接已断开")), false);
+        assert_eq!(log.entries[0].outcome, Outcome::Failed);
+        assert_eq!(
+            &*log.entries[0].output,
+            "remote: Checking push policy...
+与主机的连接已断开"
+        );
+        // 没收到过输出的只有错误
+        let other = log.begin("获取".into(), "git fetch".into());
+        log.end(other, &Err(anyhow::anyhow!("连不上")), false);
+        assert_eq!(&*log.entries[0].output, "连不上");
     }
 
     #[test]

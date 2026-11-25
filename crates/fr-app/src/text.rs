@@ -5,6 +5,72 @@
 //! 生成补丁用的始终是原始字节。
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// 显示代码时一个 Tab 占几格（设置里的「Tab 宽度」，见 `workspace.rs` 的 `apply_settings`）
+static TAB_WIDTH: AtomicUsize = AtomicUsize::new(4);
+
+/// 现在的 Tab 宽度。
+pub fn tab_width() -> usize {
+    TAB_WIDTH.load(Ordering::Relaxed).max(1)
+}
+
+/// 换 Tab 宽度（设置变了时）。
+pub fn set_tab_width(width: usize) {
+    TAB_WIDTH.store(width.clamp(1, 16), Ordering::Relaxed);
+}
+
+/// 一行里的 Tab 换成空格，对齐到 `width` 的整数倍（照列算，不是一律换几个）。没有 Tab 原样返回。
+pub fn expand_tabs(line: &str, width: usize) -> Cow<'_, str> {
+    if !line.contains('\t') {
+        return Cow::Borrowed(line);
+    }
+    let width = width.max(1);
+    let mut out = String::with_capacity(line.len() + width * 2);
+    let mut column = 0;
+    for ch in line.chars() {
+        if ch == '\t' {
+            let pad = width - column % width;
+            out.extend(std::iter::repeat_n(' ', pad));
+            column += pad;
+        } else {
+            out.push(ch);
+            column += 1;
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// 补丁里代码行的 Tab 换成空格（只换块里的内容，行首的 `+`、`-`、空格不算一列），只用来显示：
+/// 组件库的改动视图照字显示 Tab，宽窄不由我们定。没有 Tab 原样返回。
+pub fn expand_patch_tabs(patch: &str) -> Cow<'_, str> {
+    if !patch.contains('\t') {
+        return Cow::Borrowed(patch);
+    }
+    let width = tab_width();
+    let mut out = String::with_capacity(patch.len() + patch.len() / 8);
+    let mut in_hunk = false;
+    for line in patch.split_inclusive('\n') {
+        if line.starts_with("diff ") {
+            in_hunk = false;
+        } else if line.starts_with("@@") {
+            in_hunk = true;
+        }
+        let content = in_hunk
+            && line
+                .chars()
+                .next()
+                .is_some_and(|first| matches!(first, '+' | '-' | ' '));
+        match content {
+            true => {
+                out.push_str(&line[..1]);
+                out.push_str(&expand_tabs(&line[1..], width));
+            }
+            false => out.push_str(line),
+        }
+    }
+    Cow::Owned(out)
+}
 
 /// 解码一段字节。
 pub fn decode(bytes: &[u8]) -> Cow<'_, str> {
@@ -42,6 +108,29 @@ pub fn human_size(bytes: u64) -> String {
         false => format!("{value:.0}"),
     };
     format!("{number} {}", UNITS[unit])
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::{expand_patch_tabs, expand_tabs};
+
+    #[test]
+    fn tab_对齐到整数倍() {
+        assert_eq!(expand_tabs("a\tb", 4), "a   b");
+        assert_eq!(expand_tabs("\tx", 4), "    x");
+        assert_eq!(expand_tabs("abcd\tx", 4), "abcd    x");
+        assert_eq!(expand_tabs("ab\t\tx", 2), "ab    x");
+        assert_eq!(expand_tabs("none", 4), "none");
+    }
+
+    #[test]
+    fn 补丁里只换代码行() {
+        let patch = "diff --git a/x\tb b/x\tb\n--- a/x\tb\n+++ b/x\tb\n@@ -1 +1 @@\n-\told\n+\tnew\n \tsame\n";
+        let out = expand_patch_tabs(patch);
+        assert!(out.contains("-    old\n+    new\n     same\n"), "{out}");
+        // 头上的路径不动
+        assert!(out.starts_with("diff --git a/x\tb b/x\tb\n--- a/x\tb\n+++ b/x\tb\n"));
+    }
 }
 
 #[cfg(test)]

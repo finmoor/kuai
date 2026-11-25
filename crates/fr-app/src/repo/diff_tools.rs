@@ -22,7 +22,7 @@ use crate::ui;
 /// 解码、解析一份补丁。在后台调：整个文件、超长的行解析要好一会儿，不能占着界面线程。返回全文
 /// 和解析出来的文件，解析失败的是给用户看的原因。
 pub(super) fn parse_patch(bytes: &[u8]) -> (String, Result<Vec<DiffFile>, SharedString>) {
-    let text = crate::text::decode(bytes).into_owned();
+    let text = crate::text::expand_patch_tabs(&crate::text::decode(bytes)).into_owned();
     let files = DiffFile::parse(&text)
         .map_err(|err| tf!("diff 解析失败：{message}", message = err.message()).into());
     (text, files)

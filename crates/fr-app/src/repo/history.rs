@@ -27,7 +27,7 @@ use fr_core::tf;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_kit::component::diff::{Diff, DiffFile, DiffFileStatus, DiffMode, DiffState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
@@ -80,18 +80,26 @@ pub(super) enum SearchBy {
     Text,
     /// 改动过路径里有这几个字的文件
     Path,
-    /// 改动里增加或删除过这几个字
+    /// 增加或删除的行里有这几个字
     Content,
+    /// 这几个字出现的次数变了（`git log -S`）
+    Occurrence,
 }
 
 impl SearchBy {
-    const ALL: [SearchBy; 3] = [SearchBy::Text, SearchBy::Path, SearchBy::Content];
+    const ALL: [SearchBy; 4] = [
+        SearchBy::Text,
+        SearchBy::Path,
+        SearchBy::Content,
+        SearchBy::Occurrence,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             SearchBy::Text => tr("说明、作者、哈希"),
             SearchBy::Path => tr("文件路径"),
             SearchBy::Content => tr("改动内容"),
+            SearchBy::Occurrence => tr("出现次数变化"),
         }
     }
 
@@ -99,7 +107,8 @@ impl SearchBy {
         match self {
             SearchBy::Text => tr("搜索提交…"),
             SearchBy::Path => tr("输入路径中的文字，按 Enter 搜索"),
-            SearchBy::Content => tr("输入增加或删除过的文字，按 Enter 搜索"),
+            SearchBy::Content => tr("输入增加或删除的行中的文字，按 Enter 搜索"),
+            SearchBy::Occurrence => tr("输入文字，查找其出现次数有变化的提交，按 Enter 搜索"),
         }
     }
 
@@ -109,6 +118,7 @@ impl SearchBy {
             SearchBy::Text => None,
             SearchBy::Path => Some(gitlog::Find::Path),
             SearchBy::Content => Some(gitlog::Find::Content),
+            SearchBy::Occurrence => Some(gitlog::Find::Occurrence),
         }
     }
 }
@@ -218,6 +228,9 @@ pub(super) struct History {
     /// 旧的历史还显示着，新的在后台读
     reloading: bool,
     selected: Option<usize>,
+    /// 多选的提交（Ctrl、Shift 加点击，见 `multi_commit.rs`）：两个以上才算，按哈希记，列表重读了
+    /// 还对得上
+    pub(super) multi: Vec<String>,
     /// 点右键之前选中的提交：点右键会先选中那一行，菜单里「与选中的提交比较」说的是它
     marked: Option<String>,
     scroll: UniformListScrollHandle,
@@ -246,6 +259,11 @@ pub(super) struct History {
     /// 现在跳到了第几个匹配
     match_pos: Option<usize>,
     details: Option<Details>,
+    /// 详情里列的是这个提交时的全部文件（不是改动的文件），见 `commit_tree.rs`
+    pub(super) all_files: bool,
+    pub(super) tree: Option<super::commit_tree::CommitTree>,
+    /// 全部文件里点开的文件：右边看它那时的内容
+    pub(super) preview: Option<super::commit_tree::Preview>,
     diff: Entity<DiffState>,
     /// 现在显示的补丁（在改动中搜索用）
     diff_text: SharedString,
@@ -301,6 +319,7 @@ impl History {
             load_task: None,
             reloading: false,
             selected: None,
+            multi: Vec::new(),
             marked: None,
             scroll: UniformListScrollHandle::new(),
             file: None,
@@ -317,6 +336,9 @@ impl History {
             matches: Vec::new(),
             match_pos: None,
             details: None,
+            all_files: false,
+            tree: None,
+            preview: None,
             diff: cx.new(|cx| DiffState::new(Vec::new(), cx)),
             diff_text: SharedString::default(),
             diff_info: tr("选择一个提交以查看改动").into(),
@@ -343,6 +365,16 @@ impl History {
         self.details_width = px(sizes.details_width);
         self.side_width = sizes.sidebar;
         self.viewport_width = viewport.width;
+    }
+
+    /// 详情里正看着的提交（或贮藏）的哈希。
+    pub(super) fn details_id(&self) -> Option<String> {
+        self.details.as_ref().map(|d| d.id.to_string())
+    }
+
+    /// 选中的提交在列表里的位置。
+    pub(super) fn selected_index(&self) -> Option<usize> {
+        self.selected
     }
 
     /// 选中的提交。
@@ -376,7 +408,7 @@ impl History {
     }
 
     /// 提交在列表里的位置（越往后越早）。
-    fn position(&self, id: &str) -> Option<usize> {
+    pub(super) fn position(&self, id: &str) -> Option<usize> {
         match &self.load {
             Load::Ready { data, .. } => data.commits.iter().position(|c| &*c.id == id),
             _ => None,
@@ -513,6 +545,26 @@ impl RepoView {
                     (_, Some(ix)) => self.history.selected = Some(ix),
                     // 选中的提交没了（比如修改了上次提交）
                     (Some(_), None) => self.clear_commit_selection(cx),
+                    // 什么都没选（刚打开仓库）：选中 HEAD，没有就第一个提交，下面的详情不空着。
+                    // 正要定位到别的提交、正在看贮藏这类列表外的东西时不动
+                    (None, None)
+                        if self.history.pending_reveal.is_none()
+                            && self.history.details.is_none() =>
+                    {
+                        let head = self.status.as_ref().and_then(|s| s.head.clone());
+                        let first = match &self.history.load {
+                            Load::Ready { data, .. } if !data.commits.is_empty() => Some(
+                                head.and_then(|head| {
+                                    data.commits.iter().position(|c| *c.id == *head)
+                                })
+                                .unwrap_or(0),
+                            ),
+                            _ => None,
+                        };
+                        if let Some(ix) = first {
+                            self.select_commit(ix, cx);
+                        }
+                    }
                     (None, None) => {}
                 }
                 self.update_search(false, cx);
@@ -776,6 +828,25 @@ impl RepoView {
         const PAGE: usize = 15;
         let current = self.history.selected;
         let modifiers = event.keystroke.modifiers;
+        if event.keystroke.key == "escape" && self.history.multi.len() > 1 {
+            cx.stop_propagation();
+            self.clear_multi_commits();
+            cx.notify();
+            return;
+        }
+        if event.keystroke.key == "c"
+            && (modifiers.control || modifiers.platform)
+            && !modifiers.shift
+            && !modifiers.alt
+            && self.history.multi.len() > 1
+        {
+            cx.stop_propagation();
+            let ids: Vec<String> = self.picked_commits().into_iter().map(|p| p.id).collect();
+            let text = tf!("已复制 {n} 个提交的哈希", n = ids.len());
+            cx.write_to_clipboard(ClipboardItem::new_string(ids.join("\n")));
+            window.push_notification(Notification::success(text), cx);
+            return;
+        }
         if event.keystroke.key == "c"
             && (modifiers.control || modifiers.platform)
             && !modifiers.shift
@@ -1170,10 +1241,20 @@ impl RepoView {
                 tf!("改动过路径中含「{needle}」的文件的提交：{n} 个", needle, n)
             }
             (gitlog::Find::Content, false, 0) => {
-                tf!("没有增加或删除过「{needle}」的提交", needle)
+                tf!("没有增删的行中含「{needle}」的提交", needle)
             }
             (gitlog::Find::Content, false, n) => {
-                tf!("增加或删除过「{needle}」的提交：{n} 个", needle, n)
+                tf!("增删的行中含「{needle}」的提交：{n} 个", needle, n)
+            }
+            // 没找到时提一句另一种找法：只改了同一行别处的提交出现次数不变
+            (gitlog::Find::Occurrence, false, 0) => {
+                tf!(
+                    "没有「{needle}」出现次数有变化的提交。只改动所在行其他部分的提交，可改用「改动内容」查找。",
+                    needle
+                )
+            }
+            (gitlog::Find::Occurrence, false, n) => {
+                tf!("「{needle}」出现次数有变化的提交：{n} 个", needle, n)
             }
         };
         Some(text.into())
@@ -1245,6 +1326,54 @@ impl RepoView {
         cx.notify();
     }
 
+    /// 提交图上分支、标签的小牌子：右键是侧栏里同一项的菜单；双击本地分支切换过去，双击远程分支
+    /// 检出（建同名的本地分支跟踪它），和 Fork 一样。HEAD 那个牌子不接。
+    fn wire_badge(
+        &self,
+        label: &RefLabel,
+        badge: Stateful<Div>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let find = |list: &[fr_core::refs::Branch]| list.iter().position(|b| b.name == label.name);
+        let side = match label.kind {
+            RefKind::Current | RefKind::Local => {
+                find(&self.refs.branches).map(super::sidebar::SideItem::Branch)
+            }
+            RefKind::Remote => find(&self.refs.remotes).map(super::sidebar::SideItem::Remote),
+            RefKind::Tag => self
+                .refs
+                .tags
+                .iter()
+                .position(|t| t.name == label.name)
+                .map(super::sidebar::SideItem::Tag),
+            RefKind::Head => None,
+        };
+        let Some(side) = side else {
+            return badge.into_any_element();
+        };
+        let (name, kind) = (label.name.clone(), label.kind);
+        let badge = badge.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+            if event.click_count() != 2 {
+                return;
+            }
+            match kind {
+                RefKind::Local => {
+                    cx.stop_propagation();
+                    this.checkout_branch(&name, window, cx);
+                }
+                RefKind::Remote => {
+                    cx.stop_propagation();
+                    this.checkout_remote(&name, window, cx);
+                }
+                _ => {}
+            }
+        }));
+        match self.sidebar_menu(side, cx) {
+            Some(menu) => badge.context_menu(menu).into_any_element(),
+            None => badge.into_any_element(),
+        }
+    }
+
     pub(super) fn select_commit(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Load::Ready { data, .. } = &self.history.load else {
             return;
@@ -1254,6 +1383,7 @@ impl RepoView {
         };
         self.history.selected = Some(ix);
         self.history.marked = None;
+        self.history.multi.clear();
         let id = commit.id.to_string();
         self.load_details(id, cx);
     }
@@ -1363,6 +1493,7 @@ impl RepoView {
                     Ok(parsed) => {
                         this.history.details = Some(parsed.details);
                         this.history.ws_note = parsed.ws_note;
+                        this.commit_tree_follow(cx);
                         match parsed.files {
                             Err(message) => this.history.diff_info = message,
                             Ok(files) => {
@@ -1432,6 +1563,51 @@ impl RepoView {
         });
         self.reload_details(cx);
         cx.notify();
+    }
+
+    /// 提交里改的一个文件的右键菜单：看历史、逐行追溯（原有的），加上用外部工具比较。
+    fn commit_file_menu(
+        &self,
+        ix: usize,
+        at: Option<(String, bool)>,
+        cx: &mut Context<Self>,
+    ) -> super::menus::MenuFn {
+        let file = &self.history.files[ix];
+        let base = self.tracked_file_menu(file.path.to_string(), at, cx);
+        let label = self.ext_label(crate::ext_tools::Kind::Diff, cx);
+        let details = self.history.details.as_ref();
+        let commit = details.map(|d| d.id.clone()).unwrap_or_default();
+        let parent = details.and_then(|d| d.parents.first().cloned());
+        let (path, orig, letter) = (
+            file.path.to_string(),
+            file.orig.as_ref().map(|o| o.to_string()),
+            file.letter,
+        );
+        let view = cx.entity().downgrade();
+        Box::new(move |menu, window, cx| {
+            let menu = base(menu, window, cx);
+            let (view, commit, parent, path, orig) = (
+                view.clone(),
+                commit.clone(),
+                parent.clone(),
+                path.clone(),
+                orig.clone(),
+            );
+            menu.separator().item(
+                gpui_kit::component::menu::PopupMenuItem::new(label.clone()).on_click(
+                    move |_, window, cx| {
+                        let (commit, parent, path, orig) =
+                            (commit.clone(), parent.clone(), path.clone(), orig.clone());
+                        view.update(cx, |this, cx| {
+                            this.external_diff_commit(
+                                commit, parent, path, orig, letter, window, cx,
+                            )
+                        })
+                        .ok();
+                    },
+                ),
+            )
+        })
     }
 
     /// 点了提交改动里的一个文件：图片就在右边打开图片对比，别的滚到它的改动。
@@ -1540,13 +1716,18 @@ impl RepoView {
             .map(|ix| {
                 let commit = &data.commits[ix];
                 let row = data.graph.rows[ix];
-                let selected = self.history.selected == Some(ix);
+                let in_multi = self.history.multi.len() > 1
+                    && self.history.multi.iter().any(|id| **id == *commit.id);
+                let selected = self.history.selected == Some(ix) || in_multi;
                 // 搜索时不匹配的提交变淡，提交图照常画
                 let dim = searching && self.history.matches.binary_search(&ix).is_err();
                 // 待推送的标 ↑；待拉取的标 ↓，整行淡一些（还不在当前分支上）
                 let unpushed = marks && self.history.unpushed.contains(&commit.id);
                 let unpulled = marks && self.history.unpulled.contains(&commit.id);
-                let menu = self.commit_menu(ix, cx);
+                let menu = match in_multi {
+                    true => Some(self.multi_commit_menu(cx)),
+                    false => self.commit_menu(ix, cx),
+                };
                 let line = h_flex()
                     .id(ix)
                     .h(px(ROW_HEIGHT))
@@ -1561,24 +1742,26 @@ impl RepoView {
                     .when(!selected, |d| d.hover(|s| s.bg(colors.hover)))
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         this.history.focus.focus(window, cx);
-                        // 选中了一个提交，按住 Ctrl 点另一个：比较这两个
+                        // Ctrl 加点击：加进多选或去掉；Shift 加点击：从选中的连到这一个
                         let modifiers = event.modifiers();
-                        let other = this.history.selected_commit().map(|c| c.id.to_string());
-                        let clicked = this.history.commit_at(ix).map(|c| c.id.to_string());
-                        if (modifiers.control || modifiers.platform)
-                            && this.history.selected != Some(ix)
-                            && let (Some(other), Some(clicked)) = (other, clicked)
-                        {
-                            this.compare_commits(other, clicked, window, cx);
+                        if modifiers.control || modifiers.platform {
+                            this.toggle_multi_commit(ix, cx);
+                            return;
+                        }
+                        if modifiers.shift {
+                            this.range_multi_commit(ix, cx);
                             return;
                         }
                         this.select_commit(ix, cx)
                     }))
-                    // 点右键先选中这一行，菜单里的操作都是对它做的
+                    // 点右键先选中这一行，菜单里的操作都是对它做的；点在多选的提交上就保持多选
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, _, _, cx| {
-                            if this.history.selected != Some(ix) {
+                            if in_multi {
+                                return;
+                            }
+                            if this.history.selected != Some(ix) || this.history.multi.len() > 1 {
                                 let before =
                                     this.history.selected_commit().map(|c| c.id.to_string());
                                 this.select_commit(ix, cx);
@@ -1628,6 +1811,7 @@ impl RepoView {
                                 badge_budget,
                                 ix,
                                 colors,
+                                &mut |label, badge| self.wire_badge(label, badge, cx),
                             ))
                             .child(ui::clipped(
                                 ("subject", ix),
@@ -1691,7 +1875,9 @@ impl RepoView {
         // 树形还是平铺和本地修改、比较共用一个设置；文件多的时候上面有过滤框
         let tree = self.app.read(cx).settings.file_tree;
         let total = self.history.files.len();
-        let filterable = total > FILTER_FROM;
+        let all_files = self.history.all_files;
+        // 全部文件一般很多：一直有过滤框
+        let filterable = total > FILTER_FROM || all_files;
         let needle = match filterable {
             true => self
                 .history
@@ -1714,7 +1900,11 @@ impl RepoView {
         let rows = file_tree::rows(&shown, tree, &|path| {
             needle.is_empty() && folded.contains(path)
         });
-        let none_match = rows.is_empty() && total > 0;
+        let none_match = rows.is_empty() && total > 0 && !all_files;
+        let tree_rows = match all_files {
+            true => Some(self.render_commit_tree_rows(&needle, colors.hover, colors.selected, cx)),
+            false => None,
+        };
         let files: Vec<AnyElement> = rows
             .iter()
             .enumerate()
@@ -1766,7 +1956,16 @@ impl RepoView {
                     .image
                     .as_ref()
                     .is_some_and(|(path, _)| *path == file.path);
-                let menu = self.tracked_file_menu(file.path.to_string(), cx);
+                // 逐行追溯看这个提交里的版本；文件在这个提交里被删掉了，看删除前（第一个父提交）的
+                let at = self
+                    .history
+                    .details
+                    .as_ref()
+                    .and_then(|d| match file.letter {
+                        "D" => d.parents.first().map(|parent| (parent.clone(), true)),
+                        _ => Some((d.id.clone(), false)),
+                    });
+                let menu = self.commit_file_menu(ix, at, cx);
                 let color = match file.letter {
                     "A" => added,
                     "D" => removed,
@@ -1925,40 +2124,59 @@ impl RepoView {
                     .child(div().text_sm().whitespace_normal().child(d.message.clone()))
                     .child(div().h(px(1.)).bg(colors.border))
                     .child(info)
-                    .when(total > 0, |panel| {
-                        panel
-                            .child(div().h(px(1.)).bg(colors.border))
+                    .child(div().h(px(1.)).bg(colors.border))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            // 改动的文件｜这个提交时的全部文件
                             .child(
-                                h_flex()
-                                    .gap_2()
+                                ButtonGroup::new("details-files-kind")
+                                    .outline()
+                                    .xsmall()
                                     .child(
-                                        div()
-                                            .flex_1()
-                                            .text_xs()
-                                            .text_color(colors.muted)
-                                            .child(tf!("改动的文件（{files}）", files = total)),
+                                        Button::new("details-files-changed")
+                                            .label(tf!("改动的文件（{files}）", files = total))
+                                            .selected(!all_files)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.set_all_files(false, cx)
+                                            })),
                                     )
-                                    .child(file_tree::mode_toggle(
-                                        "details-list-mode",
-                                        tree,
-                                        move |tree, _, cx| {
-                                            app.update(cx, |app, cx| {
-                                                app.update_settings(cx, |s| s.file_tree = tree)
-                                            });
-                                            view.update(cx, |_, cx| cx.notify()).ok();
-                                        },
-                                    )),
+                                    .child(
+                                        Button::new("details-files-all")
+                                            .label(tr("全部文件"))
+                                            .tooltip(tr("此提交时仓库里的全部文件：点击查看当时的内容，可另存"))
+                                            .selected(all_files)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.set_all_files(true, cx)
+                                            })),
+                                    ),
                             )
-                            .children(filter_input)
-                            .when(none_match, |panel| {
-                                panel.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(colors.muted)
-                                        .child(tr("没有匹配的文件")),
-                                )
-                            })
-                            .child(v_flex().children(files))
+                            .child(div().flex_1())
+                            .when(!all_files, |row| {
+                                row.child(file_tree::mode_toggle(
+                                    "details-list-mode",
+                                    tree,
+                                    move |tree, _, cx| {
+                                        app.update(cx, |app, cx| {
+                                            app.update_settings(cx, |s| s.file_tree = tree)
+                                        });
+                                        view.update(cx, |_, cx| cx.notify()).ok();
+                                    },
+                                ))
+                            }),
+                    )
+                    .children(filter_input)
+                    .when(none_match, |panel| {
+                        panel.child(
+                            div()
+                                .text_xs()
+                                .text_color(colors.muted)
+                                .child(tr("没有匹配的文件")),
+                        )
+                    })
+                    .child(match tree_rows {
+                        Some(rows) => v_flex().children(rows),
+                        None => v_flex().children(files),
                     }),
             )
             .into_any_element()
@@ -2324,10 +2542,24 @@ impl RepoView {
                 )
                 .into_any_element()
         };
+        let multi_panel = self.render_multi_commits(cx);
+        let multi = multi_panel.is_some();
+        let tree_preview = self.render_tree_preview(cx);
+        let previewing = tree_preview.is_some();
         v_flex()
             .size_full()
             .child(top)
-            .when(!collapsed, |view| {
+            .when_some(multi_panel.filter(|_| !collapsed), |view, panel| {
+                view.child(
+                    div()
+                        .h(details_height)
+                        .flex_none()
+                        .relative()
+                        .child(panel)
+                        .child(self.split_handle(Split::DetailsHeight, cx)),
+                )
+            })
+            .when(!collapsed && !multi, |view| {
                 view.child(
                     h_flex()
                         .h(details_height)
@@ -2342,98 +2574,107 @@ impl RepoView {
                                 .child(details)
                                 .child(self.split_handle(Split::DetailsWidth, cx)),
                         )
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .h_full()
-                                .child(
-                                    h_flex()
-                                        .h(px(28.))
-                                        .flex_none()
-                                        .pl_3()
-                                        .pr_2()
-                                        .gap_1()
-                                        .border_b_1()
-                                        .border_color(border)
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child(
-                                            ui::clipped(
-                                                "diff-info",
-                                                self.history.diff_info.clone(),
+                        // 全部文件里点开了一个文件：右边是它那时的内容，不是改动
+                        .children(tree_preview)
+                        .when(!previewing, |row| {
+                            row.child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .child(
+                                        h_flex()
+                                            .h(px(28.))
+                                            .flex_none()
+                                            .pl_3()
+                                            .pr_2()
+                                            .gap_1()
+                                            .border_b_1()
+                                            .border_color(border)
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child(
+                                                ui::clipped(
+                                                    "diff-info",
+                                                    self.history.diff_info.clone(),
+                                                )
+                                                .flex_1(),
                                             )
-                                            .flex_1(),
-                                        )
-                                        .child(
-                                            Button::new("diff-prev-change")
-                                                .xsmall()
-                                                .ghost()
-                                                .icon(ui::icon(IconName::ArrowUp))
-                                                .tooltip(tr("上一处改动"))
-                                                .on_click(move |_, _, cx| {
-                                                    prev_state.update(cx, |state, cx| {
-                                                        state.previous_change(cx)
+                                            .child(
+                                                Button::new("diff-prev-change")
+                                                    .xsmall()
+                                                    .ghost()
+                                                    .icon(ui::icon(IconName::ArrowUp))
+                                                    .tooltip(tr("上一处改动"))
+                                                    .on_click(move |_, _, cx| {
+                                                        prev_state.update(cx, |state, cx| {
+                                                            state.previous_change(cx)
+                                                        })
+                                                    }),
+                                            )
+                                            .child(
+                                                Button::new("diff-next-change")
+                                                    .xsmall()
+                                                    .ghost()
+                                                    .icon(ui::icon(IconName::ArrowDown))
+                                                    .tooltip(tr("下一处改动"))
+                                                    .on_click(move |_, _, cx| {
+                                                        next_state.update(cx, |state, cx| {
+                                                            state.next_change(cx)
+                                                        })
+                                                    }),
+                                            )
+                                            .child(search_toggle)
+                                            .child(ws_toggle)
+                                            .child(
+                                                Button::new("history-whole-file")
+                                                    .xsmall()
+                                                    .ghost()
+                                                    .icon(ui::icon(IconName::UnfoldVertical))
+                                                    .selected(whole_file)
+                                                    .tooltip(tr("显示整个文件"))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.toggle_commit_whole_file(cx)
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("history-split")
+                                                    .xsmall()
+                                                    .ghost()
+                                                    .icon(ui::icon(IconName::Columns2))
+                                                    .selected(split)
+                                                    .tooltip(tr(
+                                                        "并排显示：左侧为旧版本，右侧为新版本",
+                                                    ))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.toggle_split(cx)
+                                                    })),
+                                            ),
+                                    )
+                                    .children(search_bar)
+                                    .children(ws_strip)
+                                    .child(match image_pane {
+                                        Some(pane) => pane,
+                                        None => div()
+                                            .relative()
+                                            .flex_1()
+                                            .min_h_0()
+                                            .child(
+                                                Diff::new(&self.history.diff)
+                                                    .line_number(true)
+                                                    .syntax_highlight(true)
+                                                    .decorations(search_marks)
+                                                    .render_header(move |file, _, _| {
+                                                        diff_file_header(file, header_width, muted)
                                                     })
-                                                }),
-                                        )
-                                        .child(
-                                            Button::new("diff-next-change")
-                                                .xsmall()
-                                                .ghost()
-                                                .icon(ui::icon(IconName::ArrowDown))
-                                                .tooltip(tr("下一处改动"))
-                                                .on_click(move |_, _, cx| {
-                                                    next_state.update(cx, |state, cx| {
-                                                        state.next_change(cx)
-                                                    })
-                                                }),
-                                        )
-                                        .child(search_toggle)
-                                        .child(ws_toggle)
-                                        .child(
-                                            Button::new("history-whole-file")
-                                                .xsmall()
-                                                .ghost()
-                                                .icon(ui::icon(IconName::UnfoldVertical))
-                                                .selected(whole_file)
-                                                .tooltip(tr("显示整个文件"))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.toggle_commit_whole_file(cx)
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("history-split")
-                                                .xsmall()
-                                                .ghost()
-                                                .icon(ui::icon(IconName::Columns2))
-                                                .selected(split)
-                                                .tooltip(tr("并排显示：左侧为旧版本，右侧为新版本"))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.toggle_split(cx)
-                                                })),
-                                        ),
-                                )
-                                .children(search_bar)
-                                .children(ws_strip)
-                                .child(match image_pane {
-                                    Some(pane) => pane,
-                                    None => div()
-                                        .flex_1()
-                                        .min_h_0()
-                                        .child(
-                                            Diff::new(&self.history.diff)
-                                                .line_number(true)
-                                                .syntax_highlight(true)
-                                                .decorations(search_marks)
-                                                .render_header(move |file, _, _| {
-                                                    diff_file_header(file, header_width, muted)
-                                                })
-                                                .size_full(),
-                                        )
-                                        .into_any_element(),
-                                }),
-                        )
+                                                    .size_full(),
+                                            )
+                                            // 按住 Ctrl 滚滚轮调代码字号
+                                            .child(crate::zoom::wheel_zoom(self.app.clone()))
+                                            .into_any_element(),
+                                    }),
+                            )
+                        })
                         // 放在最后：画在详情和改动的上面，整条上边都拖得动
                         .child(self.split_handle(Split::DetailsHeight, cx)),
                 )
@@ -2738,6 +2979,7 @@ fn ref_badges(
     budget: f32,
     row: usize,
     colors: RowColors,
+    wire: &mut dyn FnMut(&RefLabel, Stateful<Div>) -> AnyElement,
 ) -> Vec<AnyElement> {
     let mut labels = ref_labels(refs, is_remote);
     if !hidden.is_empty() {
@@ -2761,7 +3003,8 @@ fn ref_badges(
                 RefKind::Remote => colors.remote,
             };
             // 当前分支加粗（和侧栏一样）：「HEAD」被收起来时也认得出
-            badge(at, &label.name, color, label.kind == RefKind::Current)
+            let bold = label.kind == RefKind::Current;
+            wire(label, badge(row, at, &label.name, color, bold))
         })
         .collect();
     if shown < labels.len() {
@@ -2795,8 +3038,9 @@ fn ref_badges(
 }
 
 /// 一个分支、标签的小牌子。名字太长会截掉，停上去看全名。`at` 是这一行里的第几个。
-fn badge(at: usize, label: &str, color: Hsla, bold: bool) -> AnyElement {
+fn badge(row: usize, at: usize, label: &str, color: Hsla, bold: bool) -> Stateful<Div> {
     div()
+        .id(SharedString::from(format!("ref-badge-{row}-{at}")))
         .flex_none()
         .max_w(px(BADGE_TEXT_MAX + 10.))
         .when(bold, |d| d.font_weight(FontWeight::SEMIBOLD))
@@ -2813,7 +3057,6 @@ fn badge(at: usize, label: &str, color: Hsla, bold: bool) -> AnyElement {
             ("badge", at),
             SharedString::from(label.to_string()),
         ))
-        .into_any_element()
 }
 
 /// 改动视图里每个文件的标题：路径、增删行数、文件是新增还是删除。

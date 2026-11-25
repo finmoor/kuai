@@ -30,7 +30,9 @@ https://github.com/finmoor/kuai 。
   其他 GNOME（如 Fedora）需安装「AppIndicator and KStatusNotifierItem Support」扩展。
   桌面没有托盘时，设置中不显示托盘的选项。
 - Wayland 桌面上窗口无法隐藏到托盘：「关闭窗口时最小化到托盘」改为最小化窗口，
-  没有「最小化到托盘」的选项。X11 桌面上与 Windows 版相同。
+  没有「最小化到托盘」的选项；关闭窗口时有 AI 助手在运行，确认框中为「最小化窗口」。
+  X11 桌面上与 Windows 版相同。
+- 外部比较、合并工具中没有 WinMerge（只有 Windows 版）。
 - 将主机上的目录映射到本机需要 fuse3（sudo apt install fuse3，Fedora 为 sudo dnf install fuse3），
   只能映射为文件夹（空文件夹或尚不存在的文件夹），没有盘符。
 - 密码和私钥口令保存在系统钥匙圈中，名称为「Kuai: <主机地址>」，移除主机时一并删除。

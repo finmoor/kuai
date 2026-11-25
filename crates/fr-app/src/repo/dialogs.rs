@@ -36,6 +36,8 @@ pub(super) struct Ask {
     pub value: String,
     /// 第二个输入框的占位文字；`None` 时只有一个输入框
     pub second: Option<SharedString>,
+    /// 第二个输入框里预先填好的内容
+    pub second_value: String,
     pub hint: Hint,
     pub ok: &'static str,
     /// 勾选项：文字和默认是否勾上
@@ -139,6 +141,7 @@ impl RepoView {
             placeholder,
             value,
             second,
+            second_value,
             hint,
             ok,
             checks,
@@ -149,8 +152,13 @@ impl RepoView {
         if !value.is_empty() {
             input.update(cx, |state, cx| state.set_value(value, window, cx));
         }
-        let second = second
-            .map(|placeholder| cx.new(|cx| InputState::new(window, cx).placeholder(placeholder)));
+        let second = second.map(|placeholder| {
+            let state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+            if !second_value.is_empty() {
+                state.update(cx, |state, cx| state.set_value(second_value, window, cx));
+            }
+            state
+        });
         let states: Rc<Vec<Cell<bool>>> =
             Rc::new(checks.iter().map(|(_, on)| Cell::new(*on)).collect());
         // 校验没过的原因，显示在对话框里

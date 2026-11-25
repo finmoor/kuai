@@ -9,6 +9,11 @@
 //! 仓库那一行写分支、改动数、已打开、终端个数（点了到会话页），鼠标移上去出「新建终端」「移出工作区」；
 //! 子仓库默认展开，左边的小箭头收起（记在设置里，只在这台电脑上）。行的样子见 `repo_rows`。
 //! 1.16.1 左上角的工作区菜单（带「切换服务器」的那一套）由这一页代替。
+//!
+//! 左边的主机（`docs/design/first-run/` 第 4 节方向 A）默认跟着当前仓库所在的主机
+//! （从仓库标签页过来时），手动选过就按选的；工作区是空的时，列出这台主机上还没加入的仓库，默认都
+//! 勾着，一下加进来；有了仓库以后页尾写「另有 n 个仓库未加入工作区 · 添加…」。处处写明工作区是
+//! 可选的分组、存在哪台主机上、不影响已打开的标签页。
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -85,21 +90,34 @@ pub struct WorkspacePage {
     scroll: ScrollHandle,
     /// 标出来的那一行上一帧画在哪（滚到它用，见 [`crate::repo_rows::Block::hit_at`]）
     hit_bounds: crate::repo_rows::HitCell,
+    /// 从仓库标签页过来时那个仓库所在的主机（见 [`Self::machine`]）
+    follow: Option<String>,
+    /// 这次运行里手动选过主机、工作区：之后不再跟着仓库换主机
+    manual: bool,
+    /// 空工作区的勾选列表里去掉了勾的仓库（默认都勾着）
+    unpicked: Vec<RepoEntry>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl EventEmitter<PageEvent> for WorkspacePage {}
 
-/// 一个仓库的终端：几个还在的，和最要紧的那个的状态（已停下比运行中要紧，运行中比空闲要紧）。
+/// 一个仓库的终端：几个还在的，和最要紧的那个的状态（待查看比运行中要紧，运行中比静默、空闲要紧；
+/// 离开期间有更新的算待查看）。
 pub(crate) fn terminal_summary(board: &TermBoard, entry: &RepoEntry) -> Option<(usize, TermState)> {
     let rows = board.terms_of(entry)?;
     let alive: Vec<_> = rows.iter().filter(|row| row.alive).collect();
     let rank = |state: TermState| match state {
-        TermState::Stopped => 0,
+        TermState::Waiting => 0,
         TermState::Running => 1,
-        TermState::Idle => 2,
+        TermState::Quiet => 2,
+        TermState::Idle => 3,
+        TermState::Unknown => 4,
     };
-    let worst = alive.iter().map(|row| row.state).min_by_key(|s| rank(*s))?;
+    let state = |row: &&crate::term_board::Row| match row.wants_look() {
+        true => TermState::Waiting,
+        false => row.state,
+    };
+    let worst = alive.iter().map(state).min_by_key(|s| rank(*s))?;
     Some((alive.len(), worst))
 }
 
@@ -136,8 +154,73 @@ impl WorkspacePage {
             hit_exact: false,
             scroll: ScrollHandle::new(),
             hit_bounds: Rc::new(Cell::new(None)),
+            follow: None,
+            manual: false,
+            unpicked: Vec::new(),
             _subscriptions: subscriptions,
         }
+    }
+
+    /// 从仓库标签页过来：左边的主机跟着那个仓库所在的主机（手动选过主机的不跟）。
+    pub fn follow(&mut self, machine: String, cx: &mut Context<Self>) {
+        if self.follow.as_ref() != Some(&machine) {
+            self.follow = Some(machine);
+            self.unpicked.clear();
+            if self.visible {
+                self.want_scan(cx);
+            }
+            cx.notify();
+        }
+    }
+
+    /// 列的是哪台主机：没手动选过、从仓库标签页过来的跟着那个仓库所在的主机（它的工作区读到了才跟）；
+    /// 不然是选过的那台，再不然是现在用的工作区所在的那台。
+    fn machine(&self, cx: &App) -> String {
+        let app = self.app.read(cx);
+        let known = |id: &String| id == LOCAL || app.settings.servers.iter().any(|s| s.id == *id);
+        if !self.manual
+            && let Some(follow) = self
+                .follow
+                .clone()
+                .filter(|id| known(id) && app.workspaces_on(id).is_some())
+        {
+            return follow;
+        }
+        if let Some(chosen) = app.menu_machine.clone().filter(known) {
+            return chosen;
+        }
+        app.settings.current.machine.clone()
+    }
+
+    /// 这台主机上还没加入工作区 `key` 的仓库（主机仓库列表里的，按列表的先后）。
+    fn unjoined(&self, key: &WorkspaceKey, cx: &App) -> Vec<RepoEntry> {
+        let app = self.app.read(cx);
+        let members = app.members(key);
+        app.repos_on(&key.machine)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| !members.iter().any(|member| member.same_repo(entry)))
+            .collect()
+    }
+
+    /// 空工作区里勾着的仓库都加进去。
+    fn join_picked(&mut self, key: WorkspaceKey, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.check_writable(&key.machine, window, cx) {
+            return;
+        }
+        let picked: Vec<RepoEntry> = self
+            .unjoined(&key, cx)
+            .into_iter()
+            .filter(|entry| !self.unpicked.contains(entry))
+            .collect();
+        self.app.update(cx, |app, cx| {
+            for entry in &picked {
+                app.add_to_workspace(&key, entry, cx);
+            }
+        });
+        self.unpicked.clear();
+        self.want_scan(cx);
+        cx.notify();
     }
 
     /// 选中的工作区（后退时回到它、从这一页打开的仓库记着它）。
@@ -147,6 +230,9 @@ impl WorkspacePage {
 
     /// 「打开工作区」：选中工作区 `key`（列它所在的那台电脑），`entry` 那一行标出来、滚到看得见。
     pub fn reveal(&mut self, key: WorkspaceKey, entry: Option<RepoEntry>, cx: &mut Context<Self>) {
+        // 列它所在的那台主机（手动选过别的主机也换过去：要看的就是它）
+        self.follow = Some(key.machine.clone());
+        self.manual = false;
         self.app.update(cx, |app, cx| app.set_current(key, cx));
         self.scroll_to_hit = entry.is_some();
         self.hit_exact = false;
@@ -201,8 +287,8 @@ impl WorkspacePage {
 
     /// 列的是哪台电脑，选中的是哪个工作区（那台上的工作区还没读到、一个都没有时是 None）。
     pub fn selection(&self, cx: &App) -> (String, Option<WorkspaceKey>) {
+        let machine = self.machine(cx);
         let app = self.app.read(cx);
-        let machine = app.menu_machine();
         let current = app.current();
         let key = app.workspaces_on(&machine).and_then(|list| {
             let chosen = list.iter().find(|(key, ..)| key == current);
@@ -253,6 +339,8 @@ impl WorkspacePage {
     /// 工作区页的下拉里换一台电脑看。
     fn pick_machine(&mut self, machine: String, cx: &mut Context<Self>) {
         self.hit = None;
+        self.unpicked.clear();
+        self.manual = true;
         self.app
             .update(cx, |app, _| app.menu_machine = Some(machine));
         self.want_scan(cx);
@@ -262,6 +350,7 @@ impl WorkspacePage {
     /// 选中一个工作区：只是在这一页上看它，标签页不动。
     fn pick(&mut self, key: WorkspaceKey, cx: &mut Context<Self>) {
         self.hit = None;
+        self.manual = true;
         self.app.update(cx, |app, cx| app.set_current(key, cx));
         self.want_scan(cx);
         cx.notify();
@@ -332,8 +421,8 @@ impl WorkspacePage {
     /// 新建工作区：填名称、选保存在哪台电脑上（默认是这一页正看着的那台，它没连着时默认本机）。
     /// 建好了选中它。
     fn new_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let shown = self.machine(cx);
         let app = self.app.read(cx);
-        let shown = app.menu_machine();
         let default = match app.writable(&shown) {
             true => shown,
             false => LOCAL.to_string(),
@@ -631,6 +720,19 @@ impl WorkspacePage {
             Some(_) => None,
         };
         let switcher = self.render_machine_picker(machine, cx);
+        // 只有本机、没有下拉时也写一句工作区存在哪
+        let switcher = switcher.or_else(|| {
+            Some(
+                div()
+                    .flex_none()
+                    .mx(px(12.))
+                    .mt(px(8.))
+                    .text_size(px(11.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(tr("工作区保存在本机上"))
+                    .into_any_element(),
+            )
+        });
         v_flex()
             .w(px(width))
             .flex_none()
@@ -778,12 +880,24 @@ impl WorkspacePage {
                 }
                 menu
             });
+        let note = match machine == LOCAL {
+            true => tr("工作区保存在本机上"),
+            false => tr("工作区保存在此主机上"),
+        };
         Some(
-            div()
+            v_flex()
                 .flex_none()
                 .mx(px(10.))
                 .mt(px(8.))
+                .gap(px(4.))
                 .child(button)
+                .child(
+                    div()
+                        .px(px(2.))
+                        .text_size(px(11.))
+                        .text_color(muted)
+                        .child(note),
+                )
                 .into_any_element(),
         )
     }
@@ -846,11 +960,38 @@ impl WorkspacePage {
         );
         let app = self.app.read(cx);
         let Some(key) = key else {
-            let (icon, text) = match app.workspaces_on(machine) {
-                None => (IconName::Plug, tr("尚未连接此主机")),
-                Some(_) => (IconName::Layers, tr("这台主机上没有工作区")),
+            if app.workspaces_on(machine).is_none() {
+                return blank(IconName::Plug, tr("尚未连接此主机"), cx).into_any_element();
+            }
+            // 这台上一个工作区都没有：说一句工作区是什么，给「新建工作区…」（默认建在这台上）
+            let writable = app.writable(machine);
+            let place: SharedString = match machine == LOCAL {
+                true => tr("本机").into(),
+                false => app.machine_name(machine),
             };
-            return blank(icon, text, cx).into_any_element();
+            return blank(IconName::Layers, tr("这台主机上没有工作区"), cx)
+                .px(px(24.))
+                .child(
+                    div()
+                        .max_w(px(420.))
+                        .text_xs()
+                        .text_center()
+                        .whitespace_normal()
+                        .child(tf!(
+                            "工作区是可选的分组，用来把常用仓库放在一起，保存在 {place} 上，不影响已打开的标签页。",
+                            place
+                        )),
+                )
+                .child(
+                    Button::new("ws-new-empty")
+                        .small()
+                        .primary()
+                        .icon(ui::icon(IconName::Plus))
+                        .label(tr("新建工作区…"))
+                        .disabled(!writable)
+                        .on_click(cx.listener(|this, _, window, cx| this.new_workspace(window, cx))),
+                )
+                .into_any_element();
         };
         let key = key.clone();
         let members = app.members(&key);
@@ -987,48 +1128,58 @@ impl WorkspacePage {
                     .min_w_0()
                     .gap(px(4.))
                     .child(
-                        ui::clipped("ws-title", name)
+                        ui::clipped("ws-title", name.clone())
                             .text_lg()
                             .font_weight(FontWeight::SEMIBOLD),
                     )
                     .child(ui::clipped("ws-line", line).text_xs().text_color(muted)),
             )
             .child(actions);
+        let place: SharedString = match key.is_local() {
+            true => tr("本机").into(),
+            false => app.machine_name(&key.machine),
+        };
         let blocks = self.render_blocks(&key, &members, open, writable, compact, cx);
-        let add_key = key.clone();
+        // 工作区是什么、存在哪
+        let concept = div().text_xs().text_color(muted).whitespace_normal().child(tf!(
+            "工作区是可选的分组，用来把常用仓库放在一起，保存在 {place} 上，不影响已打开的标签页。",
+            place = place.clone()
+        ));
+        let unjoined = self.unjoined(&key, cx);
+        let empty = blocks.is_empty();
+        let join = empty.then(|| self.render_join(&key, &name, &unjoined, writable, cx));
+        // 有了仓库：页尾一行「另有 n 个仓库未加入工作区 · 添加…」
+        let footer = (!empty && !unjoined.is_empty()).then(|| {
+            let add_key = key.clone();
+            h_flex()
+                .gap(px(6.))
+                .px(px(4.))
+                .text_xs()
+                .text_color(muted)
+                .child(tf!(
+                    "另有 {n} 个仓库未加入工作区",
+                    n = unjoined.len().to_string()
+                ))
+                .child("·")
+                .child(
+                    div()
+                        .id("ws-add-more")
+                        .text_color(cx.theme().primary)
+                        .cursor_pointer()
+                        .hover(|s| s.underline())
+                        .child(tr("添加…"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.add_repos(add_key.clone(), window, cx)
+                        })),
+                )
+        });
         let card = v_flex()
             .p(px(4.))
             .border_1()
             .border_color(border)
             .rounded(px(10.))
             .bg(panel)
-            .when(blocks.is_empty(), |card| {
-                card.child(
-                    v_flex()
-                        .items_center()
-                        .gap(px(10.))
-                        .py(px(48.))
-                        .text_color(muted)
-                        .child(Icon::new(IconName::FolderGit2).size_6())
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(cx.theme().foreground)
-                                .child(tr("此工作区中暂无仓库")),
-                        )
-                        .child(
-                            Button::new("ws-add-empty")
-                                .small()
-                                .icon(ui::icon(IconName::Plus))
-                                .label(tr("添加仓库…"))
-                                .disabled(!writable)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.add_repos(add_key.clone(), window, cx)
-                                })),
-                        ),
-                )
-            })
+            .children(join)
             .children(blocks);
         div()
             .id("ws-main")
@@ -1047,8 +1198,146 @@ impl WorkspacePage {
                     .gap(px(14.))
                     .child(head)
                     .children(banner)
-                    .child(card),
+                    .when(empty, |page| page.child(concept))
+                    .child(card)
+                    .children(footer),
             )
+            .into_any_element()
+    }
+
+    /// 空工作区：这台主机上还没加入的仓库，默认都勾着，「加入「默认」（n）」一下加进来；一个都没有时
+    /// 说一声，给「前往主机页」。
+    fn render_join(
+        &self,
+        key: &WorkspaceKey,
+        name: &SharedString,
+        unjoined: &[RepoEntry],
+        writable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let (muted, fg, hover) = (theme.muted_foreground, theme.foreground, theme.list_hover);
+        if unjoined.is_empty() {
+            return v_flex()
+                .items_center()
+                .gap(px(10.))
+                .py(px(40.))
+                .text_color(muted)
+                .child(Icon::new(IconName::FolderGit2).size_6())
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(fg)
+                        .child(tr("暂无未加入的仓库")),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .child(tr("请先在主机页中打开、克隆或新建仓库。")),
+                )
+                .child(
+                    Button::new("ws-go-hosts")
+                        .small()
+                        .icon(ui::icon(IconName::Server))
+                        .label(tr("前往主机页"))
+                        .on_click(|_, window, cx| crate::workspace::go_to_hosts(window, cx)),
+                )
+                .into_any_element();
+        }
+        let app = self.app.read(cx);
+        let picked = unjoined
+            .iter()
+            .filter(|entry| !self.unpicked.contains(entry))
+            .count();
+        let rows: Vec<AnyElement> =
+            unjoined
+                .iter()
+                .enumerate()
+                .map(|(ix, entry)| {
+                    let on = !self.unpicked.contains(entry);
+                    let toggle = entry.clone();
+                    h_flex()
+                        .id(("ws-join", ix))
+                        .gap(px(10.))
+                        .px(px(12.))
+                        .py(px(7.))
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(hover))
+                        .child(Checkbox::new(("ws-join-check", ix)).checked(on).on_click(
+                            cx.listener({
+                                let toggle = toggle.clone();
+                                move |this, checked: &bool, _, cx| {
+                                    this.unpicked.retain(|other| *other != toggle);
+                                    if !*checked {
+                                        this.unpicked.push(toggle.clone());
+                                    }
+                                    cx.notify();
+                                }
+                            }),
+                        ))
+                        .child(
+                            ui::icon(match entry.server.is_some() {
+                                true => IconName::Server,
+                                false => IconName::FolderGit2,
+                            })
+                            .text_color(muted),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().text_sm().text_color(fg).child(app.repo_name(entry)))
+                                .child(
+                                    ui::clipped(("ws-join-path", ix), entry.path.clone())
+                                        .text_xs()
+                                        .text_color(muted),
+                                ),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            match this.unpicked.contains(&toggle) {
+                                true => this.unpicked.retain(|other| *other != toggle),
+                                false => this.unpicked.push(toggle.clone()),
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                })
+                .collect();
+        let join_key = key.clone();
+        let label = tf!(
+            "加入「{name}」（{n}）",
+            name = name.clone(),
+            n = picked.to_string()
+        );
+        v_flex()
+            .gap(px(6.))
+            .p(px(8.))
+            .child(
+                h_flex()
+                    .px(px(4.))
+                    .pb(px(4.))
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(tr("此工作区中暂无仓库。勾选要加入的仓库：")),
+                    )
+                    .child(
+                        Button::new("ws-join-go")
+                            .small()
+                            .primary()
+                            .label(label)
+                            .disabled(!writable || picked == 0)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.join_picked(join_key.clone(), window, cx)
+                            })),
+                    ),
+            )
+            .children(rows)
             .into_any_element()
     }
 

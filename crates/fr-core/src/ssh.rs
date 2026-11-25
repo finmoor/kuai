@@ -97,6 +97,51 @@ pub fn login_args(
     args
 }
 
+/// `~/.ssh/config` 里写的主机别名（`Host` 后面的名字，带通配符、取反的不算），按出现的先后，
+/// 不重复。添加主机时可以直接选：ssh 照它的设置连（地址、端口、用户名、私钥都在那里）。
+pub fn config_hosts(text: &str) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        // `Host a b`，也可以写成 `Host=a`；关键字不分大小写
+        let Some((key, rest)) = line.split_once(|c: char| c.is_whitespace() || c == '=') else {
+            continue;
+        };
+        if !key.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        for name in rest
+            .trim_start_matches(|c: char| c.is_whitespace() || c == '=')
+            .split_whitespace()
+        {
+            let name = name.trim_matches('"');
+            if name.is_empty() || name.contains(['*', '?', '!']) || hosts.iter().any(|h| h == name)
+            {
+                continue;
+            }
+            hosts.push(name.to_string());
+        }
+    }
+    hosts
+}
+
+/// 读本机用户的 `~/.ssh/config`，见 [`config_hosts`]。没有这个文件是空的。
+pub fn user_config_hosts() -> Vec<String> {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    let path = PathBuf::from(home).join(".ssh").join("config");
+    std::fs::read_to_string(path)
+        .map(|text| config_hosts(&text))
+        .unwrap_or_default()
+}
+
+/// 本机的用户名：ssh 目标里不写用户名时 ssh 用它（`~/.ssh/config` 里给了的除外）。
+pub fn local_user() -> String {
+    std::env::var(if cfg!(windows) { "USERNAME" } else { "USER" }).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +165,26 @@ mod tests {
         ));
         // 没有人可以问：要密码就直接失败，不卡着等
         assert!(has(&password, "BatchMode=yes"));
+    }
+
+    #[test]
+    fn 读出_ssh_config_里的主机别名() {
+        let text = [
+            "Host dev-vps",
+            "  HostName 203.0.113.8",
+            "  User root",
+            "",
+            "Host *.internal !bastion",
+            "Host=gpu box2 \"quoted\"",
+            "host dev-vps",
+            "  # Host commented",
+            "Match host x",
+        ]
+        .join("\n");
+        assert_eq!(
+            super::config_hosts(&text),
+            ["dev-vps", "gpu", "box2", "quoted"]
+        );
+        assert!(super::config_hosts("").is_empty());
     }
 }

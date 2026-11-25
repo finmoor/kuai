@@ -993,7 +993,16 @@ impl RepoView {
                 _ if on => fg,
                 _ => muted,
             };
-            let tip = tab.path.clone();
+            // 预览的标签（斜体）：单击别的文件会被换掉，提示里说清楚怎么留下
+            let tip: SharedString = match tab.preview {
+                true => format!(
+                    "{}\n{}",
+                    tab.path,
+                    tr("预览：单击其他文件时此标签页将被替换。双击标签或修改文件即可保留。")
+                )
+                .into(),
+                false => tab.path.clone().into(),
+            };
             let close = div()
                 .id(("file-tab-close", ix))
                 .flex_none()

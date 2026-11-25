@@ -43,8 +43,8 @@ pub use fr_core::protocol::{
 #[cfg(unix)]
 pub use remote::local_run_dir;
 pub use remote::{
-    ConnectOptions, Connection, FailedAt, Jump, LoginFailure, Probe, StageHandler, local_kuai_root,
-    login_failure,
+    ConnectOptions, Connection, FailedAt, Forwarder, Jump, LoginFailure, Probe, StageHandler,
+    TypedSecret, forward, local_kuai_root, login_failure,
 };
 
 /// 一次 git 调用的结果。
@@ -289,9 +289,9 @@ impl Stream for UploadStream {
     }
 }
 
-/// 回答密码请求的函数：参数是提示文字，和「是哪台跳板机在问」（不是跳板机问的为 None）；
-/// 返回 None 表示用户取消。在后台线程里调用，可以一直等。
-type PromptHandler = Arc<dyn Fn(&str, Option<&str>) -> Option<String> + Send + Sync>;
+/// 回答密码请求的函数：参数是提示文字、「是哪台跳板机在问」（不是跳板机问的为 None）、「是不是答错了
+/// 以后再问」（见 [`note_retry`]）；返回 None 表示用户取消。在后台线程里调用，可以一直等。
+type PromptHandler = Arc<dyn Fn(&str, Option<&str>, bool) -> Option<String> + Send + Sync>;
 
 static PROMPT_HANDLER: OnceLock<PromptHandler> = OnceLock::new();
 /// 加到 ssh 进程上的环境变量：连接服务器要密码时也来问我们
@@ -303,7 +303,7 @@ static SSH_ENV: OnceLock<Vec<(String, String)>> = OnceLock::new();
 /// 本机这边把当前程序设成 askpass 程序，所以 `main` 的开头要先调用
 /// `fr_core::askpass::run_helper`。
 pub fn init_prompts(
-    handler: impl Fn(&str, Option<&str>) -> Option<String> + Send + Sync + 'static,
+    handler: impl Fn(&str, Option<&str>, bool) -> Option<String> + Send + Sync + 'static,
 ) -> Result<()> {
     let handler: PromptHandler = Arc::new(handler);
     if PROMPT_HANDLER.set(handler.clone()).is_err() {
@@ -326,7 +326,12 @@ pub fn init_prompts(
         }
         // 等用户回答的这段时间不算连接超时
         let _asking = Asking::start();
-        handler(prompt, jump_of(tag).as_deref())
+        let retry = note_retry(tag, prompt);
+        let answer = handler(prompt, jump_of(tag).as_deref(), retry);
+        if let Some(answer) = &answer {
+            remember_typed(tag, prompt, answer);
+        }
+        answer
     })?;
     fr_core::git::set_extra_env(env.clone());
     let _ = SSH_ENV.set(env);
@@ -375,6 +380,10 @@ struct Saved {
     jump: Option<String>,
     /// 存着的答不了（没存、答过一次还问）时不弹窗，当作取消
     silent: bool,
+    /// 这个 ssh 已经弹窗问过哪几种（密码、口令）：同一种再问就是上次答错了
+    asked: Vec<PromptKind>,
+    /// 这次连接记用户输入的密码、口令的地方（见 [`TypedSecret`]），跳板机的没有
+    typed: Option<TypedSecret>,
 }
 
 /// 标记（ssh 进程环境变量 `FR_ASKPASS_TAG` 的值）→ 它可以用的密码、口令
@@ -388,7 +397,7 @@ pub(crate) struct SavedSecret {
 impl SavedSecret {
     #[cfg(test)]
     pub(crate) fn register(secret: &str, kind: PromptKind) -> SavedSecret {
-        Self::register_for(Some(secret), kind, None, false)
+        Self::register_for(Some(secret), kind, None, false, None)
     }
 
     /// `secret` 是存着的密码或口令（`kind` 说是哪一种）；`jump` 是跳板机的名字（连的是目标服务器时为 None）；
@@ -398,6 +407,7 @@ impl SavedSecret {
         kind: PromptKind,
         jump: Option<&str>,
         silent: bool,
+        typed: Option<TypedSecret>,
     ) -> SavedSecret {
         let tag = fr_core::askpass::random_token();
         let saved = Saved {
@@ -406,6 +416,8 @@ impl SavedSecret {
             used: false,
             jump: jump.map(str::to_string),
             silent,
+            asked: Vec::new(),
+            typed,
         };
         SAVED.lock().unwrap().insert(tag.clone(), saved);
         SavedSecret { tag }
@@ -450,6 +462,46 @@ fn silent(tag: Option<&str>) -> bool {
     let saved = SAVED.lock().unwrap();
     tag.and_then(|tag| saved.get(tag))
         .is_some_and(|entry| entry.silent)
+}
+
+/// 用户在弹窗里回答了这个 ssh 的密码、口令：记到这次连接上，后面的 ssh 用它自动回答（见
+/// [`TypedSecret`]）。口令只记 ssh 自己解私钥时那一句的回答，和 [`saved_answer`] 认的一样。
+fn remember_typed(tag: Option<&str>, prompt: &str, answer: &str) {
+    let kind = fr_core::askpass::prompt_kind(prompt);
+    let usable = match kind {
+        PromptKind::Password => true,
+        PromptKind::Passphrase => prompt.trim_start().starts_with("Enter passphrase for key"),
+        PromptKind::Other => false,
+    };
+    if !usable {
+        return;
+    }
+    let saved = SAVED.lock().unwrap();
+    if let Some(slot) = tag
+        .and_then(|tag| saved.get(tag))
+        .and_then(|entry| entry.typed.as_ref())
+    {
+        *slot.lock().unwrap() = Some((kind, answer.to_string()));
+    }
+}
+
+/// 这次弹窗是不是答错了以后再问：同一个 ssh（同一个标记）已经弹窗问过同一种（密码或口令），或者
+/// 存着的那一种已经自动答过一次。ssh 答错了会再问（换一种认证方式时提示的写法也会变，比如先
+/// `(u@h) Password:` 再 `u@h's password:`），弹窗里要说上次不对，不然用户以为是又一次连接。
+fn note_retry(tag: Option<&str>, prompt: &str) -> bool {
+    let kind = fr_core::askpass::prompt_kind(prompt);
+    if kind == PromptKind::Other {
+        return false;
+    }
+    let mut saved = SAVED.lock().unwrap();
+    let Some(entry) = tag.and_then(|tag| saved.get_mut(tag)) else {
+        return false;
+    };
+    let retry = (entry.used && entry.kind == kind) || entry.asked.contains(&kind);
+    if !entry.asked.contains(&kind) {
+        entry.asked.push(kind);
+    }
+    retry
 }
 
 /// 带着这个标记的 ssh 连的是哪台跳板机（不是跳板机就是 None）。
@@ -523,9 +575,18 @@ impl Channel {
 
     /// 列出目录下的子目录，标出哪些是仓库。
     pub fn list_dir(&self, path: &str) -> BoxFuture<'static, Result<DirListing>> {
+        self.list_dir_with(path, false)
+    }
+
+    /// 同 [`Self::list_dir`]；`hidden` 时以 `.` 开头的目录也列（旧版 kuaid 不认，照样不列）。
+    pub fn list_dir_with(
+        &self,
+        path: &str,
+        hidden: bool,
+    ) -> BoxFuture<'static, Result<DirListing>> {
         match self {
-            Channel::Local => local::list_dir(path),
-            Channel::Remote(conn) => conn.list_dir(path),
+            Channel::Local => local::list_dir(path, hidden),
+            Channel::Remote(conn) => conn.list_dir(path, hidden),
         }
     }
 
@@ -1064,7 +1125,8 @@ mod tests {
 
     #[test]
     fn 跳板机的标记带着它的名字_没存密码就不自动回答() {
-        let jump = SavedSecret::register_for(None, PromptKind::Password, Some("bastion"), false);
+        let jump =
+            SavedSecret::register_for(None, PromptKind::Password, Some("bastion"), false, None);
         let tag = jump.tag().to_string();
         assert_eq!(jump_of(Some(&tag)).as_deref(), Some("bastion"));
         assert_eq!(saved_answer(Some(&tag), "u@h's password: "), None);
@@ -1077,13 +1139,68 @@ mod tests {
     }
 
     #[test]
+    fn 这次连接里输过的密码_后面的_ssh_自动用() {
+        let slot = TypedSecret::default();
+        // 第一个 ssh：没存密码，弹窗问，用户输入的记到这次连接上
+        let first =
+            SavedSecret::register_for(None, PromptKind::Password, None, false, Some(slot.clone()));
+        let tag = first.tag().to_string();
+        assert_eq!(saved_answer(Some(&tag), "u@h's password: "), None);
+        remember_typed(Some(&tag), "u@h's password: ", "typed-pw");
+        drop(first);
+        assert_eq!(
+            slot.lock().unwrap().clone(),
+            Some((PromptKind::Password, "typed-pw".to_string()))
+        );
+        // 别的提问的回答不记；私钥口令只记 ssh 自己解私钥那一句
+        let other =
+            SavedSecret::register_for(None, PromptKind::Password, None, false, Some(slot.clone()));
+        remember_typed(Some(other.tag()), "Verification code: ", "123456");
+        remember_typed(Some(other.tag()), "(u@h) Enter passphrase: ", "phish");
+        assert_eq!(
+            slot.lock().unwrap().clone(),
+            Some((PromptKind::Password, "typed-pw".to_string()))
+        );
+        // 跳板机的标记没有这次连接的记录处：不记
+        let jump = SavedSecret::register_for(None, PromptKind::Password, Some("b"), false, None);
+        remember_typed(Some(jump.tag()), "j@b's password: ", "jump-pw");
+        assert_eq!(
+            slot.lock().unwrap().clone(),
+            Some((PromptKind::Password, "typed-pw".to_string()))
+        );
+    }
+
+    #[test]
+    fn 答错了再问时说一声() {
+        // 没存密码：第一次问不算，第二次问（哪怕提示写法变了）算答错了再问
+        let plain = SavedSecret::register_for(None, PromptKind::Password, None, false, None);
+        let tag = plain.tag().to_string();
+        assert!(!note_retry(Some(&tag), "(u@h) Password: "));
+        assert!(note_retry(Some(&tag), "u@h's password: "));
+        // 别的提问不算；没有标记的不算
+        assert!(!note_retry(Some(&tag), "Verification code: "));
+        assert!(!note_retry(None, "u@h's password: "));
+        // 口令单独算
+        assert!(!note_retry(Some(&tag), "Enter passphrase for key '/k': "));
+        assert!(note_retry(Some(&tag), "Enter passphrase for key '/k': "));
+        // 存着的密码自动答过一次还问：存的不对
+        let auto = SavedSecret::register("pw", PromptKind::Password);
+        let tag = auto.tag().to_string();
+        assert_eq!(
+            saved_answer(Some(&tag), "u@h's password: ").as_deref(),
+            Some("pw")
+        );
+        assert!(note_retry(Some(&tag), "u@h's password: "));
+    }
+
+    #[test]
     fn 不许弹窗的连接_存着的照样答_答不了的不问() {
         // 平常的连接、没有标记：可以弹窗
         let plain = SavedSecret::register("pw", PromptKind::Password);
         assert!(!silent(Some(plain.tag())));
         assert!(!silent(None));
         // 启动时自动连接的：存着密码的先用存着的答，答过了还问（密码不对）就不再弹窗
-        let auto = SavedSecret::register_for(Some("pw"), PromptKind::Password, None, true);
+        let auto = SavedSecret::register_for(Some("pw"), PromptKind::Password, None, true, None);
         let tag = auto.tag().to_string();
         assert!(silent(Some(&tag)));
         assert_eq!(
@@ -1092,7 +1209,7 @@ mod tests {
         );
         assert_eq!(saved_answer(Some(&tag), "u@h's password: "), None);
         // 没存的也登记着：不然不知道它不许弹窗
-        let bare = SavedSecret::register_for(None, PromptKind::Passphrase, None, true);
+        let bare = SavedSecret::register_for(None, PromptKind::Passphrase, None, true, None);
         assert!(silent(Some(bare.tag())));
         // 连接完了撤掉
         drop(auto);

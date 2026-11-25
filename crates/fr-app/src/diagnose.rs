@@ -407,15 +407,28 @@ fn fill_connected(
 fn fill_git(step: &mut Step, raw: &str) {
     let (min_major, min_minor, _) = fr_core::git::MIN_VERSION;
     let minimum = tf!("最低要求 {v}", v = format!("{min_major}.{min_minor}"));
+    // 没有、太旧时下面给出安装命令（Debian、Ubuntu 的；Ubuntu 20.04 这类旧系统自带的低于要求，
+    // 要从 git 官方的 PPA 装），不只说「版本过低」
     match fr_core::git::parse_version(raw) {
         Some(version) => match fr_core::git::too_old(Some(version)) {
-            Some(old) => step.set(State::Bad, tf!("{old}，版本过低", old), minimum),
+            Some(old) => {
+                let note = tf!("{minimum} · Ubuntu 可运行以下命令升级：", minimum);
+                step.set(State::Bad, tf!("{old}，版本过低", old), note);
+                step.raw = "sudo add-apt-repository -y ppa:git-core/ppa && sudo apt update && sudo apt install -y git".into();
+            }
             None => {
                 let (major, minor, patch) = version;
                 step.set(State::Ok, format!("{major}.{minor}.{patch}"), minimum)
             }
         },
-        None => step.set(State::Bad, tr("主机上没有找到 git"), ""),
+        None => {
+            step.set(
+                State::Bad,
+                tr("主机上没有找到 git"),
+                tr("Debian、Ubuntu 可运行以下命令安装："),
+            );
+            step.raw = "sudo apt update && sudo apt install -y git".into();
+        }
     }
 }
 
@@ -436,6 +449,16 @@ fn fill_probe(steps: &mut [Step], layout: &Layout, target: &Target, probe: &Prob
                 os = &probe.os
             ),
             "",
+        );
+        steps[layout.git()].skip(tr("该主机上无法运行 kuaid"));
+        return;
+    }
+    // 系统对、CPU 架构这一版不支持（ARM 的主机）：不再说「首次连接时自动安装」
+    if !probe.arch_supported {
+        kuaid.set(
+            State::Bad,
+            tf!("当前版本不支持 {arch} 架构的主机", arch = &probe.arch),
+            tf!("{system} · 请改用 x86_64（amd64）的主机", system),
         );
         steps[layout.git()].skip(tr("该主机上无法运行 kuaid"));
         return;
@@ -1334,6 +1357,7 @@ mod tests {
             os: os.into(),
             arch: "x86_64".into(),
             supported: os == "Linux" || os == "Windows",
+            arch_supported: true,
             kuaid,
             git: git.map(String::from),
         }
@@ -1372,6 +1396,25 @@ mod tests {
         fill_probe(&mut steps, &layout, &target, &probe("Linux", None, None));
         assert_eq!(steps[layout.kuaid()].state, State::Note);
         assert_eq!(steps[layout.git()].state, State::Bad);
+    }
+
+    /// ARM 的主机：系统对，这一版没带它的 kuaid。kuaid 那一步失败，不说「首次连接时自动安装」。
+    #[test]
+    fn 测试连接遇到不支持的_cpu_架构_kuaid_那一步失败() {
+        let target = target(0);
+        let layout = Layout { jumps: 0 };
+        let mut steps = initial_steps(&target);
+        let arm = Probe {
+            arch: "aarch64".into(),
+            arch_supported: false,
+            ..probe("Linux", Some(false), Some("git version 2.43.0"))
+        };
+        fill_probe(&mut steps, &layout, &target, &arm);
+        assert_eq!(steps[layout.login()].state, State::Ok);
+        assert_eq!(steps[layout.kuaid()].state, State::Bad);
+        assert!(steps[layout.kuaid()].text.contains("aarch64"));
+        assert!(!steps[layout.kuaid()].note.contains("自动安装"));
+        assert_ne!(steps[layout.git()].state, State::Ok);
     }
 
     #[test]

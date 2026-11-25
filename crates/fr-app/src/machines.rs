@@ -1286,14 +1286,6 @@ impl AppState {
         cx.notify();
     }
 
-    /// 工作区页列哪台电脑上的工作区：页面上的下拉里换过就是换到的那台（它还在的话），不然是选中的
-    /// 工作区所在的那台。
-    pub fn menu_machine(&self) -> String {
-        let known = |id: &String| id == LOCAL || self.settings.servers.iter().any(|s| s.id == *id);
-        let chosen = self.menu_machine.clone().filter(known);
-        chosen.unwrap_or_else(|| self.settings.current.machine.clone())
-    }
-
     /// 现在用的工作区不在了（别的电脑删了、还没定）：换一个。那台电脑还连着就换成它上面的第一个，
     /// 不然回到本机最近用的那个。服务器还没连上的先不动，连上了再看。
     pub(crate) fn resolve_current(&mut self, cx: &mut Context<Self>) {

@@ -61,6 +61,11 @@ pub fn open_dir<T: 'static>(
         };
         this.update_in(cx, |this, window, cx| match result {
             Ok((_, Found::Repo(root))) => on_open(this, entry(server, &root), window, cx),
+            // 主目录不给初始化：多半是选错了，整个主目录变成仓库很难收拾
+            Ok((channel, Found::NotRepo)) if is_home(&channel, &dir) => {
+                let text = tf!("{dir} 是主目录，不是 Git 仓库。请选择其中的项目目录。", dir);
+                window.push_notification(Notification::warning(text), cx);
+            }
             Ok((channel, Found::NotRepo)) => ask_init(channel, server, dir, on_open, window, cx),
             Err(err) => window.push_notification(Notification::error(err), cx),
         })
@@ -172,7 +177,25 @@ pub async fn find(channel: &Channel, dir: &str) -> Result<Found, String> {
     }
 }
 
-/// 问是否在 `dir` 中初始化新仓库；点「初始化」后执行 `git init`，成功了交给 `on_open`。
+/// `dir` 是不是这台主机的主目录（只比写法，两种斜杠、末尾的斜杠、Windows 上的大小写都不算）。
+pub fn is_home(channel: &Channel, dir: &str) -> bool {
+    let home = match channel {
+        Channel::Local => fr_core::dir::home(),
+        Channel::Remote(conn) => conn.hello.home.clone(),
+    };
+    let norm = |path: &str| {
+        let path = path.replace('\\', "/");
+        let path = path.trim_end_matches('/').to_string();
+        match cfg!(windows) || path.contains(':') {
+            true => path.to_lowercase(),
+            false => path,
+        }
+    };
+    !home.is_empty() && norm(&home) == norm(dir)
+}
+
+/// 问是否在 `dir` 中初始化新仓库；点「初始化仓库」后执行 `git init`，成功了交给 `on_open`。
+/// 「取消」是主按钮、回车也是取消：进错目录的人按回车只会退回，不会建出 `.git`。
 pub fn ask_init<T: 'static>(
     channel: Channel,
     server: Option<String>,
@@ -184,7 +207,7 @@ pub fn ask_init<T: 'static>(
     let on_open: OnOpen<T> = Box::new(on_open);
     let target = cx.entity().downgrade();
     let description = tf!(
-        "{dir} 不是 Git 仓库。将在此目录中初始化新仓库，现有文件不受影响。",
+        "{dir} 不是 Git 仓库。将在此目录中创建新仓库，现有文件不受影响。如只是选错了目录，请取消后继续浏览。",
         dir
     );
     // 对话框每次重画都会调一遍下面的闭包，要做的事只能取走一次
@@ -203,27 +226,22 @@ pub fn ask_init<T: 'static>(
                 }
             }
         };
-        let on_enter = start.clone();
         alert
-            .title(tr("初始化仓库？"))
+            .title(tr("在此初始化仓库？"))
             .description(description.clone())
-            // 不会丢东西，回车等于点「初始化」
-            .on_ok(move |event, window, cx| {
-                on_enter(event, window, cx);
+            // 回车是取消：选错了目录的人按回车只会退回
+            .on_ok(|_, window, cx| {
+                window.close_dialog(cx);
                 false
             })
             .footer(
                 DialogFooter::new()
+                    .child(Button::new("ok").label(tr("初始化仓库")).on_click(start))
                     .child(
                         Button::new("cancel")
                             .label(tr("取消"))
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                    )
-                    .child(
-                        Button::new("ok")
-                            .label(tr("初始化"))
                             .with_variant(ButtonVariant::Primary)
-                            .on_click(start),
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
                     ),
             )
     });

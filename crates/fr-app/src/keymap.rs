@@ -163,7 +163,23 @@ fn rows() -> Vec<Row> {
         ("new.pick", NewTerminal, tr_key("选择仓库新建终端"), tr_key("在会话页中打开"), &["ctrl-shift-n"], Keep, Some(|| Box::new(crate::PickNewTerminal))),
         ("hub.prev", Hub, tr_key("上一个终端"), tr_key("焦点在终端中时也可用"), &["ctrl-shift-up"], Fixed, None),
         ("hub.next", Hub, tr_key("下一个终端"), tr_key("焦点在终端中时也可用"), &["ctrl-shift-down"], Fixed, None),
+        // 会话页、仓库终端页：F6 是 Windows 上在窗格之间切换的通行键；Esc 留给
+        // Claude Code 这些程序。这几个动作只有会话页、仓库终端页接，别处按了照常交给原来的处理
+        ("hub.focus", Hub, tr_key("在侧栏和终端之间切换"), tr_key("会话页、仓库终端页；焦点在终端中时也可用"), &["f6"], Keep, Some(|| Box::new(crate::FocusSwitch))),
+        ("hub.focus_back", Hub, tr_key("反向切换焦点"), tr_key("焦点在终端中时也可用"), &["shift-f6"], Keep, Some(|| Box::new(crate::FocusSwitchBack))),
+        ("hub.input", Hub, tr_key("进入输入"), tr_key("焦点在会话页侧栏中时"), &["enter"], Fixed, None),
+        ("hub.open_repo", Hub, tr_key("打开所在仓库"), tr_key("焦点在会话页侧栏中时"), &["ctrl-enter"], Pass, Some(|| Box::new(crate::OpenTerminalRepo))),
+        ("hub.rename", Hub, tr_key("重命名终端"), tr_key("焦点在侧栏中时；终端中的 F2 交给程序"), &["f2"], Pass, Some(|| Box::new(crate::RenameTerminal))),
+        ("hub.cell", Hub, tr_key("并排查看时换格子"), tr_key("焦点在终端中时也可用"), &["ctrl-alt-left", "ctrl-alt-right"], Fixed, None),
         ("git.commit", Git, tr_key("提交"), tr_key("焦点在提交说明、文件列表或改动中时"), &["ctrl-enter"], Fixed, None),
+        // 工具栏上的几个操作，默认的键和 Fork 一样。焦点在终端里时交给程序（它们收到的是 Ctrl+F、
+        // Ctrl+L 这些）：联网、改仓库的操作不该在终端里打字时被误触
+        ("git.fetch", Git, tr_key("获取"), tr_key("从远程下载新的提交和分支，不改动当前分支"), &["ctrl-shift-f"], Pass, Some(|| Box::new(crate::Fetch))),
+        ("git.pull", Git, tr_key("拉取"), tr_key("获取远程的新提交，并合并到当前分支"), &["ctrl-shift-l"], Pass, Some(|| Box::new(crate::Pull))),
+        ("git.push", Git, tr_key("推送"), tr_key("将当前分支的新提交上传到远程"), &["ctrl-shift-p"], Pass, Some(|| Box::new(crate::Push))),
+        ("git.stash", Git, tr_key("贮藏"), tr_key("将未提交的改动暂时收起"), &["ctrl-shift-s"], Pass, Some(|| Box::new(crate::StashChanges))),
+        ("git.pop", Git, tr_key("弹出贮藏"), tr_key("恢复最近一次贮藏的改动，并删除该贮藏"), &[], Pass, Some(|| Box::new(crate::PopStash))),
+        ("git.branch", Git, tr_key("新建分支"), "", &[], Pass, Some(|| Box::new(crate::NewBranch))),
         ("git.find", Git, tr_key("查找"), tr_key("Git 页中搜索提交，文件页中查找打开的文件"), &["ctrl-f"], Pass, Some(|| Box::new(crate::FindCommit))),
         ("file.save", File, tr_key("保存文件"), "", &["ctrl-s"], Pass, Some(|| Box::new(crate::SaveFile))),
         // 和 VS Code 一样；焦点在终端里时归终端（粘贴）

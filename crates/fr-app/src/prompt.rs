@@ -21,6 +21,8 @@ pub struct Request {
     prompt: String,
     /// 是跳板机在问时，它的名字
     jump: Option<String>,
+    /// 同一次登录里又问了同一种：上次输入的不对
+    retry: bool,
     reply: Sender<Option<String>>,
 }
 
@@ -32,11 +34,12 @@ pub fn init() -> Prompts {
     let (tx, rx) = mpsc::unbounded();
     // 不许弹窗的（自动获取、自己在重连）在发问的那一头就当作取消了，到不了这里：见
     // `fr_core::askpass::NO_PROMPT` 和 `ConnectOptions::no_prompt`
-    let started = fr_channel::init_prompts(move |prompt, jump| {
+    let started = fr_channel::init_prompts(move |prompt, jump, retry| {
         let (reply, answer) = std::sync::mpsc::channel();
         tx.unbounded_send(Request {
             prompt: prompt.to_string(),
             jump: jump.map(str::to_string),
+            retry,
             reply,
         })
         .ok()?;
@@ -73,6 +76,7 @@ fn open(request: Request, window: &mut Window, cx: &mut App) {
     let Request {
         prompt,
         jump,
+        retry,
         reply,
     } = request;
     // 跳板机在问：写明是哪一台，不然用户会当成是目标服务器的密码
@@ -83,6 +87,17 @@ fn open(request: Request, window: &mut Window, cx: &mut App) {
     }
     let secret = fr_core::askpass::is_secret(&prompt);
     let input = cx.new(|cx| InputState::new(window, cx).masked(secret));
+    // 认出是哪一种：SSH 登录密码、私钥口令、仓库（HTTPS）的用户名或密码，标题和说明写清楚；
+    // 原文照样列在下面
+    let (title, explain) = classify(&prompt, secret);
+    // ssh 答错了会再问：说一声上次不对（ssh 自己的那句 Permission denied 只在它的输出里）
+    let wrong: Option<SharedString> = retry.then(|| {
+        match fr_core::askpass::prompt_kind(&prompt) {
+            fr_core::askpass::PromptKind::Passphrase => tr("口令不正确，请重新输入。"),
+            _ => tr("密码不正确，请重新输入。"),
+        }
+        .into()
+    });
     let prompt: SharedString = prompt.trim().to_string().into();
 
     let submit = {
@@ -97,15 +112,11 @@ fn open(request: Request, window: &mut Window, cx: &mut App) {
         if first_build.replace(false) {
             input.focus_handle(cx).focus(window, cx);
         }
-        let muted = cx.theme().muted_foreground;
+        let (muted, danger) = (cx.theme().muted_foreground, cx.theme().danger);
         let (submit, reply) = (submit.clone(), reply.clone());
         let (on_enter, on_dismiss) = (submit.clone(), reply.clone());
         dialog
-            .title(if secret {
-                tr("需要密码")
-            } else {
-                tr("需要输入")
-            })
+            .title(title)
             .w(px(520.))
             // 回车等于点确定（submit 里会关掉弹窗）
             .on_ok(move |_, window, cx| {
@@ -123,7 +134,20 @@ fn open(request: Request, window: &mut Window, cx: &mut App) {
                     .when_some(jump.clone(), |body, jump| {
                         body.child(div().text_sm().child(jump))
                     })
-                    .child(div().text_sm().child(prompt.clone()))
+                    .when_some(explain.clone(), |body, explain| {
+                        body.child(div().text_sm().whitespace_normal().child(explain))
+                    })
+                    .when_some(wrong.clone(), |body, wrong| {
+                        body.child(div().text_sm().text_color(danger).child(wrong))
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .font_family(crate::fonts::mono())
+                            .whitespace_normal()
+                            .child(prompt.clone()),
+                    )
                     .child(Input::new(&input))
                     .child(
                         div()
@@ -150,6 +174,102 @@ fn open(request: Request, window: &mut Window, cx: &mut App) {
     });
 }
 
+/// 主机密钥确认框里的「怎么核对」：在主机上运行的命令（可复制），核对不了时怎么办。
+fn verify_hint(key_type: &str, muted: Hsla, border: Hsla) -> impl IntoElement {
+    let kind = key_type.to_ascii_lowercase();
+    let file = if kind.contains("ecdsa") {
+        "ssh_host_ecdsa_key.pub"
+    } else if kind.contains("rsa") {
+        "ssh_host_rsa_key.pub"
+    } else {
+        "ssh_host_ed25519_key.pub"
+    };
+    let command = format!("ssh-keygen -lf /etc/ssh/{file}");
+    let copy = command.clone();
+    v_flex()
+        .gap_1()
+        .text_xs()
+        .text_color(muted)
+        .child(tr(
+            "核对方法：在主机上运行以下命令，或查看云服务商控制台中显示的主机密钥指纹。",
+        ))
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(border)
+                        .font_family(crate::fonts::mono())
+                        .child(command),
+                )
+                .child(
+                    Button::new("copy-verify")
+                        .ghost()
+                        .xsmall()
+                        .label(tr("复制"))
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                        }),
+                ),
+        )
+        .child(tr("无法核对时，请确认主机地址填写正确后再信任。"))
+}
+
+/// 认出提示问的是什么：标题，和一句说明（认不出时没有，只列原文）。看 ssh、git 固定的英文说法；
+/// 主机上的 git 翻译了的提示认不出，照旧按「需要密码」「需要输入」。
+fn classify(prompt: &str, secret: bool) -> (&'static str, Option<SharedString>) {
+    let lower = prompt.to_lowercase();
+    // 引号里的东西：私钥的路径、仓库的网址
+    let quoted = || {
+        let start = prompt.find('\'')? + 1;
+        let end = start + prompt[start..].find('\'')?;
+        Some(prompt[start..end].to_string())
+    };
+    if lower.contains("passphrase") {
+        let key = quoted().unwrap_or_default();
+        return (
+            tr("解锁私钥"),
+            Some(fr_core::tf!("请输入私钥 {key} 的口令，不是主机的登录密码。", key).into()),
+        );
+    }
+    if lower.starts_with("username for") || lower.starts_with("password for") {
+        let url = quoted().unwrap_or_default();
+        // 放在句子中间：英文要小写
+        let what = match lower.starts_with("username") {
+            true => fr_core::i18n::trc("句中", "用户名"),
+            false => tr("密码或访问令牌"),
+        };
+        return (
+            tr("远程仓库要求登录"),
+            Some(
+                fr_core::tf!(
+                    "远程仓库 {url} 要求登录，请输入代码托管平台的{what}。",
+                    url,
+                    what
+                )
+                .into(),
+            ),
+        );
+    }
+    // ssh 的登录密码：`user@host's password:`，或 `(user@host) Password:`
+    if secret && lower.contains("password") {
+        return (
+            tr("主机登录密码"),
+            Some(tr("请输入 SSH 登录主机用的密码。").into()),
+        );
+    }
+    match secret {
+        true => (tr("需要密码"), None),
+        false => (tr("需要输入"), None),
+    }
+}
+
 /// ssh 问要不要信任一台没见过的主机：显示主机和密钥指纹，让用户点「信任并连接」或「取消」。
 /// 信任时回答的是 ssh 要的那个词 `yes`，ssh 随后把密钥记进 known_hosts；取消、关掉弹窗都算不信任，
 /// ssh 放弃这次连接。回车不算确认：弹窗可能在用户正往别处打字时出来，点了按钮才信任。
@@ -171,7 +291,10 @@ fn open_host_key(
         let body = match &key {
             Some(key) => {
                 let host = match &key.address {
-                    Some(address) => format!("{}（{address}）", key.host),
+                    // 英文界面用半角括号
+                    Some(address) => {
+                        fr_core::tf!("{host}（{address}）", host = key.host.as_str(), address)
+                    }
                     None => key.host.clone(),
                 };
                 let copy = key.fingerprint.clone();
@@ -217,6 +340,8 @@ fn open_host_key(
                                 .child(key.fingerprint.clone()),
                         ),
                 )
+                // 怎么核对：在主机上看它自己的指纹（按密钥的类型找文件），或看云服务商控制台
+                .child(verify_hint(&key.key_type, muted, border))
                 // ssh 另外说的话（这把密钥还记在哪些名字下之类）原样列出
                 .when(!key.notes.is_empty(), |body| {
                     body.child(
@@ -266,4 +391,28 @@ fn open_host_key(
                     ),
             )
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify;
+
+    #[test]
+    fn 认出是哪一种密码() {
+        let (title, explain) = classify(
+            "Enter passphrase for key '/home/me/.ssh/id_ed25519': ",
+            true,
+        );
+        assert_eq!(title, "解锁私钥");
+        assert!(explain.unwrap().contains("/home/me/.ssh/id_ed25519"));
+        let (title, explain) = classify("Password for 'https://me@github.com': ", true);
+        assert_eq!(title, "远程仓库要求登录");
+        assert!(explain.unwrap().contains("https://me@github.com"));
+        let (title, _) = classify("Username for 'https://github.com': ", false);
+        assert_eq!(title, "远程仓库要求登录");
+        let (title, _) = classify("root@203.0.113.8's password: ", true);
+        assert_eq!(title, "主机登录密码");
+        let (title, explain) = classify("Verification code: ", false);
+        assert_eq!((title, explain), ("需要输入", None));
+    }
 }

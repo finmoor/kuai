@@ -2,7 +2,7 @@
 //!
 //! 只对正在看的那个标签页做，没有别的操作在进行时才做；用户一动手做别的操作就把它停掉。
 //! 要密码时不弹窗，这一次当作失败（命令带着 [`fr_core::askpass::NO_PROMPT`]，只管这一条）。结果记在
-//! 活动记录里，不弹通知。
+//! 活动记录里，不弹通知；失败了工具栏上分支名下面那一行变红（见 `fetch_state.rs`）。
 
 use std::time::{Duration, Instant};
 
@@ -112,11 +112,21 @@ impl RepoView {
                 }
                 this.activity.end(id, &result, false);
                 this.auto_fetch.running = None;
+                // 失败了工具栏上「上次获取」变红，写明原因（原来只记进日志，用户看不到）
                 match &result {
                     // 远程分支可能动了：重读引用，变了的话提交历史也跟着重读
-                    Ok(out) if out.success() => this.refresh(cx),
-                    Ok(out) => log::info!("自动获取失败：{}", out.stderr.trim()),
-                    Err(err) => log::info!("自动获取失败：{err:#}"),
+                    Ok(out) if out.success() => {
+                        this.fetch_succeeded();
+                        this.refresh(cx);
+                    }
+                    Ok(out) => {
+                        log::info!("自动获取失败：{}", out.stderr.trim());
+                        this.fetch_failed(&out.stderr, true);
+                    }
+                    Err(err) => {
+                        log::info!("自动获取失败：{err:#}");
+                        this.fetch_failed(&format!("{err:#}"), true);
+                    }
                 }
                 cx.notify();
             })

@@ -540,6 +540,11 @@ fn with_plain_retry<T>(
     attempt(&plain)
 }
 
+/// 这次连接里用户在弹窗里输入的密码或口令（哪一种、内容）。只在内存里，跟着 [`ConnectOptions`]
+/// 走（克隆的共用一份），连接结束就丢：第一次连一台主机要先后起好几个 ssh（试启动、上传 kuaid、
+/// 再启动），用密码登录时原来每个都要输一遍。
+pub type TypedSecret = Arc<Mutex<Option<(crate::PromptKind, String)>>>;
+
 /// 连接选项。
 #[derive(Clone, Default)]
 pub struct ConnectOptions {
@@ -564,6 +569,8 @@ pub struct ConnectOptions {
     /// 没见过的主机不问，直接记下它的密钥（目标服务器和跳板机都是）。只给没有界面的测试工具用：
     /// 界面上一律让用户核对指纹
     pub accept_new_host_keys: bool,
+    /// 这次连接里用户输入过的目标服务器的密码、口令（见 [`TypedSecret`]）。不存盘
+    pub typed: TypedSecret,
 }
 
 /// 测试连接的结果（见 [`Connection::probe`]）。
@@ -575,6 +582,9 @@ pub struct Probe {
     pub arch: String,
     /// 这种系统上装不装得了 kuaid
     pub supported: bool,
+    /// 这一版带没带这种系统、这种 CPU 架构的 kuaid（比如 ARM 的主机）；本机找不到随带的 kuaid、
+    /// 不知道带了哪些时算带了
+    pub arch_supported: bool,
     /// 这个客户端要的那一版 kuaid 装了没有（只看在不在，不启动）；None 是没查：本机找不到随带的
     /// kuaid，不知道是哪一版
     pub kuaid: Option<bool>,
@@ -670,7 +680,8 @@ impl Connection {
 
     fn probe_once(destination: &str, options: &ConnectOptions) -> Result<Probe> {
         // 要装的那一版 kuaid 在哪个目录：本机找不到随带的 kuaid 就不查
-        let dir = Binaries::find().ok().map(|binaries| binaries.dir_name());
+        let binaries = Binaries::find().ok();
+        let dir = binaries.as_ref().map(|binaries| binaries.dir_name());
         // 和连接时一样：先按 Linux 的写法问（已经知道是 Windows 的先按 Windows），跑不了再换另一种
         let mut windows = known_windows(destination);
         let (mut tried_sh, mut tried_cmd) = (false, false);
@@ -696,6 +707,10 @@ impl Connection {
                             Some(Os::Linux) => "Linux".into(),
                             Some(Os::Windows) => "Windows".into(),
                             None => os,
+                        },
+                        arch_supported: match (kind, &binaries) {
+                            (Some(kind), Some(binaries)) => binaries.has(kind, &arch),
+                            _ => true,
                         },
                         arch,
                         supported: kind.is_some(),
@@ -950,8 +965,16 @@ impl Connection {
         async move { call.await.map(|_| ()) }.boxed()
     }
 
-    pub(crate) fn list_dir(&self, path: &str) -> BoxFuture<'static, Result<DirListing>> {
-        let call = self.call("list_dir", json!({ "path": path }), Vec::new());
+    pub(crate) fn list_dir(
+        &self,
+        path: &str,
+        hidden: bool,
+    ) -> BoxFuture<'static, Result<DirListing>> {
+        let call = self.call(
+            "list_dir",
+            json!({ "path": path, "hidden": hidden }),
+            Vec::new(),
+        );
         async move {
             let (result, _) = call.await?;
             serde_json::from_value(result).context(tr("kuaid 返回的目录格式错误"))
@@ -1658,7 +1681,8 @@ impl Inner {
         std::thread::spawn(move || {
             // 经这台电脑连别的服务器时，那边的 ssh 要密码也是这样来问：等用户回答的时间不算超时
             let _asking = crate::Asking::start();
-            let answer = crate::prompt_handler().and_then(|handler| handler(&prompt, None));
+            // 主机那边转来的提问认不出是不是答错了再问（标记在那边）：不说
+            let answer = crate::prompt_handler().and_then(|handler| handler(&prompt, None, false));
             if let Some(inner) = inner.upgrade() {
                 let reply = Request {
                     id: 0,
@@ -2404,6 +2428,7 @@ fn login(
     jump: Option<&str>,
     forward_agent: bool,
     silent: bool,
+    typed: Option<&TypedSecret>,
 ) -> (
     Vec<String>,
     Vec<(String, String)>,
@@ -2425,19 +2450,26 @@ fn login(
     let mut saved = None;
     if let Some(askpass) = askpass {
         env.extend(askpass.iter().cloned());
-        if secret.is_some() || jump.is_some() || silent {
-            let kind = if password_auth {
-                crate::PromptKind::Password
-            } else {
-                crate::PromptKind::Passphrase
-            };
-            let entry = crate::SavedSecret::register_for(secret, kind, jump, silent);
-            env.push((
-                fr_core::askpass::TAG_ENV.to_string(),
-                entry.tag().to_string(),
-            ));
-            saved = Some(entry);
-        }
+        // 每个 ssh 都带上标记（没存密码的也带）：认得出它答错了以后再问（见 `note_retry`）。
+        // 没存密码、这次连接里已经输过的：后面的 ssh 用输过的那个自动回答一次
+        let kind = if password_auth {
+            crate::PromptKind::Password
+        } else {
+            crate::PromptKind::Passphrase
+        };
+        let earlier = typed.and_then(|slot| slot.lock().unwrap().clone());
+        let (secret, kind) = match (secret, earlier) {
+            (Some(secret), _) => (Some(secret.to_string()), kind),
+            (None, Some((typed_kind, typed))) => (Some(typed), typed_kind),
+            (None, None) => (None, kind),
+        };
+        let entry =
+            crate::SavedSecret::register_for(secret.as_deref(), kind, jump, silent, typed.cloned());
+        env.push((
+            fr_core::askpass::TAG_ENV.to_string(),
+            entry.tag().to_string(),
+        ));
+        saved = Some(entry);
     }
     (args, env, saved)
 }
@@ -2450,6 +2482,16 @@ fn ssh(
     options: &ConnectOptions,
     forward_agent: bool,
 ) -> (Command, Vec<crate::SavedSecret>) {
+    let (mut cmd, held) = ssh_login(options, forward_agent);
+    cmd.arg("-T");
+    cmd.args(KEEP_OPTIONS);
+    cmd.args(["--", destination, remote_command]);
+    (cmd, held)
+}
+
+/// 起 ssh 的前一半：登录选项、跳板机、超时、要不要核对主机密钥。后面接 `-T 命令`（[`ssh`]）或者
+/// 端口转发（[`forward`]）。
+fn ssh_login(options: &ConnectOptions, forward_agent: bool) -> (Command, Vec<crate::SavedSecret>) {
     let mut cmd = Command::new(ssh_program());
     let (args, env, saved) = login(
         options.identity_file.as_deref(),
@@ -2458,6 +2500,7 @@ fn ssh(
         None,
         forward_agent,
         options.no_prompt,
+        Some(&options.typed),
     );
     let mut held: Vec<crate::SavedSecret> = saved.into_iter().collect();
     cmd.args(args);
@@ -2475,6 +2518,7 @@ fn ssh(
                 Some(&jump.name),
                 false,
                 options.no_prompt,
+                None,
             );
             args.extend(STAGE_OPTIONS.iter().map(|item| item.to_string()));
             if options.accept_new_host_keys {
@@ -2498,13 +2542,71 @@ fn ssh(
         cmd.args(["-o", &format!("ProxyCommand={proxy}")]);
         cmd.args(STAGE_OPTIONS);
     }
-    cmd.arg("-T");
     if options.accept_new_host_keys {
         cmd.args(ACCEPT_NEW_HOSTS);
     }
-    cmd.args(KEEP_OPTIONS);
-    cmd.args(["--", destination, remote_command]);
     (cmd, held)
+}
+
+/// 一个端口转发：主机上的一个端口转到本机（[`forward`]）。丢掉它就结束那个 ssh，转发跟着停。
+pub struct Forwarder {
+    child: std::process::Child,
+    /// 要密码、口令时交给 askpass 的东西：登录完以前不能丢
+    _held: Vec<crate::SavedSecret>,
+}
+
+impl Forwarder {
+    /// 那个 ssh 还在不在（登录失败、端口占用、连接断了都会退出）。退出了的话带上它说的话。
+    pub fn exited(&mut self) -> Option<String> {
+        match self.child.try_wait() {
+            Ok(None) => None,
+            Ok(Some(status)) => {
+                let mut text = String::new();
+                if let Some(mut stderr) = self.child.stderr.take() {
+                    use std::io::Read as _;
+                    let _ = stderr.read_to_string(&mut text);
+                }
+                let text = text.trim().to_string();
+                Some(match text.is_empty() {
+                    true => tf!("ssh 已退出（{status}）", status = status.to_string()),
+                    false => text,
+                })
+            }
+            Err(err) => Some(err.to_string()),
+        }
+    }
+}
+
+impl Drop for Forwarder {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// 把主机上的 `remote_port`（主机自己那边的 localhost）经 ssh 转到本机的 127.0.0.1:`local_port`：
+/// 另起一个只做转发的 ssh（`-N -L`），登录选项、跳板机和连接时一样（要密码的照样经 askpass 问）。
+/// 转发不了（端口被占、主机不让转发）时 ssh 退出，不会悄悄只连上一半（`ExitOnForwardFailure`）。
+pub fn forward(
+    destination: &str,
+    options: &ConnectOptions,
+    local_port: u16,
+    remote_port: u16,
+) -> Result<Forwarder> {
+    let (mut cmd, held) = ssh_login(options, false);
+    cmd.args(["-N", "-o", "ExitOnForwardFailure=yes", "-L"]);
+    cmd.arg(format!("127.0.0.1:{local_port}:localhost:{remote_port}"));
+    cmd.args(KEEP_OPTIONS);
+    cmd.args(["--", destination]);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    no_window(&mut cmd);
+    let child = cmd.spawn().map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => anyhow!("{}", fr_core::ssh::missing()),
+        _ => anyhow::Error::new(err).context(tr("无法启动 ssh")),
+    })?;
+    Ok(Forwarder { child, _held: held })
 }
 
 /// 远程执行的启动脚本：这一版的 kuaid 装了就启动它的转接程序，没装就报告系统和架构。

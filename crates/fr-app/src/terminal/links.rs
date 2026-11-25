@@ -10,7 +10,10 @@
 //!   [`TerminalEvent::OpenFile`]。相对路径按那一段输出当时所在的目录算：往上找最近一行写着目录的
 //!   提示符（见 [`prompt_dir_above`]），`cd` 过也对得上；找不到（提示符里没写目录）时从终端开在的
 //!   目录、仓库根算。
-//! - 仓库外的本机文件、目录：用系统给它设的默认程序打开、在资源管理器里打开。服务器上仓库外的不认。
+//! - 仓库外的本机文件、目录：用系统给它设的默认程序打开、在资源管理器里打开。主机上仓库外的文件
+//!   （`/tmp/build.log` 这类日志）：取一份副本用默认程序打开（只读，改了不回写）；目录只能复制路径。
+//! - 主机上的终端打印的本地地址（`http://localhost:3000`）：问过以后经 SSH 转发到本机再打开（见
+//!   `port_forward`）。
 //!
 //! 认字的规则在 `fr_core::term_link`。路径要真的在（问一下仓库通道或者本机的文件系统）才算链接，
 //! 问过的记一会儿：鼠标挪来挪去不用每次都问。
@@ -66,6 +69,20 @@ pub struct LinkBase {
     pub server: Option<String>,
     /// 现在的仓库通道（连接断了、换了时跟着换；没有就问不了）
     pub channel: ChannelNow,
+}
+
+/// 主机上的绝对路径拆成仓库通道要的（根、相对根的路径）：`/tmp/a.log` → (`/`, `tmp/a.log`)，
+/// Windows 主机的 `C:\logs\a.log` → (`C:/`, `logs/a.log`)。不是绝对路径的没有。
+fn remote_split(path: &str) -> Option<(String, String)> {
+    let path = path.replace('\\', "/");
+    if let Some(rest) = path.strip_prefix('/') {
+        return Some(("/".to_string(), rest.to_string()));
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/' {
+        return Some((path[..3].to_string(), path[3..].to_string()));
+    }
+    None
 }
 
 /// 现拿仓库通道（见 [`LinkBase::channel`]）。
@@ -842,7 +859,16 @@ impl TerminalView {
                             .spawn(async move { std::fs::metadata(&path).ok().map(|m| m.is_dir()) })
                             .await
                     }
-                    Place::Outside(_) => None,
+                    // 主机上仓库外的：从文件系统的根问起（仓库通道的路径都相对一个根）
+                    Place::Outside(path) => match (&channel, remote_split(path)) {
+                        (Some(channel), Some((root, rel))) => channel
+                            .fs_stat(&root, &rel)
+                            .await
+                            .ok()
+                            .filter(|stat| stat.exists)
+                            .map(|stat| stat.dir),
+                        _ => None,
+                    },
                 };
                 if let Some(dir) = dir {
                     found = Some((place, dir));
@@ -999,15 +1025,68 @@ impl TerminalView {
         true
     }
 
+    /// 打开终端里的网址。主机上的终端打印的本地地址（localhost:3000 这类）在本机打开连的是本机，
+    /// 交给端口转发（见 `port_forward`）：问过以后把主机上的端口转到本机再打开。
+    fn open_url(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        let host = self
+            .links
+            .base
+            .as_ref()
+            .filter(|base| !base.local)
+            .and_then(|base| base.server.clone());
+        match host {
+            Some(host) if crate::port_forward::loopback(&url).is_some() => {
+                crate::with_main_workspace(cx, move |workspace, window, cx| {
+                    let app = workspace.app_entity();
+                    crate::port_forward::open(app, host, url, window, cx);
+                });
+            }
+            _ => crate::shell::report(crate::shell::open_link(&url), window, cx),
+        }
+    }
+
     fn open_target(&mut self, open: Open, window: &mut Window, cx: &mut Context<Self>) {
         log::info!("按住 Ctrl 单击了终端里的链接");
         match open {
-            Open::Url(url) => crate::shell::report(crate::shell::open_link(&url), window, cx),
+            Open::Url(url) => self.open_url(url, window, cx),
             Open::Repo { path, at, dir } => cx.emit(TerminalEvent::OpenFile { path, at, dir }),
+            Open::Outside { path, dir } if !self.links_local() => {
+                self.open_remote_outside(path, dir, window, cx)
+            }
             Open::Outside { path, dir: true } => {
                 crate::shell::report(crate::shell::open_folder(&path), window, cx)
             }
             Open::Outside { path, dir: false } => crate::shell::open_file(&path, window, cx),
+        }
+    }
+
+    /// 终端开在这台电脑上（仓库外的路径是本机的）。
+    fn links_local(&self) -> bool {
+        self.links.base.as_ref().is_none_or(|base| base.local)
+    }
+
+    /// 主机上仓库外的路径：文件取一份副本用默认程序打开；目录打不开，复制路径并说一声。
+    fn open_remote_outside(
+        &mut self,
+        path: String,
+        dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let channel = self.links.base.as_ref().and_then(|base| (base.channel)(cx));
+        match (dir, channel, remote_split(&path)) {
+            (false, Some(channel), Some((root, rel))) => {
+                open_with::open_copy(channel, &root, &rel, window, cx)
+            }
+            (false, None, _) => {
+                let text = tr("主机未连接，无法读取此文件。");
+                crate::shell::report(Err(text.into()), window, cx);
+            }
+            _ => {
+                cx.write_to_clipboard(ClipboardItem::new_string(path));
+                let text = tr("主机上仓库外的目录无法在此打开，已复制路径。");
+                crate::shell::report(Err(text.into()), window, cx);
+            }
         }
     }
 
@@ -1115,7 +1194,10 @@ impl TerminalView {
                 },
                 None => {}
             },
-            MenuAction::Url(url) => crate::shell::report(crate::shell::open_link(&url), window, cx),
+            MenuAction::Url(url) => self.open_url(url, window, cx),
+            MenuAction::OutsideFile(path) if !self.links_local() => {
+                self.open_remote_outside(path, false, window, cx)
+            }
             MenuAction::OutsideFile(path) => crate::shell::open_file(&path, window, cx),
             MenuAction::OutsideDir(path) => {
                 crate::shell::report(crate::shell::open_folder(&path), window, cx)
@@ -1141,6 +1223,10 @@ impl TerminalView {
             Open::Url(_) => tr("Ctrl+单击在浏览器中打开"),
             Open::Repo { dir: true, .. } => tr("Ctrl+单击在文件页中显示"),
             Open::Repo { dir: false, .. } => tr("Ctrl+单击在文件页中打开"),
+            Open::Outside { dir: true, .. } if !self.links_local() => tr("Ctrl+单击复制路径"),
+            Open::Outside { dir: false, .. } if !self.links_local() => {
+                tr("Ctrl+单击用默认程序打开副本")
+            }
             Open::Outside { dir: true, .. } if cfg!(windows) => tr("Ctrl+单击在资源管理器中打开"),
             Open::Outside { dir: true, .. } => tr("Ctrl+单击在文件管理器中打开"),
             Open::Outside { dir: false, .. } => tr("Ctrl+单击用默认程序打开"),
@@ -1307,6 +1393,22 @@ pub(super) fn fill_menu(
                     .separator()
                     .item(act(tr("复制路径"), MenuAction::CopyText(full(&path))))
                     .item(act(tr("复制相对路径"), MenuAction::CopyText(path)))
+            }
+            // 主机上仓库外的：目录只能复制路径，文件用默认程序打开一份副本
+            MenuState::Ready(Open::Outside { path, dir: true })
+                if base.as_ref().is_some_and(|base| !base.local) =>
+            {
+                menu.item(act(tr("复制路径"), MenuAction::CopyText(path)))
+            }
+            MenuState::Ready(Open::Outside { path, dir: false })
+                if base.as_ref().is_some_and(|base| !base.local) =>
+            {
+                menu.item(first(
+                    tr("用默认程序打开副本"),
+                    MenuAction::OutsideFile(path.clone()),
+                ))
+                .separator()
+                .item(act(tr("复制路径"), MenuAction::CopyText(path)))
             }
             MenuState::Ready(Open::Outside { path, dir: true }) => menu
                 .item(first(
@@ -1605,5 +1707,23 @@ mod tests {
         let (start, end, target) = find(&term, at(0, 3)).expect("link");
         assert_eq!((start, end), (at(0, 2), at(0, 5)));
         assert_eq!(target, Target::Url("https://example.com/a".into()));
+    }
+}
+
+#[cfg(test)]
+mod remote_split_tests {
+    use super::remote_split;
+
+    #[test]
+    fn 主机上的绝对路径拆成根和相对路径() {
+        assert_eq!(
+            remote_split("/tmp/build.log"),
+            Some(("/".into(), "tmp/build.log".into()))
+        );
+        assert_eq!(
+            remote_split(r"C:\logs\a.log"),
+            Some(("C:/".into(), "logs/a.log".into()))
+        );
+        assert_eq!(remote_split("src/main.rs"), None);
     }
 }

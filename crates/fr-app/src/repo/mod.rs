@@ -22,11 +22,15 @@ mod activity;
 mod auto_fetch;
 mod blame;
 mod changes;
+mod commit_tree;
 mod compare;
 mod detached;
 mod dialogs;
 mod diff_search;
 mod diff_tools;
+mod discard;
+mod ext_compare;
+mod fetch_state;
 mod file_picker;
 mod file_tree;
 mod files;
@@ -40,7 +44,9 @@ mod layout;
 mod markdown;
 mod menus;
 mod merge;
+mod multi_commit;
 mod ops;
+mod output;
 mod rail;
 mod rebase;
 mod recover;
@@ -68,8 +74,11 @@ use futures::StreamExt as _;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
@@ -159,8 +168,12 @@ pub struct RepoView {
     remote_names: Vec<String>,
     /// 子模块的路径（相对仓库根）
     submodules: Vec<String>,
+    /// 还没读到过状态：第一次读到时有未提交的改动就停在「本地修改」（见 `refresh`）
+    first_status: bool,
     blame: Option<blame::BlameView>,
     merge: Option<merge::MergeView>,
+    /// 关掉时还没保存的合并编辑（按文件路径）：重新打开同一个文件时接着编辑；文件不再有冲突时丢掉
+    merge_drafts: Vec<merge::MergeView>,
     /// 上次读历史时的引用快照（所有分支、标签加 HEAD），变了才重读历史
     history_key: Option<Vec<u8>>,
     refresh_task: Option<Task<()>>,
@@ -189,6 +202,12 @@ pub struct RepoView {
     /// 执行过的 git 命令和它们的结果
     activity: activity::Log,
     auto_fetch: auto_fetch::AutoFetch,
+    /// 上次获取：工具栏上分支名下面那一行
+    fetch: fetch_state::FetchState,
+    /// 底部的「输出」：联网操作的完整输出
+    output: output::Output,
+    /// 上一次丢弃：撤销用（见 `discard.rs`）
+    discarded: Option<discard::Discarded>,
     /// 窗口内容区的大小，每帧更新；各块的大小按它收
     viewport: Size<Pixels>,
     /// 显示的是 Git 页还是终端页
@@ -268,8 +287,10 @@ impl RepoView {
             refs: Refs::default(),
             remote_names: Vec::new(),
             submodules: Vec::new(),
+            first_status: true,
             blame: None,
             merge: None,
+            merge_drafts: Vec::new(),
             history_key: None,
             refresh_task: None,
             refreshing: false,
@@ -287,6 +308,9 @@ impl RepoView {
             op_cancel: None,
             activity: activity::Log::default(),
             auto_fetch: auto_fetch::AutoFetch::new(cx),
+            fetch: fetch_state::FetchState::default(),
+            output: output::Output::default(),
+            discarded: None,
             viewport: window.viewport_size(),
             page: Page::Git,
             terminals: terminals::Terminals::default(),
@@ -551,7 +575,21 @@ impl RepoView {
                     .unwrap_or_default();
                 this.set_worktrees(trees, cx);
                 let head = parsed.head.clone().unwrap_or_default();
+                // 刚打开的仓库有未提交的改动：停在「本地修改」，不用再去找。用户已经点到别处（侧栏
+                // 选了别的、换了视图）就不动；藏起来的未跟踪文件不算
+                let hide = this.app.read(cx).settings.hide_untracked;
+                let changed = parsed.entries.iter().any(|e| {
+                    e.staged.is_some()
+                        || (e.unstaged.is_some()
+                            && !(hide && e.unstaged == Some(status::Kind::Untracked)))
+                });
+                let untouched = this.mode == Mode::History
+                    && this.sidebar.selected == sidebar::SideItem::History;
+                let first = std::mem::take(&mut this.first_status);
                 this.apply_status(parsed, cx);
+                if first && changed && untouched {
+                    this.show_changes(cx);
+                }
                 this.files_status_changed(cx);
                 let refs_out = rf.and_then(|out| out.ok()).unwrap_or_default();
                 let stash_out = sh.map(|out| out.stdout).unwrap_or_default();
@@ -567,10 +605,18 @@ impl RepoView {
                     this.reload_history(cx);
                     this.recover_refs_changed(cx);
                 }
+                this.read_fetch_head(cx);
                 cx.notify();
             })
             .ok();
         }));
+    }
+
+    /// 设置里的 Tab 宽度变了：看着的改动（本地修改、提交详情）重新读，照新的宽度排。
+    pub fn tab_width_changed(&mut self, cx: &mut Context<Self>) {
+        self.changes.mark_stale();
+        self.load_file_diff(cx);
+        self.reload_details(cx);
     }
 
     /// 丢掉缓存，重读状态和提交历史（F5 和「刷新」按钮）。
@@ -696,6 +742,9 @@ impl RepoView {
             .as_ref()
             .is_some_and(|st| !st.entries.is_empty());
         let separator = || div().flex_none().w(px(1.)).h(px(24.)).mx(px(6.)).bg(border);
+        let fetch_line = self.render_fetch_line(cx);
+        let chip_height = if fetch_line.is_some() { 26. } else { 30. };
+        let hover = cx.theme().list_hover;
 
         h_flex()
             .h(px(TOOLBAR_HEIGHT))
@@ -705,14 +754,26 @@ impl RepoView {
             .bg(bg)
             .border_b_1()
             .border_color(border)
-            // 当前分支。窗口窄、右边又在显示进度时它先让地方，所以可以缩
+            // 当前分支，下面一行是上次获取的时间。窗口窄、右边又在显示进度时它先让地方，所以可以缩
             .child(
+                v_flex()
+                    .min_w(px(30.))
+                    .flex_shrink(1.)
+                    .gap(px(1.))
+                    .child(
                 h_flex()
                     .id("current-branch")
-                    .h(px(30.))
+                    .h(px(chip_height))
                     .min_w(px(30.))
                     .flex_shrink(1.)
                     .px(px(10.))
+                    // 侧栏里的分支拖到这里：合并或变基
+                    .drag_over::<sidebar::DraggedRef>(move |style, _, _, _| {
+                        style.bg(accent.opacity(0.22))
+                    })
+                    .on_drop(cx.listener(|this, dragged: &sidebar::DraggedRef, window, cx| {
+                        this.drop_ref(dragged.clone(), window, cx)
+                    }))
                     .gap(px(6.))
                     .rounded(px(ui::RADIUS))
                     .bg(chip)
@@ -757,6 +818,8 @@ impl RepoView {
                             cx,
                         )
                     }),
+                    )
+                    .children(fetch_line),
             )
             .child(div().flex_1().min_w(px(4.)))
             .when_some(self.op.clone(), |bar, op| {
@@ -766,84 +829,136 @@ impl RepoView {
                     }
                     _ => tf!("正在{op}…", op = op),
                 };
-                // 不让它缩：窗口窄的时候缩的是左边的分支名，不然这里只剩「正在…」两个字
+                // 进度：点开底部的「输出」看完整的输出；联网的那一步里面带「取消」。不让它缩：窗口窄
+                // 的时候缩的是左边的分支名，不然这里只剩「正在…」两个字
                 bar.child(
-                    ui::clipped("op-progress", text)
+                    h_flex()
+                        .id("op-progress")
                         .mr_1()
                         .flex_none()
-                        .max_w(px(240.))
-                        .text_xs()
-                        .text_color(muted),
+                        .max_w(px(300.))
+                        .h(px(28.))
+                        .pl(px(10.))
+                        .pr(px(if self.op_progress.is_some() { 3. } else { 10. }))
+                        .gap(px(6.))
+                        .rounded(px(14.))
+                        .bg(chip)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(hover))
+                        .tooltip(move |window, cx| {
+                            ui::two_line_tip(
+                                text.clone().into(),
+                                tr("点击查看完整输出").into(),
+                                window,
+                                cx,
+                            )
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_output(cx)))
+                        .child(
+                            ui::icon_small(IconName::SquareTerminal)
+                                .flex_none()
+                                .text_color(muted),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(match &self.op_progress {
+                                    Some(progress) if !progress.is_empty() => {
+                                        SharedString::from(progress.to_string())
+                                    }
+                                    _ => tf!("正在{op}…", op = op).into(),
+                                }),
+                        )
+                        // 只有联网的操作能取消：中途杀掉改暂存区的 git 会留下锁文件
+                        .when(self.op_progress.is_some(), |pill| {
+                            pill.child(
+                                Button::new("cancel-op")
+                                    .xsmall()
+                                    .label(tr("取消"))
+                                    .tooltip(tr("中止此操作"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.cancel_op(cx)
+                                    })),
+                            )
+                        }),
                 )
-                // 只有联网的操作能取消：中途杀掉改暂存区的 git 会留下锁文件
-                .when(self.op_progress.is_some(), |bar| {
-                    bar.child(
-                        Button::new("cancel-op")
-                            .xsmall()
-                            .label(tr("取消"))
-                            .tooltip(tr("中止此操作"))
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel_op(cx))),
-                    )
-                })
             })
-            // 这三个按钮点右键有不常用的选项
-            .child(
-                div()
-                    .id("fetch-menu")
-                    .flex_none()
-                    .child(
-                        tool_button(
-                            "fetch",
-                            IconName::ArrowDownToDot,
-                            tr("获取"),
-                            tr("git fetch --all；右键查看更多选项"),
-                            running(tr("获取")) || self.auto_fetching(),
-                            idle,
-                            0,
-                            cx,
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| this.fetch(window, cx))),
-                    )
-                    .context_menu(self.fetch_menu(cx)),
-            )
-            .child(
-                div()
-                    .id("pull-menu")
-                    .flex_none()
-                    .child(
-                        tool_button(
-                            "pull",
-                            IconName::ArrowDownToLine,
-                            tr("拉取"),
-                            tr("git pull；右键查看更多选项"),
-                            running(tr("拉取")),
-                            idle,
-                            behind,
-                            cx,
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| this.pull(false, window, cx))),
-                    )
-                    .context_menu(self.pull_menu(cx)),
-            )
-            .child(
-                div()
-                    .id("push-menu")
-                    .flex_none()
-                    .child(
-                        tool_button(
-                            "push",
-                            IconName::ArrowUpFromLine,
-                            tr("推送"),
-                            tr("git push；右键查看更多选项"),
-                            running(tr("推送")),
-                            idle,
-                            ahead,
-                            cx,
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| this.push(window, cx))),
-                    )
-                    .context_menu(self.push_menu(cx)),
-            )
+            // 主操作加 ⌄：⌄ 和右键是同一份菜单
+            .child(split_tool(
+                "fetch-menu",
+                tool_button(
+                    "fetch",
+                    IconName::ArrowDownToDot,
+                    tr("获取"),
+                    crate::keymap::with_key(
+                        tr("从所有远程下载新的提交和分支，不改动当前分支和工作区（Ctrl+Shift+F）"),
+                        "git.fetch",
+                        cx,
+                    ),
+                    running(tr("获取")) || self.auto_fetching(),
+                    idle,
+                    0,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.fetch(window, cx))),
+                tr("获取的更多选项"),
+                idle,
+                self.fetch_menu(cx),
+                self.fetch_menu(cx),
+                muted,
+            ))
+            .child(split_tool(
+                "pull-menu",
+                tool_button(
+                    "pull",
+                    IconName::ArrowDownToLine,
+                    tr("拉取"),
+                    crate::keymap::with_key(
+                        tr("获取上游的新提交，并合并到当前分支（Ctrl+Shift+L）"),
+                        "git.pull",
+                        cx,
+                    ),
+                    running(tr("拉取")),
+                    idle,
+                    behind,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.pull(ops::PullMode::Default, window, cx)
+                })),
+                tr("拉取的更多选项"),
+                idle,
+                self.pull_menu(cx),
+                self.pull_menu(cx),
+                muted,
+            ))
+            .child(split_tool(
+                "push-menu",
+                tool_button(
+                    "push",
+                    IconName::ArrowUpFromLine,
+                    tr("推送"),
+                    crate::keymap::with_key(
+                        tr("将当前分支的新提交上传到上游（Ctrl+Shift+P）"),
+                        "git.push",
+                        cx,
+                    ),
+                    running(tr("推送")),
+                    idle,
+                    ahead,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.push(window, cx))),
+                tr("推送的更多选项"),
+                idle,
+                self.push_menu(cx),
+                self.push_menu(cx),
+                muted,
+            ))
             .child(separator())
             .child(
                 tool_button(
@@ -851,9 +966,13 @@ impl RepoView {
                     IconName::Archive,
                     tr("贮藏"),
                     if has_changes {
-                        tr("git stash push：贮藏当前改动")
+                        crate::keymap::with_key(
+                            tr("将未提交的改动暂时收起，工作区恢复干净；之后可点击「弹出」恢复（Ctrl+Shift+S）"),
+                            "git.stash",
+                            cx,
+                        )
                     } else {
-                        tr("没有可贮藏的改动")
+                        tr("没有可贮藏的改动").into()
                     },
                     running(tr("贮藏")),
                     idle && has_changes,
@@ -867,7 +986,11 @@ impl RepoView {
                     "pop",
                     IconName::ArchiveRestore,
                     tr("弹出"),
-                    tr("git stash pop：恢复最近一次贮藏并将其删除"),
+                    crate::keymap::with_key(
+                        tr("恢复最近一次贮藏的改动，并删除该贮藏"),
+                        "git.pop",
+                        cx,
+                    ),
                     running(tr("弹出贮藏")),
                     idle && has_stash,
                     0,
@@ -880,7 +1003,7 @@ impl RepoView {
                     "branch",
                     IconName::GitBranchPlus,
                     tr("分支"),
-                    tr("新建分支（git checkout -b）"),
+                    crate::keymap::with_key(tr("新建分支并切换过去；在提交列表中选中了提交时从该提交新建"), "git.branch", cx),
                     running(tr("新建分支")),
                     idle,
                     0,
@@ -918,6 +1041,40 @@ impl RepoView {
             )
     }
 
+    /// 快捷键做的 Git 操作（设置 → 快捷键 → Git），和点工具栏上的按钮一样：仓库还没读好、读状态
+    /// 出错时不做；没有改动不能贮藏、没有贮藏不能弹出，说明原因。
+    pub fn git_shortcut(&mut self, op: GitShortcut, window: &mut Window, cx: &mut Context<Self>) {
+        let ready = self.channel.is_some() && self.status.is_some() && self.error.is_none();
+        if !ready {
+            return;
+        }
+        match op {
+            GitShortcut::Fetch => self.fetch(window, cx),
+            GitShortcut::Pull => self.pull(ops::PullMode::Default, window, cx),
+            GitShortcut::Push => self.push(window, cx),
+            GitShortcut::Stash => {
+                let has_changes = self
+                    .status
+                    .as_ref()
+                    .is_some_and(|st| !st.entries.is_empty());
+                match has_changes {
+                    true => self.stash_dialog(window, cx),
+                    false => {
+                        let text = tr("没有可贮藏的改动");
+                        window.push_notification(Notification::info(text), cx);
+                    }
+                }
+            }
+            GitShortcut::Pop => match self.refs.stashes.is_empty() {
+                true => {
+                    window.push_notification(Notification::info(tr("暂无贮藏")), cx);
+                }
+                false => self.stash_pop_latest(window, cx),
+            },
+            GitShortcut::Branch => self.new_branch_dialog(window, cx),
+        }
+    }
+
     /// 「打开」按钮：把仓库交给外面的终端、VS Code 或资源管理器。
     fn render_open_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let dir = self.entry.path.clone();
@@ -936,12 +1093,13 @@ impl RepoView {
             .map(|(via, _)| self.app.read(cx).machine_name(via));
         let app = self.app.clone();
         // 不加悬停提示：提示也出现在按钮下面，会把弹出的菜单第一项盖住
-        tool_button_bare(
+        tool_button_with(
             "open-in",
             IconName::SquareArrowOutUpRight,
             tr("打开"),
             false,
             0,
+            true,
             cx,
         )
         .dropdown_menu(move |menu, _, cx| {
@@ -1220,6 +1378,7 @@ impl RepoView {
         let banner = self
             .in_progress
             .map(|state| self.render_in_progress(state, cx).into_any_element());
+        let output = self.render_output(cx);
         v_flex()
             .flex_1()
             .min_w_0()
@@ -1227,8 +1386,20 @@ impl RepoView {
             .child(self.render_toolbar(cx))
             .children(banner)
             .child(div().flex_1().min_h_0().child(main))
+            .children(output)
             .into_any_element()
     }
+}
+
+/// 快捷键直接做的几个 Git 操作（见 [`RepoView::git_shortcut`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitShortcut {
+    Fetch,
+    Pull,
+    Push,
+    Stash,
+    Pop,
+    Branch,
 }
 
 /// 工具栏按钮：图标在上、字在下。`badge` 不是 0 时在图标旁边标一个数（拉取、推送有几个提交）。
@@ -1243,9 +1414,68 @@ pub(crate) fn tool_button(
     badge: usize,
     cx: &App,
 ) -> Button {
+    // 只留图标时提示里先写名字
+    let tooltip: SharedString = tooltip.into();
+    let tooltip: SharedString = match compact_toolbar() {
+        true if !tooltip.starts_with(label) => format!("{label} · {tooltip}").into(),
+        _ => tooltip,
+    };
     tool_button_bare(id, icon, label, running, badge, cx)
         .tooltip(tooltip)
         .disabled(!enabled)
+}
+
+thread_local! {
+    /// 窗口窄于 [`COMPACT_TOOLBAR_BELOW`]：工具栏只留图标。主窗口每次画之前记下
+    static COMPACT_TOOLBAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 窗口窄于这么多时工具栏只留图标，名字写在悬停提示里
+const COMPACT_TOOLBAR_BELOW: f32 = 1000.;
+
+/// 工具栏现在是不是只留图标。
+pub(crate) fn compact_toolbar() -> bool {
+    COMPACT_TOOLBAR.with(|compact| compact.get())
+}
+
+/// 按窗口的宽度记下工具栏要不要只留图标（画之前调）。
+pub(crate) fn note_window_width(width: f32) {
+    COMPACT_TOOLBAR.with(|compact| compact.set(width < COMPACT_TOOLBAR_BELOW));
+}
+
+/// 分体按钮：左边是主操作，右边窄窄的 ⌄ 点开更多选项；右键整块也是那份菜单。
+fn split_tool(
+    id: &'static str,
+    main: Button,
+    more: &'static str,
+    enabled: bool,
+    menu: menus::MenuFn,
+    context: menus::MenuFn,
+    muted: Hsla,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex_none()
+        .flex()
+        .flex_row()
+        .items_center()
+        .child(main)
+        .child(
+            Button::new(SharedString::from(format!("{id}-more")))
+                .ghost()
+                .h(px(42.))
+                .w(px(15.))
+                .px(px(0.))
+                .icon(
+                    Icon::new(IconName::ChevronDown)
+                        .size(px(12.))
+                        .text_color(muted),
+                )
+                .tooltip(more)
+                .disabled(!enabled)
+                .dropdown_menu(menu),
+        )
+        .context_menu(context)
 }
 
 fn tool_button_bare(
@@ -1256,6 +1486,19 @@ fn tool_button_bare(
     badge: usize,
     cx: &App,
 ) -> Button {
+    tool_button_with(id, icon, label, running, badge, false, cx)
+}
+
+/// 工具栏按钮；`menu` 为真时图标旁边多一个小 ⌄（点开是菜单的按钮，如「打开」）。
+fn tool_button_with(
+    id: &'static str,
+    icon: IconName,
+    label: &'static str,
+    running: bool,
+    badge: usize,
+    menu: bool,
+    cx: &App,
+) -> Button {
     let glyph = if running {
         Spinner::new()
             .icon(Icon::new(IconName::LoaderCircle))
@@ -1264,11 +1507,12 @@ fn tool_button_bare(
     } else {
         Icon::new(icon).size_4().into_any_element()
     };
+    let compact = compact_toolbar();
     Button::new(id)
         .ghost()
         .h(px(42.))
-        .min_w(px(46.))
-        .px(px(8.))
+        .min_w(px(if compact { 34. } else { 46. }))
+        .px(px(if compact { 6. } else { 8. }))
         .child(
             v_flex()
                 .items_center()
@@ -1278,9 +1522,18 @@ fn tool_button_bare(
                         .h(px(16.))
                         .gap(px(4.))
                         .child(glyph)
-                        .when(badge > 0, |row| row.child(ui::count_pill(badge, true, cx))),
+                        .when(badge > 0, |row| row.child(ui::count_pill(badge, true, cx)))
+                        .when(menu, |row| {
+                            row.child(
+                                Icon::new(IconName::ChevronDown)
+                                    .size(px(11.))
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                        }),
                 )
-                .child(div().text_size(px(11.)).line_height(px(13.)).child(label)),
+                .when(!compact, |col| {
+                    col.child(div().text_size(px(11.)).line_height(px(13.)).child(label))
+                }),
         )
 }
 
@@ -1292,11 +1545,14 @@ impl Render for RepoView {
         }
         self.tick_bench(window, cx);
         self.viewport = window.viewport_size();
+        note_window_width(f32::from(self.viewport.width));
+        self.forget_narrow_open(cx);
         let sizes = self.sizes(cx);
-        self.history.set_layout(self.viewport, sizes);
+        self.history.set_layout(self.content_viewport(), sizes);
         self.focus_blame_if_new(window, cx);
         self.sync_terminals(window, cx);
         self.sync_files(window, cx);
+        self.sync_commit_placeholder(window, cx);
         let right = match self.page {
             Page::Git => self.render_git_page(cx),
             Page::Terminal => self.render_terminal_page(cx),
@@ -1304,6 +1560,20 @@ impl Render for RepoView {
         };
         h_flex()
             .size_full()
+            // 终端页的 F6、F2（会话页同样的键，见 `keymap.rs` 的 hub.*）：别的页不接，照常交给原来的处理
+            .when(self.page == Page::Terminal, |root| {
+                root.on_action(cx.listener(|this, _: &crate::FocusSwitch, window, cx| {
+                    this.switch_terminal_focus(window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &crate::FocusSwitchBack, window, cx| {
+                    this.switch_terminal_focus(window, cx)
+                }))
+                .on_action(cx.listener(
+                    |this, _: &crate::RenameTerminal, window, cx| {
+                        this.rename_active_terminal(window, cx)
+                    },
+                ))
+            })
             // 拖分隔条：不管鼠标拖到哪一块上面，都由这里按位置算大小
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<layout::DragSplit>, _, cx| {

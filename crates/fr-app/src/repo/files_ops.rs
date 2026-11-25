@@ -10,7 +10,7 @@ use fr_channel::{FsWrite, UploadItem};
 use fr_core::i18n::tr;
 use fr_core::tf;
 use futures::StreamExt as _;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{Sizable as _, WindowExt as _};
@@ -63,6 +63,79 @@ pub(super) fn name_error(name: &str, nested: bool) -> Option<String> {
 
 /// 把选中、拖进来的文件和目录排成要传的一个个文件：本机路径，和放到目标目录下的相对路径。
 /// `.git` 目录（拖进来的是一个仓库时里面有）不传：文件页不往 Git 的数据目录里写。
+/// 计划里哪些文件主机上已经有了（相对 `dir` 的路径，按计划的顺序）。从 `dir` 往下逐层列目录，
+/// 只进计划里有、主机上也有的目录；同名比较不分大小写（Windows 主机上本来就不分，宁可多报）。
+async fn existing_files(
+    channel: &fr_channel::Channel,
+    repo: &str,
+    dir: &str,
+    plan: &[(PathBuf, String)],
+) -> Vec<String> {
+    use std::collections::{HashMap, HashSet};
+    // 计划里用到的目录（相对 `dir`），按深度排：先列上一层才知道下一层在不在
+    let mut dirs: Vec<String> = plan
+        .iter()
+        .filter_map(|(_, relative)| {
+            relative
+                .rsplit_once('/')
+                .map(|(parent, _)| parent.to_string())
+        })
+        .flat_map(|parent| {
+            let parts: Vec<&str> = parent.split('/').collect();
+            (1..=parts.len())
+                .map(|n| parts[..n].join("/"))
+                .collect::<Vec<_>>()
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    dirs.sort_by_key(|d| (d.matches('/').count(), d.clone()));
+    // 每个在主机上存在的目录里有什么：名字（小写）→ 是不是目录
+    let mut listed: HashMap<String, HashMap<String, bool>> = HashMap::new();
+    let list = |relative: &str| {
+        let path = match (dir.is_empty(), relative.is_empty()) {
+            (true, _) => relative.to_string(),
+            (false, true) => dir.to_string(),
+            (false, false) => format!("{dir}/{relative}"),
+        };
+        channel.fs_list(repo, &path)
+    };
+    let names = |entries: Vec<fr_channel::FsEntry>| {
+        entries
+            .into_iter()
+            .map(|entry| (entry.name.to_lowercase(), entry.dir))
+            .collect::<HashMap<_, _>>()
+    };
+    match list("").await {
+        Ok(entries) => listed.insert(String::new(), names(entries)),
+        Err(_) => return Vec::new(),
+    };
+    for relative in dirs {
+        let (parent, name) = match relative.rsplit_once('/') {
+            Some((parent, name)) => (parent.to_string(), name),
+            None => (String::new(), relative.as_str()),
+        };
+        let exists = listed
+            .get(&parent)
+            .is_some_and(|names| names.get(&name.to_lowercase()) == Some(&true));
+        if exists && let Ok(entries) = list(&relative).await {
+            listed.insert(relative.clone(), names(entries));
+        }
+    }
+    plan.iter()
+        .filter(|(_, relative)| {
+            let (parent, name) = match relative.rsplit_once('/') {
+                Some((parent, name)) => (parent, name),
+                None => ("", relative.as_str()),
+            };
+            listed
+                .get(parent)
+                .is_some_and(|names| names.contains_key(&name.to_lowercase()))
+        })
+        .map(|(_, relative)| relative.clone())
+        .collect()
+}
+
 fn plan_upload(paths: &[PathBuf]) -> Result<Vec<(PathBuf, String)>, String> {
     fn walk(
         local: &Path,
@@ -544,7 +617,9 @@ impl RepoView {
         .detach();
     }
 
-    /// 把本机的文件、目录传到 `dir` 里（选的，或者拖进来的）。有同名的先问要不要覆盖。
+    /// 把本机的文件、目录传到 `dir` 里（选的，或者拖进来的）。先在主机上逐个核对会不会覆盖已有的
+    /// 文件（目录展开到里面的每个文件）：有的话列出来，可以只传新文件，或者确认覆盖。原来只比顶层的
+    /// 名字，同名目录里会被覆盖的是哪些文件不说。
     pub(super) fn upload_paths(
         &mut self,
         dir: String,
@@ -552,52 +627,120 @@ impl RepoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if paths.is_empty() || self.channel.is_none() {
+        if paths.is_empty() {
             return;
         }
-        let existing = self.files.names_in(&dir);
-        let clash: Vec<String> = paths
-            .iter()
-            .filter_map(|path| Some(path.file_name()?.to_string_lossy().into_owned()))
-            .filter(|name| {
-                existing
-                    .iter()
-                    .any(|other| other.eq_ignore_ascii_case(name))
-            })
-            .collect();
-        if clash.is_empty() {
-            self.start_upload(dir, paths, false, window, cx);
+        let Some((channel, repo)) = self.files_channel() else {
             return;
-        }
-        let names = match clash.len() {
-            1..=3 => clash.join(tr("、")),
-            count => tf!(
-                "{first} 等 {count} 项",
-                first = clash[..2].join(tr("、")),
-                count
-            ),
         };
+        let target = dir.clone();
+        let local = paths.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let planned = cx
+                .background_executor()
+                .spawn(async move { plan_upload(&local) })
+                .await;
+            // 列不出计划（文件太多、读不了）交给 start_upload 照常报错
+            let clash = match &planned {
+                Ok(plan) => existing_files(&channel, &repo, &target, plan).await,
+                Err(_) => Vec::new(),
+            };
+            this.update_in(cx, |this, window, cx| {
+                if clash.is_empty() {
+                    return this.start_upload(dir, paths, Vec::new(), false, window, cx);
+                }
+                this.confirm_overwrite(dir, paths, clash, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 上传会覆盖主机上已有的文件：列出是哪些，「仅上传新文件」（回车）、「覆盖」或取消。
+    fn confirm_overwrite(
+        &mut self,
+        dir: String,
+        paths: Vec<PathBuf>,
+        clash: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let place = if dir.is_empty() {
             tr("仓库根目录").to_string()
         } else {
             dir.clone()
         };
-        self.confirm(
-            tr("覆盖同名文件？"),
-            tf!("{place} 中已有 {names}，继续将覆盖同名文件。", place, names),
-            tr("覆盖"),
-            window,
-            cx,
-            move |this, window, cx| {
-                this.start_upload(dir.clone(), paths.clone(), true, window, cx);
-            },
+        const SHOWN: usize = 8;
+        let mut list = clash
+            .iter()
+            .take(SHOWN)
+            .map(|path| format!("  {path}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if clash.len() > SHOWN {
+            list.push('\n');
+            list.push_str("  ");
+            list.push_str(&tf!("等 {count} 个文件", count = clash.len()));
+        }
+        let description = tf!(
+            "{place} 中已有以下 {count} 个同名文件，覆盖后无法恢复：\n\n{list}",
+            place,
+            count = clash.len(),
+            list
         );
+        let view = cx.entity().downgrade();
+        let job = std::rc::Rc::new((dir, paths, clash));
+        crate::ui::cancel_pending_tip(window, cx);
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let run = |overwrite: bool| {
+                let (view, job) = (view.clone(), job.clone());
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    window.close_dialog(cx);
+                    let (dir, paths, clash) = (job.0.clone(), job.1.clone(), job.2.clone());
+                    view.update(cx, |this, cx| {
+                        this.start_upload(dir, paths, clash, overwrite, window, cx)
+                    })
+                    .ok();
+                }
+            };
+            let (skip, on_enter, overwrite) = (run(false), run(false), run(true));
+            alert
+                .title(tr("覆盖同名文件？"))
+                .description(description.clone())
+                .on_ok(move |event, window, cx| {
+                    on_enter(event, window, cx);
+                    false
+                })
+                .footer(
+                    gpui_kit::component::dialog::DialogFooter::new()
+                        .child(
+                            Button::new("cancel")
+                                .label(tr("取消"))
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("overwrite")
+                                .label(tr("覆盖"))
+                                .with_variant(ButtonVariant::Danger)
+                                .on_click(overwrite),
+                        )
+                        .child(
+                            Button::new("skip")
+                                .label(tr("仅上传新文件"))
+                                .with_variant(ButtonVariant::Primary)
+                                .on_click(skip),
+                        ),
+                )
+        });
     }
 
+    /// 照计划上传。`clash` 是核对时主机上已有的文件（相对路径）：`overwrite` 为真时覆盖它们，
+    /// 否则跳过。其余的文件不覆盖：核对以后才在主机上出现的同名文件，上传时报错，不悄悄盖掉。
     fn start_upload(
         &mut self,
         dir: String,
         paths: Vec<PathBuf>,
+        clash: Vec<String>,
         overwrite: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -621,7 +764,10 @@ impl RepoView {
                 .ok();
             };
             let plan = match planned {
-                Ok(plan) => plan,
+                Ok(plan) => plan
+                    .into_iter()
+                    .filter(|(_, relative)| overwrite || !clash.contains(relative))
+                    .collect::<Vec<_>>(),
                 Err(text) => return failed(text, cx),
             };
             let count = plan.len();
@@ -635,7 +781,8 @@ impl RepoView {
                 }
                 .into();
                 let dest = join(&dir, &relative);
-                let mut stream = channel.fs_upload(&repo, &dest, local, overwrite);
+                let replace = clash.contains(&relative);
+                let mut stream = channel.fs_upload(&repo, &dest, local, replace);
                 let mut done = false;
                 while let Some(item) = stream.next().await {
                     let (sent, total) = match item {
@@ -1161,7 +1308,7 @@ impl RepoView {
 
 /// 「下载」文件夹：Windows 是 `<用户目录>\Downloads`；Linux 问 `xdg-user-dir`（中文桌面上叫「下载」），
 /// 问不到用 `~/Downloads`。不存在时是 None。
-fn downloads_dir() -> Option<PathBuf> {
+pub(super) fn downloads_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     let dir = std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join("Downloads"));
     #[cfg(not(windows))]

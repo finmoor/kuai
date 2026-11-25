@@ -99,6 +99,7 @@ fn main() -> Result<()> {
         no_prompt: false,
         // 没有界面可以核对指纹：没见过的主机直接记下
         accept_new_host_keys: true,
+        typed: Default::default(),
     };
     if let Some(destination) = value("--test-login") {
         let started = Instant::now();
@@ -191,7 +192,7 @@ fn main() -> Result<()> {
         [destination] => {
             if ask {
                 // 没有界面：存着的答不了的提问，打出来并当作取消
-                fr_channel::init_prompts(|prompt, jump| {
+                fr_channel::init_prompts(|prompt, jump, _retry| {
                     let who = jump.map(|name| format!("（{name}）")).unwrap_or_default();
                     println!("ssh 问了没有存着答案的{who}：{}", prompt.trim());
                     None

@@ -300,10 +300,11 @@ impl RepoView {
         own && subs.all(|(_, view)| view.read(cx).cancellable_with_subs(cx))
     }
 
-    /// 根仓库和进过的子仓库里一共有几个文件没保存。
+    /// 根仓库和进过的子仓库里一共有几个文件没保存（合并编辑器里没保存的也算）。
     pub fn unsaved_with_subs(&self, cx: &App) -> usize {
         let subs = self.subs.views.iter();
         self.unsaved_files()
+            + self.unsaved_merges(cx)
             + subs
                 .map(|(_, view)| view.read(cx).unsaved_with_subs(cx))
                 .sum::<usize>()

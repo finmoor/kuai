@@ -19,6 +19,8 @@ const MAX_CHARS: usize = 2000;
 
 pub(super) struct BlameView {
     path: String,
+    /// 追溯哪个提交里的版本；None 是工作区现在的样子
+    rev: Option<String>,
     data: Option<Blame>,
     /// 每一行显示的文字
     texts: Vec<SharedString>,
@@ -35,12 +37,22 @@ pub(super) struct BlameView {
 }
 
 impl RepoView {
-    /// 打开逐行追溯。
+    /// 打开逐行追溯：工作区现在的版本。
     pub(super) fn show_blame(&mut self, path: String, cx: &mut Context<Self>) {
+        self.show_blame_at(path, None, cx);
+    }
+
+    /// 打开逐行追溯：`rev` 给了就是那个提交里的版本（从提交详情、比较里打开时），页头写明是哪个提交。
+    pub(super) fn show_blame_at(
+        &mut self,
+        path: String,
+        rev: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(channel) = self.channel.clone() else {
             return;
         };
-        let request = channel.git(&self.entry.path, blame::args(&path));
+        let request = channel.git(&self.entry.path, blame::args_at(rev.as_deref(), &path));
         let task = cx.spawn(async move |this, cx| {
             let result = request.await.and_then(|out| out.ok());
             this.update(cx, |this, cx| {
@@ -80,6 +92,7 @@ impl RepoView {
         };
         self.blame = Some(BlameView {
             path,
+            rev,
             data: None,
             texts: Vec::new(),
             error: None,
@@ -210,6 +223,20 @@ impl RepoView {
                     .text_sm()
                     .child(div().text_color(muted).child(tr("逐行追溯")))
                     .child(crate::ui::clipped("blame-path", view.path.clone()).flex_1())
+                    // 追溯的是哪个版本：提交里的写短哈希，工作区写「当前版本」
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(match &view.rev {
+                                Some(rev) => SharedString::from(tf!(
+                                    "提交 {rev} 中的版本",
+                                    rev = &rev[..rev.len().min(8)]
+                                )),
+                                None => tr("当前版本").into(),
+                            }),
+                    )
                     .child(div().text_xs().text_color(muted).child(tr(
                         "点击一行跳转到修改该行的提交；使用上下方向键选择，按 Enter 跳转",
                     )))

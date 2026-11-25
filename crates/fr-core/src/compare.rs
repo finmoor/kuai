@@ -30,9 +30,11 @@ pub struct File {
 }
 
 /// 两端怎么写进 `git diff` 的参数里。两端都是工作区时没有可比的。
-/// 基准是工作区、对比是提交时用 `-R` 倒过来。
-fn ends(base: &End, other: &End) -> Option<Vec<String>> {
+/// 基准是工作区、对比是提交时用 `-R` 倒过来。`from_base` 为真且两端都是提交时，从两端的共同祖先
+/// 比到对比（`基准...对比`）：只看对比那边引入的改动，基准上后来的提交不算进来。
+fn ends(base: &End, other: &End, from_base: bool) -> Option<Vec<String>> {
     Some(match (base, other) {
+        (End::Rev(a), End::Rev(b)) if from_base => vec![format!("{a}...{b}")],
         (End::Rev(a), End::Rev(b)) => vec![a.clone(), b.clone()],
         (End::Rev(a), End::Worktree) => vec![a.clone()],
         (End::Worktree, End::Rev(b)) => vec!["-R".into(), b.clone()],
@@ -41,7 +43,7 @@ fn ends(base: &End, other: &End) -> Option<Vec<String>> {
 }
 
 /// 两端之间改了哪些文件：状态和增删行数一次取回来（[`parse_files`]）。
-pub fn files_args(base: &End, other: &End) -> Option<Vec<String>> {
+pub fn files_args(base: &End, other: &End, from_base: bool) -> Option<Vec<String>> {
     let mut args: Vec<String> = [
         "diff",
         "--no-ext-diff",
@@ -54,7 +56,7 @@ pub fn files_args(base: &End, other: &End) -> Option<Vec<String>> {
     ]
     .map(String::from)
     .to_vec();
-    args.extend(ends(base, other)?);
+    args.extend(ends(base, other, from_base)?);
     args.push("--".into());
     Some(args)
 }
@@ -135,6 +137,7 @@ pub fn parse_files(out: &[u8]) -> Vec<File> {
 pub fn patch_args(
     base: &End,
     other: &End,
+    from_base: bool,
     path: &str,
     orig_path: Option<&str>,
 ) -> Option<Vec<String>> {
@@ -150,7 +153,7 @@ pub fn patch_args(
     ]
     .map(String::from)
     .to_vec();
-    args.extend(ends(base, other)?);
+    args.extend(ends(base, other, from_base)?);
     args.push("--".into());
     args.push(path.to_string());
     args.extend(orig_path.map(String::from));
@@ -334,13 +337,21 @@ mod tests {
             let from = args.iter().position(|arg| arg == "-M").unwrap();
             args[from + 1..].join(" ")
         };
-        assert_eq!(tail(files_args(&rev("a"), &rev("b"))), "a b --");
-        assert_eq!(tail(files_args(&rev("a"), &End::Worktree)), "a --");
+        assert_eq!(tail(files_args(&rev("a"), &rev("b"), false)), "a b --");
+        assert_eq!(tail(files_args(&rev("a"), &End::Worktree, false)), "a --");
         // 基准是工作区：倒过来比
-        assert_eq!(tail(files_args(&End::Worktree, &rev("b"))), "-R b --");
-        assert!(files_args(&End::Worktree, &End::Worktree).is_none());
-        let patch = patch_args(&rev("a"), &rev("b"), "new.rs", Some("old.rs")).unwrap();
+        assert_eq!(
+            tail(files_args(&End::Worktree, &rev("b"), false)),
+            "-R b --"
+        );
+        assert!(files_args(&End::Worktree, &End::Worktree, false).is_none());
+        let patch = patch_args(&rev("a"), &rev("b"), false, "new.rs", Some("old.rs")).unwrap();
         assert_eq!(patch[patch.len() - 5..].join(" "), "a b -- new.rs old.rs");
+        // 只看对比引入的：两端都是提交时从共同祖先比；有一端是工作区时照旧直接比
+        assert_eq!(tail(files_args(&rev("a"), &rev("b"), true)), "a...b --");
+        assert_eq!(tail(files_args(&rev("a"), &End::Worktree, true)), "a --");
+        let patch = patch_args(&rev("a"), &rev("b"), true, "x", None).unwrap();
+        assert_eq!(patch[patch.len() - 3..].join(" "), "a...b -- x");
         assert!(patch.contains(&"-U3".to_string()));
         assert_eq!(untracked_patch_args("x", true)[..2].join(" "), "diff -R");
         assert_eq!(untracked_patch_args("x", false)[0], "diff");

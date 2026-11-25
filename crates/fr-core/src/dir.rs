@@ -28,6 +28,12 @@ pub fn windows_key(key: &str) -> String {
 
 /// 列出一个目录下的子目录，标出哪些是仓库。`path` 为空或 `~` 表示主目录，也支持 `~/xxx`。
 pub fn list_dir(path: &str) -> Result<DirListing> {
+    list_dir_with(path, false)
+}
+
+/// 同 [`list_dir`]；`hidden` 时以 `.` 开头的目录（`.git` 除外）也列，标上 [`DirEntry::hidden`]。
+/// 顺带往上找这个目录在哪个仓库里（[`DirListing::root`]）。
+pub fn list_dir_with(path: &str, hidden: bool) -> Result<DirListing> {
     let home = home();
     let path = match path.trim() {
         "" | "~" => home.clone(),
@@ -42,7 +48,8 @@ pub fn list_dir(path: &str) -> Result<DirListing> {
     {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
+        let dotted = name.starts_with('.');
+        if dotted && (!hidden || name == ".git") {
             continue;
         }
         // 跟随符号链接判断是不是目录
@@ -53,15 +60,26 @@ pub fn list_dir(path: &str) -> Result<DirListing> {
         entries.push(DirEntry {
             repo: path.join(".git").exists(),
             name,
+            hidden: dotted,
         });
     }
-    entries.sort_by_cached_key(|e| e.name.to_lowercase());
+    // 隐藏的排在后面
+    entries.sort_by_cached_key(|e| (e.hidden, e.name.to_lowercase()));
     Ok(DirListing {
         path: show(&dir),
         parent: dir.parent().map(show),
         repo: dir.join(".git").exists(),
+        root: enclosing_repo(&dir).map(|root| show(&root)),
         entries,
     })
+}
+
+/// 往上找第一个有 `.git`（目录，或者子模块、工作树的 `.git` 文件）的目录。
+fn enclosing_repo(dir: &Path) -> Option<std::path::PathBuf> {
+    dir.ancestors()
+        .take(64)
+        .find(|at| std::fs::symlink_metadata(at.join(".git")).is_ok())
+        .map(Path::to_path_buf)
 }
 
 /// 路径转成显示用的字符串；去掉 Windows 上 canonicalize 加的 `\\?\` 前缀。

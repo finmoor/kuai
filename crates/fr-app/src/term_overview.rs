@@ -26,9 +26,14 @@
 //! 这一页自己开的（新建、重启）是正经接着的（[`TerminalView::new`]），大小跟着这一页的画面，也就和
 //! 仓库的终端页一样大；选到别的终端再回来，就换成只看。
 //!
-//! 焦点：打开这一页时在侧栏上（↑↓ 选一行，Enter 打开它的仓库、显示 Git 页，→ 进到终端里）；点画面、
-//! 点标签、新开一个终端时进到终端里，之后的键都归里面的程序，只留 Ctrl+Shift+↑、↓ 沿着侧栏换终端。
-//! 输入时画面带一圈主色的边框：Enter 在侧栏上是打开仓库、在终端里是回车，得一眼看得出焦点在哪。
+//! 焦点（`docs/design/sessions-status/` 第 7 节）：打开这一页、点侧栏里的终端、点标签、
+//! 新开一个终端时进到终端里，之后的键都归里面的程序，只留 F6（Shift+F6）回到侧栏、Ctrl+Shift+↑、↓
+//! 沿着侧栏换终端。侧栏上 ↑↓ 选一行，Enter、→ 进到终端里输入，Ctrl+Enter 打开它的仓库（显示 Git 页），
+//! F2 改名，空格勾上并排查看。输入时画面顶上一条主色细线，工具栏写「输入中」。
+//!
+//! 状态（运行中、静默、待查看、空闲、已退出、状态未知）见 [`TermBoard`]；主机断开时它的终端留在侧栏里
+//! 灰掉，分节头写「未连接」带「重新连接」。终端可以改名（右键「重命名…」、双击名字、F2），同一个仓库
+//! 里重名的自动加序号。侧栏里勾上 2～4 个可以并排查看（[`crate::term_split`]）。
 //!
 //! 侧栏和仓库页的侧栏一样宽、一样的底色和字号，右边上面一条和仓库终端页的工具栏一样高，下面全是画面：
 //! 这样画面和仓库的终端页一样大，终端是几行几列就正好放得下，字不用缩小。侧栏右边有分隔条，拖它改的
@@ -36,13 +41,14 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use fr_channel::Channel;
 use fr_core::i18n::{tr, trc};
 use fr_core::tf;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
@@ -57,8 +63,10 @@ use crate::presets;
 use crate::repo::tool_button;
 use crate::settings::{RepoEntry, TermSlot};
 use crate::term_board::{
-    GroupKey, Program, RepoGroup, Row, TermBoard, TermId, TermState, free_number,
+    GroupKey, Program, RepoGroup, Row, Shown, TermBoard, TermId, TermState, free_number,
+    state_words,
 };
+use crate::term_split::{self, Handler};
 use crate::terminal::{self, LinkBase, TerminalEvent, TerminalView};
 use crate::ui;
 use crate::workspace::{PickFor, Picked, QuickOpen, show_picker};
@@ -67,6 +75,8 @@ use crate::workspace::{PickFor, Picked, QuickOpen, show_picker};
 const HEAD_HEIGHT: f32 = 52.;
 /// 侧栏里一行的高度（和仓库终端页侧栏里的一行一样）
 const ROW_HEIGHT: f32 = 28.;
+/// 终端行下面多一行最后一行字时的高度
+const TALL_ROW: f32 = 44.;
 /// 工作区分节标题的高度（下面 26 是能点的那一块）
 const GROUP_HEAD: f32 = 28.;
 /// 两个工作区之间空着的高度
@@ -77,7 +87,8 @@ const UNPIN_AFTER: Duration = Duration::from_secs(3);
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Filter {
     All,
-    Stopped,
+    /// 待查看、离开期间有更新的
+    Waiting,
     Running,
 }
 
@@ -105,6 +116,27 @@ struct Peek {
     owned: bool,
     /// 终端里按住 Ctrl 单击了仓库里的文件
     _events: Subscription,
+}
+
+/// 正在改名的终端：侧栏那一行（标签）的名字换成输入框，Enter、点别处确认，Esc 取消，留空回到默认的。
+struct Renaming {
+    slot: TermSlot,
+    id: TermId,
+    input: Entity<InputState>,
+    _events: Subscription,
+}
+
+/// 并排查看的一格。
+struct Cell {
+    slot: TermSlot,
+    peek: Option<Peek>,
+}
+
+/// 并排查看（[`crate::term_split`]）：哪几个、输入进哪一格、放大着哪一格。
+struct Split {
+    cells: Vec<Cell>,
+    focus: usize,
+    zoom: Option<usize>,
 }
 
 /// 侧栏里能选中的一行。
@@ -159,10 +191,10 @@ struct Side {
     scope: Option<String>,
     /// 选的那台服务器这次还没连上
     offline: bool,
-    /// 没筛「已停下」「运行中」之前，侧栏里看得到的（选的那台电脑上的，加上固定的）：一共几个
-    /// 终端，几个已停下，几个运行中
+    /// 没筛「待查看」「运行中」之前，侧栏里看得到的（选的那台电脑上的，加上固定的）：一共几个
+    /// 终端，几个待查看（含离开期间有更新的），几个运行中
     total: usize,
-    stopped: usize,
+    waiting: usize,
     running: usize,
 }
 
@@ -189,6 +221,10 @@ pub struct TermOverview {
     cursor: Cursor,
     filter: Filter,
     peek: Option<Peek>,
+    /// 换了终端、离开这一页时还在忙的画面（正在往里传文件、预设的命令还没输入）：先留着，忙完再放；
+    /// 切回那个终端时接着用它，看得到传到哪了（见 [`Self::set_peek`]）
+    parked: Vec<Peek>,
+    parked_task: Option<Task<()>>,
     /// 这一页正在开（新建、重启）的终端：等它出现在列表里
     opening: Option<TermSlot>,
     /// 仓库行上「新建终端」的 ⌄ 正开着菜单：那一行的按钮一直显示（鼠标挪进菜单时离开了那一行）
@@ -203,6 +239,12 @@ pub struct TermOverview {
     rows_scroll: ScrollHandle,
     /// 上一帧树的样子（见 [`Self::layout_sig`]）
     layout_sig: u64,
+    /// 正在改名的终端
+    renaming: Option<Renaming>,
+    /// 侧栏里勾上、要并排查看的终端（还没点「并排查看」时）
+    picks: Vec<TermSlot>,
+    /// 正并排查看着
+    split: Option<Split>,
     focus: FocusHandle,
     _observe: Subscription,
 }
@@ -212,17 +254,6 @@ impl EventEmitter<Go> for TermOverview {}
 impl Focusable for TermOverview {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
-    }
-}
-
-/// 多久以前，粗略地说。
-pub(crate) fn ago(at: Instant) -> String {
-    let secs = at.elapsed().as_secs();
-    match secs {
-        0..60 => tr("刚刚").to_string(),
-        60..3600 => tf!("{n} 分钟前", n = (secs / 60).to_string()),
-        3600..86400 => tf!("{n} 小时前", n = (secs / 3600).to_string()),
-        _ => tf!("{n} 天前", n = (secs / 86400).to_string()),
     }
 }
 
@@ -298,12 +329,37 @@ fn term_menu(
             at(&view),
             at(&view),
         );
-        let menu = menu.item(
-            PopupMenuItem::new(tr("打开仓库")).on_click(move |_, _, cx| {
-                go.0.update(cx, |_, cx| cx.emit(Go::Repo(go.1.entry.clone())))
-                    .ok();
-            }),
-        );
+        let (rename, pick) = (at(&view), at(&view));
+        let picked = view
+            .upgrade()
+            .is_some_and(|view| view.read(cx).picked(&slot));
+        let rename_label = crate::keymap::with_key(tr("重命名…（F2）"), "hub.rename", cx);
+        let menu = menu
+            .item(
+                PopupMenuItem::new(tr("打开仓库")).on_click(move |_, _, cx| {
+                    go.0.update(cx, |_, cx| cx.emit(Go::Repo(go.1.entry.clone())))
+                        .ok();
+                }),
+            )
+            .item(
+                PopupMenuItem::new(rename_label).on_click(move |_, window, cx| {
+                    rename
+                        .0
+                        .update(cx, |this, cx| this.start_rename(&rename.1, window, cx))
+                        .ok();
+                }),
+            )
+            .item(
+                PopupMenuItem::new(match picked {
+                    true => tr("移出并排查看"),
+                    false => tr("加入并排查看"),
+                })
+                .on_click(move |_, window, cx| {
+                    pick.0
+                        .update(cx, |this, cx| this.toggle_pick(&pick.1, window, cx))
+                        .ok();
+                }),
+            );
         workspace_items(menu, &view, &slot.entry, false, window, cx)
             .item(
                 PopupMenuItem::new(if pinned {
@@ -485,6 +541,8 @@ impl TermOverview {
             cursor: Cursor::Term,
             filter: Filter::All,
             peek: None,
+            parked: Vec::new(),
+            parked_task: None,
             opening: None,
             menu_open: None,
             ending: Vec::new(),
@@ -492,6 +550,9 @@ impl TermOverview {
             unpin: None,
             rows_scroll: ScrollHandle::new(),
             layout_sig: 0,
+            renaming: None,
+            picks: Vec::new(),
+            split: None,
             focus: cx.focus_handle(),
             _observe: observe,
         }
@@ -540,8 +601,8 @@ impl TermOverview {
     fn matches(&self, row: &Row) -> bool {
         match self.filter {
             Filter::All => true,
-            Filter::Stopped => row.state == TermState::Stopped,
-            Filter::Running => row.state == TermState::Running,
+            Filter::Waiting => row.wants_look(),
+            Filter::Running => row.online && row.state == TermState::Running,
         }
     }
 
@@ -703,8 +764,15 @@ impl TermOverview {
             })
             .collect();
         let seen = self.seen(hub, cx);
-        let count = |state| seen.iter().filter(|row| row.state == state).count();
-        let offline = here.is_some_and(|id| id != LOCAL && !self.board.read(cx).watching(id));
+        let waiting = seen.iter().filter(|row| row.wants_look()).count();
+        let running = seen
+            .iter()
+            .filter(|row| row.online && row.state == TermState::Running)
+            .count();
+        let offline = here.is_some_and(|id| {
+            let board = self.board.read(cx);
+            id != LOCAL && !board.watching(id) && !board.is_offline(id)
+        });
         Side {
             pinned_terms,
             pinned_repos,
@@ -712,8 +780,8 @@ impl TermOverview {
             hues,
             offline,
             total: seen.len(),
-            stopped: count(TermState::Stopped),
-            running: count(TermState::Running),
+            waiting,
+            running,
             scope,
         }
     }
@@ -736,6 +804,10 @@ impl TermOverview {
     fn highlight(&self, side: &Side) -> Option<Pick> {
         let picks = Self::picks(side);
         let listed = |pick: Pick| picks.contains(&pick).then_some(pick);
+        if let Some(split) = &self.split {
+            let slot = split.cells.get(split.focus).map(|cell| cell.slot.clone())?;
+            return listed(Pick::Term(slot.clone())).or(listed(Pick::Pinned(slot)));
+        }
         let term = || self.shown.clone().map(Pick::Term).and_then(listed);
         let on = match self.cursor {
             Cursor::Repo => None,
@@ -756,7 +828,7 @@ impl TermOverview {
             .unwrap_or_default()
     }
 
-    /// 这一页显示出来了：先选中一个要看的（已停下的优先），焦点放到侧栏上。
+    /// 这一页显示出来了：先选中一个要看的（待查看的优先），焦点放进终端（没有终端时在侧栏上）。
     pub fn shown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = true;
         let hub = self.hub(cx);
@@ -767,7 +839,7 @@ impl TermOverview {
         if !still && self.opening.is_none() {
             // 侧栏里看得到的优先（选了只看一台服务器时，别的服务器上的不在侧栏里）
             let seen = self.seen(&hub, cx);
-            let stopped = |row: &&Row| row.state == TermState::Stopped;
+            let stopped = |row: &&Row| row.wants_look();
             let first = seen.iter().find(stopped).or(seen.first());
             let first = first.or(rows_in(&hub).next());
             self.shown = first.map(Row::slot);
@@ -790,6 +862,7 @@ impl TermOverview {
         }
         self.sync(window, cx);
         self.focus.focus(window, cx);
+        self.type_in(window, cx);
         cx.notify();
     }
 
@@ -797,10 +870,39 @@ impl TermOverview {
     /// 放掉的话 kuaid 里已经开好的 shell 等不到这条命令（等提示符的计时在画面上）。
     pub fn hidden(&mut self, cx: &mut Context<Self>) {
         self.visible = false;
+        self.cancel_rename(cx);
+        // 并排着的几格：不用再接着，回来时重新接（正在往里传文件的停着，传完再放）
+        let cells: Vec<Peek> = self
+            .split
+            .as_mut()
+            .map(|split| {
+                split
+                    .cells
+                    .iter_mut()
+                    .filter_map(|cell| cell.peek.take())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for peek in cells {
+            if peek.view.read(cx).busy() {
+                self.parked.push(peek);
+                self.watch_parked(cx);
+            }
+        }
         let starting = self
             .peek
             .as_ref()
             .is_some_and(|peek| peek.owned && peek.view.read(cx).run_pending());
+        // 正在往里传文件的（不是自己开的也算）：停到 `parked` 里，传完再放
+        if !starting
+            && self
+                .peek
+                .as_ref()
+                .is_some_and(|peek| peek.view.read(cx).busy())
+        {
+            self.set_peek(None, cx);
+            return;
+        }
         if starting {
             cx.spawn(async move |this, cx| {
                 loop {
@@ -836,9 +938,38 @@ impl TermOverview {
 
     /// 焦点在右边的终端里：敲的字都归它。
     pub fn typing(&self, window: &Window, cx: &App) -> bool {
-        self.peek
-            .as_ref()
-            .is_some_and(|peek| peek.view.focus_handle(cx).is_focused(window))
+        let focused = |peek: &Peek| peek.view.focus_handle(cx).is_focused(window);
+        match &self.split {
+            Some(split) => split
+                .cells
+                .iter()
+                .any(|cell| cell.peek.as_ref().is_some_and(focused)),
+            None => self.peek.as_ref().is_some_and(focused),
+        }
+    }
+
+    /// 告诉 [`TermBoard`] 正显示着哪个（几个）终端：并排时是那几格，不然是选中的（正往里输入的另算）。
+    pub fn shown_for_board(&self, window: &Window, cx: &App) -> Option<Shown> {
+        if let Some(split) = &self.split {
+            let board = self.board.read(cx);
+            let ids: Vec<TermId> = split
+                .cells
+                .iter()
+                .filter_map(|cell| {
+                    let rows = board.terms_of(&cell.slot.entry)?;
+                    let row = rows
+                        .into_iter()
+                        .find(|row| row.number == cell.slot.number)?;
+                    Some(row.id)
+                })
+                .collect();
+            return Some(Shown::Split(ids));
+        }
+        let shown = match self.typing(window, cx) {
+            true => Shown::Typing,
+            false => Shown::Term,
+        };
+        self.shown_id(cx).map(shown)
     }
 
     /// 让右边的画面跟上：显示的终端换了一个、改了大小、别处把它重启了就重新接；它没了就换成这个
@@ -854,6 +985,10 @@ impl TermOverview {
         }
         self.check_pins(cx);
         if !self.visible {
+            return;
+        }
+        if self.split.is_some() {
+            self.sync_split(window, cx);
             return;
         }
         let typing = self.typing(window, cx);
@@ -913,6 +1048,16 @@ impl TermOverview {
         if current {
             return;
         }
+        // 刚才切走时还在传文件、停着的就是这个终端：接着用它（传输、进度都在它身上）
+        if let Some(at) = self
+            .parked
+            .iter()
+            .position(|peek| peek.slot == slot && peek.id.as_ref() == Some(&row.id))
+        {
+            let peek = self.parked.remove(at);
+            self.set_peek(Some(peek), cx);
+            return;
+        }
         let view =
             cx.new(|cx| TerminalView::watch(&conn, &row.id.term, row.cols, row.rows, window, cx));
         let events = self.link_view(&view, &row.entry, cx);
@@ -928,13 +1073,53 @@ impl TermOverview {
                 false => self.focus.focus(window, cx),
             }
         }
-        self.peek = Some(Peek {
+        let peek = Peek {
             slot,
             id: Some(row.id.clone()),
             view,
             owned: false,
             _events: events,
-        });
+        };
+        self.set_peek(Some(peek), cx);
+    }
+
+    /// 换上显示的画面。换下来的还在忙（正在往里传文件、预设的命令还没输入）就先停着，忙完再放：
+    /// 原来一换终端、离开这一页，传了一半的文件就停了。
+    fn set_peek(&mut self, peek: Option<Peek>, cx: &mut Context<Self>) {
+        if let Some(old) = self.peek.take() {
+            let reused = peek
+                .as_ref()
+                .is_some_and(|new| new.view.entity_id() == old.view.entity_id());
+            if !reused && old.view.read(cx).busy() {
+                self.parked.push(old);
+                self.watch_parked(cx);
+            }
+        }
+        self.peek = peek;
+    }
+
+    /// 隔一会儿看一眼停着的画面，忙完的放掉；都放完了就不看了。
+    fn watch_parked(&mut self, cx: &mut Context<Self>) {
+        if self.parked_task.is_some() {
+            return;
+        }
+        self.parked_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(300))
+                    .await;
+                let left = this.update(cx, |this, cx| {
+                    this.parked.retain(|peek| peek.view.read(cx).busy());
+                    if this.parked.is_empty() {
+                        this.parked_task = None;
+                    }
+                    this.parked.len()
+                });
+                if left.unwrap_or(0) == 0 {
+                    break;
+                }
+            }
+        }));
     }
 
     /// 告诉画面它开在哪个仓库（认终端里的路径用），按住 Ctrl 单击了仓库里的文件时离开这一页去
@@ -1000,18 +1185,52 @@ impl TermOverview {
 
     /// 别处要看一个仓库的终端（工作区页上点了终端个数）：侧栏选中它，右边显示它的终端。
     pub fn reveal_repo(&mut self, entry: &RepoEntry, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_split(cx);
         self.select_repo(entry.clone(), window, cx);
         self.focus.focus(window, cx);
+        self.type_in(window, cx);
     }
 
-    /// 别处要在这一页看一个终端（终端停下了点「前往」、点了系统通知）：右边显示它，焦点在侧栏上。
+    /// 别处要在这一页看一个终端（提醒里点「前往」、点了系统通知）：右边显示它，焦点进去（并排着的、
+    /// 它在并排里就换到那一格）。
     pub fn reveal_term(&mut self, slot: &TermSlot, window: &mut Window, cx: &mut Context<Self>) {
+        let in_split = self
+            .split
+            .as_ref()
+            .is_some_and(|split| split.cells.iter().any(|cell| cell.slot == *slot));
+        if !in_split {
+            self.leave_split(cx);
+        }
         self.select_term(slot.clone(), window, cx);
         self.focus.focus(window, cx);
+        self.type_in(window, cx);
     }
 
-    /// 显示一个终端（点标签、点侧栏里仓库下面它那一行）。
+    /// 只看「待查看」的（标题栏的提醒、离开期间有更新的那条提醒里点「查看」）。
+    pub fn show_waiting(&mut self, cx: &mut Context<Self>) {
+        self.filter = Filter::Waiting;
+        cx.notify();
+    }
+
+    /// 显示一个终端（点标签、点侧栏里仓库下面它那一行）。并排着时：它在并排里就把焦点换过去，不在就
+    /// 换掉焦点格里的那个。
     fn select_term(&mut self, slot: TermSlot, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(split) = &mut self.split {
+            match split.cells.iter().position(|cell| cell.slot == slot) {
+                Some(at) => split.focus = at,
+                None => {
+                    let at = split.focus.min(split.cells.len().saturating_sub(1));
+                    if let Some(cell) = split.cells.get_mut(at) {
+                        cell.slot = slot.clone();
+                        cell.peek = None;
+                    }
+                }
+            }
+            self.repo = Some(slot.entry.clone());
+            self.sync(window, cx);
+            cx.notify();
+            return;
+        }
         if self.opening.as_ref() != Some(&slot) {
             self.opening = None;
         }
@@ -1044,15 +1263,17 @@ impl TermOverview {
 
     /// 焦点放到右边的终端里，开始输入（后退回到这一页时，离开前就在输入的也放回去）。
     pub fn type_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(peek) = &self.peek {
+        let peek = match &self.split {
+            Some(split) => split
+                .cells
+                .get(split.focus)
+                .and_then(|cell| cell.peek.as_ref()),
+            None => self.peek.as_ref(),
+        };
+        if let Some(peek) = peek {
             peek.view.focus_handle(cx).focus(window, cx);
             cx.notify();
         }
-    }
-
-    /// 打开一个终端所在的仓库（双击那一行）。
-    fn go_term(&mut self, slot: &TermSlot, cx: &mut Context<Self>) {
-        cx.emit(Go::Repo(slot.entry.clone()));
     }
 
     /// 打开显示着的终端所在的仓库；没有显示着的就打开选中的仓库（工具栏的「打开仓库」、Enter）。
@@ -1303,6 +1524,7 @@ impl TermOverview {
 
     /// 开（或者重新开）这个位置上的终端，显示它，焦点进去。
     fn open(&mut self, slot: TermSlot, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_split(cx);
         // 仓库、它所在的那一节收着的话展开：新开的终端要在侧栏里看得见
         if self.collapsed_repo(&slot.entry, cx) {
             self.toggle_repo(&slot.entry, cx);
@@ -1348,22 +1570,20 @@ impl TermOverview {
         });
         view.focus_handle(cx).focus(window, cx);
         let events = self.link_view(&view, &slot.entry, cx);
-        self.peek = Some(Peek {
+        let peek = Peek {
             slot,
             id: None,
             view,
             owned: true,
             _events: events,
-        });
+        };
+        self.set_peek(Some(peek), cx);
     }
 
-    /// 列表、标签上写的终端名字：程序设的标题（完整路径只留程序名，见
-    /// [`crate::terminal::short_title`]）；从预设开的、标题还是 shell 的写预设的名字（见
-    /// [`presets::display_name`]）；都没有的写「终端 N」。
-    pub(crate) fn term_name(row: &Row, cx: &App) -> SharedString {
-        let start = presets::started(&row.slot(), Some(&row.id.term), cx);
-        presets::display_name(row.title.as_deref(), start.as_ref())
-            .unwrap_or_else(|| tf!("终端 {n}", n = row.number.to_string()).into())
+    /// 列表、标签上写的终端名字：起过的名字；没起过是程序设的标题（完整路径只留程序名）或预设的
+    /// 名字，同一个仓库里重名的加序号；都没有的写「终端 N」（[`TermBoard`] 算好的，见 [`Row::label`]）。
+    pub(crate) fn term_name(row: &Row, _cx: &App) -> SharedString {
+        row.label.clone()
     }
 
     /// 结束、重启前先问一句：里面还在输出、或者除了 shell 还有程序在跑的（见 [`crate::term_end`]）。
@@ -1519,9 +1739,11 @@ impl TermOverview {
         if Self::changed(row.as_ref(), id, window, cx) {
             return;
         }
-        // 从预设开的：重启以后新开的再输入一遍（记着的是别的会话的就不输入）
+        // 从预设开的：重启以后新开的再输入一遍（记着的是别的会话的就不输入）；起的名字跟到新开的上
         if let Some(row) = &row {
             presets::restarting(slot, &row.id.term, cx);
+            self.board
+                .update(cx, |board, cx| board.restarting(&row.id, cx));
         }
         // 问的这一会儿它自己没了（结束以后被清掉了）：不用关，直接在这个位置上开一个新的
         let closing = match &row {
@@ -1579,10 +1801,32 @@ impl TermOverview {
 
     /// 正往终端里输入时，抢在终端前面看一眼按键：Ctrl+Shift+↑、↓ 沿着侧栏换到上一个、下一个
     /// 终端，接着输入，能跨仓库。收起的工作区、收起的仓库里的跳过（正显示着的那个仓库除外）。
+    /// 并排时 Ctrl+Alt+方向键（输入时、在侧栏上都行）、Ctrl+Shift+↑↓（输入时）在几格之间换。
     fn on_key_first(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let mods = &event.keystroke.modifiers;
+        let key = event.keystroke.key.as_str();
+        if let Some(split) = &self.split {
+            let cells = mods.control && mods.alt && !mods.shift && !mods.platform;
+            let hop = mods.control && mods.shift && !mods.alt && !mods.platform;
+            let typing = self.typing(window, cx);
+            if cells || (hop && typing && matches!(key, "up" | "down")) {
+                let key = match key {
+                    "down" => "right",
+                    "up" => "left",
+                    other => other,
+                };
+                if let Some(next) = term_split::step(key, split.focus, split.cells.len()) {
+                    cx.stop_propagation();
+                    match typing {
+                        true => self.focus_cell(next, window, cx),
+                        false => self.set_cell(next, cx),
+                    }
+                }
+            }
+            return;
+        }
         let hop = mods.control && mods.shift && !mods.alt && !mods.platform;
-        let down = match event.keystroke.key.as_str() {
+        let down = match key {
             "down" => true,
             "up" => false,
             _ => return,
@@ -1617,18 +1861,42 @@ impl TermOverview {
         }
     }
 
+    /// 侧栏上的键：↑↓ 选一行（并排时在几格之间换），Enter、→ 进到终端里输入，Ctrl+Enter 打开仓库
+    /// （改了「打开所在仓库」的键以后也认），空格勾上、去掉并排查看。
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // 焦点在右边的终端里时，它没要的键也不拿来换行、前往
         if !self.focus.is_focused(window) {
             return;
         }
+        let mods = &event.keystroke.modifiers;
+        let key = event.keystroke.key.as_str();
+        if let Some(split) = &self.split {
+            match key {
+                "down" | "up" => {
+                    let step = if key == "down" { "right" } else { "left" };
+                    if let Some(next) = term_split::step(step, split.focus, split.cells.len()) {
+                        self.set_cell(next, cx);
+                    }
+                }
+                "right" | "enter" if !mods.control => self.type_in(window, cx),
+                "enter" => self.go(cx),
+                "space" => {
+                    let at = split.focus;
+                    self.remove_cell(at, window, cx);
+                }
+                _ => return,
+            }
+            cx.stop_propagation();
+            return;
+        }
         let side = self.side(&self.hub(cx), cx);
         let picks = Self::picks(&side);
-        let at = self
-            .highlight(&side)
-            .and_then(|on| picks.iter().position(|pick| *pick == on));
+        let on = self.highlight(&side);
+        let at = on
+            .as_ref()
+            .and_then(|on| picks.iter().position(|pick| pick == on));
         let step = |next: usize| picks.get(next).cloned();
-        match event.keystroke.key.as_str() {
+        match key {
             "down" => {
                 let next = at.map_or(0, |at| (at + 1).min(picks.len().saturating_sub(1)));
                 if let Some(pick) = step(next) {
@@ -1641,68 +1909,722 @@ impl TermOverview {
                 }
             }
             "right" => self.type_in(window, cx),
-            "enter" => self.go(cx),
+            "enter" if mods.control => self.go(cx),
+            "enter" => self.type_in(window, cx),
+            "space" => match on {
+                Some(Pick::Term(slot) | Pick::Pinned(slot)) => self.toggle_pick(&slot, window, cx),
+                _ => return,
+            },
             _ => return,
         }
         cx.stop_propagation();
     }
 
-    /// 状态前面的圆点：运行中是实心的主色，已停下是带一圈的警示色，空闲是空心的。
+    /// F6、Shift+F6：焦点在侧栏和终端（并排时是焦点格）之间换。
+    fn switch_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.typing(window, cx) {
+            self.focus.focus(window, cx);
+        } else {
+            self.type_in(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// F2：给侧栏上选着的终端（并排时是焦点格里的）改名。
+    fn rename_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.renaming.is_some() {
+            return;
+        }
+        let slot = match &self.split {
+            Some(split) => split.cells.get(split.focus).map(|cell| cell.slot.clone()),
+            None => self.shown.clone(),
+        };
+        if let Some(slot) = slot {
+            self.start_rename(&slot, window, cx);
+        }
+    }
+
+    // ---------- 改名 ----------
+
+    /// 开始给一个终端改名：侧栏里它那一行的名字换成输入框（收着的仓库、工作区展开，筛掉了的换回
+    /// 「全部」）。
+    pub(crate) fn start_rename(
+        &mut self,
+        slot: &TermSlot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(row) = self.find(slot, cx) else {
+            return;
+        };
+        if !self.matches(&row) {
+            self.filter = Filter::All;
+        }
+        if self.collapsed_repo(&slot.entry, cx) {
+            self.toggle_repo(&slot.entry, cx);
+        }
+        let hub = self.hub(cx);
+        if let Some(group) = hub
+            .iter()
+            .find(|group| group.repos.iter().any(|(entry, _)| *entry == slot.entry))
+            && self.collapsed_group(&group.key, cx)
+        {
+            self.toggle_group(group.key.clone(), cx);
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("留空则使用默认名称")));
+        input.update(cx, |state, cx| {
+            state.set_value(row.label.to_string(), window, cx);
+            state.select_all(window, cx);
+        });
+        let events =
+            cx.subscribe_in(
+                &input,
+                window,
+                |this, _, event: &InputEvent, window, cx| match event {
+                    InputEvent::PressEnter { .. } => this.finish_rename(true, true, window, cx),
+                    InputEvent::Blur => this.finish_rename(true, false, window, cx),
+                    _ => {}
+                },
+            );
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.renaming = Some(Renaming {
+            slot: slot.clone(),
+            id: row.id,
+            input,
+            _events: events,
+        });
+        cx.notify();
+    }
+
+    /// 改完了：`keep` 是确认（Enter、点别处），不然是取消（Esc）；`refocus` 时焦点回到侧栏上（点别处
+    /// 确认的不抢焦点）。和默认的名字一样（没改）不算起了名字：程序自己设的标题还会变。
+    fn finish_rename(
+        &mut self,
+        keep: bool,
+        refocus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(renaming) = self.renaming.take() else {
+            return;
+        };
+        if keep {
+            let name = renaming.input.read(cx).value().to_string();
+            let row = self.board.read(cx).row(&renaming.id);
+            let unchanged = row
+                .as_ref()
+                .is_some_and(|row| !row.named && row.label.as_ref() == name.trim());
+            if !unchanged {
+                self.board
+                    .update(cx, |board, cx| board.rename(&renaming.id, &name, cx));
+            }
+        }
+        if refocus {
+            self.focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        if self.renaming.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 侧栏一行里的改名输入框（正在改这个终端的名字时）。
+    fn rename_box(&self, slot: &TermSlot, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let renaming = self.renaming.as_ref().filter(|r| r.slot == *slot)?;
+        Some(
+            div()
+                .id("hub-rename")
+                .flex_1()
+                .min_w_0()
+                .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.finish_rename(false, true, window, cx);
+                    }
+                }))
+                // 点输入框不当作点了这一行
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(Input::new(&renaming.input).small())
+                .into_any_element(),
+        )
+    }
+
+    // ---------- 并排查看 ----------
+
+    /// 这个终端勾上了要并排查看，或者正在并排里。
+    fn picked(&self, slot: &TermSlot) -> bool {
+        match &self.split {
+            Some(split) => split.cells.iter().any(|cell| cell.slot == *slot),
+            None => self.picks.contains(slot),
+        }
+    }
+
+    /// 勾上、去掉一个要并排查看的终端（侧栏行前的勾、空格、右键菜单）。并排着时是加一格、移出一格。
+    pub(crate) fn toggle_pick(
+        &mut self,
+        slot: &TermSlot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(split) = &mut self.split {
+            match split.cells.iter().position(|cell| cell.slot == *slot) {
+                Some(at) => {
+                    self.remove_cell(at, window, cx);
+                    return;
+                }
+                None if split.cells.len() >= term_split::MAX_CELLS => {
+                    Self::too_many(window, cx);
+                    return;
+                }
+                None => {
+                    split.cells.push(Cell {
+                        slot: slot.clone(),
+                        peek: None,
+                    });
+                    split.zoom = None;
+                }
+            }
+            self.sync(window, cx);
+            cx.notify();
+            return;
+        }
+        match self.picks.iter().position(|other| other == slot) {
+            Some(at) => {
+                self.picks.remove(at);
+            }
+            None if self.picks.len() >= term_split::MAX_CELLS => {
+                Self::too_many(window, cx);
+                return;
+            }
+            None => self.picks.push(slot.clone()),
+        }
+        cx.notify();
+    }
+
+    fn too_many(window: &mut Window, cx: &mut App) {
+        let text = tf!(
+            "最多并排查看 {n} 个终端",
+            n = term_split::MAX_CELLS.to_string()
+        );
+        window.push_notification(Notification::info(text), cx);
+    }
+
+    /// 并排查看勾上的那几个（2～4 个），焦点进第一格。
+    fn start_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picks.len() < term_split::MIN_CELLS {
+            return;
+        }
+        let picks = std::mem::take(&mut self.picks);
+        self.cancel_rename(cx);
+        // 单个看着的画面放掉（忙着的停着，见 `set_peek`）
+        self.set_peek(None, cx);
+        self.repo = picks.first().map(|slot| slot.entry.clone());
+        self.split = Some(Split {
+            cells: picks
+                .into_iter()
+                .map(|slot| Cell { slot, peek: None })
+                .collect(),
+            focus: 0,
+            zoom: None,
+        });
+        self.sync(window, cx);
+        self.type_in(window, cx);
+        cx.notify();
+    }
+
+    /// 换下来的画面还在忙（正在往里传文件）就停着，忙完再放。
+    fn park(&mut self, peek: Option<Peek>, cx: &mut Context<Self>) {
+        if let Some(peek) = peek
+            && peek.view.read(cx).busy()
+        {
+            self.parked.push(peek);
+            self.watch_parked(cx);
+        }
+    }
+
+    /// 退出并排：回到单个，显示焦点格里的那个（接着用它的画面），焦点进去。
+    fn exit_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(split) = self.split.take() else {
+            return;
+        };
+        let mut keep = None;
+        let mut focused = None;
+        for (at, cell) in split.cells.into_iter().enumerate() {
+            if at == split.focus {
+                focused = Some(cell.slot);
+                keep = cell.peek;
+            } else {
+                self.park(cell.peek, cx);
+            }
+        }
+        if let Some(slot) = focused {
+            self.repo = Some(slot.entry.clone());
+            self.cursor = Cursor::Term;
+            self.shown = Some(slot);
+        }
+        self.peek = keep;
+        self.sync(window, cx);
+        self.type_in(window, cx);
+        cx.notify();
+    }
+
+    /// 不再并排（新开终端、别处要看别的终端）：几格的画面放掉，勾上的也不要了。
+    fn leave_split(&mut self, cx: &mut Context<Self>) {
+        self.picks.clear();
+        let Some(split) = self.split.take() else {
+            return;
+        };
+        for cell in split.cells {
+            self.park(cell.peek, cx);
+        }
+        cx.notify();
+    }
+
+    /// 把一格移出并排；只剩一格时回到单个。
+    fn remove_cell(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(split) = &mut self.split else {
+            return;
+        };
+        if at >= split.cells.len() {
+            return;
+        }
+        let cell = split.cells.remove(at);
+        split.zoom = None;
+        if split.focus > at || split.focus >= split.cells.len() {
+            split.focus = split.focus.saturating_sub(1);
+        }
+        let few = split.cells.len() < term_split::MIN_CELLS;
+        self.park(cell.peek, cx);
+        if few {
+            self.exit_split(window, cx);
+            return;
+        }
+        self.sync(window, cx);
+        cx.notify();
+    }
+
+    /// 焦点格换成第 `at` 格（侧栏上 ↑↓），焦点不动。
+    fn set_cell(&mut self, at: usize, cx: &mut Context<Self>) {
+        if let Some(split) = &mut self.split
+            && at < split.cells.len()
+        {
+            split.focus = at;
+            self.repo = Some(split.cells[at].slot.entry.clone());
+            cx.notify();
+        }
+    }
+
+    /// 焦点格换成第 `at` 格，焦点进去（点格子、Ctrl+Alt+方向键）。
+    fn focus_cell(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_cell(at, cx);
+        self.type_in(window, cx);
+    }
+
+    /// 放大第 `at` 格；已经放大着的还原。
+    fn zoom_cell(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(split) = &mut self.split {
+            split.zoom = match split.zoom {
+                Some(zoomed) if zoomed == at => None,
+                _ => Some(at),
+            };
+        }
+        self.focus_cell(at, window, cx);
+    }
+
+    /// 让并排的几格跟上：终端没了的移出（剩一格时回到单个），没接上的接上，换了连接、被别处重启的
+    /// 重新接。和单个的一样是「只看」，往里输入时大小改成格子放得下的。
+    fn sync_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let hub = self.hub(cx);
+        let typing = self.typing(window, cx);
+        let Some(split) = self.split.as_mut() else {
+            return;
+        };
+        let before = split.cells.len();
+        split
+            .cells
+            .retain(|cell| row_in(&hub, &cell.slot).is_some());
+        if split.cells.len() != before {
+            split.zoom = None;
+            split.focus = split.focus.min(split.cells.len().saturating_sub(1));
+        }
+        if split.cells.len() < term_split::MIN_CELLS {
+            self.exit_split(window, cx);
+            return;
+        }
+        let mut stale: Vec<(usize, Row, std::sync::Arc<fr_channel::Connection>)> = Vec::new();
+        let board = self.board.read(cx);
+        for (at, cell) in split.cells.iter_mut().enumerate() {
+            let Some(row) = row_in(&hub, &cell.slot) else {
+                continue;
+            };
+            let Some(conn) = board.conn(&row.id.machine) else {
+                cell.peek = None;
+                continue;
+            };
+            let current = cell.peek.as_ref().is_some_and(|peek| {
+                peek.id.as_ref() == Some(&row.id)
+                    && peek
+                        .view
+                        .read(cx)
+                        .conn()
+                        .is_none_or(|old| std::sync::Arc::ptr_eq(&old, &conn))
+            });
+            if !current {
+                stale.push((at, row.clone(), conn));
+            }
+        }
+        for (at, row, conn) in stale {
+            let view = cx
+                .new(|cx| TerminalView::watch(&conn, &row.id.term, row.cols, row.rows, window, cx));
+            let events = self.link_view(&view, &row.entry, cx);
+            let old = self
+                .split
+                .as_mut()
+                .and_then(|split| split.cells.get_mut(at))
+                .and_then(|cell| {
+                    let peek = Peek {
+                        slot: cell.slot.clone(),
+                        id: Some(row.id.clone()),
+                        view,
+                        owned: false,
+                        _events: events,
+                    };
+                    cell.peek.replace(peek)
+                });
+            self.park(old, cx);
+        }
+        if typing {
+            self.type_in(window, cx);
+        }
+    }
+
+    /// 并排时的右边：上面一条（并排查看、几个、怎么输入、退出并排），中间是格子，底下一条提示。
+    fn render_split(
+        &self,
+        hub: &[RepoGroup],
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(split) = &self.split else {
+            return div().into_any_element();
+        };
+        let theme = cx.theme();
+        let (bg, border, muted, chip_bg, primary) = (
+            theme.background,
+            theme.border,
+            theme.muted_foreground,
+            theme.secondary,
+            theme.primary,
+        );
+        let typing = self.typing(window, cx);
+        let this = cx.entity().downgrade();
+        let handler =
+            |run: fn(&mut TermOverview, usize, &mut Window, &mut Context<TermOverview>),
+             at: usize|
+             -> Handler {
+                let this = this.clone();
+                Rc::new(move |window, cx| {
+                    this.update(cx, |view, cx| run(view, at, window, cx)).ok();
+                })
+            };
+        let indices: Vec<usize> = match split.zoom {
+            Some(at) if at < split.cells.len() => vec![at],
+            _ => (0..split.cells.len()).collect(),
+        };
+        let app = self.app.read(cx);
+        let cells: Vec<AnyElement> = indices
+            .iter()
+            .map(|&at| {
+                let cell = &split.cells[at];
+                let row = row_in(hub, &cell.slot);
+                let head = match row {
+                    Some(row) => term_split::Head {
+                        name: Self::term_name(row, cx),
+                        place: Self::cell_place(app, row),
+                        state: Self::state_text(row),
+                        state_color: Self::state_color(row, cx),
+                        dot: Self::dot_color(row, cx),
+                        focused: at == split.focus,
+                        zoomed: split.zoom == Some(at),
+                    },
+                    None => term_split::Head {
+                        name: tr("终端").into(),
+                        place: SharedString::default(),
+                        state: SharedString::default(),
+                        state_color: muted,
+                        dot: muted,
+                        focused: at == split.focus,
+                        zoomed: split.zoom == Some(at),
+                    },
+                };
+                let body = match (&cell.peek, row) {
+                    (Some(peek), _) => div()
+                        .size_full()
+                        .child(peek.view.clone())
+                        .into_any_element(),
+                    (None, Some(row)) if !row.online => term_split::placeholder(
+                        tf!(
+                            "{host} 未连接，此终端的状态未知。终端仍在主机上运行。",
+                            host = app.machine_name(&row.id.machine)
+                        )
+                        .into(),
+                        cx,
+                    ),
+                    _ => term_split::placeholder(tr("正在连接…").into(), cx),
+                };
+                term_split::cell(
+                    ("hub-cell", at),
+                    head,
+                    body,
+                    handler(Self::focus_cell, at),
+                    handler(Self::zoom_cell, at),
+                    handler(Self::remove_cell, at),
+                    cx,
+                )
+                .into_any_element()
+            })
+            .collect();
+        let target = split
+            .cells
+            .get(split.focus)
+            .and_then(|cell| row_in(hub, &cell.slot))
+            .map(|row| Self::term_name(row, cx));
+        // 最小的那格大概多大：右边的宽高按格数分（放大着的是整块）
+        let viewport = window.viewport_size();
+        let side = crate::repo::sidebar_open(&app.settings.layout, f32::from(viewport.width));
+        let (w, h) = (
+            f32::from(viewport.width) - side - 12.,
+            f32::from(viewport.height) - HEAD_HEIGHT - 26. - 12. - 40.,
+        );
+        let size = match (indices.len(), split.cells.len()) {
+            (1, _) | (_, 0..=1) => (w, h),
+            (_, 2) => (w / 2., h),
+            _ => (w / 2., h / 2.),
+        };
+        let focus_key = crate::keymap::label("hub.focus", cx).unwrap_or_else(|| "F6".into());
+        let hint: SharedString = match typing {
+            true => tf!("输入中 · {key} 回到侧栏", key = focus_key).into(),
+            false => tf!("按 {key} 或点击格子输入", key = focus_key).into(),
+        };
+        let bar = h_flex()
+            .h(px(HEAD_HEIGHT))
+            .flex_none()
+            .px(px(12.))
+            .gap(px(8.))
+            .border_b_1()
+            .border_color(border)
+            .child(ui::icon(IconName::Columns2).text_color(muted))
+            .child(
+                div()
+                    .flex_none()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(tr("并排查看")),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .h(px(18.))
+                    .px(px(7.))
+                    .rounded_full()
+                    .bg(chip_bg)
+                    .text_size(px(11.))
+                    .line_height(px(18.))
+                    .text_color(muted)
+                    .child(tf!("{n} 个", n = split.cells.len().to_string())),
+            )
+            .child(div().flex_1().min_w(px(4.)))
+            .child(
+                ui::clipped("hub-split-hint", hint)
+                    .flex_shrink(100.)
+                    .mr(px(6.))
+                    .text_xs()
+                    .text_color(if typing { primary } else { muted }),
+            )
+            .child(
+                Button::new("hub-split-exit")
+                    .small()
+                    .flex_none()
+                    .icon(ui::icon(IconName::Square))
+                    .label(tr("退出并排"))
+                    .tooltip(tr("回到单个终端，显示焦点格中的终端"))
+                    .on_click(cx.listener(|this, _, window, cx| this.exit_split(window, cx))),
+            );
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .bg(bg)
+            .child(bar)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .p(px(6.))
+                    .flex()
+                    .child(term_split::grid(cells).size_full()),
+            )
+            .child(term_split::foot(target, Some(size), cx))
+            .into_any_element()
+    }
+
+    /// 格头上写的位置：仓库，主机上的带主机名。
+    fn cell_place(app: &AppState, row: &Row) -> SharedString {
+        let repo = app.repo_name(&row.entry);
+        match row.entry.server.is_some() {
+            true => format!("{repo} · {}", Self::place(app, &row.entry)).into(),
+            false => repo,
+        }
+    }
+
+    /// 侧栏一行前面的勾：勾上要并排查看的（并排着时是在不在并排里）。平时鼠标移到这一行上才出现，
+    /// 勾了一个以后都出现。
+    fn pick_box(&self, index: usize, slot: &TermSlot, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = cx.theme();
+        let (primary, muted, bg) = (theme.primary, theme.muted_foreground, theme.background);
+        let checked = self.picked(slot);
+        let picking = !self.picks.is_empty() || self.split.is_some();
+        let slot = slot.clone();
+        let tip = match checked {
+            true => tr("移出并排查看"),
+            false => tr("加入并排查看（勾选 2～4 个）"),
+        };
+        div()
+            .id(("hub-pick", index))
+            .flex_none()
+            .size(px(14.))
+            .rounded(px(4.))
+            .border_1()
+            .border_color(if checked { primary } else { muted })
+            .bg(if checked { primary } else { bg })
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .when(checked, |el| {
+                el.child(
+                    Icon::new(IconName::Check)
+                        .size(px(10.))
+                        .text_color(gpui_kit::white()),
+                )
+            })
+            .when(!checked && !picking, |el| {
+                el.invisible().group_hover("hub-row", |s| s.visible())
+            })
+            .tooltip(move |window, cx| ui::tip(tip, window, cx))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.toggle_pick(&slot, window, cx);
+            }))
+    }
+
+    /// 重新连上一台主机（断开时侧栏分节头、画面上的「重新连接」）。
+    fn reconnect(&mut self, machine: &str, cx: &mut Context<Self>) {
+        let machine = machine.to_string();
+        self.app.update(cx, |app, cx| match machine.as_str() {
+            LOCAL => drop(app.connect_local(cx)),
+            id => drop(app.connect(id, cx)),
+        });
+        cx.notify();
+    }
+
+    /// 状态前面的圆点：运行中实心主色，待查看实心警示色，静默实心灰，空闲空心，状态未知淡一档的空心。
     pub(crate) fn dot(state: TermState, size: f32, cx: &App) -> Div {
         let theme = cx.theme();
+        let muted = theme.muted_foreground;
         let dot = div().flex_none().size(px(size)).rounded_full();
         match state {
             TermState::Running => dot.bg(theme.primary),
-            TermState::Stopped => dot.bg(theme.warning),
-            TermState::Idle => dot.border_1().border_color(theme.muted_foreground),
+            TermState::Waiting => dot.bg(theme.warning),
+            TermState::Quiet => dot.bg(muted.opacity(0.7)),
+            TermState::Idle => dot.border_1().border_color(muted),
+            TermState::Unknown => dot.border_1().border_color(muted.opacity(0.5)),
         }
     }
 
+    /// 状态的颜色（行尾的字、格头）：运行中主色，要人看一眼的警示色，别的灰。
+    pub(crate) fn state_color(row: &Row, cx: &App) -> Hsla {
+        let theme = cx.theme();
+        if row.away && row.online {
+            return theme.primary;
+        }
+        match (row.online && row.alive, row.state) {
+            (true, TermState::Running) => theme.primary,
+            (true, TermState::Waiting) => theme.warning,
+            _ => theme.muted_foreground,
+        }
+    }
+
+    /// 格头前面圆点的颜色。
+    fn dot_color(row: &Row, cx: &App) -> Hsla {
+        let theme = cx.theme();
+        match (row.wants_look(), row.online && row.alive, row.state) {
+            (true, _, _) => theme.warning,
+            (false, true, TermState::Running) => theme.primary,
+            _ => theme.muted_foreground,
+        }
+    }
+
+    /// 状态写成字：运行中、静默 3 分钟、待查看 · 5 分钟、空闲、已退出、状态未知；离开期间有更新的
+    /// 写这个。
     pub(crate) fn state_text(row: &Row) -> SharedString {
-        match (row.alive, row.state) {
-            (false, _) => tr("已结束").into(),
-            (true, TermState::Running) => tr("运行中").into(),
-            (true, TermState::Stopped) => tr("已停下").into(),
-            (true, TermState::Idle) => tr("空闲").into(),
+        if row.away && row.online {
+            return tr("离开期间有更新").into();
         }
+        state_words(row).into()
     }
 
-    /// 鼠标停在一个终端上时的提示：叫什么、哪个仓库的、状态，停下了的写停了多久，里面除了 shell
-    /// 还在跑的程序（图标只分得出是哪一类）。
+    /// 鼠标停在一个终端上时的提示：叫什么、哪个仓库的、状态，里面除了 shell 还在跑的程序（图标只分得
+    /// 出是哪一类），再说一句这个状态是怎么回事。
     fn term_tip(&self, row: &Row, cx: &App) -> String {
-        let repo = self.app.read(cx).repo_name(&row.entry);
-        let since = row
-            .last_output
-            .filter(|_| row.alive && row.state != TermState::Running)
-            .map(|at| format!(" · {}", ago(at)))
-            .unwrap_or_default();
+        let app = self.app.read(cx);
+        let repo = app.repo_name(&row.entry);
+        // 括号、逗号要翻译：英文界面里是半角的
+        let mut lines = vec![tf!(
+            "{name}（{repo}，{state}）",
+            name = Self::term_name(row, cx),
+            repo,
+            state = Self::state_text(row)
+        )];
         let programs = row
             .programs
             .as_ref()
-            .filter(|names| row.alive && !names.is_empty())
-            .map(|names| {
-                // 不知道名字的是空串（PowerShell 自己执行的命令、看不到别的用户的进程）
-                let names: Vec<&str> = names
-                    .iter()
-                    .map(|name| name.trim())
-                    .filter(|name| !name.is_empty())
-                    .collect();
-                let running = match names.is_empty() {
-                    true => tr("有程序正在运行").to_string(),
-                    false => tf!("正在运行：{names}", names = names.join(tr("、"))),
-                };
-                format!("\n{running}")
-            })
-            .unwrap_or_default();
-        // 括号、逗号要翻译：英文界面里是半角的
-        let head = tf!(
-            "{name}（{repo}，{state}{since}）",
-            name = Self::term_name(row, cx),
-            repo,
-            state = Self::state_text(row),
-            since
-        );
-        format!("{head}{programs}")
+            .filter(|names| row.alive && row.online && !names.is_empty());
+        if let Some(names) = programs {
+            // 不知道名字的是空串（PowerShell 自己执行的命令、看不到别的用户的进程）
+            let names: Vec<&str> = names
+                .iter()
+                .map(|name| name.trim())
+                .filter(|name| !name.is_empty())
+                .collect();
+            lines.push(match names.is_empty() {
+                true => tr("有程序正在运行").to_string(),
+                false => tf!("正在运行：{names}", names = names.join(tr("、"))),
+            });
+        }
+        let agent = matches!(row.kind, crate::term_board::Kind::Agent(_));
+        if !row.online {
+            lines.push(tf!(
+                "{host} 未连接，无法得知此终端的状态。终端仍在主机上运行。",
+                host = app.machine_name(&row.id.machine)
+            ));
+        } else if row.away {
+            lines.push(tr("离开期间有新输出，选中后清除标记。").to_string());
+        } else if row.alive && agent && matches!(row.state, TermState::Quiet | TermState::Waiting) {
+            lines.push(
+                tr("没有新输出：可能在等你确认，也可能在思考或执行不输出内容的命令。").to_string(),
+            );
+        } else if row.alive && row.state == TermState::Quiet {
+            lines
+                .push(tr("普通命令可能长时间不输出（编译、下载、开发服务），不提醒。").to_string());
+        }
+        if row.named {
+            lines.push(tr("名称是起的，右键「重命名…」留空可恢复默认名称").to_string());
+        }
+        lines.join("\n")
     }
 
     /// 它在哪台电脑上：经别的电脑连的写成「B，经由 A」。
@@ -1719,26 +2641,37 @@ impl TermOverview {
         }
     }
 
-    /// 几个停下了、几个在跑、几个空着：仓库那一行的行尾、收起的工作区那一行上。
+    /// 几个待查看、几个在跑、几个别的（静默、空闲、状态未知）：仓库那一行的行尾、收起的工作区那一行上。
     fn counts(rows: &[Row], cx: &App) -> Div {
         let muted = cx.theme().muted_foreground;
-        let count = |state| rows.iter().filter(|row| row.state == state).count();
-        let states = [TermState::Stopped, TermState::Running, TermState::Idle];
+        let waiting = rows.iter().filter(|row| row.wants_look()).count();
+        let running = rows
+            .iter()
+            .filter(|row| !row.wants_look() && row.online && row.state == TermState::Running)
+            .count();
+        let rest = rows.len() - waiting - running;
+        let counts = [
+            (TermState::Waiting, waiting),
+            (TermState::Running, running),
+            (TermState::Idle, rest),
+        ];
         h_flex()
             .flex_none()
             .gap(px(7.))
             .text_size(px(11.))
             .font_weight(FontWeight::NORMAL)
             .text_color(muted)
-            .children(states.into_iter().filter_map(|state| {
-                let n = count(state);
-                (n > 0).then(|| {
-                    h_flex()
-                        .gap(px(4.))
-                        .child(Self::dot(state, 7., cx))
-                        .child(n.to_string())
-                })
-            }))
+            .children(
+                counts
+                    .into_iter()
+                    .filter(|(_, n)| *n > 0)
+                    .map(|(state, n)| {
+                        h_flex()
+                            .gap(px(4.))
+                            .child(Self::dot(state, 7., cx))
+                            .child(n.to_string())
+                    }),
+            )
     }
 
     /// 行尾鼠标移上去才出现的那几个按钮：盖在行尾原来的字上面（那些字这时藏起来）。悬停的样式只在
@@ -1747,7 +2680,7 @@ impl TermOverview {
         h_flex()
             .absolute()
             .top_0()
-            .bottom_0()
+            .h(px(ROW_HEIGHT - 2.))
             .right(px(4.))
             .gap(px(1.))
             .invisible()
@@ -1781,19 +2714,26 @@ impl TermOverview {
     /// 各列在侧栏里的横坐标（方向 C，`docs/design/terminal-sidebar/`）：工作区标题的色块 13、名字 29；仓库
     /// 的箭头 10、图标 26、名字 46；终端的图标 46、名字 66，竖线在 33（仓库图标的中线）；「已固定」里
     /// 的终端和仓库的图标、名字对齐。
-    fn row_shell(id: impl Into<ElementId>, on: bool, cx: &App) -> (Stateful<Div>, Stateful<Div>) {
+    fn row_shell(
+        id: impl Into<ElementId>,
+        on: bool,
+        tall: bool,
+        cx: &App,
+    ) -> (Stateful<Div>, Stateful<Div>) {
         let theme = cx.theme();
         let (selected_bg, hover) = (theme.sidebar_accent, theme.list_hover);
+        // 带最后一行字的终端行高一些（`TermAlerts::last_line`）
+        let height = if tall { TALL_ROW } else { ROW_HEIGHT };
         let outer = h_flex()
             .id(id)
             .group("hub-row")
-            .h(px(ROW_HEIGHT))
+            .h(px(height))
             .w_full()
             .cursor_pointer();
         let inner = h_flex()
             // 要有 id：悬停样式只有带 id 的元素才会在鼠标进出时重画
             .id("inner")
-            .h(px(ROW_HEIGHT - 2.))
+            .h(px(height - 2.))
             .flex_1()
             .min_w_0()
             .relative()
@@ -1825,10 +2765,12 @@ impl TermOverview {
     /// 程序，退回状态圆点。
     pub(crate) fn term_icon(row: &Row, cx: &App) -> Div {
         let theme = cx.theme();
-        let color = match (row.alive, row.state) {
-            (false, _) | (true, TermState::Idle) => theme.muted_foreground,
-            (true, TermState::Running) => theme.primary,
-            (true, TermState::Stopped) => theme.warning,
+        let color = match (row.alive && row.online, row.wants_look(), row.state) {
+            (_, true, _) => theme.warning,
+            (true, false, TermState::Running) => theme.primary,
+            (true, ..) => theme.muted_foreground,
+            // 主机没连着：淡一档
+            (false, ..) => theme.muted_foreground.opacity(0.55),
         };
         let slot = h_flex().flex_none().size(px(14.)).justify_center();
         let glyph = |name: IconName, size: f32| Icon::new(name).size(px(size)).text_color(color);
@@ -1855,8 +2797,66 @@ impl TermOverview {
         }
     }
 
+    /// 终端名字那一格：要人看一眼的加粗，主机没连着、程序结束了的淡一档；双击名字改名。正在改名时
+    /// 换成输入框。
+    fn term_label(
+        &self,
+        id: impl Into<ElementId>,
+        row: &Row,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let slot = row.slot();
+        if editable && let Some(editor) = self.rename_box(&slot, cx) {
+            return editor;
+        }
+        let theme = cx.theme();
+        let (fg, muted) = (theme.sidebar_foreground, theme.muted_foreground);
+        div()
+            .id(id)
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .text_color(if row.alive && row.online { fg } else { muted })
+            .when(row.wants_look(), |el| el.font_weight(FontWeight::SEMIBOLD))
+            .child(Self::term_name(row, cx))
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                if event.click_count() >= 2 {
+                    cx.stop_propagation();
+                    this.start_rename(&slot, window, cx);
+                }
+            }))
+            .into_any_element()
+    }
+
+    /// 带最后一行字时名字下面那一行（等宽小字，左边和名字对齐）。
+    fn last_line(&self, row: &Row, indent: f32, cx: &App) -> Option<Div> {
+        let app = self.app.read(cx);
+        if !app.settings.term_alerts.last_line {
+            return None;
+        }
+        let text: SharedString = match (row.online, row.last.trim().is_empty()) {
+            (false, _) => "—".into(),
+            (true, true) => SharedString::default(),
+            (true, false) => row.last.trim().to_string().into(),
+        };
+        Some(
+            div()
+                .w_full()
+                .h(px(15.))
+                .pl(px(indent))
+                .pr(px(6.))
+                .truncate()
+                .font_family(app.settings.terminal.font.clone())
+                .text_size(px(11.))
+                .line_height(px(15.))
+                .text_color(cx.theme().muted_foreground)
+                .child(text),
+        )
+    }
+
     /// 「已固定」里一个终端的那一行：程序和状态的图标、名字，行尾是工作区的色块和仓库名；鼠标移上去
-    /// 行尾是取消固定。图标、名字和仓库那一行的对齐。
+    /// 行尾是取消固定。图标、名字和仓库那一行的对齐。行前的勾是并排查看。
     fn render_pinned_term(
         &self,
         index: usize,
@@ -1865,13 +2865,11 @@ impl TermOverview {
         hue: Option<usize>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = cx.theme();
-        let (fg, muted) = (theme.sidebar_foreground, theme.muted_foreground);
+        let muted = cx.theme().muted_foreground;
         let mark = Self::hue_color(hue, cx);
         let repo = self.app.read(cx).repo_name(&row.entry);
-        let unseen = row.state == TermState::Stopped;
         let slot = row.slot();
-        let (for_click, for_go, for_unpin) = (slot.clone(), slot.clone(), slot.clone());
+        let (for_click, for_unpin) = (slot.clone(), slot.clone());
         let tip = self.term_tip(row, cx);
         let unpin = Self::row_button(("hub-unpin", index), IconName::PinOff, cx)
             .tooltip(|window, cx| ui::tip(tr("取消固定"), window, cx))
@@ -1879,44 +2877,47 @@ impl TermOverview {
                 cx.stop_propagation();
                 this.toggle_pin_term(&for_unpin, cx);
             }));
-        let (outer, inner) = Self::row_shell(("hub-pinned-term", index), on, cx);
+        let second = self.last_line(row, 20., cx);
+        let tall = second.is_some();
+        let (outer, inner) = Self::row_shell(("hub-pinned-term", index), on, tall, cx);
+        let line = h_flex()
+            .w_full()
+            .h(px(ROW_HEIGHT - 2.))
+            .child(Self::term_icon(row, cx))
+            .child(Self::space(6.))
+            .child(self.term_label(("hub-pinned-name", index), row, true, cx))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .min_w(px(22.))
+                    .max_w(px(96.))
+                    .ml(px(8.))
+                    .pr(px(4.))
+                    .gap(px(4.))
+                    .text_size(px(11.))
+                    .text_color(muted)
+                    .group_hover("hub-row", |s| s.invisible())
+                    .child(ui::hue_mark(mark, 6.))
+                    .child(div().min_w_0().truncate().child(repo)),
+            );
         outer
-            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.focus.focus(window, cx);
-                match event.click_count() >= 2 {
-                    true => this.go_term(&for_go, cx),
-                    false => this.select_pinned(for_click.clone(), window, cx),
-                }
+                this.select_pinned(for_click.clone(), window, cx);
+                this.type_in(window, cx);
             }))
             .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
             .child(
                 inner
                     .pl(px(20.))
-                    .child(Self::term_icon(row, cx))
-                    .child(Self::space(6.))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(if row.alive { fg } else { muted })
-                            .when(unseen, |el| el.font_weight(FontWeight::SEMIBOLD))
-                            .child(Self::term_name(row, cx)),
+                            .absolute()
+                            .left(px(3.))
+                            .top(px((ROW_HEIGHT - 2. - 14.) / 2.))
+                            .child(self.pick_box(index, &slot, cx)),
                     )
-                    .child(
-                        h_flex()
-                            .flex_none()
-                            .min_w(px(22.))
-                            .max_w(px(96.))
-                            .ml(px(8.))
-                            .pr(px(4.))
-                            .gap(px(4.))
-                            .text_size(px(11.))
-                            .text_color(muted)
-                            .group_hover("hub-row", |s| s.invisible())
-                            .child(ui::hue_mark(mark, 6.))
-                            .child(div().min_w_0().truncate().child(repo)),
-                    )
+                    .child(v_flex().flex_1().min_w_0().child(line).children(second))
                     .child(Self::row_actions().child(unpin)),
             )
             .context_menu(term_menu(
@@ -1928,9 +2929,10 @@ impl TermOverview {
             .into_any_element()
     }
 
-    /// 仓库下面一个终端的那一行：程序和状态的图标、名字，行尾是停下、空闲了多久（固定着的是图钉）；
-    /// 鼠标移上去行尾换成固定和结束。图标对着仓库的名字，左边一条工作区颜色的竖线从仓库图标垂下来，
-    /// 选中的仓库的那几条深一些。
+    /// 仓库下面一个终端的那一行：程序和状态的图标、名字，行尾是状态（静默、待查看的带多久；固定着的
+    /// 是图钉）；鼠标移上去行尾换成固定和结束。图标对着仓库的名字，左边一条工作区颜色的竖线从仓库
+    /// 图标垂下来，选中的仓库的那几条深一些；竖线左边的空里是并排查看的勾。点一下显示它、焦点进去，
+    /// 双击名字改名。
     fn render_term(
         &self,
         index: usize,
@@ -1939,24 +2941,13 @@ impl TermOverview {
         hue: Option<usize>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = cx.theme();
-        let (fg, muted, accent) = (
-            theme.sidebar_foreground,
-            theme.muted_foreground,
-            theme.primary,
-        );
+        let accent = cx.theme().primary;
         let active = self.repo.as_ref() == Some(&row.entry);
         let guide = Self::hue_color(hue, cx).opacity(if active { 0.75 } else { 0.4 });
-        let unseen = row.state == TermState::Stopped;
         let slot = row.slot();
         let pinned = self.pinned_term(&slot, cx);
-        let (for_click, for_go, for_pin, for_end) =
-            (slot.clone(), slot.clone(), slot.clone(), slot.clone());
+        let (for_click, for_pin, for_end) = (slot.clone(), slot.clone(), slot.clone());
         let tip = self.term_tip(row, cx);
-        let since = row
-            .last_output
-            .filter(|_| row.alive && row.state != TermState::Running)
-            .map(ago);
         let pin_tip = if pinned {
             tr("取消固定")
         } else {
@@ -1986,7 +2977,7 @@ impl TermOverview {
             .justify_end()
             .pr(px(4.))
             .text_size(px(11.))
-            .text_color(muted)
+            .text_color(Self::state_color(row, cx))
             .group_hover("hub-row", |s| s.invisible());
         let tail = match pinned {
             true => tail.child(
@@ -1994,16 +2985,24 @@ impl TermOverview {
                     .size(px(11.))
                     .text_color(accent.opacity(0.8)),
             ),
-            false => tail.children(since),
+            false => tail.child(Self::state_text(row)),
         };
-        let (outer, inner) = Self::row_shell(("hub-term", index), on, cx);
+        let second = self.last_line(row, 20., cx);
+        let tall = second.is_some();
+        let (outer, inner) = Self::row_shell(("hub-term", index), on, tall, cx);
+        // 固定着的终端在「已固定」那一行里改名，这里只显示
+        let line = h_flex()
+            .w_full()
+            .h(px(ROW_HEIGHT - 2.))
+            .child(Self::term_icon(row, cx))
+            .child(Self::space(6.))
+            .child(self.term_label(("hub-term-name", index), row, !pinned, cx))
+            .child(tail);
         outer
-            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.focus.focus(window, cx);
-                match event.click_count() >= 2 {
-                    true => this.go_term(&for_go, cx),
-                    false => this.select_term(for_click.clone(), window, cx),
-                }
+                this.select_term(for_click.clone(), window, cx);
+                this.type_in(window, cx);
             }))
             .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
             .child(
@@ -2018,18 +3017,14 @@ impl TermOverview {
                             .w(px(1.))
                             .bg(guide),
                     )
-                    .child(Self::term_icon(row, cx))
-                    .child(Self::space(6.))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(if row.alive { fg } else { muted })
-                            .when(unseen, |el| el.font_weight(FontWeight::SEMIBOLD))
-                            .child(Self::term_name(row, cx)),
+                            .absolute()
+                            .left(px(7.))
+                            .top(px((ROW_HEIGHT - 2. - 14.) / 2.))
+                            .child(self.pick_box(index, &slot, cx)),
                     )
-                    .child(tail)
+                    .child(v_flex().flex_1().min_w_0().child(line).children(second))
                     .child(Self::row_actions().child(pin).child(end)),
             )
             .context_menu(term_menu(
@@ -2104,10 +3099,17 @@ impl TermOverview {
                     }))
             }
         };
-        // 展开着时终端就列在下面，行尾不用再写个数；位置留着，鼠标移上去按钮才不压着名字
-        let counts = match repo.collapsed {
-            true => Self::counts(rows, cx),
-            false => h_flex().flex_none(),
+        // 展开着时终端就列在下面，行尾不用再写个数；位置留着，鼠标移上去按钮才不压着名字。主机断开了
+        // 的写「未连接」
+        let offline = self.board.read(cx).is_offline(machine_of(entry));
+        let counts = match (offline, repo.collapsed) {
+            (true, _) => h_flex()
+                .flex_none()
+                .text_size(px(11.))
+                .text_color(muted)
+                .child(tr("未连接")),
+            (false, true) => Self::counts(rows, cx),
+            (false, false) => h_flex().flex_none(),
         };
         let pin_tip = if pinned {
             tr("取消固定")
@@ -2164,7 +3166,7 @@ impl TermOverview {
             true => muted,
             false => Self::hue_color(repo.hue, cx),
         };
-        let (outer, inner) = Self::row_shell(("hub-repo", index), on, cx);
+        let (outer, inner) = Self::row_shell(("hub-repo", index), on, false, cx);
         outer
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.focus.focus(window, cx);
@@ -2172,9 +3174,13 @@ impl TermOverview {
                 if foldable && clicks <= 2 {
                     this.toggle_repo(&for_click, cx);
                 }
+                // 并排着时右边不换：点仓库只收起、展开
                 match clicks >= 2 {
                     true => cx.emit(Go::Repo(for_go.clone())),
-                    false => this.select_repo(for_click.clone(), window, cx),
+                    false if this.split.is_none() => {
+                        this.select_repo(for_click.clone(), window, cx)
+                    }
+                    false => {}
                 }
             }))
             .child(
@@ -2233,22 +3239,33 @@ impl TermOverview {
             GroupKey::Unbound(_) => (tr("未加入工作区").into(), true),
         };
         // 主机上的标出是哪台；只看一台时，那台自己的不用标（经它连的别台照样标，不然几节都叫
-        // 「未加入工作区」，分不出是哪台）
-        let at = group.key.machine();
-        let machine = (at != LOCAL && scope != Some(at)).then(|| app.machine_name(at));
+        // 「未加入工作区」，分不出是哪台）。断开了的总标，写「未连接」，后面跟「重新连接」
+        let at = group.key.machine().to_string();
+        let offline = self.board.read(cx).is_offline(&at);
+        let named = at != LOCAL && scope != Some(at.as_str());
+        let machine: Option<SharedString> = match (offline, named) {
+            (true, false) => Some(tr("未连接").into()),
+            (_, true) => Some(app.machine_name(&at)),
+            (false, false) => None,
+        };
         let chip = |text: SharedString| {
-            div()
-                .flex_none()
+            h_flex()
+                .flex_shrink(1.)
+                .min_w_0()
                 .h(px(16.))
                 .ml(px(6.))
                 .px(px(6.))
+                .gap(px(3.))
                 .rounded_full()
                 .bg(chip_bg)
                 .text_size(px(11.))
                 .line_height(px(16.))
                 .font_weight(FontWeight::NORMAL)
                 .text_color(muted)
-                .child(text)
+                .when(offline, |el| {
+                    el.child(Icon::new(IconName::Unplug).size(px(10.)))
+                })
+                .child(div().min_w_0().truncate().child(text))
         };
         let all: Vec<Row> = group
             .repos
@@ -2269,10 +3286,32 @@ impl TermOverview {
             true => IconName::ChevronRight,
             false => IconName::ChevronDown,
         };
-        let (id, name_id) = match sticky {
-            true => ("hub-group-sticky", "hub-group-sticky-name"),
-            false => ("hub-group", "hub-group-name"),
+        let (id, name_id, reconnect_id) = match sticky {
+            true => (
+                "hub-group-sticky",
+                "hub-group-sticky-name",
+                "hub-reconnect-sticky",
+            ),
+            false => ("hub-group", "hub-group-name", "hub-reconnect"),
         };
+        let primary = cx.theme().primary;
+        let reconnect = offline.then(|| {
+            let machine = at.clone();
+            div()
+                .id((reconnect_id, index))
+                .flex_none()
+                .mr(px(8.))
+                .text_size(px(11.))
+                .font_weight(FontWeight::NORMAL)
+                .text_color(primary)
+                .hover(|s| s.underline())
+                .child(tr("重新连接"))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.reconnect(&machine, cx);
+                }))
+        });
         let key = group.key.clone();
         let mark = match group.key {
             GroupKey::Workspace(_) => ui::hue_mark(Self::hue_color(group.hue, cx), 8.),
@@ -2299,7 +3338,7 @@ impl TermOverview {
             .child(
                 ui::clipped((name_id, index), name)
                     .flex_shrink(1.)
-                    .when(soft, |el| el.text_color(muted)),
+                    .when(soft || offline, |el| el.text_color(muted)),
             )
             .children(machine.map(chip))
             .child(
@@ -2310,6 +3349,7 @@ impl TermOverview {
                     .mx(px(8.))
                     .bg(border),
             )
+            .children(reconnect)
             .child(count)
             .cursor_pointer()
             .hover(|s| s.bg(hover))
@@ -2396,11 +3436,12 @@ impl TermOverview {
         let items = [
             (Filter::All, "overview-all", tr("全部"), side.total, ""),
             (
-                Filter::Stopped,
-                "overview-stopped",
-                tr("已停下"),
-                side.stopped,
-                tr("超过 10 秒没有新输出，且停下后尚未查看"),
+                Filter::Waiting,
+                "overview-waiting",
+                // 三格平分侧栏：英文用短的写法（Needs attention 放不下，被截成 Needs att…）
+                fr_core::i18n::trc("筛选", "待查看"),
+                side.waiting,
+                tr("静默超过所设时长且尚未查看的 AI 终端，以及离开期间有新输出的"),
             ),
             (
                 Filter::Running,
@@ -2651,14 +3692,84 @@ impl TermOverview {
             theme.primary,
         );
         let (head_fg, head_hover) = (theme.sidebar_foreground, theme.secondary);
-        let summary = match side.stopped {
+        let summary = match side.waiting {
             0 => tf!("{n} 个终端", n = side.total.to_string()),
             _ => tf!(
-                "{n} 个终端，{m} 个已停下",
+                "{n} 个终端，{m} 个待查看",
                 n = side.total.to_string(),
-                m = side.stopped.to_string()
+                m = side.waiting.to_string()
             ),
         };
+        // 重开 Kuai、重连以后离开期间有新输出的：顶上一条，可以全部标为已看
+        let away = self.board.read(cx).away_count();
+        let away = (away > 0).then(|| {
+            h_flex()
+                .flex_none()
+                .mx(px(10.))
+                .mt(px(6.))
+                .px(px(8.))
+                .py(px(5.))
+                .gap(px(6.))
+                .rounded(px(ui::RADIUS))
+                .bg(accent.opacity(0.12))
+                .text_size(px(12.))
+                .child(Icon::new(IconName::Bell).size(px(13.)).text_color(accent))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(tf!("离开期间 {n} 个终端有新输出", n = away.to_string())),
+                )
+                .child(
+                    div()
+                        .id("hub-clear-away")
+                        .flex_none()
+                        .text_color(accent)
+                        .cursor_pointer()
+                        .hover(|s| s.underline())
+                        .child(tr("全部标为已看"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.board.update(cx, |board, cx| board.clear_away(cx));
+                        })),
+                )
+        });
+        // 勾了要并排查看的：底下一条「已选 n 个」「并排查看」「取消」
+        let picking = (!self.picks.is_empty() && self.split.is_none()).then(|| {
+            let n = self.picks.len();
+            h_flex()
+                .flex_none()
+                .px(px(10.))
+                .py(px(7.))
+                .gap(px(6.))
+                .border_t_1()
+                .border_color(border)
+                .text_size(px(12.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(tf!("已选 {n} 个", n = n.to_string())),
+                )
+                .child(
+                    Button::new("hub-split-go")
+                        .small()
+                        .primary()
+                        .label(tr("并排查看"))
+                        .tooltip(tr("勾选 2～4 个终端并排查看"))
+                        .disabled(n < term_split::MIN_CELLS)
+                        .on_click(cx.listener(|this, _, window, cx| this.start_split(window, cx))),
+                )
+                .child(
+                    Button::new("hub-split-cancel")
+                        .small()
+                        .label(tr("取消"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.picks.clear();
+                            cx.notify();
+                        })),
+                )
+        });
         let on = self.highlight(side);
         let is_on = |pick: Pick| on.as_ref() == Some(&pick);
         // 「已固定」单独一块，不跟着下面的树滚动，也不受换服务器影响
@@ -2736,7 +3847,9 @@ impl TermOverview {
             let (app, board) = (self.app.read(cx), self.board.read(cx));
             let servers = app.settings.servers.iter();
             servers
-                .filter(|server| !scoped && !board.watching(&server.id))
+                .filter(|server| {
+                    !scoped && !board.watching(&server.id) && !board.is_offline(&server.id)
+                })
                 .map(|server| server.name.clone())
                 .collect()
         };
@@ -2746,7 +3859,7 @@ impl TermOverview {
                 names = offline.join(tr("、"))
             )
         });
-        let hint = |keys: &'static str, text: &'static str| {
+        let hint = |keys: SharedString, text: &'static str| {
             h_flex()
                 .flex_none()
                 .gap(px(4.))
@@ -2754,19 +3867,25 @@ impl TermOverview {
                 .child(text)
         };
         // 底下一行按键提示：哪一条放不下就整条不显示，不截成半截。左边留 14，右边不够时可以占掉
-        // 一些、至少离边 4：默认宽度下三条英文正好都放得下
+        // 一些、至少离边 4。改过的键照改过的写
         let hints = {
             let mut room = width - 1. - 14. - 4.;
             let mut shown = Vec::new();
+            let key = |id: &str, default: &str| -> SharedString {
+                crate::keymap::label(id, cx)
+                    .map(SharedString::from)
+                    .unwrap_or_else(|| default.to_string().into())
+            };
             let all = [
-                ("↑ ↓", tr("选择")),
-                ("Enter", tr("打开仓库")),
-                ("→", tr("输入")),
+                (SharedString::from("↑ ↓"), tr("选择")),
+                ("Enter".into(), tr("输入")),
+                (key("hub.open_repo", "Ctrl+Enter"), tr("打开仓库")),
+                (key("hub.focus", "F6"), tr("到终端")),
             ];
             for (keys, text) in all {
                 let gap = if shown.is_empty() { 0. } else { 10. };
                 let need = gap
-                    + ui::text_width(window, keys, 11., None, FontWeight::MEDIUM)
+                    + ui::text_width(window, &keys, 11., None, FontWeight::MEDIUM)
                     + 4.
                     + ui::text_width(window, text, 11., None, FontWeight::NORMAL);
                 if need <= room {
@@ -2847,6 +3966,7 @@ impl TermOverview {
                     ),
             )
             .child(self.render_filter(side, width, window, cx))
+            .children(away)
             .when(has_pinned, |side| {
                 side.child(
                     v_flex()
@@ -2886,7 +4006,7 @@ impl TermOverview {
                                         .text_center()
                                         .child(match self.filter {
                                             Filter::All => tr("没有仓库"),
-                                            Filter::Stopped => tr("没有已停下的终端"),
+                                            Filter::Waiting => tr("没有待查看的终端"),
                                             Filter::Running => tr("没有运行中的终端"),
                                         }),
                                 )
@@ -2902,6 +4022,7 @@ impl TermOverview {
                     )
                     .children(sticky),
             )
+            .children(picking)
             .child(
                 h_flex()
                     .h(px(28.))
@@ -2994,9 +4115,14 @@ impl TermOverview {
             )
             .child(close)
             .tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.select_term(for_click.clone(), window, cx);
-                this.type_in(window, cx);
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                match event.click_count() >= 2 {
+                    true => this.start_rename(&for_click, window, cx),
+                    false => {
+                        this.select_term(for_click.clone(), window, cx);
+                        this.type_in(window, cx);
+                    }
+                }
             }))
             .context_menu(term_menu(cx.entity().downgrade(), slot, pinned, repo))
             .into_any_element()
@@ -3107,11 +4233,17 @@ impl TermOverview {
                         .dropdown_menu(presets::menu_builder(repo_name, on_start_in(&view, entry))),
                 )
         });
-        // 怎么开始往终端里输入；正在输入时不写，画面顶上那条细线就是
-        let hint = shown
-            .as_ref()
-            .filter(|row| !typing && row.alive)
-            .map(|_| tr("点击画面或按 → 输入"));
+        // 怎么开始往终端里输入、怎么回到侧栏（键照设置里改过的写）
+        let focus_key = crate::keymap::label("hub.focus", cx).unwrap_or_else(|| "F6".into());
+        let hint: Option<SharedString> =
+            shown
+                .as_ref()
+                .filter(|row| row.alive && row.online)
+                .map(|_| match typing {
+                    true => tf!("输入中 · {key} 回到侧栏", key = focus_key).into(),
+                    false => tf!("点击画面或按 {key} 输入", key = focus_key).into(),
+                });
+        let primary = cx.theme().primary;
         let slot = shown.as_ref().map(Row::slot);
         let (for_attach, for_restart) = (slot.clone(), slot);
         // 两个按钮对着哪个仓库（和 `go` 一样）、它在侧栏里列在哪个工作区下面
@@ -3149,7 +4281,7 @@ impl TermOverview {
                     .flex_shrink(100.)
                     .mr(px(6.))
                     .text_xs()
-                    .text_color(muted)
+                    .text_color(if typing { primary } else { muted })
             }))
             .when(shown.is_some(), |bar| {
                 bar.child(
@@ -3223,10 +4355,14 @@ impl TermOverview {
                         .flex_none()
                         .ml(px(6.))
                         .label(tr("打开仓库"))
-                        .tooltip(match shown.is_some() {
-                            true => tr("打开此终端所在的仓库（Enter）"),
-                            false => tr("打开此仓库（Enter）"),
-                        })
+                        .tooltip(crate::keymap::with_key(
+                            match shown.is_some() {
+                                true => tr("打开此终端所在的仓库（Ctrl+Enter）"),
+                                false => tr("打开此仓库（Ctrl+Enter）"),
+                            },
+                            "hub.open_repo",
+                            cx,
+                        ))
                         .on_click(cx.listener(|this, _, _, cx| this.go(cx))),
                 )
             })
@@ -3238,7 +4374,10 @@ impl TermOverview {
         hub: &[RepoGroup],
         window: &Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
+        if self.split.is_some() {
+            return self.render_split(hub, window, cx);
+        }
         let theme = cx.theme();
         let (bg, muted, primary) = (theme.background, theme.muted_foreground, theme.primary);
         let typing = self.typing(window, cx);
@@ -3273,6 +4412,36 @@ impl TermOverview {
                     )
                 })
                 .into_any_element(),
+            // 主机断开了：终端还在那台上跑，这边接不上
+            (None, Some(slot), _) if row_in(hub, slot).is_some_and(|row| !row.online) => {
+                let machine = machine_of(&slot.entry).to_string();
+                let host = self.app.read(cx).machine_name(&machine);
+                centered()
+                    .px(px(24.))
+                    .text_color(muted)
+                    .child(Icon::new(IconName::Unplug).size(px(28.)))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .child(tf!("{host} 未连接，此终端的状态未知。", host)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .child(tr("终端仍在主机上运行，重新连接后可继续查看和输入。")),
+                    )
+                    .child(
+                        Button::new("hub-reconnect-main")
+                            .small()
+                            .primary()
+                            .icon(ui::icon(IconName::Plug))
+                            .label(tr("重新连接"))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.reconnect(&machine, cx)),
+                            ),
+                    )
+                    .into_any_element()
+            }
             // 重启：原来那个正在结束
             (None, Some(_), _) => centered()
                 .text_color(muted)
@@ -3312,6 +4481,7 @@ impl TermOverview {
             .bg(bg)
             .child(self.render_toolbar(hub, typing, cx))
             .child(body)
+            .into_any_element()
     }
 }
 
@@ -3332,6 +4502,18 @@ impl Render for TermOverview {
             .track_focus(&self.focus)
             .capture_key_down(cx.listener(Self::on_key_first))
             .on_key_down(cx.listener(Self::on_key))
+            .on_action(
+                cx.listener(|this, _: &crate::FocusSwitch, window, cx| {
+                    this.switch_focus(window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &crate::FocusSwitchBack, window, cx| {
+                this.switch_focus(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::RenameTerminal, window, cx| {
+                this.rename_current(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::OpenTerminalRepo, _, cx| this.go(cx)))
             // 拖侧栏的分隔条：鼠标拖到画面上面也由这里按位置算宽度
             .on_drag_move(cx.listener(
                 |this, event: &DragMoveEvent<crate::side_split::DragSide>, window, cx| {
@@ -3347,29 +4529,19 @@ impl Render for TermOverview {
 #[cfg(test)]
 mod tests {
     // 不整个引进来：界面库里也有一个叫 test 的属性宏，会顶掉标准的 #[test]
-    use super::{RepoEntry, Row, TermId, TermSlot, TermState};
+    use super::{RepoEntry, Row, TermId, TermSlot};
     use super::{on_machine, ordered};
 
     fn row(number: u32) -> Row {
-        Row {
-            id: TermId {
-                machine: String::new(),
-                term: number.to_string(),
-            },
-            entry: RepoEntry {
-                server: None,
-                path: "/repo".into(),
-            },
-            number,
-            title: None,
-            last: String::new(),
-            cols: 80,
-            rows: 24,
-            alive: true,
-            state: TermState::Idle,
-            last_output: None,
-            programs: None,
-        }
+        let id = TermId {
+            machine: String::new(),
+            term: number.to_string(),
+        };
+        let entry = RepoEntry {
+            server: None,
+            path: "/repo".into(),
+        };
+        crate::term_board::tests::plain_row(id, entry, number)
     }
 
     #[test]

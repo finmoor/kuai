@@ -8,6 +8,7 @@ mod browser;
 mod clone;
 mod desktop;
 mod diagnose;
+mod ext_tools;
 mod fonts;
 mod graph_paint;
 mod history;
@@ -17,10 +18,12 @@ mod keys_page;
 mod machines;
 mod manager;
 mod mapping;
+mod new_project;
 mod open_dir;
 mod open_with;
 mod packaging;
 mod palette;
+mod port_forward;
 mod presets;
 mod prompt;
 mod redirect_guard;
@@ -37,7 +40,10 @@ mod signals;
 mod tab_fit;
 mod term_board;
 mod term_end;
+mod term_memory;
+mod term_names;
 mod term_overview;
+mod term_split;
 mod terminal;
 mod text;
 mod toast;
@@ -50,6 +56,7 @@ mod win;
 mod workspace;
 mod workspace_page;
 mod ws_links;
+mod zoom;
 
 use std::path::PathBuf;
 
@@ -86,12 +93,26 @@ gpui_kit::actions!(
         PickNewTerminal,
         GoToHead,
         NextProgram,
-        PrevProgram
+        PrevProgram,
+        DiffLineUp,
+        DiffLineDown,
+        DiffExtendUp,
+        DiffExtendDown,
+        Fetch,
+        Pull,
+        Push,
+        StashChanges,
+        PopStash,
+        NewBranch,
+        FocusSwitch,
+        FocusSwitchBack,
+        RenameTerminal,
+        OpenTerminalRepo
     ]
 );
 
 /// 焦点在终端里时，键位表里出现过的键除了终端里也可用的快捷键（[`keymap::terminal_keeps`]，再加上
-/// Ctrl+Shift+F 帧耗时浮层）一律不当快捷键；设置页录快捷键时（[`keymap::RECORD_CONTEXT`]）全都不当。
+/// Ctrl+Alt+Shift+F 帧耗时浮层）一律不当快捷键；设置页录快捷键时（[`keymap::RECORD_CONTEXT`]）全都不当。
 ///
 /// GPUI 收到按键先查键位表，查不到才轮到终端自己的按键处理。所以别处绑过的键终端收不到：
 /// 界面库在最外层绑了 Tab、Shift+Tab（切焦点）和 Ctrl+C（复制界面上选中的文字），补全、
@@ -100,9 +121,12 @@ gpui_kit::actions!(
 /// 都在终端这一层绑成「什么都不做」，盖住外层的绑定。之后在设置里改的键由 `keymap::sync` 跟着改。
 ///
 /// 要在所有快捷键都登记完以后调用：同一层里后登记的优先。
+/// 帧耗时浮层（排查卡顿用）的键。
+const FRAME_OVERLAY_KEY: &str = "ctrl-alt-shift-f";
+
 fn release_keys_to_terminal(cx: &mut App) {
     let mut keeps = keymap::terminal_keeps(cx);
-    keeps.push(keymap::canonical("ctrl-shift-f", cx));
+    keeps.push(keymap::canonical(FRAME_OVERLAY_KEY, cx));
     let mut taken: Vec<String> = {
         let bindings = cx.key_bindings();
         let bindings = bindings.borrow();
@@ -160,6 +184,25 @@ fn workspace_action<A: Action>(
             handle
                 .update(cx, |_, window, cx| {
                     workspace.update(cx, |ws, cx| f(ws, window, cx)).ok();
+                })
+                .ok();
+        });
+    });
+}
+
+/// 一个 Git 操作的快捷键：交给当前仓库，和点工具栏上的按钮一样。
+fn git_action<A: Action>(cx: &mut App, op: repo::GitShortcut) {
+    cx.on_action(move |_: &A, cx: &mut App| {
+        cx.defer(move |cx| {
+            let Some(MainWorkspace(workspace, handle)) = cx.try_global::<MainWorkspace>() else {
+                return;
+            };
+            let (workspace, handle) = (workspace.clone(), *handle);
+            handle
+                .update(cx, |_, window, cx| {
+                    workspace
+                        .update(cx, |ws, cx| ws.git_in_active(op, window, cx))
+                        .ok();
                 })
                 .ok();
         });
@@ -483,8 +526,9 @@ fn main() {
             // 组件库自带的文字（输入框的右键菜单、对话框的关闭按钮等）跟着界面语言
             gpui_kit::component::set_locale(fr_core::i18n::lang().code());
             cx.bind_keys([
-                // Ctrl+Shift+F：切换 GPUI 的帧耗时浮层（隐藏 → 简要 → 详细）
-                KeyBinding::new("ctrl-shift-f", ToggleFrameOverlay, None),
+                // 切换 GPUI 的帧耗时浮层（隐藏 → 简要 → 详细）。原来是 Ctrl+Shift+F，让给了「获取」
+                // （和 Fork 一样）
+                KeyBinding::new(FRAME_OVERLAY_KEY, ToggleFrameOverlay, None),
                 // 新建终端的选仓库框里换要运行的程序。快捷键表先于按键监听，界面库在最外层把 Tab 绑成了
                 // 切焦点，所以要在框自己的上下文里绑
                 KeyBinding::new("tab", NextProgram, Some(workspace::QUICK_OPEN_CONTEXT)),
@@ -493,6 +537,13 @@ fn main() {
                     PrevProgram,
                     Some(workspace::QUICK_OPEN_CONTEXT),
                 ),
+                // 本地修改的并排视图：焦点在组件库的改动正文里时，上下键原本是它的滚动。同一个上下文里
+                // 后绑的先试：本地修改那边接了就是选行，没接（别处的改动视图、没有能选的行）
+                // 照样交给组件库滚动
+                KeyBinding::new("up", DiffLineUp, Some("Diff")),
+                KeyBinding::new("down", DiffLineDown, Some("Diff")),
+                KeyBinding::new("shift-up", DiffExtendUp, Some("Diff")),
+                KeyBinding::new("shift-down", DiffExtendDown, Some("Diff")),
             ]);
             // 能在设置里改的快捷键（关标签页、切页面、新建终端……）按设置绑，见 keymap.rs。给预设设的
             // 快捷键跟着预设走，所以先把预设定下来
@@ -515,6 +566,20 @@ fn main() {
                 ws.pick_new_terminal(window, cx)
             });
             workspace_action::<Refresh>(cx, |ws, _, cx| ws.refresh_active(cx));
+            // 工具栏上的几个 Git 操作（设置 → 快捷键 → Git）
+            for (op, register) in [
+                (
+                    repo::GitShortcut::Fetch,
+                    git_action::<Fetch> as fn(&mut App, repo::GitShortcut),
+                ),
+                (repo::GitShortcut::Pull, git_action::<Pull>),
+                (repo::GitShortcut::Push, git_action::<Push>),
+                (repo::GitShortcut::Stash, git_action::<StashChanges>),
+                (repo::GitShortcut::Pop, git_action::<PopStash>),
+                (repo::GitShortcut::Branch, git_action::<NewBranch>),
+            ] {
+                register(cx, op);
+            }
             workspace_action::<CloseTab>(cx, |ws, window, cx| ws.close_active(window, cx));
             workspace_action::<ShowChanges>(cx, |ws, window, cx| {
                 ws.show_in_active(true, window, cx)

@@ -100,8 +100,22 @@ fn scope_refs(scope: &Scope, hidden: &[String]) -> Vec<String> {
 pub enum Find {
     /// 改动过路径里有这几个字的文件
     Path,
-    /// 改动里增加或删除过这几个字（`git log -S`）
+    /// 增加或删除的行里有这几个字（`git log -G`，按字面找）
     Content,
+    /// 这几个字在文件里出现的次数变了（`git log -S`）：只是挪了位置、改了同一行别处的不算
+    Occurrence,
+}
+
+/// 把要找的字写成扩展正则（`-G` 用的）里按字面匹配的样子。
+fn literal_regex(needle: &str) -> String {
+    let mut out = String::with_capacity(needle.len() * 2);
+    for ch in needle.chars() {
+        if "\\.^$|?*+()[]{}".contains(ch) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// 在范围里找提交的参数，输出和 [`scoped_log_args`] 一样，用 [`parse`] 解析。都不分大小写。
@@ -136,6 +150,13 @@ pub fn find_log_args(scope: &Scope, hidden: &[String], find: Find, needle: &str)
             args.extend(["--".into(), pattern]);
         }
         Find::Content => {
+            args.extend([
+                "-i".into(),
+                format!("-G{}", literal_regex(needle)),
+                "--".into(),
+            ]);
+        }
+        Find::Occurrence => {
             args.extend(["-i".into(), format!("-S{needle}"), "--".into()]);
         }
     }
@@ -393,6 +414,12 @@ mod tests {
         git(&["checkout", "-q", "-b", "side", "HEAD~2"]);
         commit("side.txt", "s\n", "on side");
         git(&["checkout", "-q", "main"]);
+        // 只改了同一行的别处、出现次数没变：按增删的行找得到，按出现次数找不到
+        commit(
+            "src/Repo/Diff.rs",
+            "fn a() {}\nlet ignore_whitespace = 2;\n",
+            "tweak value",
+        );
 
         let found = |scope: &Scope, find: Find, needle: &str| -> Vec<String> {
             let args = find_log_args(scope, &[], find, needle);
@@ -403,11 +430,11 @@ mod tests {
         // 路径：不分大小写，隔着目录也算，反斜杠当斜杠
         assert_eq!(
             found(&Scope::All, Find::Path, "diff.rs"),
-            ["ignore blanks", "add diff"]
+            ["tweak value", "ignore blanks", "add diff"]
         );
         assert_eq!(
             found(&Scope::All, Find::Path, "repo\\diff"),
-            ["ignore blanks", "add diff"]
+            ["tweak value", "ignore blanks", "add diff"]
         );
         // 通配符按字面算：`[1]` 不是「一个 1」，`*` 不是「随便什么」
         assert_eq!(found(&Scope::All, Find::Path, "new[1]"), ["bracket"]);
@@ -416,19 +443,27 @@ mod tests {
         // 范围照样管用
         assert_eq!(found(&Scope::All, Find::Path, "side"), ["on side"]);
         assert!(found(&Scope::Refs(vec!["HEAD".into()]), Find::Path, "side").is_empty());
-        // 改动内容：增加或删除过这几个字的提交，不分大小写
+        // 改动内容：增加或删除的行里有这几个字的提交，不分大小写
         assert_eq!(
             found(&Scope::All, Find::Content, "ignore_whitespace"),
-            ["mention it", "ignore blanks"]
+            ["tweak value", "mention it", "ignore blanks"]
         );
         assert!(found(&Scope::All, Find::Content, "没有这几个字").is_empty());
+        // 按字面找：`.` 不是「随便一个字」
+        assert!(found(&Scope::All, Find::Content, "ignore.whitespace").is_empty());
+        assert_eq!(found(&Scope::All, Find::Content, "= 2;"), ["tweak value"]);
+        // 出现次数变了的：只改了值的那次不算
+        assert_eq!(
+            found(&Scope::All, Find::Occurrence, "ignore_whitespace"),
+            ["mention it", "ignore blanks"]
+        );
 
-        // main 比 side 多 2 个、少 1 个
+        // main 比 side 多 3 个、少 1 个
         git(&["update-ref", "refs/remotes/origin/side", "refs/heads/side"]);
         let args = pending_args("origin/side");
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let (ahead, behind) = parse_pending(&crate::git::run(&dir, &args).unwrap());
-        assert_eq!((ahead.len(), behind.len()), (2, 1));
+        assert_eq!((ahead.len(), behind.len()), (3, 1));
         let head = String::from_utf8(git(&["rev-parse", "HEAD"])).unwrap();
         assert!(ahead.iter().any(|id| **id == *head.trim()));
         let _ = std::fs::remove_dir_all(&dir);

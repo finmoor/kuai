@@ -25,7 +25,7 @@ Terminals that survive disconnects, line-by-line review, in-place file editing, 
 </p>
 
 <p>
-<a href="https://github.com/finmoor/kuai/releases/latest"><b>Download</b></a> ·
+<a href="#download"><b>Download</b></a> ·
 <a href="#features">Features</a> ·
 <a href="#getting-started">Getting started</a> ·
 <a href="#how-it-works">How it works</a> ·
@@ -75,10 +75,10 @@ Every repository has its own terminals, running on the host the repository lives
 
 ![The Sessions page: terminals of each repository grouped by workspace on the left, a Claude Code session on the right](assets/screenshots/en/terminals.png)
 
-- **Told when it stops**: the Sessions page gathers the terminals of every repository on every host, including repositories not in a workspace; icons tell AI assistants from other commands and idle shells. You are notified when a terminal stops producing output, with a system notification when Kuai is in the background
+- **Told when it stops**: the Sessions page gathers the terminals of every repository on every host, including repositories not in a workspace, and tells running, waiting and idle ones apart. You are notified when an AI assistant stops and waits for you, with a system notification when Kuai is in the background, and terminals that printed output while you were away are marked
 - **Hand it a screenshot**: copy a screenshot and paste, or drop images and files on the terminal. The file is uploaded to the host, and the terminal receives its path there
-- **Several tasks at once**: a repository can have several terminals
-- **Claude Code in one click**: the ⌄ next to New terminal runs Claude Code, Codex, OpenCode, Antigravity CLI or a command of your own, or continues the last session; choose in Settings what the button itself opens
+- **Several tasks at once**: a repository can have several terminals; rename them, or check 2 to 4 to view them side by side
+- **Claude Code in one click**: the ⌄ next to New terminal runs Claude Code, Codex, OpenCode, Antigravity CLI or a command of your own, or continues the last conversation in a new terminal; choose in Settings what the button itself opens
 - Terminals of local repositories also keep running after Kuai quits
 - Font, size, line height, cursor and scrollback are configurable
 
@@ -88,12 +88,12 @@ A full graphical Git client, modelled on Fork. When Claude Code is done, switch 
 
 ![Local changes: a few lines selected for staging, with the commit message below](assets/screenshots/en/changes.png)
 
-- **Stage and discard by file, hunk or line**; side-by-side view, inline word diff, ignore whitespace, image diff
+- **Stage and discard by file, hunk or line**, and undo a discard; split or single list (check a box to stage); side-by-side view, inline word diff, ignore whitespace, image diff
 - **Commit graph**, with branches, remotes, tags and stashes grouped into folders by name; search commits by message, author, hash, file path or changed content
-- **Merge, rebase and interactive rebase** (reorder, reword, squash, drop), cherry-pick, revert, reset
-- **Conflict resolution**: pick the current version, the incoming one or both for each conflict, or edit by hand
+- **Merge, rebase and interactive rebase** (reorder, reword, squash, drop), cherry-pick, revert, reset; select several commits to act on them at once, or drag a branch onto the current one to merge it
+- **Conflict resolution**: current and incoming side by side on top (with the common ancestor if you like), take a side for each conflict, and edit the result below; or hand the file to an external tool such as Beyond Compare, WinMerge or Meld
 - **Compare** any two branches, tags, commits or the local changes; file history and blame
-- **Worktrees, sub-repository overview, submodules**; background auto-fetch; Activity lists every git command that ran, with its output
+- **Worktrees, sub-repository overview, submodules**; background auto-fetch, with the time of the last fetch under the branch name; the full output of pushes and pulls, including what server hooks say, in the Output panel at the bottom
 - **Recover commits**: every move of HEAD and your branches, including resets and rebases Claude Code ran in the terminal; pick a step and create a branch there. Resets, rebases and force pushes spell out which commits they affect before they run
 
 ### ③ Edit: files on the server, as if they were local
@@ -146,11 +146,13 @@ Also: Chinese and English UI, system tray and start at sign-in, pinned and reope
 - **What Kuai adds**: repositories on remote hosts; built-in terminals that outlive the app; the Files page and directory mapping; a Chinese UI; open source.
 - **What is still missing**: bisect, a dedicated Git LFS UI, git-flow, custom commands, batch operations on several selected commits, and account integration and pull requests for GitHub, GitLab and the like.
 
-**With an IDE.** Kuai is not an IDE. The Files page is for reading and small edits: there is no code completion, go-to-definition or debugger. For heavier editing, map the directory on the host to this computer and open it in VS Code or another editor.
+**With an IDE.** Kuai is not an IDE. The Files page is for reading and small edits: there is no code completion, go-to-definition or debugger. For heavier editing, map the directory on the host to this computer and open it in VS Code or another editor. The editor then reads and writes files carried over SSH, which suits editing; git, running and building are still best done on the host (in Kuai's Git page and terminal). If you need VS Code extensions or a debugger running on the host, use VS Code's Remote - SSH.
 
 ## Download
 
-Get it from [GitHub Releases](https://github.com/finmoor/kuai/releases/latest). For Windows, in either form:
+Get it from [GitHub Releases](https://github.com/finmoor/kuai/releases/latest). The binaries are not code-signed: on first run Windows may show "Windows protected your PC"; choose "More info", then "Run anyway". You can check each download against the SHA-256 shown next to it on the Releases page.
+
+For Windows, in either form:
 
 - **Installer** `kuai-<version>-windows-x64-setup.exe` (recommended): installs into your user profile (`%LOCALAPPDATA%\Programs\Kuai`), no administrator rights needed; starts from the Start menu and uninstalls from Settings → Apps.
 - **Portable** `kuai-<version>-windows-x64.zip`: unzip the Kuai folder anywhere and run `kuai.exe`.
@@ -172,21 +174,32 @@ Requirements:
 | Remote host | Linux (x86_64; ARM is not supported yet), or Windows with the OpenSSH server enabled; git 2.31 or newer; no root needed |
 | Directory mapping | On Windows, [WinFsp](https://winfsp.dev/) (Kuai offers to install it through winget if it is missing); on Linux, fuse3, folders only |
 
-The binaries are not code-signed, so on first run Windows may show "Windows protected your PC": choose "More info", then "Run anyway".
-
 When a new version is out, a notice appears left of the gear in the title bar; click it to read the changes and update in one step (the installer build runs the new installer in the background and the portable build replaces its files; on Linux the .deb is installed by apt after the system asks for administrator authentication, and the AppImage replaces its own file). You can also check from Settings → About. `kuaid` on your hosts needs no separate update: a newer Kuai replaces it on connection. Release notes are in [CHANGELOG.md](CHANGELOG.md) (in Chinese).
 
 ## Getting started
 
-1. Install and open Kuai.
-2. On the Hosts page click "Add host…" and enter the address and user name of your VPS (or a host alias from `~/.ssh/config`), then choose key or password sign-in.
-3. On first connection Kuai installs `kuaid` under `~/.kuai` on the host and starts it.
-4. Click "Open repository…" and pick the repository's directory on the host.
-5. Each repository has three pages, Git, Terminal and Files: run `claude` on the Terminal page, then press <kbd>Ctrl</kbd>+<kbd>&#96;</kbd> to return to the Git page, review the changes, stage by line and commit.
+### Before you start
 
-Claude Code and Codex are not installed by Kuai: install and sign in to them on the host yourself.
+| Where | What you need | How to check or install |
+|---|---|---|
+| This computer (Windows) | git 2.31 or newer; the OpenSSH client (built into Windows 10 and 11) | `git --version`, `ssh -V`; without git, install [Git for Windows](https://git-scm.com/download/win) |
+| This computer (Linux) | git 2.31 or newer, ssh | `sudo apt install git openssh-client` |
+| Remote host | Linux x86_64 (ARM is not supported yet) or Windows with the OpenSSH server enabled; SSH sign-in works (a key, or the IP, user name and password from your VPS console) | Try `ssh user@address` from a command line first |
+| Remote host | git 2.31 or newer | `git --version`. The git that ships with Ubuntu 20.04 and Debian 11 is too old: on Ubuntu run `sudo add-apt-repository -y ppa:git-core/ppa && sudo apt update && sudo apt install -y git`; on Debian 11 run `sudo apt install -t bullseye-backports git` (enable backports first) |
+| Remote host | The AI assistants you want to use, installed and signed in | See step 5 below |
+
+### Steps
+
+1. Install and open Kuai.
+2. On the Hosts page click "Add host…" and enter the address and user name of your VPS (or choose a host alias from `~/.ssh/config`), then choose key or password sign-in. Click "Test connection" if you are not sure it will connect.
+3. On first connection Kuai shows the host key fingerprint for you to verify (the dialog explains how); after you confirm, it installs `kuaid` under `~/.kuai` on the host and starts it.
+4. Once connected, click "Open repository…" and pick the repository's directory on the host. With no repository yet, use "Clone…", or pick a directory and initialize a new repository when asked.
+5. Install and sign in to Claude Code on the host (needs Node.js 18 or newer): on the repository's Terminal page run `npm install -g @anthropic-ai/claude-code`, then run `claude` and follow the prompts to sign in. Codex is `npm install -g @openai/codex`; OpenCode is `npm install -g opencode-ai`. Kuai does not install them for you; when a preset's program is missing, the terminal shows the install command at the top.
+6. Each repository has three pages, Git, Terminal and Files: run `claude` on the Terminal page, then press <kbd>Ctrl</kbd>+<kbd>&#96;</kbd> to return to the Git page, review the changes, stage by line and commit.
 
 For a repository on this computer: select "This computer" on the Hosts page and click "Add local repository…", or run `kuai.exe <path>` from a command line.
+
+**Coming from tmux:** reattach existing tmux sessions on the host with `tmux attach` in a Kuai terminal as usual; attaching over plain SSH keeps working too. Start new tasks directly in Kuai's terminal without another tmux layer: Kuai's terminals already live on the host, and a program inside tmux looks like just tmux to Kuai, so stop alerts and message marks on the Sessions page are not accurate for it.
 
 ## How it works
 
@@ -246,6 +259,9 @@ You can change shortcuts in Settings → Shortcuts, and give each new-terminal p
 | F5 | Refresh the current repository's status and history |
 | Ctrl+Enter | Commit (while focus is in the commit message, the file list or the diff) |
 | Ctrl+1, Ctrl+2 | Switch to Local changes / All commits on the Git page and move keyboard focus there |
+| Ctrl+0 | Go back to HEAD in the commit list |
+| Ctrl+Shift+F, Ctrl+Shift+L, Ctrl+Shift+P | Fetch, pull, push (same as the toolbar buttons) |
+| Ctrl+Shift+S | Stash changes |
 | Ctrl+F | Find in the current page: search commits on the Git page (or within the diff you are viewing), find in the open file on the Files page, find text in the merge editor |
 | Ctrl+P | Quick open repository (Up/Down to select, Enter to open) |
 | Ctrl+, | Open or close Settings |
@@ -259,6 +275,10 @@ You can change shortcuts in Settings → Shortcuts, and give each new-terminal p
 | Ctrl+Shift+A | Open the Sessions page (terminals of every repository on every host) |
 | Ctrl+Shift+N | Pick a repository and open a new terminal in it on the Sessions page |
 | Ctrl+Shift+↑, Ctrl+Shift+↓ | While typing into a terminal on the Sessions page, switch to the previous / next terminal in the sidebar (a thin line along the top of the terminal shows that it has the input) |
+| F6, Shift+F6 | Move focus between the sidebar and the terminal on the Sessions page and a repository's Terminal page |
+| F2 | Rename the selected terminal while the sidebar of the Sessions page or Terminal page has focus |
+| Ctrl+Alt+←, Ctrl+Alt+→ | Move to the pane on the left / right when viewing terminals side by side |
+| Ctrl+mouse wheel | Change the code font size over a diff or the merge editor |
 | Alt+←, Alt+→ | Go back / forward (same as the two buttons at the far left of the title bar; the mouse side buttons work too); inside a sub-repository or a worktree, Back first returns to the root repository's overview. Not while focus is in a terminal or a text field |
 | Ctrl+S | Save the open file on the Files page |
 | Ctrl+Shift+V | Switch a Markdown file on the Files page between preview and source |
@@ -267,14 +287,14 @@ Keys in lists (click the list first, or move focus there with Ctrl+1 / Ctrl+2):
 
 | Where | Keys |
 |---|---|
-| File list in Local changes | Up/Down to move, Shift+Up/Down to extend the selection, Ctrl+A to select the whole column; Space or Enter to stage or unstage; Delete to discard (asks first); Right to enter the diff. Ctrl-click and Shift-click also multi-select |
-| Diff | Up/Down to move between changed lines, Shift+Up/Down to extend the selection; Space or Enter to stage or unstage the selected lines; Delete to discard them (asks first); Left to return to the file list. In the side-by-side view, drag over the line numbers to select lines; Space and Delete work the same |
-| Commit list | Up, Down, PageUp, PageDown, Home, End |
+| File list in Local changes | Up/Down to move, Shift+Up/Down to extend the selection, Ctrl+A to select the whole column; Space or Enter to stage or unstage; Delete to discard (asks first); Right to enter the diff; Ctrl+Z undoes the last discard. Ctrl-click and Shift-click also multi-select |
+| Diff | Up/Down to move between changed lines, Shift+Up/Down to extend the selection; Space or Enter to stage or unstage the selected lines; Delete to discard them (asks first); Left to return to the file list. In the side-by-side view you can also drag over the line numbers to select lines |
+| Commit list | Up, Down, PageUp, PageDown, Home, End; Ctrl+C copies the selected commit's hash. Ctrl-click or Shift-click to select several commits and cherry-pick, revert, squash or export them as patches; with exactly two selected you can compare them |
 | Sidebar | Up/Down to move, Enter acts as a double-click (switch branch); on a folder, Left collapses and Right expands |
 | Blame | Up, Down, PageUp, PageDown, Home, End to select a line; Enter jumps to the commit that changed it; Esc closes |
 | File tree on the Files page | Up/Down to move, Left/Right to collapse or expand a folder, Enter to open and keep the file, Space to preview; F2 to rename, Delete to delete (asks first) |
 
-While focus is in a terminal, Kuai handles only these shortcuts (the ones marked "Available in the terminal" on the Shortcuts settings page): Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+Shift+T, Ctrl+1, Ctrl+2, Ctrl+Shift+E, Ctrl+\`, Ctrl+Shift+\`, Ctrl+,, Ctrl+Shift+B, Ctrl+Shift+A, Ctrl+Shift+N, and Ctrl+Shift+↑ / Ctrl+Shift+↓ on the Sessions page. Every other key (Tab, Shift+Tab, Esc, F5, Ctrl+W, Ctrl+F, Ctrl+P, Ctrl+S, function keys, Alt combinations and so on) goes to the program in the terminal (see below for Alt+V). In a terminal: Ctrl+C interrupts (copies when text is selected), Ctrl+Shift+C copies (after you drag to select inside a program that uses the mouse, such as opencode, the program does the copying), Ctrl+V and Shift+Insert paste (an image or a file on the clipboard is pasted as its path); in a terminal on a remote host, Alt+V (the key Claude Code uses on Windows to paste an image) is also sent by Kuai when the clipboard holds an image or a file, exactly like Ctrl+V, and goes to the program otherwise; right-click on a URL or a file path opens a menu (open on the Files page, open in the browser, open in the default program, copy the path and so on), and elsewhere copies when text is selected and pastes otherwise; Shift+PageUp, Shift+PageDown, the mouse wheel and the scrollbar on the right show earlier output. While you are scrolled back, the input area stays pinned at the bottom, typing does not move the view, and Enter returns to the bottom; the marks on the left are the messages you sent: hover to preview, click to jump. Ctrl+click a URL or a file path to open it (rest the mouse on one for a moment to see a dashed underline and a hint): URLs open in the browser, files in the repository open on the Files page at that line, and other files on this computer open in their default program. When the program in the terminal uses the mouse (opencode, or Claude Code in fullscreen mode), clicks, drags, right-clicks and the wheel go to the program; hold Shift to let Kuai handle them instead: drag to select text, right-click for the menu or to copy and paste, scroll through the terminal's history.
+While focus is in a terminal, Kuai handles only these shortcuts (the ones marked "Available in the terminal" on the Shortcuts settings page): Ctrl+Tab, Ctrl+Shift+Tab, Ctrl+Shift+T, Ctrl+1, Ctrl+2, Ctrl+Shift+E, Ctrl+\`, Ctrl+Shift+\`, Ctrl+,, Ctrl+Shift+B, Ctrl+Shift+A, Ctrl+Shift+N, and Ctrl+Shift+↑ / Ctrl+Shift+↓ on the Sessions page. Every other key (Tab, Shift+Tab, Esc, F5, Ctrl+W, Ctrl+F, Ctrl+P, Ctrl+S, function keys, Alt combinations and so on) goes to the program in the terminal (see below for Alt+V). In a terminal: Ctrl+C interrupts (copies when text is selected), Ctrl+Shift+C copies (after you drag to select inside a program that uses the mouse, such as opencode, the program does the copying), Ctrl+V and Shift+Insert paste (an image or a file on the clipboard is pasted as its path; in Settings → Terminal you can send Ctrl+V to the program instead and paste with Ctrl+Shift+V); when the clipboard holds an image or a file, Alt+V (the key Claude Code uses on Windows to paste an image) makes Kuai send it, even if there is also text on the clipboard, and goes to the program otherwise; right-click on a URL or a file path opens a menu (open on the Files page, open in the browser, open in the default program, copy the path and so on), and elsewhere copies when text is selected and pastes otherwise; Shift+PageUp, Shift+PageDown, the mouse wheel and the scrollbar on the right show earlier output. While you are scrolled back, the input area stays pinned at the bottom, typing does not move the view, and Enter returns to the bottom; the marks on the left are the messages you sent: hover to preview, click to jump. Ctrl+click a URL or a file path to open it (rest the mouse on one for a moment to see a dashed underline and a hint): URLs open in the browser (a `localhost` address printed in a terminal on a remote host is forwarded to this computer over SSH first, after you confirm), files in the repository open on the Files page at that line, and other files open in their default program (on a remote host, a copy is opened). When the program in the terminal uses the mouse (opencode, or Claude Code in fullscreen mode), clicks, drags, right-clicks and the wheel go to the program; hold Shift to let Kuai handle them instead: drag to select text, right-click for the menu or to copy and paste, scroll through the terminal's history.
 
 </details>
 

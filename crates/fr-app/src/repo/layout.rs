@@ -7,6 +7,11 @@
 //! 侧栏可以收成图标栏（见 [`super::rail`]）：把侧栏的分隔条往左拖到头，或者点侧栏右上角的按钮、
 //! 按 Ctrl+Shift+B。收着时侧栏按图标栏的宽度算，存的宽度不动，展开时回到原来的宽度；
 //! 把图标栏的右边往右拖开，或者双击它，也会展开。
+//!
+//! 窄窗口逐级让位（`docs/design/narrow-and-changes/` 方向 A）：窗口窄于 1100 时侧栏自动收成
+//! 图标栏（手动展开的在这次运行里保持展开，见 [`rail_shown`]）、文件列表最多 300；窄于 900 时文件列表
+//! 最多 240、提交框收成一行；窄于 760 时文件列表和改动上下排；矮于 640 时提交框也收成一行；窄于
+//! 1000 时工具栏只留图标（[`super::compact_toolbar`]）。
 
 use gpui_kit::component::InteractiveElementExt as _;
 use gpui_kit::component::resizable::{HandleEdge, resize_handle};
@@ -41,6 +46,13 @@ impl Render for DragSplit {
 }
 
 pub(super) const SIDEBAR_DEFAULT: f32 = 240.;
+/// 窗口窄于这么多时侧栏自动收成图标栏
+pub(super) const AUTO_RAIL_BELOW: f32 = 1100.;
+/// 窗口窄于这么多时本地修改的文件列表和改动上下排
+pub(super) const STACK_BELOW: f32 = 760.;
+/// 窗口窄于这么多（或者矮于 [`COMPACT_COMMIT_LOWER`]）时提交框收成一行
+pub(super) const COMPACT_COMMIT_BELOW: f32 = 900.;
+pub(super) const COMPACT_COMMIT_LOWER: f32 = 640.;
 /// 侧栏收起后图标栏的宽度
 pub(super) const RAIL_WIDTH: f32 = 48.;
 /// 拖侧栏的分隔条：离左边不到这么远就收成图标栏，收着时拖过这么远就展开
@@ -71,20 +83,30 @@ pub(super) struct Sizes {
     pub details_width: f32,
 }
 
+/// 侧栏现在是不是图标栏：手动收起的，或者窗口窄于 [`AUTO_RAIL_BELOW`]、又没手动展开的。
+pub(super) fn rail_shown(layout: &Layout, vw: f32) -> bool {
+    layout.sidebar_collapsed || (vw < AUTO_RAIL_BELOW && !layout.narrow_open)
+}
+
 /// 按设置里存的数和窗口的大小算各块的大小。没拖过的用默认值（详情区按窗口的比例）；
 /// 每一块都夹在「自己还看得清」和「别的块还看得清」之间。
 pub(super) fn sizes(layout: &Layout, viewport: Size<Pixels>) -> Sizes {
     let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
     let fit = |value: f32, min: f32, max: f32| value.clamp(min, max.max(min));
     // 侧栏：收着时是图标栏
-    let sidebar = match layout.sidebar_collapsed {
+    let sidebar = match rail_shown(layout, vw) {
         true => RAIL_WIDTH,
         false => sidebar_open(layout, vw),
     };
     let main = vw - sidebar;
-    // 文件列表：右边至少留 300 看改动
+    // 文件列表：右边至少留 300 看改动；窗口窄时再收一收（存的宽度不动）
+    let cap = match vw {
+        w if w < COMPACT_COMMIT_BELOW => 240.,
+        w if w < AUTO_RAIL_BELOW => 300.,
+        _ => f32::MAX,
+    };
     let changes_list = fit(
-        layout.changes_list.unwrap_or(CHANGES_LIST_DEFAULT),
+        layout.changes_list.unwrap_or(CHANGES_LIST_DEFAULT).min(cap),
         220.,
         main - 300.,
     );
@@ -113,7 +135,14 @@ pub(super) fn sizes(layout: &Layout, viewport: Size<Pixels>) -> Sizes {
 impl RepoView {
     /// 各块现在的大小。
     pub(super) fn sizes(&self, cx: &App) -> Sizes {
-        sizes(&self.app.read(cx).settings.layout, self.viewport)
+        sizes(&self.app.read(cx).settings.layout, self.content_viewport())
+    }
+
+    /// 窗口内容区扣掉底部的「输出」（开着时）：各块的大小按它算。
+    pub(super) fn content_viewport(&self) -> Size<Pixels> {
+        let mut viewport = self.viewport;
+        viewport.height = (viewport.height - px(self.output_height())).max(px(0.));
+        viewport
     }
 
     /// 一条分隔条：贴在它所属那一块的边上（那一块要是 `relative` 的）。拖动改大小，双击回到默认。
@@ -141,13 +170,22 @@ impl RepoView {
         let now = self.sizes(cx);
         let sidebar = now.sidebar;
         let from_left = f32::from(pos.x - bounds.left());
-        let from_bottom = f32::from(bounds.bottom() - pos.y);
+        // 底部开着「输出」时，详情区的底边在它上面
+        let from_bottom = f32::from(bounds.bottom() - pos.y) - self.output_height();
         // 侧栏往左拖到头就收成图标栏；收着时往右拖开就展开
         if split == Split::Sidebar {
             let collapse = from_left < COLLAPSE_AT;
+            let narrow = f32::from(self.viewport.width) < AUTO_RAIL_BELOW;
             self.app.update(cx, |app, cx| {
                 app.edit_layout(cx, |layout| {
-                    layout.sidebar_collapsed = collapse;
+                    // 窗口窄、自动收起时：拖开只在这次运行里记着，拖回去回到自动收起
+                    match narrow {
+                        true => layout.narrow_open = !collapse,
+                        false => layout.sidebar_collapsed = collapse,
+                    }
+                    if narrow && !collapse {
+                        layout.sidebar_collapsed = false;
+                    }
                     // 拖到头之前经过的那些宽度不算：展开时回到开始拖之前的宽度
                     if collapse {
                         layout.sidebar = sidebar_before;
@@ -167,7 +205,7 @@ impl RepoView {
         // 存之前先按现在的窗口收一下：拖到头以后再往回拖，马上就跟手
         let mut layout = self.app.read(cx).settings.layout;
         set(&mut layout, split, Some(value.max(0.)));
-        let fitted = sizes(&layout, self.viewport);
+        let fitted = sizes(&layout, self.content_viewport());
         let value = match split {
             Split::Sidebar => fitted.sidebar,
             Split::ChangesList => fitted.changes_list,
@@ -184,9 +222,10 @@ impl RepoView {
         self.app.update(cx, |app, cx| {
             app.edit_layout(cx, |layout| {
                 set(layout, split, None);
-                // 双击图标栏的右边：展开，回到默认宽度
+                // 双击图标栏的右边：展开，回到默认宽度（窗口窄时只在这次运行里展开）
                 if split == Split::Sidebar {
                     layout.sidebar_collapsed = false;
+                    layout.narrow_open = true;
                 }
             })
         });
@@ -195,7 +234,10 @@ impl RepoView {
 
     /// 侧栏是不是收成了图标栏。
     pub(super) fn sidebar_collapsed(&self, cx: &App) -> bool {
-        self.app.read(cx).settings.layout.sidebar_collapsed
+        rail_shown(
+            &self.app.read(cx).settings.layout,
+            f32::from(self.viewport.width),
+        )
     }
 
     /// 收起、展开侧栏（侧栏右上角的按钮、图标栏底下的按钮、Ctrl+Shift+B）。所有标签页一起变。
@@ -205,10 +247,44 @@ impl RepoView {
         if collapse && self.sidebar_has_focus(window, cx) {
             window.blur(cx);
         }
+        // 窗口窄、自动收起时：展开只在这次运行里记着，收起回到自动收起，不改存着的
+        let narrow = f32::from(self.viewport.width) < AUTO_RAIL_BELOW;
         self.app.update(cx, |app, cx| {
-            app.edit_layout(cx, |layout| layout.sidebar_collapsed = collapse)
+            app.edit_layout(cx, |layout| match narrow {
+                true => {
+                    layout.narrow_open = !collapse;
+                    if !collapse {
+                        layout.sidebar_collapsed = false;
+                    }
+                }
+                false => layout.sidebar_collapsed = collapse,
+            })
         });
         cx.notify();
+    }
+
+    /// 窗口宽到不用自动收起了：清掉「窄时手动展开」，下次变窄照样自动收起。画之前调。
+    pub(super) fn forget_narrow_open(&mut self, cx: &mut Context<Self>) {
+        let wide = f32::from(self.viewport.width) >= AUTO_RAIL_BELOW;
+        if wide && self.app.read(cx).settings.layout.narrow_open {
+            let app = self.app.clone();
+            cx.defer(move |cx| {
+                app.update(cx, |app, cx| {
+                    app.edit_layout(cx, |layout| layout.narrow_open = false)
+                })
+            });
+        }
+    }
+
+    /// 本地修改的文件列表和改动上下排（窗口窄于 [`STACK_BELOW`]）。
+    pub(super) fn stacked_changes(&self) -> bool {
+        f32::from(self.viewport.width) < STACK_BELOW
+    }
+
+    /// 提交框收成一行（窗口窄于 [`COMPACT_COMMIT_BELOW`] 或矮于 [`COMPACT_COMMIT_LOWER`]）。
+    pub(super) fn compact_commit(&self) -> bool {
+        f32::from(self.viewport.width) < COMPACT_COMMIT_BELOW
+            || f32::from(self.content_viewport().height) < COMPACT_COMMIT_LOWER
     }
 }
 
@@ -238,20 +314,27 @@ mod tests {
         assert_eq!(s.changes_list, 340.);
         assert_eq!(s.details_height, 360.);
         assert_eq!(s.details_width, 380.);
-        // 最小的窗口
+        // 窄的窗口：侧栏自动收成图标栏，手动展开了是原来的宽度
         let s = at(Layout::default(), 900., 560.);
-        assert_eq!(s.sidebar, 240.);
+        assert_eq!(s.sidebar, RAIL_WIDTH);
         assert_eq!(s.details_height, 224.);
         assert_eq!(s.details_width, 270.);
+        let open = Layout {
+            narrow_open: true,
+            ..Layout::default()
+        };
+        assert_eq!(at(open, 900., 560.).sidebar, 240.);
     }
 
     #[test]
     fn 拖出来的大小不会把别的块挤没() {
+        // 窄的窗口里手动展开了侧栏（不然自动收成图标栏）
         let wide = Layout {
             sidebar: Some(2000.),
             changes_list: Some(2000.),
             details_height: Some(2000.),
             details_width: Some(2000.),
+            narrow_open: true,
             ..Layout::default()
         };
         let s = at(wide, 900., 560.);

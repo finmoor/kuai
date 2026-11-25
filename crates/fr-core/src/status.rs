@@ -66,6 +66,9 @@ pub struct Entry {
     /// 工作区相对暂存区的改动；未跟踪和有冲突的文件也算在这边
     pub unstaged: Option<Kind>,
     pub submodule: bool,
+    /// 暂存区里这个文件的模式和对象号（porcelain v2 的 `mI hI`）。暂存区里的内容变了（又暂存了一些、
+    /// 在别处暂存），改动类型可能不变，这里会变；冲突、未跟踪的文件没有
+    pub index: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -141,6 +144,7 @@ pub fn parse(out: &[u8]) -> Status {
                     staged: xy.first().and_then(|&c| Kind::from_code(c)),
                     unstaged: xy.get(1).and_then(|&c| Kind::from_code(c)),
                     submodule: fields[2].starts_with('S'),
+                    index: Some(format!("{} {}", fields[4], fields[7])),
                 });
             }
             // 有冲突：u XY sub m1 m2 m3 mW h1 h2 h3 path
@@ -155,6 +159,7 @@ pub fn parse(out: &[u8]) -> Status {
                     staged: None,
                     unstaged: Some(Kind::Conflicted),
                     submodule: fields[2].starts_with('S'),
+                    index: None,
                 });
             }
             b'?' => {
@@ -165,6 +170,7 @@ pub fn parse(out: &[u8]) -> Status {
                         staged: None,
                         unstaged: Some(Kind::Untracked),
                         submodule: false,
+                        index: None,
                     });
                 }
             }
@@ -210,6 +216,7 @@ mod tests {
             (e.staged, e.unstaged),
             (Some(Kind::Modified), Some(Kind::Deleted))
         );
+        assert_eq!(e.index.as_deref(), Some("100644 ddd"));
         let e = &status.entries[3];
         assert_eq!(e.path, "新名字.md");
         assert_eq!(e.orig_path.as_deref(), Some("旧名字.md"));

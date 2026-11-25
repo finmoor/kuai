@@ -180,6 +180,184 @@ impl SettingsPage {
                 "定时在后台获取当前仓库（git fetch --all），需要密码时跳过。",
             ))
         };
+        let changes_view = {
+            let (get, set) = (app.clone(), app.clone());
+            SettingItem::new(
+                tr("本地修改默认视图"),
+                SettingField::dropdown(
+                    vec![
+                        ("split".into(), tr("分栏").into()),
+                        ("single".into(), tr("单列表").into()),
+                    ],
+                    move |cx| match get.read(cx).settings.changes_single {
+                        true => "single".into(),
+                        false => "split".into(),
+                    },
+                    move |value: SharedString, cx| {
+                        let single = value.as_ref() == "single";
+                        set.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| s.changes_single = single)
+                        });
+                    },
+                ),
+            )
+            .description(tr(
+                "分栏将未暂存和已暂存的文件分开列出，单列表列在一起、勾选方框暂存。各仓库可在本地修改中单独切换。",
+            ))
+        };
+        let code_size = {
+            let (get, set) = (app.clone(), app.clone());
+            SettingItem::new(
+                tr("代码字号"),
+                SettingField::dropdown(
+                    crate::settings::CODE_SIZES
+                        .map(|size| (size.to_string().into(), format!("{size} px").into()))
+                        .collect(),
+                    move |cx| get.read(cx).settings.code_font_size.to_string().into(),
+                    move |value: SharedString, cx| {
+                        let size = value.parse().unwrap_or(13);
+                        set.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| s.code_font_size = size)
+                        });
+                    },
+                ),
+            )
+            .description(tr(
+                "改动、合并编辑器和文件页里代码的字号。在改动上按住 Ctrl 滚动滚轮也可调整。",
+            ))
+        };
+        let tab_width = {
+            let (get, set) = (app.clone(), app.clone());
+            SettingItem::new(
+                tr("Tab 宽度"),
+                SettingField::dropdown(
+                    crate::settings::TAB_WIDTHS
+                        .iter()
+                        .map(|width| {
+                            (
+                                width.to_string().into(),
+                                tf!("{n} 个空格", n = width).into(),
+                            )
+                        })
+                        .collect(),
+                    move |cx| get.read(cx).settings.tab_width.to_string().into(),
+                    move |value: SharedString, cx| {
+                        let width = value.parse().unwrap_or(4);
+                        set.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| s.tab_width = width)
+                        });
+                    },
+                ),
+            )
+            .description(tr("显示改动时一个 Tab 占几个空格的宽度。"))
+        };
+        // 外部比较、合并工具：选一个认得的，或者自定义命令
+        let tool_choices = |kind: crate::ext_tools::Kind| {
+            let mut choices: Vec<(SharedString, SharedString)> =
+                vec![("".into(), tr("不使用").into())];
+            choices.extend(
+                crate::ext_tools::PRESETS
+                    .iter()
+                    .filter(|p| {
+                        // WinMerge 只有 Windows 版；比较、合并都能用的才列
+                        p.id != "winmerge" || cfg!(windows)
+                    })
+                    // 没装的写明，选了也用不了
+                    .map(|p| {
+                        let label: SharedString = match crate::ext_tools::installed(p.id) {
+                            true => p.name.into(),
+                            false => tf!("{name}（未找到）", name = p.name).into(),
+                        };
+                        (p.id.into(), label)
+                    }),
+            );
+            let _ = kind;
+            choices.push((crate::ext_tools::CUSTOM.into(), tr("自定义命令").into()));
+            choices
+        };
+        let diff_tool = {
+            let (get, set) = (app.clone(), app.clone());
+            SettingItem::new(
+                tr("外部比较工具"),
+                SettingField::dropdown(
+                    tool_choices(crate::ext_tools::Kind::Diff),
+                    move |cx| get.read(cx).settings.diff_tool.clone().into(),
+                    move |value: SharedString, cx| {
+                        set.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| s.diff_tool = value.to_string())
+                        });
+                    },
+                ),
+            )
+            .description(tr(
+                "在文件的右键菜单里「用外部工具比较」。服务器上的仓库会先把要比较的版本取到本机。",
+            ))
+        };
+        let diff_cmd = {
+            let (get, set) = (app.clone(), app.clone());
+            SettingItem::new(
+                tr("自定义比较命令"),
+                SettingField::input(
+                    move |cx| get.read(cx).settings.diff_tool_cmd.clone().into(),
+                    move |value: SharedString, cx| {
+                        set.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| s.diff_tool_cmd = value.trim().to_string())
+                        });
+                    },
+                ),
+            )
+            .description(tr("外部比较工具选「自定义命令」时使用：$LOCAL 左侧、$REMOTE 右侧，例如 code --wait --diff $LOCAL $REMOTE。"))
+        };
+        let merge_tool = {
+            let (get, set) = (app.clone(), app.clone());
+            SettingItem::new(
+                tr("外部合并工具"),
+                SettingField::dropdown(
+                    tool_choices(crate::ext_tools::Kind::Merge),
+                    move |cx| get.read(cx).settings.merge_tool.clone().into(),
+                    move |value: SharedString, cx| {
+                        set.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| s.merge_tool = value.to_string())
+                        });
+                    },
+                ),
+            )
+            .description(tr(
+                "解决冲突时「用外部工具合并」。工具关闭后若已无冲突标记，可标记为已解决。",
+            ))
+        };
+        let merge_cmd = {
+            let (get, set) = (app.clone(), app.clone());
+            SettingItem::new(
+                tr("自定义合并命令"),
+                SettingField::input(
+                    move |cx| get.read(cx).settings.merge_tool_cmd.clone().into(),
+                    move |value: SharedString, cx| {
+                        set.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| s.merge_tool_cmd = value.trim().to_string())
+                        });
+                    },
+                ),
+            )
+            .description(tr("外部合并工具选「自定义命令」时使用：$LOCAL 当前、$REMOTE 传入、$BASE 共同祖先、$MERGED 结果文件。"))
+        };
+        let confirm_discard = {
+            let (get, set) = (app.clone(), app.clone());
+            SettingItem::new(
+                tr("丢弃改动前确认"),
+                SettingField::switch(
+                    move |cx| get.read(cx).settings.confirm_discard,
+                    move |on, cx| {
+                        set.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| s.confirm_discard = on)
+                        })
+                    },
+                ),
+            )
+            .description(tr(
+                "丢弃文件、块或行之前先确认。关闭后直接丢弃；丢弃后均可在提示中撤销（Ctrl+Z）。",
+            ))
+        };
         let stash = {
             let (get, set) = (app.clone(), app.clone());
             SettingItem::new(
@@ -251,9 +429,25 @@ impl SettingsPage {
             })
             .group(
                 SettingGroup::new()
+                    .title(tr("代码"))
+                    .item(code_size)
+                    .item(tab_width),
+            )
+            .group(
+                SettingGroup::new()
                     .title("Git")
                     .item(auto_fetch)
+                    .item(changes_view)
+                    .item(confirm_discard)
                     .item(stash),
+            )
+            .group(
+                SettingGroup::new()
+                    .title(tr("外部工具"))
+                    .item(diff_tool)
+                    .item(diff_cmd)
+                    .item(merge_tool)
+                    .item(merge_cmd),
             )
     }
 
@@ -508,6 +702,17 @@ impl SettingsPage {
             .default_value(defaults.copy_on_select),
         )
         .description(tr("选中文字后自动复制。"));
+        let ctrl_v = SettingItem::new(
+            tr("Ctrl+V 交给程序"),
+            SettingField::switch(
+                get(&app, |t| t.ctrl_v_to_program),
+                set(&app, |t, on: bool| t.ctrl_v_to_program = on),
+            )
+            .default_value(defaults.ctrl_v_to_program),
+        )
+        .description(tr(
+            "打开后 Ctrl+V 发给终端中的程序，粘贴改用 Ctrl+Shift+V 或 Shift+Insert。",
+        ));
         let right_click = {
             let key = |choice: RightClick| -> SharedString {
                 match choice {
@@ -570,7 +775,7 @@ impl SettingsPage {
         let notify = {
             let (get, set) = (app.clone(), app.clone());
             SettingItem::new(
-                tr("终端停下时提醒"),
+                tr("终端待查看时提醒"),
                 SettingField::switch(
                     move |cx| get.read(cx).settings.notify_terminal_stopped,
                     move |on, cx| {
@@ -581,7 +786,100 @@ impl SettingsPage {
                 ),
             )
             .description(tr(
-                "未显示的终端超过 10 秒没有新输出时提醒；Kuai 不在前台时任务栏按钮闪烁。",
+                "未显示的 AI 终端静默超过下面所设的时长、且尚未查看时提醒；Kuai 不在前台时任务栏按钮闪烁。shell 和普通命令不提醒。",
+            ))
+        };
+        // AI 程序静默多久算待查看：各家分开设
+        let wait = |label: &'static str,
+                    field: fn(&mut crate::settings::TermAlerts) -> &mut u32,
+                    default: u32| {
+            let (get, set) = (app.clone(), app.clone());
+            SettingItem::new(
+                label,
+                SettingField::dropdown(
+                    crate::settings::TermAlerts::MINUTES
+                        .into_iter()
+                        .map(|minutes| {
+                            let text = match minutes == default {
+                                true => tf!("{n} 分钟（默认）", n = minutes.to_string()),
+                                false => tf!("{n} 分钟", n = minutes.to_string()),
+                            };
+                            (minutes.to_string().into(), text.into())
+                        })
+                        .collect(),
+                    move |cx| {
+                        let mut alerts = get.read(cx).settings.term_alerts.clone();
+                        (*field(&mut alerts)).to_string().into()
+                    },
+                    move |value: SharedString, cx| {
+                        let minutes: u32 = value.parse().unwrap_or(default);
+                        set.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| *field(&mut s.term_alerts) = minutes)
+                        });
+                    },
+                )
+                .default_value(SharedString::from(default.to_string())),
+            )
+        };
+        let defaults_alerts = crate::settings::TermAlerts::default();
+        let wait_claude = wait(
+            tr("Claude Code 静默多久算待查看"),
+            |a| &mut a.claude,
+            defaults_alerts.claude,
+        )
+        .description(tr(
+            "AI 程序思考、执行不输出内容的命令时也会静默；时长设短了容易误报。",
+        ));
+        let wait_codex = wait(
+            tr("Codex 静默多久算待查看"),
+            |a| &mut a.codex,
+            defaults_alerts.codex,
+        );
+        let wait_opencode = wait(
+            tr("OpenCode 静默多久算待查看"),
+            |a| &mut a.opencode,
+            defaults_alerts.opencode,
+        );
+        let wait_other = wait(
+            tr("其他 AI 程序静默多久算待查看"),
+            |a| &mut a.other,
+            defaults_alerts.other,
+        )
+        .description(tr("Gemini、Aider、Antigravity 等。"));
+        let away = {
+            let (get, set) = (app.clone(), app.clone());
+            SettingItem::new(
+                tr("标出离开期间有新输出的终端"),
+                SettingField::switch(
+                    move |cx| get.read(cx).settings.term_alerts.away,
+                    move |on, cx| {
+                        set.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| s.term_alerts.away = on)
+                        })
+                    },
+                )
+                .default_value(defaults_alerts.away),
+            )
+            .description(tr(
+                "重新打开 Kuai 或重新连接主机后，在会话页标出离开期间有新输出的 AI 终端，并合并为一条提醒。",
+            ))
+        };
+        let last_line = {
+            let (get, set) = (app.clone(), app.clone());
+            SettingItem::new(
+                tr("显示最后一行输出"),
+                SettingField::switch(
+                    move |cx| get.read(cx).settings.term_alerts.last_line,
+                    move |on, cx| {
+                        set.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| s.term_alerts.last_line = on)
+                        })
+                    },
+                )
+                .default_value(defaults_alerts.last_line),
+            )
+            .description(tr(
+                "会话页和仓库终端页的终端名称下面多一行屏幕上的最后一行文字；同屏能列出的终端会少一些。",
             ))
         };
         let notify_system = {
@@ -602,10 +900,10 @@ impl SettingsPage {
             )
             .description(match cfg!(windows) {
                 true => tr(
-                    "Kuai 不在前台时，终端停下同时发送 Windows 通知；点击通知前往该终端。需开启上一项。",
+                    "Kuai 不在前台时，终端待查看同时发送 Windows 通知；点击通知前往该终端。需开启上一项。",
                 ),
                 false => tr(
-                    "Kuai 不在前台时，终端停下同时发送系统通知；点击通知前往该终端。需开启上一项。",
+                    "Kuai 不在前台时，终端待查看同时发送系统通知；点击通知前往该终端。需开启上一项。",
                 ),
             })
         };
@@ -633,15 +931,22 @@ impl SettingsPage {
                     .title(tr("滚动和复制"))
                     .item(scrollback)
                     .item(copy_on_select)
-                    .item(right_click),
+                    .item(right_click)
+                    .item(ctrl_v),
             )
             .group(SettingGroup::new().title(tr("本机仓库")).item(shell))
             .group(
                 SettingGroup::new()
                     .title(tr("提醒"))
                     .item(notify)
-                    .item(notify_system),
+                    .item(notify_system)
+                    .item(wait_claude)
+                    .item(wait_codex)
+                    .item(wait_opencode)
+                    .item(wait_other)
+                    .item(away),
             )
+            .group(SettingGroup::new().title(tr("终端列表")).item(last_line))
     }
 
     fn appearance(&self) -> SettingPage {
@@ -770,6 +1075,40 @@ impl SettingsPage {
                 .trim_start_matches("https://")
                 .to_string(),
         );
+        // 以前各版改了什么：CHANGELOG 在仓库里
+        let changelog = SettingItem::new(
+            tr("更新记录"),
+            SettingField::render(|_, _, _| {
+                Button::new("open-changelog")
+                    .small()
+                    .icon(Icon::new(IconName::ExternalLink))
+                    .label(tr("打开"))
+                    .on_click(|_, window, cx| {
+                        let url = format!("{}/blob/main/CHANGELOG.md", update::repo_url());
+                        let result = crate::shell::open_url(&url);
+                        crate::shell::report(result, window, cx);
+                    })
+            }),
+        )
+        .description(tr("各版本的新功能和修复。"));
+        // 报告问题：开 GitHub 的新建 Issue 页；附诊断信息的话先在下面「复制诊断信息…」里看过再贴
+        let issues = SettingItem::new(
+            tr("报告问题"),
+            SettingField::render(|_, _, _| {
+                Button::new("open-issues")
+                    .small()
+                    .icon(Icon::new(IconName::ExternalLink))
+                    .label(tr("打开"))
+                    .on_click(|_, window, cx| {
+                        let url = format!("{}/issues/new", update::repo_url());
+                        let result = crate::shell::open_url(&url);
+                        crate::shell::report(result, window, cx);
+                    })
+            }),
+        )
+        .description(tr(
+            "在 GitHub 上新建 Issue。可先用下方的「复制诊断信息…」复制版本和连接情况，一并贴上。安全问题请经仓库 Security 页的「Report a vulnerability」私下报告，不要公开提 Issue。",
+        ));
         // GPL-3.0 要求的「适当的法律声明」：版权、不提供担保、可以按 GPL 再分发、在哪看全文。
         // 原版界面上显示了，改版也必须保留（第 5 条 d 款）
         let license = SettingItem::new(
@@ -839,6 +1178,8 @@ impl SettingsPage {
                     .title("Kuai")
                     .item(version)
                     .item(check_updates)
+                    .item(changelog)
+                    .item(issues)
                     .item(source)
                     .item(license)
                     // WinFsp 只有 Windows 上用；Linux 上映射用系统的 fuse3，不随 Kuai 分发
@@ -1074,7 +1415,8 @@ impl Render for SettingsPage {
             .child(
                 Settings::new("settings")
                     .with_group_variant(GroupBoxVariant::Outline)
-                    .sidebar_width(px(200.))
+                    // 放得下英文最长的分组名（Scrolling and copying）
+                    .sidebar_width(px(224.))
                     .default_selected_index(SelectIndex {
                         page_ix: self.start_page,
                         group_ix: None,

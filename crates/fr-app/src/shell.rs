@@ -76,6 +76,20 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
     find_in_path_ext(name, EXTS)
 }
 
+/// 找一个程序：给的是存在的路径就用它，否则在 PATH 里找（外部比较、合并工具用）。
+pub(crate) fn find_program(name: &str) -> Option<PathBuf> {
+    let path = Path::new(name);
+    if path.is_absolute() || name.contains(['/', '\\']) {
+        return is_program(path).then(|| path.to_path_buf());
+    }
+    find_in_path(name)
+}
+
+/// VS Code 的命令行工具在哪（外部比较、合并工具用）。
+pub(crate) fn code_program() -> Option<PathBuf> {
+    code_cmd().ok()
+}
+
 /// 同 [`find_in_path`]，只认这几种扩展名。
 fn find_in_path_ext(name: &str, exts: &[&str]) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;

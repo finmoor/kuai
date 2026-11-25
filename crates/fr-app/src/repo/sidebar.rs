@@ -528,27 +528,24 @@ impl RepoView {
                             .text_color(muted),
                     )
                 }),
+            // 没加入工作区：描边的小按钮「+ 添加到工作区」，看得出能点
             None => h_flex()
-                .gap(px(4.))
-                .text_color(muted)
-                .child(
-                    div()
-                        .flex_none()
-                        .size(px(7.))
-                        .rounded(px(2.))
-                        .border(px(1.5))
-                        .border_color(muted),
-                )
-                .child(tr("未加入工作区")),
+                .gap(px(3.))
+                .text_color(fg.opacity(0.85))
+                .child(gpui_kit::component::Icon::new(IconName::Plus).size(px(10.)))
+                .child(tr("添加到工作区")),
         };
+        let joined = !homes.is_empty();
         let button = Button::new("side-home")
-            .ghost()
             .xsmall()
             .compact()
             .flex_none()
             .h(px(18.))
-            .ml(px(-4.))
-            .px(px(4.))
+            .px(px(5.))
+            .map(|button| match joined {
+                true => button.ghost().ml(px(-4.)).px(px(4.)),
+                false => button.outline(),
+            })
             .child(content.text_size(px(11.)))
             .tooltip(tip);
         crate::ws_links::button(
@@ -1269,11 +1266,39 @@ impl RepoView {
                         .child(ui::icon(IconName::Archive).flex_none().text_color(muted))
                         .child(name(row.label)),
                 };
+                // 拖分支：别的本地分支、远程分支可以拖起来，放到当前分支上（这一行、工具栏上
+                // 的分支名）选合并还是变基
+                let dragged = match item {
+                    SideItem::Branch(i) => {
+                        self.refs.branches.get(i).filter(|b| !b.current).map(|b| {
+                            DraggedRef::new(b.name.clone(), format!("refs/heads/{}", b.name))
+                        })
+                    }
+                    SideItem::Remote(i) => self.refs.remotes.get(i).map(|b| {
+                        DraggedRef::new(b.name.clone(), format!("refs/remotes/{}", b.name))
+                    }),
+                    _ => None,
+                };
+                let drop_here = matches!(item, SideItem::Branch(i)
+                    if self.refs.branches.get(i).is_some_and(|b| b.current));
                 let outer = h_flex()
                     .id(ix)
                     .h(px(ROW_HEIGHT))
                     .w_full()
                     .cursor_pointer()
+                    .when_some(dragged, |row, dragged| {
+                        row.on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+                    })
+                    .when(drop_here, |row| {
+                        row.drag_over::<DraggedRef>(move |style, _, _, _| {
+                            style.bg(accent.opacity(0.18))
+                        })
+                        .on_drop(cx.listener(
+                            |this, dragged: &DraggedRef, window, cx| {
+                                this.drop_ref(dragged.clone(), window, cx)
+                            },
+                        ))
+                    })
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         this.sidebar.focus.focus(window, cx);
                         this.click_sidebar(item, event.click_count(), window, cx)
@@ -1304,6 +1329,45 @@ impl RepoView {
                 })
             })
             .collect()
+    }
+
+    /// 一个分支拖到了当前分支上（侧栏里的那一行、工具栏上的分支名）：问合并还是变基，再照右键菜单里
+    /// 那两项做（各自还会再确认）。
+    pub(super) fn drop_ref(
+        &mut self,
+        dragged: DraggedRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.op.is_some() || self.status.as_ref().is_none_or(|s| s.branch.is_none()) {
+            return;
+        }
+        let cur = self.current_label();
+        let name = dragged.name.clone();
+        let choose = super::dialogs::Choose {
+            title: tf!("把 {name} 拖到了 {cur}", name = name.as_str(), cur = cur.as_str()).into(),
+            description: tr("选择怎么把它的提交放进当前分支：").into(),
+            options: vec![
+                (
+                    tf!("合并 {name} 到 {cur}", name = name.as_str(), cur = cur.as_str()).into(),
+                    tr("保留两边的历史；能快进时直接快进，否则生成一个合并提交。").into(),
+                ),
+                (
+                    tf!("将 {cur} 变基到 {name}", cur = cur.as_str(), name = name.as_str()).into(),
+                    tr("把当前分支上新的提交挪到它后面重新生成，历史成一条线；已推送的需强制推送。").into(),
+                ),
+            ],
+            selected: 0,
+            checks: Vec::new(),
+            ok: tr("继续"),
+        };
+        self.choose(choose, window, cx, move |this, picked, _, window, cx| {
+            let (name, full) = (dragged.name.clone(), dragged.full.clone());
+            match picked {
+                0 => this.merge(name, full, window, cx),
+                _ => this.rebase_onto(full, name, window, cx),
+            }
+        });
     }
 
     /// 引用刷新后找回原来选中的那一项：分支、远程分支、标签按名字，贮藏按提交。
@@ -1724,5 +1788,38 @@ mod tests {
             ["v feature/ (2)", "  > ui/ (1)", "  login #0", "main #2"]
         );
         assert!(draw(&[], &[]).is_empty());
+    }
+}
+
+/// 侧栏里拖着的分支（拖到当前分支上合并、变基），也是拖动时跟着鼠标的那一小块。
+#[derive(Clone)]
+pub(super) struct DraggedRef {
+    /// 给人看的名字（`feature`、`origin/feature`）
+    pub(super) name: String,
+    /// 完整的引用名：短名可能和同名的标签撞上
+    pub(super) full: String,
+}
+
+impl DraggedRef {
+    fn new(name: String, full: String) -> Self {
+        Self { name, full }
+    }
+}
+
+impl Render for DraggedRef {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        h_flex()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .rounded(px(6.))
+            .bg(theme.popover)
+            .border_1()
+            .border_color(theme.border)
+            .shadow_md()
+            .text_sm()
+            .child(ui::icon(IconName::GitBranch).text_color(theme.primary))
+            .child(self.name.clone())
     }
 }

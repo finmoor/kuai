@@ -106,7 +106,24 @@ impl Binaries {
         )
     }
 
-    /// 给某种系统、某种 CPU 架构用的那一份。
+    /// 带没带给这种系统、这种 CPU 架构用的那一份（测试连接时先说清楚，不等到连接时才报）。
+    pub fn has(&self, os: Os, arch: &str) -> bool {
+        self.found
+            .iter()
+            .any(|found| found.target.os == os && found.target.arch.eq_ignore_ascii_case(arch))
+    }
+
+    /// 这一版带了这种系统的哪几种 CPU 架构（`x86_64`、`AMD64`……）。
+    pub fn arches(&self, os: Os) -> Vec<&'static str> {
+        self.found
+            .iter()
+            .filter(|found| found.target.os == os)
+            .map(|found| found.target.arch)
+            .collect()
+    }
+
+    /// 给某种系统、某种 CPU 架构用的那一份。没有的话说清是这一版不支持这种架构、支持哪些：
+    /// 原来只说「暂无对应的 kuaid」，看不出是 ARM 的主机用不了。
     fn found_for(&self, os: Os, arch: &str) -> Result<&Found> {
         let found = self
             .found
@@ -117,9 +134,15 @@ impl Binaries {
                 Os::Linux => "Linux",
                 Os::Windows => "Windows",
             };
+            let list = self.arches(os).join(tr("、"));
             bail!(
                 "{}",
-                tf!("主机为 {system}（{arch}），暂无对应的 kuaid", system, arch)
+                tf!(
+                    "该主机为 {system}（{arch}），当前版本不支持此 CPU 架构。支持的架构：{list}。",
+                    system,
+                    arch,
+                    list
+                )
             );
         };
         Ok(found)

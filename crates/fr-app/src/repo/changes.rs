@@ -12,15 +12,16 @@
 
 use fr_core::i18n::tr;
 use fr_core::tf;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 
 use fr_core::patch::{self, LineKind};
 use fr_core::status::{Entry, Kind, Status};
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants as _, DropdownButton};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _, DropdownButton};
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffLineRange, DiffMode, DiffState};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
@@ -42,10 +43,15 @@ use super::stage_diff::{Row, StageDiff};
 use super::{Mode, RepoView};
 use crate::ui;
 
+#[path = "changes_single.rs"]
+mod single;
+
 const FILE_ROW_HEIGHT: f32 = 24.;
-/// diff 里每一行（包括块标题）的高度。uniform_list 按量出来的一行给所有行排版，
-/// 行高必须一样；块标题里的 xsmall 按钮高 20px，正好放得下
-const DIFF_ROW_HEIGHT: f32 = 22.;
+/// diff 里每一行（包括块标题）的高度：跟着代码字号（见 [`crate::zoom`]）。uniform_list 按量出来的
+/// 一行给所有行排版，行高必须一样；块标题里的 xsmall 按钮高 20px，至少 22 才放得下
+fn diff_row_height(size: f32) -> f32 {
+    (size * 1.7).round().max(22.)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Area {
@@ -101,6 +107,24 @@ pub(super) struct Changes {
     /// 勾选「修改上次提交」时，上次提交在哪些远程分支上（已推送）；没推送、还没读到是空的
     amend_pushed: Vec<String>,
     amend_pushed_task: Option<Task<()>>,
+    /// 提交时用的作者（`git var GIT_AUTHOR_IDENT` 读到的名称和邮箱）。外层 None 是还没读，
+    /// 里层 None 是没设置（提交会失败）
+    author: Option<Option<(String, String)>>,
+    author_task: Option<Task<()>>,
+    /// 窗口窄、提交框收成一行时点了展开
+    pub(super) commit_expanded: bool,
+    /// 提交说明框现在用的提示文字（按框的宽度换长短，见 `sync_commit_placeholder`）
+    placeholder: SharedString,
+    /// 单列表（见 `changes_single.rs`）：全部改动按路径排好
+    single: Vec<Entry>,
+    single_scroll: UniformListScrollHandle,
+    /// 单列表 Shift 连选的起点
+    single_anchor_path: Option<String>,
+    /// 选中的文件在单列表里排第几：它没了（丢弃、提交了）选同一位置的下一个
+    single_pos: usize,
+    /// 部分暂存的文件：路径 →（已暂存的行数，未暂存的行数），单列表写「2/5」
+    numstat: HashMap<String, (u32, u32)>,
+    numstat_task: Option<Task<()>>,
 }
 
 impl Changes {
@@ -159,6 +183,8 @@ impl Changes {
                         let scroll = this.changes.scroll(area);
                         scroll.scroll_to_item(0, ScrollStrategy::Top);
                     }
+                    let single = &this.changes.single_scroll;
+                    single.scroll_to_item(0, ScrollStrategy::Top);
                     cx.notify();
                 }
             });
@@ -191,6 +217,16 @@ impl Changes {
             amend_task: None,
             amend_pushed: Vec::new(),
             amend_pushed_task: None,
+            author: None,
+            author_task: None,
+            commit_expanded: false,
+            placeholder: SharedString::default(),
+            single: Vec::new(),
+            single_scroll: UniformListScrollHandle::new(),
+            single_anchor_path: None,
+            single_pos: 0,
+            numstat: HashMap::new(),
+            numstat_task: None,
         };
         (changes, vec![subscription, split_events, filter_events])
     }
@@ -435,13 +471,32 @@ impl RepoView {
     pub(super) fn apply_status(&mut self, status: Status, cx: &mut Context<Self>) {
         self.changes.unstaged = status.unstaged().cloned().collect();
         self.changes.staged = status.staged().cloned().collect();
+        // 留着的合并编辑：文件已经不再有冲突（别处解决了、中止了合并）就用不上了
+        self.prune_merge_drafts(&status);
         self.status = Some(status);
+        self.sync_single(cx);
         self.sync_file_selection(cx);
     }
 
     /// 状态变了以后：选中的文件还在就重读它的改动；不在了就选同一位置的下一个文件。
     fn sync_file_selection(&mut self, cx: &mut Context<Self>) {
-        if let Some((area, _)) = &self.changes.selected {
+        // 单列表：多选里去掉不在了的；选中的文件整个暂存了、取消暂存了就跟着换到它现在那一份
+        if self.single_list_on(cx) {
+            let single = &self.changes.single;
+            let still: BTreeSet<String> = single
+                .iter()
+                .filter(|e| self.changes.multi.contains(&e.path))
+                .map(|e| e.path.clone())
+                .collect();
+            self.changes.multi = if still.len() > 1 {
+                still
+            } else {
+                BTreeSet::new()
+            };
+            if self.keep_single_selection(cx) {
+                return;
+            }
+        } else if let Some((area, _)) = &self.changes.selected {
             let area = *area;
             let still: BTreeSet<String> = self
                 .changes
@@ -512,6 +567,12 @@ impl RepoView {
 
     /// 切到本地修改时还没选文件：选显示出来的第一个。
     pub(super) fn select_first_file(&mut self, cx: &mut Context<Self>) {
+        if self.single_list_on(cx)
+            && let Some(ix) = self.single_order(cx).first().copied()
+        {
+            self.select_single(ix, cx);
+            return;
+        }
         let first = [Area::Unstaged, Area::Staged].into_iter().find_map(|area| {
             let ix = self.file_order(area, cx).first().copied()?;
             Some((area, self.changes.list(area)[ix].path.clone(), ix))
@@ -626,7 +687,16 @@ impl RepoView {
             return;
         }
         let (key, m) = (event.keystroke.key.as_str(), event.keystroke.modifiers);
+        let single = self.single_list_on(cx);
         match key {
+            "up" if single => self.move_single(false, m.shift, cx),
+            "down" if single => self.move_single(true, m.shift, cx),
+            "space" | "enter" if single && !(m.control || m.platform) => {
+                self.toggle_single_picked(window, cx)
+            }
+            "delete" if single => self.discard_single_picked(window, cx),
+            "z" if (m.control || m.platform) && !m.shift => self.undo_discard(window, cx),
+            "a" if single && (m.control || m.platform) => self.select_all_single(cx),
             "up" => self.move_file_selection(false, m.shift, cx),
             "down" => self.move_file_selection(true, m.shift, cx),
             "enter" if m.control || m.platform => self.commit(window, cx),
@@ -664,13 +734,17 @@ impl RepoView {
             return;
         }
         let (key, m) = (event.keystroke.key.as_str(), event.keystroke.modifiers);
-        // 并排视图自己管上下键（滚动、连选），这里不抢
-        let split = self.split_mode(cx);
         match key {
-            "up" | "down" if split => return,
-            "up" => self.step_diff_row(false, m.shift, cx),
-            "down" => self.step_diff_row(true, m.shift, cx),
+            // 并排视图也能用上下键选行：焦点在改动的正文里时那是组件库自己的滚动、连选，
+            // 到不了这里
+            "up" => {
+                self.step_diff_row(false, m.shift, cx);
+            }
+            "down" => {
+                self.step_diff_row(true, m.shift, cx);
+            }
             "enter" if m.control || m.platform => self.commit(window, cx),
+            "z" if (m.control || m.platform) && !m.shift => self.undo_discard(window, cx),
             "space" | "enter" => self.apply_selection(None, window, cx),
             "delete" => {
                 if self
@@ -688,14 +762,43 @@ impl RepoView {
         cx.stop_propagation();
     }
 
-    fn step_diff_row(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) {
-        let Some(diff) = &mut self.changes.diff else {
-            return;
-        };
-        if let Some(row) = diff.step(down, extend) {
-            diff.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
-            cx.notify();
+    /// 焦点在并排视图的正文里按上下键（快捷键见 `main.rs` 的 `DiffLineUp` 等）：有能选的改动行就选行，
+    /// 没有（已暂存那一份以外不能按行操作的、走到头了）交回组件库滚动。
+    fn split_step(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) {
+        let editable = self
+            .changes
+            .diff
+            .as_ref()
+            .is_some_and(|diff| diff.editable());
+        if !(self.split_mode(cx) && editable && self.step_diff_row(down, extend, cx)) {
+            cx.propagate();
         }
+    }
+
+    /// 上下键在改动行之间走（Shift 连选）。并排看时把选中的行画到并排视图上，并滚到那一行。
+    /// 走动了返回 true。
+    fn step_diff_row(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) -> bool {
+        let split = self.split_mode(cx);
+        let Some(diff) = &mut self.changes.diff else {
+            return false;
+        };
+        let Some(row) = diff.step(down, extend) else {
+            return false;
+        };
+        diff.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
+        if split && diff.editable() {
+            let range = diff.split_range();
+            let position = diff.split_position(row);
+            self.changes.split_selection = range.clone();
+            self.changes.split.update(cx, |state, cx| {
+                state.set_selected_lines(range, cx);
+                if let Some(position) = position {
+                    state.scroll_to_line(position, cx);
+                }
+            });
+        }
+        cx.notify();
+        true
     }
 
     /// 上下键换文件：到一栏的头尾就跨到另一栏。`extend`（按着 Shift）时在这一栏里连选。
@@ -863,42 +966,53 @@ impl RepoView {
             .cloned()
             .partition(|e| e.unstaged == Some(Kind::Untracked));
         let description = tf!(
-            "{entries} 个文件未暂存的改动将被丢弃，其中 {untracked} 个未跟踪的文件将被删除。此操作无法撤销。\n\n{entries2}",
+            "{entries} 个文件未暂存的改动将被丢弃，其中 {untracked} 个未跟踪的文件将被删除。丢弃后可在提示中撤销。\n\n{entries2}",
             entries = entries.len(),
             untracked = untracked.len(),
             entries2 = name_list(&entries)
         );
-        self.confirm(
+        let tracked: Vec<String> = tracked.into_iter().map(|e| e.path).collect();
+        let untracked: Vec<String> = untracked.into_iter().map(|e| e.path).collect();
+        // 确认框开着时这些文件又被写了（agent 还在改），不能连没看过的一起丢掉：确认后先核对内容
+        let guard = self.guard_content(tracked.clone(), untracked.clone(), cx);
+        self.confirm_discard(
             tf!("丢弃 {entries} 个文件的改动？", entries = entries.len()),
             description,
-            tr("丢弃"),
             window,
             cx,
             move |this, window, cx| {
-                let mut steps = Vec::new();
-                if !tracked.is_empty() {
-                    steps.push(Step::input(
-                        vec![
-                            "checkout".into(),
-                            "-q".into(),
-                            "--pathspec-from-file=-".into(),
-                            "--pathspec-file-nul".into(),
-                        ],
-                        nul_paths(tracked.iter().map(|e| e.path.as_str())),
-                    ));
-                }
-                if !untracked.is_empty() {
-                    // -d：未跟踪的目录在状态里是一项，要连目录一起删
-                    let mut clean: Vec<String> =
-                        ["clean", "-f", "-d", "-q", "--"].map(String::from).to_vec();
-                    clean.extend(untracked.iter().map(|e| e.path.clone()));
-                    steps.push(Step::local(clean));
-                }
-                let count = tracked.len() + untracked.len();
-                this.run_seq(tr("丢弃"), steps, window, cx, move |_, _, window, cx| {
+                let (tracked, untracked) = (tracked.clone(), untracked.clone());
+                let run = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                    let mut steps = Vec::new();
+                    if !tracked.is_empty() {
+                        steps.push(Step::input(
+                            vec![
+                                "checkout".into(),
+                                "-q".into(),
+                                "--pathspec-from-file=-".into(),
+                                "--pathspec-file-nul".into(),
+                            ],
+                            nul_paths(tracked.iter().map(String::as_str)),
+                        ));
+                    }
+                    if !untracked.is_empty() {
+                        // -d：未跟踪的目录在状态里是一项，要连目录一起删
+                        let mut clean: Vec<String> =
+                            ["clean", "-f", "-d", "-q", "--"].map(String::from).to_vec();
+                        clean.extend(untracked.iter().cloned());
+                        steps.push(Step::local(clean));
+                    }
+                    let count = tracked.len() + untracked.len();
+                    let files: Vec<String> = tracked.iter().chain(&untracked).cloned().collect();
                     let text = tf!("已丢弃 {count} 个文件的改动", count);
-                    window.push_notification(Notification::success(text), cx);
-                });
+                    this.discard_with_undo(files, steps, text, window, cx);
+                };
+                match guard.clone() {
+                    Some(guard) => {
+                        this.verify_content_then(guard, discard_changed(), window, cx, run)
+                    }
+                    None => run(this, window, cx),
+                }
             },
         );
     }
@@ -1039,7 +1153,8 @@ impl RepoView {
     fn sync_split_diff(&mut self, cx: &mut Context<Self>) {
         let files = match &self.changes.diff {
             Some(diff) if diff.editable() && self.split_mode(cx) => {
-                DiffFile::parse(&crate::text::decode(diff.source())).unwrap_or_default()
+                let text = crate::text::decode(diff.source());
+                DiffFile::parse(&crate::text::expand_patch_tabs(&text)).unwrap_or_default()
             }
             _ => Vec::new(),
         };
@@ -1096,8 +1211,93 @@ impl RepoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 有冲突的文件暂存就是「标记为已解决」：先看文件里还有没有冲突标记，有的话先问（点错了按钮，
+        // 带着标记的文件就悄悄进了暂存区，提交以后标记留在仓库里）
+        if entry.unstaged == Some(Kind::Conflicted)
+            && let Some(channel) = self.channel.clone()
+        {
+            let path = entry.path.clone();
+            let request = channel.git(&self.entry.path, fr_core::workfile::read_args(&path));
+            cx.spawn_in(window, async move |this, cx| {
+                let marked = request
+                    .await
+                    .ok()
+                    .filter(|out| out.success())
+                    .and_then(|out| {
+                        fr_core::workfile::split_read(&out.stdout).map(|(_, bytes)| {
+                            super::merge::has_marker(&String::from_utf8_lossy(bytes))
+                        })
+                    })
+                    // 读不到（另一边删掉了这个文件、二进制）：照原来的直接标记
+                    .unwrap_or(false);
+                this.update_in(cx, |this, window, cx| match marked {
+                    false => this.mark_resolved(path, window, cx),
+                    true => this.confirm_markers(path, window, cx),
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
         let args = vec!["add".into(), "--".into(), entry.path.clone()];
         self.run_op(tr("暂存"), args, None, window, cx, |_, _, _, _| {});
+    }
+
+    fn mark_resolved(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        let args = vec!["add".into(), "--".into(), path];
+        self.run_op(tr("标记为已解决"), args, None, window, cx, |_, _, _, _| {});
+    }
+
+    /// 要标记为已解决的文件里还有冲突标记：说清楚，主按钮是「解决冲突…」，真要标记的点红色的那个。
+    fn confirm_markers(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity().downgrade();
+        crate::ui::cancel_pending_tip(window, cx);
+        let text = tf!(
+            "{path} 中仍有冲突标记（<<<<<<<、=======、>>>>>>>）。标记为已解决后，这些标记会随提交进入仓库。",
+            path = path.as_str()
+        );
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (resolve_view, mark_view) = (view.clone(), view.clone());
+            let (resolve_path, mark_path) = (path.clone(), path.clone());
+            alert
+                .title(tr("文件中仍有冲突标记"))
+                .description(text.clone())
+                .on_ok(|_, _, _| false)
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("cancel")
+                                .label(tr("取消"))
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("mark-anyway")
+                                .label(tr("仍然标记为已解决"))
+                                .with_variant(ButtonVariant::Danger)
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    mark_view
+                                        .update(cx, |this, cx| {
+                                            this.mark_resolved(mark_path.clone(), window, cx)
+                                        })
+                                        .ok();
+                                }),
+                        )
+                        .child(
+                            Button::new("open-merge")
+                                .label(tr("解决冲突…"))
+                                .primary()
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    resolve_view
+                                        .update(cx, |this, cx| {
+                                            this.open_merge_editor(resolve_path.clone(), window, cx)
+                                        })
+                                        .ok();
+                                }),
+                        ),
+                )
+        });
     }
 
     pub(super) fn unstage_file(
@@ -1130,32 +1330,40 @@ impl RepoView {
         args.push(entry.path.clone());
         let description = if untracked {
             tf!(
-                "未跟踪的文件 {path} 将被删除，此操作无法撤销。",
+                "未跟踪的文件 {path} 将被删除，删除后可在提示中撤销。",
                 path = entry.path
             )
         } else {
             tf!(
-                "{path} 在工作区中未暂存的改动将被丢弃，此操作无法撤销。",
+                "{path} 在工作区中未暂存的改动将被丢弃，丢弃后可在提示中撤销。",
                 path = entry.path
             )
         };
-        self.confirm(
+        // 同 `discard_files`：确认后先核对这个文件在确认框打开以后有没有又被改过
+        let paths = vec![entry.path.clone()];
+        let guard = match untracked {
+            true => self.guard_content(Vec::new(), paths, cx),
+            false => self.guard_content(paths, Vec::new(), cx),
+        };
+        let file = entry.path.clone();
+        self.confirm_discard(
             tr("丢弃改动？"),
             description,
-            tr("丢弃"),
             window,
             cx,
             move |this, window, cx| {
-                this.run_op(
-                    tr("丢弃"),
-                    args.clone(),
-                    None,
-                    window,
-                    cx,
-                    |_, _, window, cx| {
-                        window.push_notification(Notification::success(tr("已丢弃")), cx);
-                    },
-                );
+                let (args, file) = (args.clone(), file.clone());
+                let run = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                    let text = tf!("已丢弃 {file} 的改动", file = file.as_str());
+                    let steps = vec![Step::local(args)];
+                    this.discard_with_undo(vec![file], steps, text, window, cx);
+                };
+                match guard.clone() {
+                    Some(guard) => {
+                        this.verify_content_then(guard, discard_changed(), window, cx, run)
+                    }
+                    None => run(this, window, cx),
+                }
             },
         );
     }
@@ -1199,6 +1407,35 @@ impl RepoView {
         self.run_op(tr("取消暂存"), args, None, window, cx, |_, _, _, _| {});
     }
 
+    /// 过滤框里有字时，标题栏那个按钮只作用于列出来的文件：看不见的不该被一起暂存、取消暂存。
+    fn apply_shown(&mut self, area: Area, window: &mut Window, cx: &mut Context<Self>) {
+        let list = self.changes.list(area);
+        let mut entries: Vec<Entry> = self
+            .shown_entries(area, cx)
+            .into_iter()
+            .map(|ix| list[ix].clone())
+            .collect();
+        match area {
+            Area::Unstaged => {
+                // 同 `stage_all`：冲突的先挑出去，只剩一个时 stage_files 会直接 git add 把它标成已解决
+                let before = entries.len();
+                entries.retain(|e| e.unstaged != Some(Kind::Conflicted));
+                let skipped = before - entries.len();
+                if skipped > 0 {
+                    let text = tf!(
+                        "{skipped} 个文件存在冲突，未暂存。解决后请右键选择「标记为已解决」。",
+                        skipped
+                    );
+                    window.push_notification(Notification::warning(text), cx);
+                }
+                if !entries.is_empty() {
+                    self.stage_files(entries, window, cx);
+                }
+            }
+            Area::Staged => self.unstage_files(entries, window, cx),
+        }
+    }
+
     /// 暂存（未暂存一栏）或取消暂存（已暂存一栏）选中的行；给了 `hunk` 就是整块。
     fn apply_selection(
         &mut self,
@@ -1233,6 +1470,15 @@ impl RepoView {
         );
     }
 
+    /// 改动行上的小按钮：只选中这一行，暂存（已暂存一栏是取消暂存）。
+    fn apply_one_line(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(diff) = &mut self.changes.diff {
+            diff.press(row, false, false, 1);
+            diff.dragging = false;
+        }
+        self.apply_selection(None, window, cx);
+    }
+
     /// 丢弃工作区里选中的行；给了 `hunk` 就是整块。先确认。
     fn discard_selection(
         &mut self,
@@ -1257,17 +1503,16 @@ impl RepoView {
             None => diff.selected_count(),
         };
         let description = tf!(
-            "{path} 中的 {count} 行改动将从工作区丢弃，此操作无法撤销。",
+            "{path} 中的 {count} 行改动将从工作区丢弃，丢弃后可在提示中撤销。",
             path = diff.entry.path,
             count
         );
         // 补丁是按现在这份改动生成的：确认框开着的这一会儿改动变了（刷新、在外面改了文件），不能
         // 拿它去丢弃，行号对不上可能丢到别的地方
         let (area, path, source) = (diff.area, diff.entry.path.clone(), diff.source.clone());
-        self.confirm(
+        self.confirm_discard(
             tr("丢弃改动？"),
             description,
-            tr("丢弃"),
             window,
             cx,
             move |this, window, cx| {
@@ -1278,20 +1523,17 @@ impl RepoView {
                         .as_ref()
                         .is_some_and(|diff| diff.same_source(area, &path, &source));
                 if !same {
-                    let text = tr("改动已经变了，请重新选择要丢弃的行。");
+                    let text = tr("改动已变化，请重新选择要丢弃的行。");
                     window.push_notification(Notification::warning(text), cx);
                     return;
                 }
-                this.run_op(
-                    tr("丢弃"),
-                    patch::discard_args(),
-                    Some(bytes.clone()),
-                    window,
-                    cx,
-                    |_, _, window, cx| {
-                        window.push_notification(Notification::success(tr("已丢弃")), cx);
-                    },
+                let text = tf!(
+                    "已丢弃 {path} 中的 {count} 行改动",
+                    path = path.as_str(),
+                    count
                 );
+                let steps = vec![Step::input(patch::discard_args(), bytes.clone())];
+                this.discard_with_undo(vec![path.clone()], steps, text, window, cx);
             },
         );
     }
@@ -1350,7 +1592,7 @@ impl RepoView {
                 "-r",
                 "--contains",
                 "HEAD",
-                "--format=%(refname:short)",
+                "--format=%(refname:lstrip=2)",
             ]
             .map(String::from)
             .to_vec();
@@ -1359,13 +1601,7 @@ impl RepoView {
                 let Ok(out) = request.await.and_then(|out| out.ok()) else {
                     return;
                 };
-                let remotes: Vec<String> = String::from_utf8_lossy(&out)
-                    .lines()
-                    .map(str::trim)
-                    // `origin/HEAD` 只是指向默认分支的别名
-                    .filter(|name| !name.is_empty() && !name.ends_with("/HEAD"))
-                    .map(str::to_string)
-                    .collect();
+                let remotes = remote_names(&out);
                 this.update(cx, |this, cx| {
                     if this.changes.amend {
                         this.changes.amend_pushed = remotes;
@@ -1429,6 +1665,90 @@ impl RepoView {
             window.push_notification(Notification::warning(tr("没有已暂存的改动")), cx);
             return;
         }
+        // 提交的是主机上暂存区里那一份：在别处又暂存、取消暂存了（agent 在终端里 git add），
+        // 和这里列着、审过的不一样，先不提交。提交说明照旧留着
+        let Some(shown) = self.status.as_ref().map(staged_snapshot) else {
+            return;
+        };
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        let repo = self.entry.path.clone();
+        let mut check = fr_core::status::args();
+        check.retain(|arg| arg != "--untracked-files=all");
+        check.push("--untracked-files=no".into());
+        // 修改上次提交：它已经推送过的，先确认（按钮和 Ctrl+Enter 都走这里）。提交框下面的提醒
+        // 要等异步读到才出来，点得快的时候看不到
+        let pushed = amend.then(|| {
+            let list = [
+                "branch",
+                "-r",
+                "--contains",
+                "HEAD",
+                "--format=%(refname:lstrip=2)",
+            ];
+            channel.git(&repo, list.map(String::from).to_vec())
+        });
+        let status = channel.git(&repo, check);
+        cx.spawn_in(window, async move |this, cx| {
+            let now = status
+                .await
+                .ok()
+                .filter(|out| out.success())
+                .map(|out| staged_snapshot(&fr_core::status::parse(&out.stdout)));
+            let remotes = match pushed {
+                Some(request) => match request.await.and_then(|out| out.ok()) {
+                    Ok(out) => remote_names(&out),
+                    Err(_) => Vec::new(),
+                },
+                None => Vec::new(),
+            };
+            this.update_in(cx, |this, window, cx| match now {
+                // 读不到（连接断了）也照常往下走，失败时 git 会报
+                Some(now) if now != shown => {
+                    let text = tr("已暂存的改动在提交前有了变化，未提交。请查看最新的改动后重试。");
+                    window.push_notification(Notification::warning(text), cx);
+                    this.refresh(cx);
+                }
+                _ if !remotes.is_empty() => {
+                    let head = this
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.head.clone())
+                        .unwrap_or_default();
+                    let description = tf!(
+                        "上次提交 {head} 已推送到 {remotes}。修改后需要强制推送；其他人如已基于它继续提交，将与修改后的提交分叉。",
+                        head = &head[..head.len().min(8)],
+                        remotes = remotes.join(tr("、"))
+                    );
+                    let (sent, message) = (sent.clone(), message.clone());
+                    this.confirm_plain(
+                        tr("修改已推送的提交？"),
+                        description,
+                        tr("修改提交"),
+                        window,
+                        cx,
+                        move |this, window, cx| {
+                            this.commit_now(push, amend, sent.clone(), message.clone(), window, cx)
+                        },
+                    );
+                }
+                _ => this.commit_now(push, amend, sent, message, window, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn commit_now(
+        &mut self,
+        push: bool,
+        amend: bool,
+        sent: String,
+        message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mut args: Vec<String> = vec!["commit".into(), "-F".into(), "-".into()];
         if amend {
             args.push("--amend".into());
@@ -1439,13 +1759,18 @@ impl RepoView {
             tr("提交")
         };
         let used = message.clone();
-        self.run_op(
+        let step = Step::input(args, message.into_bytes());
+        self.run_steps(
             label,
-            args,
-            Some(message.into_bytes()),
+            vec![step],
             window,
             cx,
-            move |this, _, window, cx| {
+            Box::new(move |this, result, window, cx| {
+                if let Err(detail) = result {
+                    // 没设置作者（名称、邮箱）时直接弹出设置框；git 的报错会随主机的语言翻译，
+                    // 不按文字认，再问一次 git 当前的作者
+                    return this.after_commit_failure(label, detail, window, cx);
+                }
                 // 记下这条说明，下次可以从「最近用过的」里再拿
                 let entry = this.entry.clone();
                 this.app.update(cx, |app, cx| {
@@ -1466,8 +1791,116 @@ impl RepoView {
                 if push {
                     this.push(window, cx);
                 }
-            },
+            }),
         );
+    }
+
+    /// 提交失败：先看是不是没设置作者，是就弹出设置框（提交说明还在，设好再提交）；不是照常报错。
+    fn after_commit_failure(
+        &mut self,
+        label: &'static str,
+        detail: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(channel) = self.channel.clone() else {
+            return super::ops::failure(window, cx, label, detail);
+        };
+        let request = channel.git(&self.entry.path, ident_args());
+        cx.spawn_in(window, async move |this, cx| {
+            let missing = matches!(request.await, Ok(out) if !out.success());
+            this.update_in(cx, |this, window, cx| {
+                if missing {
+                    this.changes.author = Some(None);
+                    let note = tr("提交失败：未设置提交作者。请填写名称和邮箱，提交说明已保留。");
+                    this.author_dialog(Some(note), window, cx);
+                } else {
+                    super::ops::failure(window, cx, label, detail);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 读提交用的作者。`git var GIT_AUTHOR_IDENT` 和提交时是同一套规则（仓库、全局配置、环境变量，
+    /// 猜不出邮箱时失败），失败就是没设置。连接出错时不改，等下次再读。
+    pub(super) fn load_author(&mut self, cx: &mut Context<Self>) {
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        let request = channel.git(&self.entry.path, ident_args());
+        self.changes.author_task = Some(cx.spawn(async move |this, cx| {
+            let Ok(out) = request.await else {
+                return;
+            };
+            let author = match out.success() {
+                true => parse_ident(&String::from_utf8_lossy(&out.stdout)),
+                false => None,
+            };
+            this.update(cx, |this, cx| {
+                this.changes.author = Some(author);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// 设置提交作者：默认只写这个仓库的配置，勾选后写主机上的全局配置。`note` 是对话框下面那行说明。
+    fn author_dialog(
+        &mut self,
+        note: Option<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (name, email) = self.changes.author.clone().flatten().unwrap_or_default();
+        let ask = super::dialogs::Ask {
+            title: tr("设置提交作者").into(),
+            placeholder: tr("名称").into(),
+            value: name,
+            second: Some(tr("邮箱").into()),
+            second_value: email,
+            hint: note
+                .unwrap_or(tr(
+                    "默认只用于此仓库。勾选后写入该主机的全局配置，用于主机上的所有仓库。",
+                ))
+                .into(),
+            ok: tr("保存"),
+            checks: vec![(tr("用于该主机上的所有仓库").into(), false)],
+            validate: Some(Box::new(|_, answer| {
+                answer
+                    .second
+                    .is_empty()
+                    .then(|| tr("请填写邮箱").to_string())
+            })),
+            ..Default::default()
+        };
+        self.ask(ask, window, cx, |this, answer, window, cx| {
+            let global = answer.checks.first().copied().unwrap_or(false);
+            let set = |key: &str, value: &str| {
+                let mut list = vec!["config".to_string()];
+                if global {
+                    list.push("--global".into());
+                }
+                list.extend([key.to_string(), value.to_string()]);
+                Step::local(list)
+            };
+            let steps = vec![
+                set("user.name", &answer.text),
+                set("user.email", &answer.second),
+            ];
+            this.run_seq(
+                tr("设置提交作者"),
+                steps,
+                window,
+                cx,
+                |this, _, window, cx| {
+                    this.load_author(cx);
+                    window.push_notification(Notification::success(tr("已设置提交作者")), cx);
+                },
+            );
+        });
     }
 
     /// 最近用过的提交说明（新的在前）。
@@ -1502,17 +1935,76 @@ impl RepoView {
 
     /// 换了界面语言：提交说明框里的提示文字要重新设一遍。
     pub(super) fn retranslate_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.changes.message.update(cx, |state, cx| {
-            state.set_placeholder(tr("提交说明（首行为标题），按 Ctrl+Enter 提交"), window, cx)
-        });
+        self.changes.placeholder = SharedString::default();
+        self.sync_commit_placeholder(window, cx);
         self.changes.filter.update(cx, |state, cx| {
             state.set_placeholder(tr("过滤文件…"), window, cx)
         });
     }
 
+    /// 提交说明框的提示文字按框的宽度换长短：输入框里的提示不折行，窄窗口里放不下会从字的中间截断。
+    pub(super) fn sync_commit_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sizes = self.sizes(cx);
+        let width = match self.stacked_changes() {
+            true => f32::from(self.content_viewport().width) - sizes.sidebar,
+            false => sizes.changes_list,
+        };
+        let compact = self.compact_commit() && !self.changes.commit_expanded;
+        // 能放字的宽度：提交框两边的留白、输入框的内边距；收成一行时还有提交、展开两个按钮
+        let room = width - if compact { 180. } else { 44. };
+        let long = tr("提交说明（首行为标题），按 Ctrl+Enter 提交");
+        let medium = tr("提交说明（首行为标题）");
+        let short = tr("提交说明");
+        let text: SharedString = [long, medium]
+            .into_iter()
+            .find(|text| placeholder_width(text) <= room)
+            .unwrap_or(short)
+            .into();
+        if self.changes.placeholder == text {
+            return;
+        }
+        self.changes.placeholder = text.clone();
+        self.changes
+            .message
+            .update(cx, |state, cx| state.set_placeholder(text, window, cx));
+    }
+
     pub(super) fn render_changes(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let c = colors(cx);
         let list_width = self.sizes(cx).changes_list;
+        // 窗口很窄：文件列表在上（约占一半高，不要过滤那一行），改动在下
+        if self.stacked_changes() {
+            return v_flex()
+                .size_full()
+                .track_focus(&self.changes.focus)
+                .on_key_down(cx.listener(Self::changes_key))
+                .child(
+                    v_flex()
+                        .h(relative(0.46))
+                        .flex_none()
+                        .border_b_1()
+                        .border_color(c.border)
+                        // 窄到上下排时没有过滤那一行：「分栏｜单列表」放在列表上面
+                        .child(
+                            h_flex()
+                                .flex_none()
+                                .h(px(34.))
+                                .px_2()
+                                .border_b_1()
+                                .border_color(c.border)
+                                .child(self.render_view_toggle(cx)),
+                        )
+                        .children(self.render_lists(c, cx))
+                        .child(self.render_commit_box(c, cx)),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .child(self.render_stage_diff(c, cx)),
+                )
+                .into_any_element();
+        }
         h_flex()
             .size_full()
             .track_focus(&self.changes.focus)
@@ -1524,8 +2016,7 @@ impl RepoView {
                     .h_full()
                     .relative()
                     .child(self.render_list_bar(c, cx))
-                    .child(self.render_file_section(Area::Unstaged, c, cx))
-                    .child(self.render_file_section(Area::Staged, c, cx))
+                    .children(self.render_lists(c, cx))
                     .child(self.render_commit_box(c, cx))
                     // 右边那条线就是分隔条：文件名太长看不全时把列表拉宽
                     .child(self.split_handle(Split::ChangesList, cx)),
@@ -1540,7 +2031,18 @@ impl RepoView {
             .into_any_element()
     }
 
-    /// 文件列表上面一行：过滤框、树形和平铺的切换、筛选（隐藏未跟踪的文件）。
+    /// 文件列表：分栏是未暂存、已暂存两个，单列表是一个。
+    fn render_lists(&mut self, c: Colors, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        match self.single_list_on(cx) {
+            true => vec![self.render_single_section(c, cx)],
+            false => vec![
+                self.render_file_section(Area::Unstaged, c, cx),
+                self.render_file_section(Area::Staged, c, cx),
+            ],
+        }
+    }
+
+    /// 文件列表上面一行：过滤框、分栏和单列表的切换、树形和平铺的切换、筛选（隐藏未跟踪的文件）。
     fn render_list_bar(&mut self, c: Colors, cx: &mut Context<Self>) -> AnyElement {
         let tree = self.app.read(cx).settings.file_tree;
         let hide = self.hide_untracked(cx);
@@ -1561,6 +2063,7 @@ impl RepoView {
                         .prefix(ui::icon(IconName::Search).text_color(c.muted)),
                 ),
             )
+            .child(self.render_view_toggle(cx))
             .child(file_tree::mode_toggle(
                 "changes-list-mode",
                 tree,
@@ -1623,11 +2126,24 @@ impl RepoView {
         let rows = Rc::new(self.changes_rows(area, cx));
         let picked = self.changes.multi_count(area);
         let busy = self.op.is_some();
-        let (title, action, empty, id) = match area {
-            Area::Unstaged => (tr("未暂存"), tr("全部暂存"), tr("工作区无改动"), "unstaged"),
+        // 过滤框里有字：按钮只作用于列出来的文件，名字写明是几个
+        let filtering = !self.changes.filter.read(cx).value().trim().is_empty();
+        let (title, action, empty, id): (_, SharedString, _, _) = match area {
+            Area::Unstaged => (
+                tr("未暂存"),
+                match filtering {
+                    true => tf!("暂存匹配的 {count} 项", count).into(),
+                    false => tr("全部暂存").into(),
+                },
+                tr("工作区无改动"),
+                "unstaged",
+            ),
             Area::Staged => (
                 tr("已暂存"),
-                tr("全部取消暂存"),
+                match filtering {
+                    true => tf!("取消暂存匹配的 {count} 项", count).into(),
+                    false => tr("全部取消暂存").into(),
+                },
                 tr("暂无已暂存的改动"),
                 "staged",
             ),
@@ -1751,9 +2267,12 @@ impl RepoView {
                                 .ghost()
                                 .label(action)
                                 .disabled(busy || count == 0)
-                                .on_click(cx.listener(move |this, _, window, cx| match area {
-                                    Area::Unstaged => this.stage_all(window, cx),
-                                    Area::Staged => this.unstage_all(window, cx),
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    match (area, filtering) {
+                                        (_, true) => this.apply_shown(area, window, cx),
+                                        (Area::Unstaged, false) => this.stage_all(window, cx),
+                                        (Area::Staged, false) => this.unstage_all(window, cx),
+                                    }
                                 })),
                         )
                     }),
@@ -1992,11 +2511,150 @@ impl RepoView {
                 .and_then(|status| status.head.as_deref())
                 .unwrap_or_default();
             let text = tf!(
-                "上次提交 {head} 已推送到 {remotes}。修改后要强制推送；别人如果已经基于它继续提交，会和你的分叉。",
+                "上次提交 {head} 已推送到 {remotes}。修改后需要强制推送；其他人如已基于它继续提交，将与修改后的提交分叉。",
                 head = &head[..head.len().min(8)],
                 remotes = self.changes.amend_pushed.join(tr("、"))
             );
             super::impact::note(text.into(), None, cx)
+        });
+        // 提交按钮下面一行：未暂存的改动不会提交（左），提交说明首行的长度（右）
+        let hidden = self.hidden_untracked(cx);
+        let unstaged = self.changes.unstaged.len().saturating_sub(hidden);
+        // 单列表里没有「全部暂存」：说勾方框
+        let single = self.single_list_on(cx);
+        let hint: Option<SharedString> = match (amend, staged, unstaged) {
+            (_, _, 0) => None,
+            (false, 0, _) if single => {
+                Some(tr("请先暂存要提交的改动：勾选文件前的方框，或勾选「更改」全部暂存").into())
+            }
+            (false, 0, _) => Some(tr("请先暂存要提交的改动：双击文件，或点击「全部暂存」").into()),
+            (_, _, n) => Some(tf!("另有 {n} 个文件的改动未暂存，不会提交", n).into()),
+        };
+        let title_len = self
+            .changes
+            .message
+            .read(cx)
+            .value()
+            .lines()
+            .next()
+            .map_or(0, |line| line.trim_end().chars().count());
+        // Git 的习惯：首行不超过 50 个字符，最多 72 个
+        let title_color = match title_len {
+            0..=50 => c.muted,
+            51..=72 => c.warning,
+            _ => c.danger,
+        };
+        let status_line = (hint.is_some() || title_len > 0).then(|| {
+            h_flex()
+                .h(px(16.))
+                .gap_2()
+                .text_xs()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(c.muted)
+                        .children(hint.map(|hint| ui::clipped("commit-hint", hint))),
+                )
+                .when(title_len > 0, |line| {
+                    line.child(
+                        div()
+                            .id("title-length")
+                            .flex_none()
+                            .text_color(title_color)
+                            .child(tf!("首行 {n}/50", n = title_len))
+                            .tooltip(|window, cx| {
+                                ui::tip(
+                                    tr("提交说明的首行建议不超过 50 个字符，最多 72 个"),
+                                    window,
+                                    cx,
+                                )
+                            }),
+                    )
+                })
+        });
+        // 提交用的作者：没读过就读一次；点了可以改
+        if self.changes.author.is_none() && self.changes.author_task.is_none() {
+            self.load_author(cx);
+        }
+        // 窗口窄、矮：收成一行（说明、提交按钮、展开），点 ⌄ 展开完整的提交框
+        if self.compact_commit() && !self.changes.commit_expanded {
+            return v_flex()
+                .flex_none()
+                .p_2()
+                .gap_1()
+                .border_t_1()
+                .border_color(c.border)
+                .children(detached_note)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Textarea::new(&self.changes.message).h(px(32.))),
+                        )
+                        .child(
+                            Button::new("commit-compact")
+                                .primary()
+                                .small()
+                                .label(match (amend, staged) {
+                                    (true, _) => SharedString::from(tr("修改提交")),
+                                    (false, 0) => tr("提交").into(),
+                                    (false, n) => tf!("提交（{n}）", n).into(),
+                                })
+                                .loading(committing)
+                                .disabled(!can_commit)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.commit(window, cx)),
+                                ),
+                        )
+                        .child(
+                            Button::new("commit-expand")
+                                .ghost()
+                                .small()
+                                .icon(crate::ui::icon(IconName::ChevronUp))
+                                .tooltip(tr(
+                                    "展开提交框（作者、最近使用、修改上次提交、提交并推送）",
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.changes.commit_expanded = true;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .children(status_line)
+                .children(pushed_note)
+                .into_any_element();
+        }
+        // 窄的时候展开了：右上角可以收回一行
+        let collapse = self.compact_commit().then(|| {
+            Button::new("commit-collapse")
+                .xsmall()
+                .ghost()
+                .icon(crate::ui::icon_small(IconName::ChevronDown))
+                .tooltip(tr("收起提交框"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.changes.commit_expanded = false;
+                    cx.notify();
+                }))
+        });
+        let author = self.changes.author.clone().map(|author| {
+            let (text, color): (SharedString, _) = match author {
+                Some((name, email)) => (tf!("作者：{name} <{email}>", name, email).into(), c.muted),
+                None => (tr("未设置提交作者").into(), c.danger),
+            };
+            div()
+                .id("commit-author")
+                .min_w_0()
+                .flex_shrink(1.)
+                .text_xs()
+                .text_color(color)
+                .cursor_pointer()
+                .hover(|s| s.underline())
+                .child(ui::clipped("commit-author-text", text))
+                .on_click(cx.listener(|this, _, window, cx| this.author_dialog(None, window, cx)))
         });
         v_flex()
             .flex_none()
@@ -2011,12 +2669,13 @@ impl RepoView {
                     .gap_2()
                     .child(
                         div()
-                            .flex_1()
+                            .flex_none()
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(c.muted)
                             .child(tr("提交说明")),
                     )
+                    .child(h_flex().flex_1().min_w_0().justify_end().children(author))
                     // 不加悬停提示：提示出现在按钮下面，会盖住弹出的菜单
                     .child(
                         Button::new("recent-messages")
@@ -2046,7 +2705,8 @@ impl RepoView {
                                 }
                                 menu
                             }),
-                    ),
+                    )
+                    .children(collapse),
             )
             .child(Textarea::new(&self.changes.message).h(px(110.)))
             .child(
@@ -2099,6 +2759,7 @@ impl RepoView {
                             }),
                     ),
             )
+            .children(status_line)
             .children(pushed_note)
             .into_any_element()
     }
@@ -2132,12 +2793,23 @@ impl RepoView {
         let idle = self.op.is_none();
         let ws = self.ignore_ws;
         let line_ops = idle && !self.changes.diff_stale && !ws;
+        // 改动区多宽（提示按它换短写）
+        let diff_width = {
+            let sizes = self.sizes(cx);
+            let vw = f32::from(self.viewport.width);
+            match self.stacked_changes() {
+                true => vw - sizes.sidebar,
+                false => vw - sizes.sidebar - sizes.changes_list,
+            }
+        };
         let ws_strip = self
             .changes
             .ws_note
             .clone()
             .filter(|_| ws)
             .map(|note| diff_tools::info_strip("changes-ws-note", note, cx));
+        let single = self.single_list_on(cx);
+        let area_switch = self.single_area_switch(cx);
         let ws_toggle = self.ws_toggle("diff-ignore-ws", cx);
         let ws_toggle_alone = self.ws_toggle("diff-ignore-ws-alone", cx);
         let search_toggle = self.search_toggle(Where::Changes, cx);
@@ -2222,7 +2894,8 @@ impl RepoView {
                         let title: SharedString = title.into();
                         move |window, cx| ui::tip(title.clone(), window, cx)
                     }),
-            );
+            )
+            .children(area_switch);
         // 选中行以后的按钮单独占一行，不和文件名、「暂存文件」挤在一起：窗口窄的时候那一行放不下。
         // 这一行一直在（没选中时写怎么选），选中、取消选中时下面的改动不会上下跳。
         let select_bar = diff.editable().then(|| {
@@ -2250,12 +2923,39 @@ impl RepoView {
                         tr("点击选择行，按住 Shift 连选；空格暂存，Delete 丢弃")
                     }
                     (Area::Staged, false) => tr("点击选择行，按住 Shift 连选；空格取消暂存"),
-                    (Area::Unstaged, true) => tr("在行号上拖动选择多行；空格暂存，Delete 丢弃"),
-                    (Area::Staged, true) => tr("在行号上拖动选择多行；空格取消暂存"),
+                    (Area::Unstaged, true) => {
+                        tr("在行号上拖动或按上下键选行，按住 Shift 连选；空格暂存，Delete 丢弃")
+                    }
+                    (Area::Staged, true) => {
+                        tr("在行号上拖动或按上下键选行，按住 Shift 连选；空格取消暂存")
+                    }
                 };
-                return bar
-                    .child(crate::ui::clipped("select-hint", hint).flex_1())
-                    .child(toggles);
+                // 改动区窄了换短写，再窄只剩一个问号；悬停都是全文
+                let short = match (area, split) {
+                    _ if ws => tr("已忽略空白：只能整个文件操作"),
+                    (Area::Unstaged, false) => tr("点击选行 · Shift 连选 · 空格暂存"),
+                    (Area::Staged, false) => tr("点击选行 · Shift 连选 · 空格取消暂存"),
+                    (Area::Unstaged, true) => tr("拖动行号或上下键选行 · 空格暂存"),
+                    (Area::Staged, true) => tr("拖动行号或上下键选行 · 空格取消暂存"),
+                };
+                let text = match diff_width {
+                    w if w >= 560. => crate::ui::clipped("select-hint", hint)
+                        .flex_1()
+                        .into_any_element(),
+                    w if w >= 380. => crate::ui::clipped_with_tip("select-hint", short, hint)
+                        .flex_1()
+                        .into_any_element(),
+                    _ => h_flex()
+                        .flex_1()
+                        .child(
+                            div()
+                                .id("select-hint")
+                                .child(crate::ui::icon_small(IconName::CircleQuestionMark))
+                                .tooltip(move |window, cx| crate::ui::tip(hint, window, cx)),
+                        )
+                        .into_any_element(),
+                };
+                return bar.child(text).child(toggles);
             }
             let bar = bar.child(
                 div()
@@ -2330,23 +3030,26 @@ impl RepoView {
                             })),
                     )
                 })
-                .child(
-                    // 有冲突时主按钮是「解决冲突…」，这个退到普通样式
-                    if conflicted {
-                        Button::new("stage-file").small()
-                    } else {
-                        Button::new("stage-file").small().primary()
-                    }
-                    .label(if conflicted {
-                        tr("标记为已解决")
-                    } else {
-                        tr("暂存文件")
-                    })
-                    .disabled(!idle)
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.stage_file(&stage, window, cx)),
-                    ),
-                )
+                // 单列表里暂存靠行首的方框，不再放「暂存文件」（有冲突时的「标记为已解决」留着）
+                .when(conflicted || !single, |bar| {
+                    bar.child(
+                        // 有冲突时主按钮是「解决冲突…」，这个退到普通样式
+                        if conflicted {
+                            Button::new("stage-file").small()
+                        } else {
+                            Button::new("stage-file").small().primary()
+                        }
+                        .label(if conflicted {
+                            tr("标记为已解决")
+                        } else {
+                            tr("暂存文件")
+                        })
+                        .disabled(!idle)
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| this.stage_file(&stage, window, cx),
+                        )),
+                    )
+                })
                 .when(!conflicted, |bar| {
                     bar.child(
                         Button::new("discard-file")
@@ -2360,15 +3063,17 @@ impl RepoView {
                     )
                 })
             }
-            Area::Staged => bar.child(
-                Button::new("unstage-file")
-                    .small()
-                    .label(tr("取消暂存文件"))
-                    .disabled(!idle)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.unstage_file(&entry, window, cx)
-                    })),
-            ),
+            Area::Staged => bar.when(!single, |bar| {
+                bar.child(
+                    Button::new("unstage-file")
+                        .small()
+                        .label(tr("取消暂存文件"))
+                        .disabled(!idle)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.unstage_file(&entry, window, cx)
+                        })),
+                )
+            }),
         };
 
         let body = match error {
@@ -2404,6 +3109,24 @@ impl RepoView {
             .size_full()
             .track_focus(&self.changes.diff_focus)
             .on_key_down(cx.listener(Self::diff_key))
+            .on_action(
+                cx.listener(|this, _: &crate::DiffLineUp, _, cx| this.split_step(false, false, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::DiffLineDown, _, cx| {
+                    this.split_step(true, false, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::DiffExtendUp, _, cx| {
+                    this.split_step(false, true, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::DiffExtendDown, _, cx| {
+                    this.split_step(true, true, cx)
+                }),
+            )
             .child(bar)
             .children(select_bar)
             .children(search_bar)
@@ -2421,7 +3144,14 @@ impl RepoView {
                         .child(notice),
                 )
             })
-            .child(div().flex_1().min_h_0().child(body))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(body)
+                    .child(crate::zoom::wheel_zoom(self.app.clone())),
+            )
             .into_any_element()
     }
 
@@ -2442,17 +3172,19 @@ impl RepoView {
         let warning = cx.theme().warning;
         let (found_bg, current_bg) = (warning.opacity(0.35), warning.opacity(0.8));
         let search = self.diff_search.at(Where::Changes);
+        let size = crate::zoom::code_size(cx);
+        let row_height = diff_row_height(size);
         range
             .filter_map(|ix| {
                 let text = diff.texts.get(ix)?.clone();
                 Some(match diff.rows[ix] {
                     Row::Meta => h_flex()
                         .id(ix)
-                        .h(px(DIFF_ROW_HEIGHT))
+                        .h(px(row_height))
                         .w_full()
                         .px_3()
                         .font_family(crate::fonts::mono())
-                        .text_size(px(12.))
+                        .text_size(px(size - 1.))
                         .text_color(c.muted)
                         .child(text)
                         .into_any_element(),
@@ -2461,12 +3193,12 @@ impl RepoView {
                         let title = div()
                             .flex_none()
                             .font_family(crate::fonts::mono())
-                            .text_size(px(12.))
+                            .text_size(px(size - 1.))
                             .text_color(c.muted)
                             .child(text);
                         let mut row = h_flex()
                             .id(ix)
-                            .h(px(DIFF_ROW_HEIGHT))
+                            .h(px(row_height))
                             .w_full()
                             .px_3()
                             .gap_2()
@@ -2536,12 +3268,61 @@ impl RepoView {
                         } else {
                             bg
                         };
+                        // 改了的行：鼠标停上去，符号那一格换成一个小按钮，点一下只暂存（已暂存一栏是取消
+                        // 暂存）这一行，不用先选再按空格
+                        let one_line = editable && line_ops && line.kind != LineKind::Context;
+                        let (glyph, tip) = match area {
+                            Area::Unstaged => (IconName::Plus, tr("暂存此行")),
+                            Area::Staged => (IconName::Minus, tr("取消暂存此行")),
+                        };
+                        let sign_cell = div()
+                            .w(px(16.))
+                            .flex_none()
+                            .relative()
+                            .text_color(c.muted)
+                            .child(
+                                div()
+                                    .when(one_line, |d| {
+                                        d.group_hover("diff-line", |s| s.invisible())
+                                    })
+                                    .child(sign),
+                            )
+                            .when(one_line, |cell| {
+                                cell.child(
+                                    div()
+                                        .id(("stage-line", ix))
+                                        .absolute()
+                                        .top(px(((row_height - 16.) / 2.).max(0.) - 1.))
+                                        .left_0()
+                                        .size(px(16.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(3.))
+                                        .bg(c.hunk)
+                                        .border_1()
+                                        .border_color(c.border)
+                                        .cursor_pointer()
+                                        .invisible()
+                                        .group_hover("diff-line", |s| s.visible())
+                                        .child(ui::icon_small(glyph))
+                                        .tooltip(move |window, cx| ui::tip(tip, window, cx))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.apply_one_line(ix, window, cx);
+                                            }),
+                                        ),
+                                )
+                            });
                         h_flex()
                             .id(ix)
-                            .h(px(DIFF_ROW_HEIGHT))
+                            .group("diff-line")
+                            .h(px(row_height))
                             .w_full()
                             .font_family(crate::fonts::mono())
-                            .text_size(px(13.))
+                            .text_size(px(size))
                             .when_some(bg, |d, bg| d.bg(bg))
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -2560,7 +3341,7 @@ impl RepoView {
                             )
                             .child(line_number(line.old_no, c))
                             .child(line_number(line.new_no, c))
-                            .child(div().w(px(16.)).flex_none().text_color(c.muted).child(sign))
+                            .child(sign_cell)
                             .child(div().flex_none().whitespace_nowrap().child(
                                 if styles.is_empty() {
                                     text.into_any_element()
@@ -2576,6 +3357,61 @@ impl RepoView {
             })
             .collect()
     }
+}
+
+/// 问 git 当前提交用的作者。
+fn ident_args() -> Vec<String> {
+    ["var", "GIT_AUTHOR_IDENT"].map(String::from).to_vec()
+}
+
+/// `git var GIT_AUTHOR_IDENT` 的输出（`名称 <邮箱> 时间 时区`）里的名称和邮箱。
+fn parse_ident(text: &str) -> Option<(String, String)> {
+    let open = text.find('<')?;
+    let close = open + text[open..].find('>')?;
+    let name = text[..open].trim().to_string();
+    let email = text[open + 1..close].trim().to_string();
+    (!email.is_empty()).then_some((name, email))
+}
+
+/// `git branch -r --contains --format=%(refname:lstrip=2)` 列出的远程分支名；`origin/HEAD` 只是
+/// 指向默认分支的别名，不算（用 `refname:short` 时它显示成「origin」，认不出来，所以用 lstrip）。
+fn remote_names(out: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(out)
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && !name.ends_with("/HEAD"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// 暂存区相对 HEAD 的样子：HEAD 指向哪个提交，加上每个已暂存的文件（路径、原路径、改动类型、
+/// 暂存区里的模式和对象号）。工作区那一边的变化不算：agent 一直在改别的文件时照样能提交。
+type StagedSnapshot = (
+    Option<String>,
+    Vec<(String, Option<String>, Option<Kind>, Option<String>)>,
+);
+
+fn staged_snapshot(status: &Status) -> StagedSnapshot {
+    let mut staged: Vec<_> = status
+        .entries
+        .iter()
+        .filter(|e| e.staged.is_some())
+        .map(|e| {
+            (
+                e.path.clone(),
+                e.orig_path.clone(),
+                e.staged,
+                e.index.clone(),
+            )
+        })
+        .collect();
+    staged.sort_by(|a, b| a.0.cmp(&b.0));
+    (status.head.clone(), staged)
+}
+
+/// 丢弃前核对内容时发现文件在确认期间又被改过（见 `RepoView::verify_content_then`）。
+fn discard_changed() -> &'static str {
+    tr("文件在确认期间有新的改动，未丢弃。请查看最新改动后重试。")
 }
 
 /// 菜单里显示的一条提交说明：只要第一行，太长截断；后面还有内容的加省略号。
@@ -2598,4 +3434,15 @@ fn line_number(n: Option<u32>, c: Colors) -> Div {
         .text_size(px(12.))
         .text_color(c.muted)
         .child(n.map(|n| n.to_string()).unwrap_or_default())
+}
+
+/// 提示文字大约多宽（14 像素的字，按界面字体量过）：汉字、全角标点 14，其余平均不到一半，
+/// 算 6.5 留点余量。
+fn placeholder_width(text: &str) -> f32 {
+    text.chars()
+        .map(|ch| match ch as u32 {
+            0x2E80.. => 14.,
+            _ => 6.5,
+        })
+        .sum()
 }

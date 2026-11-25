@@ -71,8 +71,8 @@ use fr_core::tf;
 use futures::channel::mpsc;
 use futures::future::LocalBoxFuture;
 use futures::{FutureExt as _, StreamExt as _};
-use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
@@ -733,6 +733,11 @@ pub struct TerminalView {
     run_quiet: Option<Task<()>>,
     /// 一直看不出提示符（没有输出、光标停在行首）：到时间照样输入
     run_give_up: Option<Task<()>>,
+    /// 刚替用户输入了预设的命令：接下来几秒的输出里看有没有「找不到命令」（见 [`Self::check_missing`]）。
+    /// 命令的第一个词、预设的名字、看到什么时候为止
+    run_check: Option<(String, String, Instant)>,
+    /// 预设的程序在主机上找不到：终端上面一条提示，带安装命令（见 [`missing_tool`]）
+    missing: Option<MissingTool>,
     _blink: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -904,6 +909,8 @@ impl TerminalView {
             run: None,
             run_armed: false,
             run_due: false,
+            run_check: None,
+            missing: None,
             run_slot: None,
             run_quiet: None,
             run_give_up: None,
@@ -1007,6 +1014,11 @@ impl TerminalView {
     /// 已经开始开了（在连、开好了），预设的命令还没输入：这时放掉画面，kuaid 里开好的 shell 就等不到它。
     pub fn run_pending(&self) -> bool {
         self.run_due || (self.run_armed && (self.connecting.is_some() || self.session.is_some()))
+    }
+
+    /// 放掉这个画面会丢东西：预设的命令还没输入，或者正在往里传文件（传输归画面管，画面没了传输就停了）。
+    pub fn busy(&self) -> bool {
+        self.run_pending() || self.sending.is_some()
     }
 
     /// kuaid 给这个终端的编号：开在 Kuai 进程里的、还没接上的是 None。
@@ -1296,6 +1308,7 @@ impl TerminalView {
             // 往回翻着时来了新输出：回到底部的按钮上一个蓝点。只是输入区里的字变了（往回翻着打字的
             // 回显）不算，见 `scroll::outside_digest`、`settle_outside`
             TermEvent::Wakeup => {
+                self.check_missing(cx);
                 self.scroll.saw_output();
                 self.watch_outside(cx);
                 self.run_output(cx);
@@ -1352,6 +1365,47 @@ impl TerminalView {
             // 只记是哪个预设，不记命令：命令里可能带着密码、令牌（日志会转给别人看）
             log::info!("新终端里输入预设「{}」的命令", start.name);
             self.write(format!("{}\r", start.command).into_bytes());
+            // 程序没装时 shell 只留一行「command not found」：看几秒，认出来了在终端上面说清楚
+            if let Some(word) = start.command.split_whitespace().next() {
+                let until = Instant::now() + Duration::from_secs(10);
+                self.run_check = Some((word.to_string(), start.name.clone(), until));
+            }
+        }
+    }
+
+    /// 输入预设的命令以后有新输出：最近几行里有「找不到命令」（bash、zsh、sh、PowerShell、cmd 的说法，
+    /// 中英文）并且提到了这个命令，就在终端上面提示没装、怎么装。
+    fn check_missing(&mut self, cx: &mut Context<Self>) {
+        let Some((word, name, until)) = self.run_check.clone() else {
+            return;
+        };
+        if Instant::now() > until {
+            self.run_check = None;
+            return;
+        }
+        let Some(session) = &self.session else {
+            return;
+        };
+        let lines = {
+            let term = session.term.lock();
+            let grid = term.grid();
+            let cols = grid.columns();
+            let cursor = grid.cursor.point.line.0;
+            let top = (cursor - 6).max(-(grid.history_size() as i32));
+            (top..=cursor)
+                .map(|line| {
+                    let row = &grid[GridLine(line)];
+                    (0..cols)
+                        .map(|col| row[GridColumn(col)].c)
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        if lines.iter().any(|line| not_found_line(line, &word)) {
+            self.run_check = None;
+            log::info!("预设「{name}」的程序在主机上找不到");
+            self.missing = Some(missing_tool(&word, &name));
+            cx.notify();
         }
     }
 
@@ -1518,24 +1572,37 @@ impl TerminalView {
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
+        // 截图工具常常同时放一段文字和图片：贴的是文字，说一声图片怎么发（原来图片悄悄没了）
+        let mixed = {
+            let entries = item.entries();
+            let has = |pick: fn(&ClipboardEntry) -> bool| entries.iter().any(pick);
+            has(|e| matches!(e, ClipboardEntry::String(_)))
+                && has(|e| {
+                    matches!(
+                        e,
+                        ClipboardEntry::Image(_) | ClipboardEntry::ExternalPaths(_)
+                    )
+                })
+        };
         match attach::from_clipboard(item, false, chrono::Local::now()) {
             Some(attach::Pasted::Text(text)) => {
                 let bracketed = self.mode().contains(TermMode::BRACKETED_PASTE);
                 self.input(keys::paste(&text, bracketed), cx);
+                if mixed {
+                    self.flash =
+                        Some(tr("已粘贴文字。剪贴板中还有图片或文件，按 Alt+V 发送。").into());
+                }
             }
             Some(attach::Pasted::Send(files)) => self.send(files, cx),
             None => {}
         }
     }
 
-    /// Alt+V：Claude Code 在 Windows 上用它读剪贴板里的图。它读的是它所在那台主机的剪贴板，终端开在
-    /// 别的主机上时读不到这台电脑上截的图。所以这时剪贴板里有图片（或复制的文件）就由 Kuai 发过去，
-    /// 和 Ctrl+V 一样传上去、贴路径（不看文字：截图工具有时连带放一段文字）；没有就照旧交给程序。
-    /// 开在这台电脑上的终端不接：程序自己读得到。返回接了没有。
+    /// Alt+V：剪贴板里有图片（或复制的文件）就由 Kuai 发过去，和 Ctrl+V 一样贴路径（主机上的终端
+    /// 先传上去），不看文字：截图工具有时连带放一段文字，这时 Ctrl+V 贴文字、Alt+V 发图；没有就照旧
+    /// 交给程序。本机的终端也接：Claude Code 自己读得到剪贴板，别的程序（Codex、OpenCode）
+    /// 不认 Alt+V，统一由 Kuai 发，「剪贴板中还有图片」的提示才对谁都成立。返回接了没有。
     fn paste_image(&mut self, cx: &mut Context<Self>) -> bool {
-        if !self.session.as_ref().is_some_and(Session::is_remote) {
-            return false;
-        }
         let Some(item) = cx.read_from_clipboard() else {
             return false;
         };
@@ -1809,14 +1876,16 @@ impl TerminalView {
             cx.stop_propagation();
             return;
         }
-        // 粘贴：Ctrl+V、Ctrl+Shift+V、Shift+Insert
+        // 粘贴：Ctrl+V、Ctrl+Shift+V、Shift+Insert。设置里让 Ctrl+V 交给程序时只剩后两个，
+        // Ctrl+V 照普通的键发给程序
         let shift_insert = key == "insert" && mods.shift && !mods.control && !mods.alt;
-        if (only_ctrl && key == "v") || shift_insert {
+        let ctrl_v_pastes = mods.shift || !prefs::get(cx).ctrl_v_to_program;
+        if (only_ctrl && key == "v" && ctrl_v_pastes) || shift_insert {
             self.paste(cx);
             cx.stop_propagation();
             return;
         }
-        // Alt+V：主机上的终端里贴这台电脑剪贴板里的图（见 `paste_image`）
+        // Alt+V：发剪贴板里的图片、文件（见 `paste_image`）
         let only_alt = mods.alt && !mods.control && !mods.shift && !mods.platform;
         if only_alt && key == "v" && self.paste_image(cx) {
             cx.stop_propagation();
@@ -2210,6 +2279,121 @@ impl TerminalView {
     }
 }
 
+/// 预设的程序在主机上找不到时终端上面那条提示。
+#[derive(Clone)]
+struct MissingTool {
+    text: SharedString,
+    /// 安装命令（认得的几个常用程序才有）
+    install: Option<&'static str>,
+}
+
+/// 这一行是不是 shell 说找不到 `word` 这个命令。只认几种 shell 的固定说法，免得程序自己的输出里碰巧
+/// 有这几个字也报。
+fn not_found_line(line: &str, word: &str) -> bool {
+    let lower = line.to_lowercase();
+    let word = word.to_lowercase();
+    lower.contains(&word)
+        && (lower.contains("command not found")
+            || lower.contains(": not found")
+            || lower.contains("is not recognized as")
+            || lower.contains("未找到命令")
+            || lower.contains("无法将")
+            || lower.contains("不是内部或外部命令"))
+}
+
+/// 找不到的是哪个程序：常用的几个给出安装命令（要主机上有 Node.js 的 npm），装好后再运行一次登录。
+fn missing_tool(word: &str, name: &str) -> MissingTool {
+    let install = match word {
+        "claude" => Some("npm install -g @anthropic-ai/claude-code"),
+        "codex" => Some("npm install -g @openai/codex"),
+        "opencode" => Some("npm install -g opencode-ai"),
+        _ => None,
+    };
+    let text = match install {
+        Some(_) => tf!(
+            "主机上未找到 {word}，{name} 可能尚未安装。可运行以下命令安装（需要 Node.js），安装后再运行 {word} 按提示登录：",
+            word,
+            name
+        ),
+        None => tf!(
+            "主机上未找到 {word}，{name} 可能尚未安装。请先在主机上安装。",
+            word,
+            name
+        ),
+    };
+    MissingTool {
+        text: text.into(),
+        install,
+    }
+}
+
+impl TerminalView {
+    /// 预设的程序没装：终端最上面一条，写清楚、给安装命令（可复制），右边可以关掉。
+    fn render_missing(&self, missing: MissingTool, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (bar, fg, muted, border) = (
+            theme.secondary,
+            theme.foreground,
+            theme.muted_foreground,
+            theme.border,
+        );
+        div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .top_0()
+            .px(px(PADDING))
+            .py_1()
+            .bg(bar)
+            .border_b_1()
+            .border_color(border)
+            .text_xs()
+            .text_color(fg)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_start()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(div().whitespace_normal().child(missing.text.clone()))
+                            .children(missing.install.map(|command| {
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .font_family(crate::fonts::mono())
+                                            .text_color(muted)
+                                            .child(command),
+                                    )
+                                    .child(
+                                        gpui_kit::component::button::Button::new("copy-install")
+                                            .xsmall()
+                                            .label(tr("复制"))
+                                            .on_click(move |_, _, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    command.to_string(),
+                                                ))
+                                            }),
+                                    )
+                            })),
+                    )
+                    .child(
+                        gpui_kit::component::button::Button::new("close-missing")
+                            .xsmall()
+                            .label(tr("关闭"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.missing = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
 impl Sending {
     /// 传到哪了。
     fn notice(&self) -> SharedString {
@@ -2380,6 +2564,9 @@ impl Render for TerminalView {
                 .size_full(),
             )
             .children(overlays)
+            .when_some(self.missing.clone(), |this, missing| {
+                this.child(self.render_missing(missing, cx))
+            })
             .when_some(self.notice(), |this, notice| {
                 this.child(
                     div()
@@ -3362,5 +3549,25 @@ mod tests {
         assert_eq!(session_number(repo, "c:/users/me/repo2"), None);
         // Linux 上分大小写
         assert_eq!(session_number("/Data/Repo", "/data/repo"), None);
+    }
+}
+
+#[cfg(test)]
+mod missing_tests {
+    use super::not_found_line;
+
+    #[test]
+    fn 认出_shell_说找不到命令() {
+        assert!(not_found_line("bash: claude: command not found", "claude"));
+        assert!(not_found_line("zsh: command not found: codex", "codex"));
+        assert!(not_found_line("sh: 1: opencode: not found", "opencode"));
+        assert!(not_found_line(
+            "claude : The term 'claude' is not recognized as a name of a cmdlet",
+            "claude"
+        ));
+        assert!(not_found_line("bash: claude：未找到命令", "claude"));
+        // 程序自己的输出：没提到这个命令，或者没有 shell 的说法
+        assert!(!not_found_line("bash: vim: command not found", "claude"));
+        assert!(!not_found_line("claude is thinking…", "claude"));
     }
 }

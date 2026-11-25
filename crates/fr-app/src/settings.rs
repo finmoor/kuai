@@ -27,6 +27,20 @@ fn default_auto_fetch() -> u32 {
     10
 }
 
+fn default_code_size() -> u8 {
+    13
+}
+
+fn default_tab_width() -> u8 {
+    4
+}
+
+/// 「代码字号」能选的范围
+pub const CODE_SIZES: std::ops::RangeInclusive<u8> = 10..=24;
+
+/// 「Tab 宽度」能选的
+pub const TAB_WIDTHS: [u8; 3] = [2, 4, 8];
+
 fn default_true() -> bool {
     true
 }
@@ -52,6 +66,10 @@ pub struct Layout {
     /// 详情区左边一栏（说明、改动的文件）的宽度
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details_width: Option<f32>,
+    /// 窗口窄、侧栏自动收成图标栏时手动展开了（只在这次运行里记着，窗口宽到不用自动收起时清掉，
+    /// 见 `repo::layout::rail_shown`）
+    #[serde(skip)]
+    pub narrow_open: bool,
     // 1.3～1.6 还有 terminal_height（仓库页底下终端的高度）。1.7 起终端单独一页、占满，
     // 不再要它；旧设置文件里的这一项读的时候忽略，下次保存就没了。1.16 以前的 all_repos
     // （仓库页上「全部仓库」展开着）也一样，改成服务器页以后不要了
@@ -395,6 +413,12 @@ pub struct Settings {
     /// 最小化时收到托盘，任务栏上不留按钮
     #[serde(default)]
     pub minimize_to_tray: bool,
+    /// 第一次启动的欢迎页点了「暂时跳过」（见 `workspace.rs` 的 `welcome`）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub welcome_skipped: bool,
+    /// 打开仓库的对话框里也列以 `.` 开头的目录（「显示隐藏目录」）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub browse_hidden: bool,
     /// 第一次把目录映射到本机时提示过了（映射的目录不适合跑 git、构建）
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mapping_tip_shown: bool,
@@ -419,6 +443,36 @@ pub struct Settings {
     /// 工作区有改动时切换分支、拉取：先贮藏，做完再恢复
     #[serde(default)]
     pub stash_before_switch: bool,
+    /// 拉取时工作区有改动：不问，直接贮藏、拉完放回（拉取菜单里的开关）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pull_autostash: bool,
+    /// 代码的字号：改动、合并编辑器、文件页的编辑器（在改动上按住 Ctrl 滚滚轮也能调）
+    #[serde(default = "default_code_size")]
+    pub code_font_size: u8,
+    /// 显示代码时一个 Tab 占几格
+    #[serde(default = "default_tab_width")]
+    pub tab_width: u8,
+    /// 外部比较工具：`ext_tools::PRESETS` 里的名字、`custom`，空的是不用
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub diff_tool: String,
+    /// 选「自定义命令」时的比较命令（`$LOCAL`、`$REMOTE` 换成文件）
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub diff_tool_cmd: String,
+    /// 外部合并工具，同上
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub merge_tool: String,
+    /// 选「自定义命令」时的合并命令（`$LOCAL`、`$REMOTE`、`$BASE`、`$MERGED`）
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub merge_tool_cmd: String,
+    /// 丢弃改动前先确认（确认框里勾「不再询问」就关了；丢弃以后都能撤销）
+    #[serde(default = "default_true")]
+    pub confirm_discard: bool,
+    /// 本地修改默认用单列表（不勾是分栏：未暂存、已暂存分开列）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub changes_single: bool,
+    /// 各仓库自己切过的「分栏｜单列表」（和默认不一样的才记）：键是 `电脑|路径`，值为真是单列表
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub changes_views: std::collections::BTreeMap<String, bool>,
     /// 标签页上显示关闭按钮；关了以后用中键、Ctrl+W 或右键菜单关，免得手滑点到
     #[serde(default = "default_true")]
     pub tab_close_button: bool,
@@ -428,6 +482,12 @@ pub struct Settings {
     /// 上面那项开着、Kuai 又不在前台时，再发一条 Windows 通知（见 `toast`）
     #[serde(default = "default_true")]
     pub notify_terminal_system: bool,
+    /// AI 终端静默多久算「待查看」，离开期间的新输出要不要标出，终端行带不带最后一行字
+    #[serde(default, skip_serializing_if = "TermAlerts::is_default")]
+    pub term_alerts: TermAlerts,
+    /// 起过名字的终端（见 `term_names.rs`）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub term_names: Vec<crate::term_names::TermName>,
     /// 本机仓库的终端用哪个程序（`shell::local_shells` 里的 id）；空着自动挑
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub terminal_shell: String,
@@ -517,6 +577,56 @@ impl TermHub {
     }
 }
 
+/// 会话页的提醒（`term_board.rs`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TermAlerts {
+    /// 各家 AI 程序静默超过几分钟、之后又没看过，算「待查看」（进标题栏的角标、提醒）
+    pub claude: u32,
+    pub codex: u32,
+    pub opencode: u32,
+    /// 别的 AI 程序（Gemini、Aider 这些，见 `term_board::AGENTS`）
+    pub other: u32,
+    /// 重开 Kuai、重新连上主机以后，标出离开期间有新输出的 AI 终端
+    pub away: bool,
+    /// 会话页、仓库终端页的终端行下面多一行屏幕上的最后一行字
+    pub last_line: bool,
+}
+
+impl Default for TermAlerts {
+    fn default() -> Self {
+        TermAlerts {
+            claude: 3,
+            codex: 3,
+            opencode: 2,
+            other: 2,
+            away: true,
+            last_line: false,
+        }
+    }
+}
+
+impl TermAlerts {
+    /// 设置里能选的分钟数
+    pub const MINUTES: [u32; 8] = [1, 2, 3, 5, 10, 15, 30, 60];
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// 手改设置文件写了 0 这类：至少 1 分钟。
+    pub fn normalize(&mut self) {
+        for minutes in [
+            &mut self.claude,
+            &mut self.codex,
+            &mut self.opencode,
+            &mut self.other,
+        ] {
+            *minutes = (*minutes).clamp(1, 24 * 60);
+        }
+    }
+}
+
 /// 终端的外观和操作习惯：所有终端共用，改了马上生效。默认值就是 1.9 以前写死的那一套，
 /// 升上来以后看不出变化。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -539,6 +649,8 @@ pub struct TerminalSettings {
     /// 用鼠标选中文字就复制到剪贴板
     pub copy_on_select: bool,
     pub right_click: RightClick,
+    /// Ctrl+V 交给终端里的程序（vim 的列选择这类要用到它），粘贴改用 Ctrl+Shift+V、Shift+Insert
+    pub ctrl_v_to_program: bool,
 }
 
 /// 光标的样子。
@@ -648,6 +760,7 @@ impl Default for TerminalSettings {
             scrollback: 10_000,
             copy_on_select: false,
             right_click: RightClick::Paste,
+            ctrl_v_to_program: false,
         }
     }
 }
@@ -698,6 +811,8 @@ impl Default for Settings {
             dark_theme: default_dark_theme(),
             minimize_to_tray: false,
             mapping_tip_shown: false,
+            browse_hidden: false,
+            welcome_skipped: false,
             close_to_tray: false,
             auto_fetch_minutes: default_auto_fetch(),
             diff_split: false,
@@ -705,9 +820,21 @@ impl Default for Settings {
             image_diff: 0,
             hide_untracked: false,
             stash_before_switch: false,
+            pull_autostash: false,
+            code_font_size: default_code_size(),
+            tab_width: default_tab_width(),
+            diff_tool: String::new(),
+            diff_tool_cmd: String::new(),
+            merge_tool: String::new(),
+            merge_tool_cmd: String::new(),
+            confirm_discard: true,
+            changes_single: false,
+            changes_views: Default::default(),
             tab_close_button: true,
             notify_terminal_stopped: true,
             notify_terminal_system: true,
+            term_alerts: TermAlerts::default(),
+            term_names: Vec::new(),
             terminal_shell: String::new(),
             terminal: TerminalSettings::default(),
             terminal_presets: None,
@@ -775,6 +902,7 @@ impl Settings {
                 .unwrap_or(0);
         }
         self.terminal.normalize();
+        self.term_alerts.normalize();
         // 预设列表里内置预设以前的命令换成现在的；换完和内置的一样就不存列表（同 `presets::edit`）
         if let Some(list) = &mut self.terminal_presets {
             crate::presets::upgrade_builtins(list);

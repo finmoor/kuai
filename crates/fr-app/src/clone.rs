@@ -486,7 +486,7 @@ fn empty_dir(dir: &Path) -> std::io::Result<()> {
 
 /// 本机只写了盘符（`D:`）时补成盘的根目录：`git -C D:` 进的是那个盘的「当前目录」，
 /// 和预览里拼出来的 `D:\名字` 不是一个地方。
-fn drive_root(path: &str) -> String {
+pub(crate) fn drive_root(path: &str) -> String {
     let bytes = path.as_bytes();
     match bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         true => format!("{path}\\"),
@@ -495,7 +495,7 @@ fn drive_root(path: &str) -> String {
 }
 
 /// 服务器上的 `~`、`~/…` 换成主目录 `home`：git -C 不展开 `~`（目录浏览器里能用，这里也要能用）。
-fn expand_home(path: &str, home: &str) -> String {
+pub(crate) fn expand_home(path: &str, home: &str) -> String {
     let home = home.trim_end_matches(['/', '\\']);
     if path == "~" {
         return home.to_string();
@@ -507,7 +507,7 @@ fn expand_home(path: &str, home: &str) -> String {
 }
 
 /// 目录和文件夹名拼成完整路径。本机用反斜杠，服务器上用斜杠。
-fn join(parent: &str, name: &str, local: bool) -> String {
+pub(crate) fn join(parent: &str, name: &str, local: bool) -> String {
     // Windows 本机用反斜杠，别的（服务器上的、Linux 本机）用正斜杠
     let separator = if local && cfg!(windows) { '\\' } else { '/' };
     // 反斜杠只在 Windows 的路径里是分隔符（本机是 Windows，或者写着盘符的 Windows 主机）；Linux 上
@@ -600,9 +600,12 @@ impl Render for CloneView {
         let (muted, danger) = (theme.muted_foreground, theme.danger);
         let busy = self.running.is_some();
         let label = move |text: &'static str| div().text_xs().text_color(muted).child(text);
+        // 私有仓库在哪一端认证要说清：克隆到主机时是主机去连，用的是主机上的密钥、凭据
         let hint = match &self.server {
             None => tr("克隆到本机。目录不存在时将自动创建。"),
-            Some(_) => tr("由主机连接远程仓库，存放位置须已存在。"),
+            Some(_) => tr(
+                "由主机连接远程仓库，存放位置须已存在。私有仓库在主机上认证：SSH 地址需要主机上的密钥，HTTPS 地址将提示输入用户名和访问令牌。",
+            ),
         };
         // 实际会克隆到哪里：克隆期间显示的是开始时定下来的
         let target = match &self.running {
@@ -664,7 +667,9 @@ impl Render for CloneView {
             .child(
                 v_flex()
                     .gap_1()
-                    .child(label(tr("地址")))
+                    .child(h_flex().gap_2().child(label(tr("地址"))).child(label(tr(
+                        "在托管网站仓库页的「Code」（克隆）按钮中复制，HTTPS、SSH 地址均可",
+                    ))))
                     .child(Input::new(&self.url).disabled(busy)),
             )
             .child(

@@ -31,6 +31,7 @@ use crate::app_state::{AppState, ConnStatus};
 use crate::browser::{BrowserEvent, RemoteBrowser};
 use crate::clone::{CloneEvent, CloneView};
 use crate::machines::LOCAL;
+use crate::new_project::{NewProjectEvent, NewProjectView};
 use crate::repo_rows::{Block, Columns, Handlers, MenuFor, render_block};
 use crate::repo_scan::RepoScan;
 use crate::secrets::Saved;
@@ -63,7 +64,19 @@ pub struct ManagerView {
     selected: Option<String>,
     /// 这一页显示着
     visible: bool,
+    /// 主机主目录下找到的仓库（连上、列表还空着时找一次，见 [`Self::discover`]）
+    discovered: std::collections::HashMap<String, Discovered>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// 一台主机主目录下找到的仓库。
+struct Discovered {
+    /// 完整路径，按名字排；还在找是 None
+    repos: Option<Vec<String>>,
+    /// 太多了，没找全
+    truncated: bool,
+    /// 找的时候出错了（只记日志，界面上不提）
+    failed: bool,
 }
 
 impl EventEmitter<ManagerEvent> for ManagerView {}
@@ -92,8 +105,101 @@ impl ManagerView {
             board,
             selected: None,
             visible: false,
+            discovered: std::collections::HashMap::new(),
             _subscriptions: subscriptions,
         }
+    }
+
+    /// 在主机主目录下找仓库（列表还空着时找一次，结果留着）。找法同子仓库总览（`fs_repos`）：
+    /// 以 `.` 开头的目录和 node_modules 不进去，层数、目录数有上限。
+    fn discover(&mut self, key: &str, cx: &mut Context<Self>) {
+        if key == LOCAL || self.discovered.contains_key(key) {
+            return;
+        }
+        let ConnStatus::Ready(conn) = self.app.read(cx).status(key) else {
+            return;
+        };
+        let home = conn.hello.home.clone();
+        self.discovered.insert(
+            key.to_string(),
+            Discovered {
+                repos: None,
+                truncated: false,
+                failed: false,
+            },
+        );
+        let key = key.to_string();
+        let channel = fr_channel::Channel::Remote(conn);
+        cx.spawn(async move |this, cx| {
+            let found = channel.fs_repos(&home).await;
+            this.update(cx, |this, cx| {
+                let entry = match found {
+                    Ok(found) => Discovered {
+                        repos: Some(
+                            found
+                                .repos
+                                .iter()
+                                .map(|rel| crate::clone::join(&home, rel, false))
+                                .collect(),
+                        ),
+                        truncated: found.truncated,
+                        failed: false,
+                    },
+                    Err(err) => {
+                        log::warn!("在 {key} 的主目录下找仓库失败：{err:#}");
+                        Discovered {
+                            repos: Some(Vec::new()),
+                            truncated: false,
+                            failed: true,
+                        }
+                    }
+                };
+                this.discovered.insert(key, entry);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 新建项目：在本机（`server` 为空）或某台主机上新建文件夹、初始化成仓库，建好了打开。
+    fn new_project_dialog(
+        &mut self,
+        server: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = match server.as_deref() {
+            Some(id) => tf!(
+                "在 {name} 上新建项目",
+                name = self.app.read(cx).machine_name(id)
+            ),
+            None => tr("在本机新建项目").into(),
+        };
+        let app = self.app.clone();
+        let view = cx.new(|cx| NewProjectView::new(app, server, window, cx));
+        cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
+            NewProjectEvent::Done(entry) => {
+                window.close_dialog(cx);
+                this.add_and_open(vec![entry.clone()], cx);
+            }
+        })
+        .detach();
+        let first_build = Cell::new(true);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if first_build.replace(false) {
+                view.update(cx, |view, cx| view.focus(window, cx));
+            }
+            let on_enter = view.clone();
+            dialog
+                .title(title.clone())
+                .w(px(560.))
+                .on_ok(move |_, window, cx| {
+                    on_enter.update(cx, |view, cx| view.create(window, cx));
+                    false
+                })
+                .child(view.clone())
+        });
     }
 
     fn open(&mut self, entry: RepoEntry, cx: &mut Context<Self>) {
@@ -107,6 +213,16 @@ impl ManagerView {
                 .update(cx, |app, cx| app.add_repo(entry.clone(), cx));
             self.open(entry, cx);
         }
+    }
+
+    /// 欢迎页的「连接远程主机」：打开添加主机的对话框。
+    pub fn add_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.server_dialog(None, window, cx);
+    }
+
+    /// 欢迎页的「打开本机仓库」：选本机的目录（同「添加本机仓库…」）。
+    pub fn open_local(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_local(window, cx);
     }
 
     /// 选本机的目录，可以一次选几个；在仓库中就找到仓库根目录加进列表。
@@ -154,6 +270,7 @@ impl ManagerView {
     /// 逐步登录一次，不保存，不装、不启动 kuaid。
     fn server_dialog(&mut self, edit: Option<Server>, window: &mut Window, cx: &mut Context<Self>) {
         let editing = edit.is_some();
+        let me = cx.entity().downgrade();
         let old = edit.unwrap_or_default();
         let target = Target::parse(&old.destination);
         // 这台服务器存着的密码或口令（是哪一种，看它原来的登录方式）
@@ -171,7 +288,7 @@ impl ManagerView {
                 tr("留空则在连接时输入")
             }
         };
-        let mut input = |value: &str, placeholder: &'static str, masked: bool| {
+        let mut input = |value: &str, placeholder: SharedString, masked: bool| {
             let state = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder(placeholder)
@@ -186,22 +303,31 @@ impl ManagerView {
         };
         let host = input(
             &target.host,
-            tr("主机名、IP 或 ~/.ssh/config 中的别名"),
+            tr("主机名、IP 或 ~/.ssh/config 中的别名").into(),
             false,
         );
-        let port = input(&target.port, "22", false);
-        let user = input(&target.user, tr("留空则使用 ssh 默认值"), false);
+        let port = input(&target.port, "22".into(), false);
+        // 留空时 ssh 用本机的用户名（~/.ssh/config 里给了的除外）：写出来是谁，免得拿本机的
+        // 用户名去登录 VPS 还不知道
+        let local_user = fr_core::ssh::local_user();
+        let user_hint: SharedString = match local_user.is_empty() {
+            true => tr("留空则使用 ssh 默认值").into(),
+            false => tf!("例如 root；留空则使用本机用户名 {user}", user = local_user).into(),
+        };
+        let user = input(&target.user, user_hint, false);
+        // ~/.ssh/config 里配好的主机：主机地址一栏可以直接选（U08）
+        let config_hosts: Rc<Vec<String>> = Rc::new(fr_core::ssh::user_config_hosts());
         let key = input(
             old.identity_file.as_deref().unwrap_or_default(),
-            tr("留空则使用默认密钥和 ssh-agent"),
+            tr("留空则使用默认密钥和 ssh-agent").into(),
             false,
         );
-        let passphrase = input("", secret_hint(Auth::Key), true);
-        let password = input("", secret_hint(Auth::Password), true);
-        let name = input(&old.name, tr("默认使用主机名"), false);
+        let passphrase = input("", secret_hint(Auth::Key).into(), true);
+        let password = input("", secret_hint(Auth::Password).into(), true);
+        let name = input(&old.name, tr("默认使用主机名").into(), false);
         let start_dir = input(
             old.start_dir.as_deref().unwrap_or_default(),
-            tr("留空则为主目录"),
+            tr("留空则为主目录").into(),
             false,
         );
         // 能选作跳板机的：别的已配置的服务器，而且不经这台连接（不然绕圈）。
@@ -328,6 +454,7 @@ impl ManagerView {
             let submit = {
                 let (collect, app) = (collect.clone(), app.clone());
                 let (forget, problem, old) = (forget.clone(), problem.clone(), old.clone());
+                let me = me.clone();
                 move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                     let (server, secret) = match collect(cx) {
                         Ok(read) => read,
@@ -368,6 +495,10 @@ impl ManagerView {
                         }
                     });
                     stored.id = id.clone();
+                    // 新加的：右边换成它（连上以后是它的下一步、主目录下找到的仓库）
+                    if !editing {
+                        me.update(cx, |this, cx| this.select(id.clone(), cx)).ok();
+                    }
                     // 存、删可能要等（Linux 上钥匙圈锁着、还没有时弹系统的框等用户），放到后台做，不卡
                     // 界面；做完再连，连接时要读存着的
                     let done = cx.background_executor().spawn(async move { job.run(&stored) });
@@ -640,16 +771,54 @@ impl ManagerView {
                 .child(
                     v_flex()
                         .gap_3()
+                        // 主机要满足的条件先说：ARM 的主机、git 太旧的主机连上了也用不了
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(tr("支持 x86_64（amd64）的 Linux、Windows 主机，主机上需装有 git 2.31 或更高版本。")),
+                        )
                         .child(
                             h_flex()
                                 .gap_3()
                                 .items_start()
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .child(field(tr("主机地址"), Input::new(&host))),
-                                )
+                                .child(div().flex_1().min_w_0().child(field_with(
+                                    tr("主机地址"),
+                                    // ~/.ssh/config 里有配好的主机：可以直接选一个；没有就写一句
+                                    // VPS 控制台里哪一项填在这里
+                                    Some(match config_hosts.is_empty() {
+                                        true => div()
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child(tr("填写 VPS 控制台中的公网 IP"))
+                                            .into_any_element(),
+                                        false => {
+                                            let (hosts, host) = (config_hosts.clone(), host.clone());
+                                            Button::new("ssh-config-hosts")
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(ui::icon_small(IconName::ChevronDown))
+                                                .label(tr("选择 ~/.ssh/config 中的主机"))
+                                                .dropdown_menu(move |mut menu, _, _| {
+                                                    for name in hosts.iter() {
+                                                        let (name, host) = (name.clone(), host.clone());
+                                                        menu = menu.item(
+                                                            PopupMenuItem::new(name.clone()).on_click(
+                                                                move |_, window, cx| {
+                                                                    host.update(cx, |state, cx| {
+                                                                        state.set_value(name.clone(), window, cx)
+                                                                    });
+                                                                },
+                                                            ),
+                                                        );
+                                                    }
+                                                    menu
+                                                })
+                                                .into_any_element()
+                                        }
+                                    }),
+                                    Input::new(&host),
+                                )))
                                 .child(
                                     div()
                                         .w(px(96.))
@@ -953,10 +1122,63 @@ struct Colors {
     hover: Hsla,
     border: Hsla,
     danger: Hsla,
+    warning: Hsla,
     success: Hsla,
     accent: Hsla,
     /// 侧栏、仓库列表的底色
     panel: Hsla,
+}
+
+/// 主机页标题下面的提示框：连不上的原因（红色，带「诊断…」），或者连上了但打不开仓库的原因
+/// （黄色：主机上没有 git、git 太旧，带可以复制的安装命令）。
+#[derive(Clone)]
+struct Notice {
+    text: SharedString,
+    warning: bool,
+    /// 「复制命令」复制的命令
+    command: Option<&'static str>,
+    /// 给「诊断…」：逐步检查哪一步连不上
+    diagnose: bool,
+}
+
+/// 连上的主机上的 git 能不能用：没有、太旧时返回给提示框的说明和安装命令（Debian、Ubuntu 的）。
+fn git_notice(raw: &str) -> Option<Notice> {
+    let (major, minor, _) = fr_core::git::MIN_VERSION;
+    let minimum = format!("{major}.{minor}");
+    match fr_core::git::parse_version(raw) {
+        // Ubuntu 20.04 这类旧系统自带的 git 低于要求，要从 git 官方的 PPA 装
+        Some(version) => fr_core::git::too_old(Some(version)).map(|old| Notice {
+            text: tf!(
+                "主机上的 git 为 {old}，低于要求的 {minimum}，无法打开仓库。请升级 git 后重新连接，Ubuntu 可运行以下命令：",
+                old,
+                minimum
+            )
+            .into(),
+            warning: true,
+            command: Some(
+                "sudo add-apt-repository -y ppa:git-core/ppa && sudo apt update && sudo apt install -y git",
+            ),
+            diagnose: false,
+        }),
+        None => Some(Notice {
+            text: tr("主机上没有找到 git，无法打开仓库。请安装 git 后重新连接，Debian、Ubuntu 可运行以下命令：").into(),
+            warning: true,
+            command: Some("sudo apt update && sudo apt install -y git"),
+            diagnose: false,
+        }),
+    }
+}
+
+/// 连接用了多久：不到 1 秒写毫秒，否则写到 0.1 秒。原来只写「16123 ms」，看着像网络延迟。
+fn connect_time(elapsed: std::time::Duration) -> String {
+    let ms = elapsed.as_millis();
+    match ms {
+        0..=999 => tf!("连接用时 {ms} 毫秒", ms),
+        _ => tf!(
+            "连接用时 {s} 秒",
+            s = format!("{:.1}", elapsed.as_secs_f64())
+        ),
+    }
 }
 
 /// 移除之前问一下。`danger` 时按钮是红的，回车不执行，要明确点按钮。
@@ -1187,19 +1409,106 @@ impl ManagerView {
         );
     }
 
-    /// 一台服务器现在连没连上：圆点的颜色、一句话、能不能点「连接」、连不上的原因。
+    /// 主机页标题下面的提示框（见 [`Notice`]）：说明，下面一排按钮（复制安装命令、诊断）。
+    fn render_notice(
+        &self,
+        key: &str,
+        notice: Notice,
+        colors: Colors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let color = if notice.warning {
+            colors.warning
+        } else {
+            colors.danger
+        };
+        let id = key.to_string();
+        let command = notice.command.map(|command| {
+            h_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .px(px(8.))
+                        .py(px(4.))
+                        .rounded(px(4.))
+                        .bg(colors.muted.opacity(0.10))
+                        .font_family(crate::fonts::mono())
+                        .text_color(colors.muted)
+                        .whitespace_normal()
+                        .child(command),
+                )
+                .child(
+                    Button::new("notice-copy")
+                        .xsmall()
+                        .icon(ui::icon(IconName::Copy))
+                        .label(tr("复制命令"))
+                        .on_click(move |_, window, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(command.to_string()));
+                            window.push_notification(Notification::success(tr("已复制")), cx);
+                        }),
+                )
+        });
+        v_flex()
+            .gap(px(8.))
+            .px(px(14.))
+            .py(px(8.))
+            .rounded(px(8.))
+            .bg(color.opacity(0.08))
+            .text_xs()
+            .child(
+                div()
+                    .text_color(color)
+                    .whitespace_normal()
+                    .child(notice.text),
+            )
+            .children(command)
+            .when(notice.diagnose, |notice| {
+                notice.child(
+                    h_flex().child(
+                        Button::new("notice-diagnose")
+                            .xsmall()
+                            .icon(ui::icon(IconName::Stethoscope))
+                            .label(tr("诊断…"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                crate::diagnose::Diagnose::open(
+                                    this.app.clone(),
+                                    &id,
+                                    None,
+                                    window,
+                                    cx,
+                                )
+                            })),
+                    ),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// 一台服务器现在连没连上：圆点的颜色、一句话、能不能点「连接」、提示框（连不上的原因，或者
+    /// 连上了但主机上的 git 用不了）。
     fn conn_state(
         &self,
         key: &str,
         colors: Colors,
         cx: &App,
-    ) -> (Hsla, SharedString, bool, Option<SharedString>) {
+    ) -> (Hsla, SharedString, bool, Option<Notice>) {
         let app = self.app.read(cx);
         let loaded = app.machine(key).map(|m| m.live);
         let off = colors.muted.opacity(0.6);
         match app.status(key) {
             ConnStatus::Idle => (off, tr("未连接").into(), true, None),
-            ConnStatus::Connecting => (colors.accent, app.connecting_text(key), false, None),
+            // 后台重连的这一轮还没连上：上次失败的原因和「诊断…」留着
+            ConnStatus::Connecting => {
+                let notice = app.last_failure(key).map(|err| Notice {
+                    text: tf!("上次连接失败：{err}", err = err.as_ref()).into(),
+                    warning: false,
+                    command: None,
+                    diagnose: true,
+                });
+                (colors.accent, app.connecting_text(key), false, notice)
+            }
             // 连过，但订阅断了（还没来得及重连）。重连没连上的不在这里：照下面写「连接失败」和原因，
             // 不然主机密钥变了这样的原因看不到
             ConnStatus::Ready(_) | ConnStatus::Failed(_)
@@ -1208,20 +1517,21 @@ impl ManagerView {
                 (off, tr("已断开").into(), true, None)
             }
             ConnStatus::Ready(conn) => {
+                let time = connect_time(conn.connect_time);
                 let text = match crate::machines::split_relay(key) {
                     // kuaid 的版本是那台电脑上常驻的那个报的：和 Kuai 同一个版本号，连接时不是这一版
                     // 的会被换掉，只有别的电脑上更新的 Kuai 升过它时才比这边新。经由哪台在名字
                     // 后面写着（列表里、上面的小标签），这里不重复
                     Some(_) => tf!(
-                        "已连接 · kuaid {version} · {ms} ms",
+                        "已连接 · kuaid {version} · {time}",
                         version = conn.hello.version,
-                        ms = conn.connect_time.as_millis()
+                        time
                     ),
                     None => tf!(
-                        "已连接 · kuaid {version} · git {git} · {ms} ms{installed}",
+                        "已连接 · kuaid {version} · git {git} · {time}{installed}",
                         version = conn.hello.version,
                         git = conn.hello.git.trim_start_matches("git version "),
-                        ms = conn.connect_time.as_millis(),
+                        time,
                         installed = if conn.installed {
                             tr(" · 已安装 kuaid")
                         } else {
@@ -1229,9 +1539,21 @@ impl ManagerView {
                         }
                     ),
                 };
-                (colors.success, text.into(), false, None)
+                // 连上了但 git 用不了：圆点黄色，下面说明怎么装（原来照样绿色「已连接」，打开仓库才报错）
+                match git_notice(&conn.hello.git) {
+                    Some(notice) => (colors.warning, text.into(), false, Some(notice)),
+                    None => (colors.success, text.into(), false, None),
+                }
             }
-            ConnStatus::Failed(err) => (colors.danger, tr("连接失败").into(), true, Some(err)),
+            ConnStatus::Failed(err) => {
+                let notice = Notice {
+                    text: err,
+                    warning: false,
+                    command: None,
+                    diagnose: true,
+                };
+                (colors.danger, tr("连接失败").into(), true, Some(notice))
+            }
         }
     }
 
@@ -1519,7 +1841,7 @@ impl ManagerView {
         key: &str,
         colors: Colors,
         cx: &mut Context<Self>,
-    ) -> (AnyElement, Option<SharedString>) {
+    ) -> (AnyElement, Option<Notice>) {
         let local = key == LOCAL;
         let relay = crate::machines::split_relay(key).map(|(via, _)| via.to_string());
         let (dot, text, retry, failure) = match local {
@@ -1723,6 +2045,274 @@ impl ManagerView {
         chips
     }
 
+    /// 一个仓库都没有时：「下一步」三张卡片（打开仓库…、克隆…、新建项目…），主机上的下面再列出主目录
+    /// 下找到的仓库，一个个打开或全部打开。
+    fn render_next_steps(&self, key: &str, colors: Colors, cx: &mut Context<Self>) -> AnyElement {
+        let local = key == LOCAL;
+        // 还没找过主目录下的仓库：画完这一帧去找（连着才找）
+        let ready = matches!(self.app.read(cx).status(key), ConnStatus::Ready(_));
+        if !local && ready && !self.discovered.contains_key(key) {
+            let key = key.to_string();
+            cx.spawn(async move |this, cx| {
+                this.update(cx, |this, cx| this.discover(&key, cx)).ok();
+            })
+            .detach();
+        }
+        let theme = cx.theme();
+        let (primary, fg, secondary, list_hover) = (
+            theme.primary,
+            theme.foreground,
+            theme.secondary,
+            theme.list_hover,
+        );
+        let card = |id: &'static str,
+                    icon: IconName,
+                    title: &'static str,
+                    desc: &'static str,
+                    main: bool| {
+            div()
+                .id(id)
+                .flex_1()
+                .min_w(px(190.))
+                .p(px(16.))
+                .rounded(px(12.))
+                .border_1()
+                .border_color(if main {
+                    primary.opacity(0.55)
+                } else {
+                    colors.border
+                })
+                .bg(if main {
+                    primary.opacity(0.07)
+                } else {
+                    colors.panel
+                })
+                .cursor_pointer()
+                .hover(|s| s.border_color(primary))
+                .child(
+                    div()
+                        .size(px(38.))
+                        .mb(px(12.))
+                        .rounded(px(10.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(if main { primary } else { secondary })
+                        .text_color(if main { gpui_kit::white() } else { fg })
+                        .child(Icon::new(icon).size(px(20.))),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .mb(px(4.))
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(colors.muted)
+                        .whitespace_normal()
+                        .child(desc),
+                )
+        };
+        let (open_key, clone_key, new_key) = (key.to_string(), key.to_string(), key.to_string());
+        let open = match local {
+            true => card(
+                "next-add-local",
+                IconName::FolderGit2,
+                tr("添加本机仓库…"),
+                tr("选择本机上已有的仓库，可以一次选几个。"),
+                true,
+            )
+            .on_click(cx.listener(|this, _, window, cx| this.add_local(window, cx))),
+            false => card(
+                "next-open",
+                IconName::FolderGit2,
+                tr("打开仓库…"),
+                tr("选择主机上已有的仓库，例如 Claude Code 工作的目录。"),
+                true,
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_remote_dialog(open_key.clone(), window, cx)
+            })),
+        };
+        let clone = card(
+            "next-clone",
+            IconName::Download,
+            if local {
+                tr("克隆到本机…")
+            } else {
+                tr("克隆到此主机…")
+            },
+            tr("从网址克隆仓库。"),
+            false,
+        )
+        .on_click(cx.listener(move |this, _, window, cx| {
+            let server = (clone_key != LOCAL).then(|| clone_key.clone());
+            this.clone_dialog(server, window, cx)
+        }));
+        let new = card(
+            "next-new",
+            IconName::FolderPlus,
+            tr("新建项目…"),
+            tr("没有现成代码？新建文件夹并初始化为仓库。"),
+            false,
+        )
+        .on_click(cx.listener(move |this, _, window, cx| {
+            let server = (new_key != LOCAL).then(|| new_key.clone());
+            this.new_project_dialog(server, window, cx)
+        }));
+        let cards = v_flex()
+            .gap(px(8.))
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(colors.muted)
+                    .child(tr("下一步")),
+            )
+            // 不用 h_flex（它把孩子竖着居中）：三张卡片一样高
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap(px(12.))
+                    .child(open)
+                    .child(clone)
+                    .child(new),
+            );
+        // 主目录下找到的仓库
+        let found = self.discovered.get(key).map(|found| {
+            let head = |text: SharedString| {
+                h_flex()
+                    .gap(px(8.))
+                    .px(px(14.))
+                    .py(px(10.))
+                    .bg(colors.panel)
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .child(ui::icon_small(IconName::Search).text_color(colors.muted))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(text),
+                    )
+            };
+            let box_ = v_flex()
+                .rounded(px(10.))
+                .border_1()
+                .border_color(colors.border)
+                .overflow_hidden();
+            match &found.repos {
+                None => box_
+                    .child(head(tr("正在查找主目录下的仓库…").into()))
+                    .into_any_element(),
+                Some(repos) if repos.is_empty() => div()
+                    .px(px(4.))
+                    .text_xs()
+                    .text_color(colors.muted)
+                    .child(match found.failed {
+                        true => tr("无法查找主目录下的仓库，请使用「打开仓库…」浏览。"),
+                        false => tr("主目录下没有找到仓库。可以「克隆到此主机…」或「新建项目…」。"),
+                    })
+                    .into_any_element(),
+                Some(repos) => {
+                    let shown: Vec<String> = repos.iter().take(8).cloned().collect();
+                    let more = repos.len() - shown.len();
+                    let server = key.to_string();
+                    let all: Vec<RepoEntry> = repos
+                        .iter()
+                        .map(|path| RepoEntry {
+                            server: Some(server.clone()),
+                            path: path.clone(),
+                        })
+                        .collect();
+                    let title: SharedString = match found.truncated {
+                        true => tf!("在主目录下发现 {n} 个以上的仓库", n = repos.len()).into(),
+                        false => tf!("在主目录下发现 {n} 个仓库", n = repos.len()).into(),
+                    };
+                    let mut list = box_.child(
+                        head(title).child(
+                            Button::new("discovered-all")
+                                .small()
+                                .label(tr("全部打开"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.add_and_open(all.clone(), cx)
+                                })),
+                        ),
+                    );
+                    for (ix, path) in shown.into_iter().enumerate() {
+                        let entry = RepoEntry {
+                            server: Some(server.clone()),
+                            path: path.clone(),
+                        };
+                        list =
+                            list.child(
+                                h_flex()
+                                    .id(("discovered", ix))
+                                    .gap(px(12.))
+                                    .px(px(14.))
+                                    .py(px(8.))
+                                    .border_t_1()
+                                    .border_color(colors.border.opacity(0.5))
+                                    .hover(|s| s.bg(list_hover))
+                                    .child(ui::icon(IconName::FolderGit2).text_color(colors.muted))
+                                    .child(
+                                        v_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .child(div().text_sm().child(
+                                                crate::settings::base_name(&path).to_string(),
+                                            ))
+                                            .child(
+                                                ui::clipped(("discovered-path", ix), path.clone())
+                                                    .text_xs()
+                                                    .text_color(colors.muted),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new(("discovered-open", ix))
+                                            .small()
+                                            .label(tr("打开"))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.add_and_open(vec![entry.clone()], cx)
+                                            })),
+                                    ),
+                            );
+                    }
+                    let foot: SharedString = match more {
+                        0 => tr("没有想要的？使用「打开仓库…」浏览，或「新建项目…」。").into(),
+                        n => tf!(
+                            "另有 {n} 个未列出，可「全部打开」，或使用「打开仓库…」浏览。",
+                            n
+                        )
+                        .into(),
+                    };
+                    list.child(
+                        div()
+                            .px(px(14.))
+                            .py(px(9.))
+                            .border_t_1()
+                            .border_color(colors.border)
+                            .text_xs()
+                            .text_color(colors.muted)
+                            .child(foot),
+                    )
+                    .into_any_element()
+                }
+            }
+        });
+        v_flex()
+            .gap(px(14.))
+            .child(cards)
+            .children(found)
+            .into_any_element()
+    }
+
     /// 「仓库」那一行：个数、一句说明，右边克隆、打开（本机是添加本机仓库）。
     fn render_repos_bar(
         &self,
@@ -1733,7 +2323,7 @@ impl ManagerView {
     ) -> AnyElement {
         let local = key == LOCAL;
         let muted = cx.theme().muted_foreground;
-        let (clone_id, open_id) = (key.to_string(), key.to_string());
+        let (clone_id, open_id, new_id) = (key.to_string(), key.to_string(), key.to_string());
         let add = match local {
             true => Button::new("server-add-local")
                 .small()
@@ -1742,6 +2332,7 @@ impl ManagerView {
                 .on_click(cx.listener(|this, _, window, cx| this.add_local(window, cx))),
             false => Button::new("server-open-repo")
                 .small()
+                .primary()
                 .disabled(!live)
                 .icon(ui::icon(IconName::FolderSearch))
                 .label(tr("打开仓库…"))
@@ -1770,6 +2361,18 @@ impl ManagerView {
                 )
             })
             .child(div().flex_1())
+            .child(
+                Button::new("server-new-project")
+                    .small()
+                    .disabled(!live)
+                    .icon(ui::icon(IconName::FolderPlus))
+                    .label(tr("新建项目…"))
+                    .tooltip(tr("新建文件夹并初始化为 Git 仓库"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let server = (new_id != LOCAL).then(|| new_id.clone());
+                        this.new_project_dialog(server, window, cx)
+                    })),
+            )
             .child(
                 Button::new("server-clone")
                     .small()
@@ -2028,17 +2631,22 @@ impl ManagerView {
             .enumerate()
             .map(|(ix, (block, actions))| render_block(ix, block, actions, columns, &handlers, cx))
             .collect();
+        // 一个仓库都没有（刚连上的主机、刚装好的 Kuai）：下一步的三张卡片，主机上的再列出主目录下
+        // 找到的仓库。只用作跳板机的照旧一句话
+        if blocks.is_empty() && !jump_only {
+            return v_flex()
+                .gap(px(10.))
+                .child(bar)
+                .child(self.render_next_steps(key, colors, cx))
+                .into_any_element();
+        }
         let empty = blocks.is_empty().then(|| {
             div()
                 .px(px(10.))
                 .py(px(14.))
                 .text_sm()
                 .text_color(colors.muted)
-                .child(match (local, jump_only) {
-                    (true, _) => tr("暂无本机仓库。请点击「添加本机仓库…」或「克隆…」。"),
-                    (false, true) => tr("仅用作跳板机，暂无此主机上的仓库。"),
-                    (false, false) => tr("暂无此主机上的仓库。请点击「打开仓库…」选择。"),
-                })
+                .child(tr("仅用作跳板机，暂无此主机上的仓库。"))
         });
         v_flex()
             .gap(px(8.))
@@ -2117,6 +2725,7 @@ impl Render for ManagerView {
             hover: theme.list_hover,
             border: theme.border,
             danger: theme.danger,
+            warning: theme.warning,
             success: theme.success,
             accent: theme.primary,
             panel: theme.sidebar,
@@ -2161,17 +2770,11 @@ impl Render for ManagerView {
                             .py(px(24.))
                             .gap(px(16.))
                             .child(head)
-                            .children(failure.map(|failure| {
-                                div()
-                                    .px(px(14.))
-                                    .py(px(8.))
-                                    .rounded(px(8.))
-                                    .bg(colors.danger.opacity(0.08))
-                                    .text_xs()
-                                    .text_color(colors.danger)
-                                    .whitespace_normal()
-                                    .child(failure)
-                            }))
+                            .children(
+                                failure.map(|notice| {
+                                    self.render_notice(&selected, notice, colors, cx)
+                                }),
+                            )
                             .child(repos),
                     ),
             )

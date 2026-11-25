@@ -4,11 +4,15 @@ use std::collections::HashMap;
 
 /// `git blame` 的参数。`--porcelain`：每个提交的信息只在它第一次出现时给一次。
 pub fn args(path: &str) -> Vec<String> {
-    ["blame", "--porcelain", "--"]
-        .iter()
-        .map(|s| s.to_string())
-        .chain([path.to_string()])
-        .collect()
+    args_at(None, path)
+}
+
+/// 同 [`args`]，`rev` 给了就追溯那个提交里的版本（不看工作区）。
+pub fn args_at(rev: Option<&str>, path: &str) -> Vec<String> {
+    let mut list: Vec<String> = ["blame", "--porcelain"].map(String::from).to_vec();
+    list.extend(rev.map(str::to_string));
+    list.extend(["--".to_string(), path.to_string()]);
+    list
 }
 
 /// 改过这个文件的一个提交。

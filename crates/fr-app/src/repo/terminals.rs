@@ -16,6 +16,10 @@
 //! - 这台电脑上的 kuaid 用不了时，本机仓库的终端退回到开在 Kuai 进程里。关标签页时，程序还在
 //!   运行的交给 [`Parked`] 保管，再打开这个仓库、到终端页时接回来；退出 Kuai（包括重启以完成
 //!   更新）时才结束。
+//!
+//! 和会话页用同一套：名字、状态从实时列表来（起过的名字、同名加序号）；双击
+//! 名字、右键「重命名…」、F2 改名；行前的勾（鼠标移上去时盖在序号上）勾 2～4 个并排查看
+//! （[`crate::term_split`]）；F6 在侧栏和终端之间换，侧栏上 ↑↓ 换终端、Enter 进去输入。
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -25,9 +29,12 @@ use fr_core::i18n::tr;
 use fr_core::tf;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
@@ -35,11 +42,15 @@ use super::{Page, RepoView, TOOLBAR_HEIGHT, tool_button};
 use crate::presets::{self, Start};
 use crate::settings::{RepoEntry, TermSlot};
 use crate::term_board::{BoardHandle, Row as TermRow, TermBoard, free_number};
+use crate::term_overview::TermOverview;
+use crate::term_split::{self, Handler};
 use crate::terminal::{self, Closing, TerminalEvent, TerminalView};
 use crate::ui;
 
 /// 侧栏里一个终端一行的高度。
 const ROW_HEIGHT: f32 = 28.;
+/// 带最后一行字时一行的高度（`TermAlerts::last_line`）
+const TALL_ROW: f32 = 44.;
 
 /// 一个终端。
 struct TermTab {
@@ -90,6 +101,16 @@ pub(super) struct Terminals {
     /// 点了「新终端」、正在问 kuaid 留着哪几个的次数（见 [`RepoView::new_terminal_in`]）：
     /// 一个终端都没有时终端页写「正在连接…」
     asking: usize,
+    /// 侧栏终端列表的焦点（F6 从终端回到这里）；用到时才建
+    side_focus: Option<FocusHandle>,
+    /// 正在改名的终端（序号）和输入框
+    renaming: Option<(u32, Entity<InputState>, Subscription)>,
+    /// 勾上要并排查看的终端（序号），还没点「并排查看」时
+    picks: Vec<u32>,
+    /// 并排着的终端（序号，2～4 个）；焦点格是 `active` 那个
+    split: Vec<u32>,
+    /// 放大着的那一格（序号）
+    zoom: Option<u32>,
 }
 
 impl Terminals {
@@ -182,16 +203,48 @@ fn terminal_menu(
 ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
     move |menu, window, cx| {
         let (attach, restart, end) = (view.clone(), view.clone(), view.clone());
+        let (rename, pick) = (view.clone(), view.clone());
         // 和会话页终端行的右键一样，先是「新建终端 ▸」（在这个仓库里）
         let place = view
             .upgrade()
             .map(|this| this.read(cx).launch_place("", cx))
             .unwrap_or_default();
+        let (number, picked, nameable) = view
+            .upgrade()
+            .map(|this| {
+                let this = this.read(cx);
+                let number = this.terminals.tabs.get(index).map(|tab| tab.number);
+                let picked = number.is_some_and(|number| this.terminal_picked(number));
+                (number, picked, this.board_row(index, cx).is_some())
+            })
+            .unwrap_or((None, false, false));
+        let rename_label = crate::keymap::with_key(tr("重命名…（F2）"), "hub.rename", cx);
         menu.submenu(
             tr("新建终端"),
             window,
             cx,
             launch_menu(view.clone(), place, String::new()),
+        )
+        .item(
+            PopupMenuItem::new(rename_label)
+                .disabled(!nameable)
+                .on_click(move |_, window, cx| {
+                    rename
+                        .update(cx, |this, cx| this.start_terminal_rename(index, window, cx))
+                        .ok();
+                }),
+        )
+        .item(
+            PopupMenuItem::new(match picked {
+                true => tr("移出并排查看"),
+                false => tr("加入并排查看"),
+            })
+            .on_click(move |_, window, cx| {
+                if let Some(number) = number {
+                    pick.update(cx, |this, cx| this.toggle_terminal_pick(number, window, cx))
+                        .ok();
+                }
+            }),
         )
         .item(
             PopupMenuItem::new(tr("发送图片或文件…")).on_click(move |_, window, cx| {
@@ -621,6 +674,18 @@ impl RepoView {
     /// 画之前调用。正在终端页上、这时才知道还留着别的终端（服务器连得慢，或者断了重连；
     /// 同一个本机仓库在别的工作区里的标签页关掉了）：补进来。
     pub(super) fn sync_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 并排着的、勾上的终端结束了：去掉；并排只剩一个时回到单个
+        let numbers: Vec<u32> = self.terminals.tabs.iter().map(|tab| tab.number).collect();
+        let terms = &mut self.terminals;
+        terms.picks.retain(|number| numbers.contains(number));
+        terms.split.retain(|number| numbers.contains(number));
+        if terms.split.len() < term_split::MIN_CELLS {
+            terms.split.clear();
+            terms.zoom = None;
+        }
+        if terms.zoom.is_some_and(|zoom| !terms.split.contains(&zoom)) {
+            terms.zoom = None;
+        }
         if self.page == Page::Terminal {
             self.adopt_waiting(window, cx);
             // 显示着的那个在别处结束了：焦点放到换上来的这个上
@@ -812,6 +877,31 @@ impl RepoView {
             true => self.app.read(cx).repo_name(&self.entry),
             false => dir.to_string().into(),
         }
+    }
+
+    /// 第 `index` 个终端叫什么：实时列表里算好的（起过的名字、同名加序号，见 [`TermRow::label`]）；
+    /// 还不在列表里的（开在 Kuai 进程里的、刚开的）用程序设的标题。
+    fn terminal_name(&self, index: usize, cx: &App) -> SharedString {
+        if let Some(row) = self.board_row(index, cx) {
+            return row.label;
+        }
+        self.terminals
+            .tabs
+            .get(index)
+            .and_then(|tab| tab.view.read(cx).label())
+            .unwrap_or_else(|| tr("终端").into())
+    }
+
+    /// 终端页上并排着的终端（几个序号）；没并排、不在终端页、这一页没显示出来时是空的。
+    pub fn split_terminals(&self) -> Vec<(RepoEntry, u32)> {
+        if !self.visible || self.page != Page::Terminal || self.terminals.split.len() < 2 {
+            return Vec::new();
+        }
+        self.terminals
+            .split
+            .iter()
+            .map(|number| (self.entry.clone(), *number))
+            .collect()
     }
 
     /// 终端页上正显示着的是第几个终端；不在终端页、这一页没显示出来时是 None。
@@ -1034,9 +1124,279 @@ impl RepoView {
         };
         if let Some(term) = term {
             presets::restarting(&slot, &term, cx);
+            // 起的名字跟到新开的那个上
+            if let Some(board) = self.terminals.board.clone() {
+                let id = crate::term_board::TermId {
+                    machine: crate::machines::machine_of(&self.entry).to_string(),
+                    term,
+                };
+                board.update(cx, |board, cx| board.restarting(&id, cx));
+            }
         }
         self.select_terminal(index, window, cx);
         view.update(cx, |view, cx| view.restart(closing, cx));
+    }
+
+    // ---------- 改名 ----------
+
+    /// 开始给第 `index` 个终端改名：侧栏那一行的名字换成输入框。不在实时列表里的（开在 Kuai 进程
+    /// 里的）改不了。
+    pub(super) fn start_terminal_rename(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(tab), Some(row)) = (self.terminals.tabs.get(index), self.board_row(index, cx))
+        else {
+            return;
+        };
+        let number = tab.number;
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(tr("留空则使用默认名称")));
+        input.update(cx, |state, cx| {
+            state.set_value(row.label.to_string(), window, cx);
+            state.select_all(window, cx);
+        });
+        let events =
+            cx.subscribe_in(
+                &input,
+                window,
+                |this, _, event: &InputEvent, window, cx| match event {
+                    InputEvent::PressEnter { .. } => {
+                        this.finish_terminal_rename(true, true, window, cx)
+                    }
+                    InputEvent::Blur => this.finish_terminal_rename(true, false, window, cx),
+                    _ => {}
+                },
+            );
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.terminals.renaming = Some((number, input, events));
+        cx.notify();
+    }
+
+    /// 改完了（`keep`：确认，不然是取消）；`refocus` 时焦点回到侧栏的终端列表上。
+    fn finish_terminal_rename(
+        &mut self,
+        keep: bool,
+        refocus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((number, input, _)) = self.terminals.renaming.take() else {
+            return;
+        };
+        let index = self
+            .terminals
+            .tabs
+            .iter()
+            .position(|tab| tab.number == number);
+        let row = index.and_then(|index| self.board_row(index, cx));
+        if keep && let (Some(row), Some(board)) = (row, self.terminals.board.clone()) {
+            let name = input.read(cx).value().to_string();
+            // 和默认的名字一样（没改）不算起了名字：程序自己设的标题还会变
+            if row.named || row.label.as_ref() != name.trim() {
+                board.update(cx, |board, cx| board.rename(&row.id, &name, cx));
+            }
+        }
+        if refocus {
+            let focus = self.terminal_side_focus(cx);
+            focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// 侧栏一行里的改名输入框（正在改这个终端的名字时）。
+    fn terminal_rename_box(&self, number: u32, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (_, input, _) = self
+            .terminals
+            .renaming
+            .as_ref()
+            .filter(|(at, _, _)| *at == number)?;
+        Some(
+            div()
+                .id("terminal-rename")
+                .flex_1()
+                .min_w_0()
+                .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.finish_terminal_rename(false, true, window, cx);
+                    }
+                }))
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(Input::new(input).small())
+                .into_any_element(),
+        )
+    }
+
+    // ---------- 并排查看 ----------
+
+    fn terminal_picked(&self, number: u32) -> bool {
+        match self.terminals.split.is_empty() {
+            true => self.terminals.picks.contains(&number),
+            false => self.terminals.split.contains(&number),
+        }
+    }
+
+    /// 勾上、去掉要并排查看的终端；并排着时是加一格、移出一格。
+    pub(super) fn toggle_terminal_pick(
+        &mut self,
+        number: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let max = term_split::MAX_CELLS;
+        let too_many = |window: &mut Window, cx: &mut App| {
+            let text = tf!("最多并排查看 {n} 个终端", n = max.to_string());
+            window.push_notification(Notification::info(text), cx);
+        };
+        let terms = &mut self.terminals;
+        if !terms.split.is_empty() {
+            match terms.split.iter().position(|other| *other == number) {
+                Some(_) => return self.remove_terminal_cell(number, window, cx),
+                None if terms.split.len() >= max => return too_many(window, cx),
+                None => {
+                    terms.split.push(number);
+                    terms.zoom = None;
+                }
+            }
+            cx.notify();
+            return;
+        }
+        match terms.picks.iter().position(|other| *other == number) {
+            Some(at) => {
+                terms.picks.remove(at);
+            }
+            None if terms.picks.len() >= max => return too_many(window, cx),
+            None => terms.picks.push(number),
+        }
+        cx.notify();
+    }
+
+    /// 并排查看勾上的那几个，焦点进第一格。
+    fn start_terminal_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let terms = &mut self.terminals;
+        if terms.picks.len() < term_split::MIN_CELLS {
+            return;
+        }
+        terms.split = std::mem::take(&mut terms.picks);
+        terms.zoom = None;
+        let first = terms.split[0];
+        if let Some(index) = terms.tabs.iter().position(|tab| tab.number == first) {
+            self.select_terminal(index, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// 退出并排：回到单个，显示焦点格里的那个。
+    fn exit_terminal_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.terminals.split.clear();
+        self.terminals.zoom = None;
+        self.focus_terminal(window, cx);
+        cx.notify();
+    }
+
+    /// 把一格移出并排；只剩一格时回到单个。
+    fn remove_terminal_cell(&mut self, number: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let terms = &mut self.terminals;
+        terms.split.retain(|other| *other != number);
+        terms.zoom = None;
+        if terms.split.len() < term_split::MIN_CELLS {
+            if let Some(&last) = terms.split.first()
+                && let Some(index) = terms.tabs.iter().position(|tab| tab.number == last)
+            {
+                terms.active = index;
+            }
+            return self.exit_terminal_split(window, cx);
+        }
+        // 移出的是焦点格：焦点换到第一格
+        let active = terms.tabs.get(terms.active).map(|tab| tab.number);
+        if active == Some(number) {
+            let first = terms.split[0];
+            if let Some(index) = terms.tabs.iter().position(|tab| tab.number == first) {
+                self.select_terminal(index, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 焦点格换成序号是 `number` 的那个，焦点进去。
+    fn focus_terminal_cell(&mut self, number: u32, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self
+            .terminals
+            .tabs
+            .iter()
+            .position(|tab| tab.number == number)
+        {
+            self.select_terminal(index, window, cx);
+        }
+    }
+
+    /// 放大序号是 `number` 的那一格；已经放大着的还原。
+    fn zoom_terminal_cell(&mut self, number: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let terms = &mut self.terminals;
+        terms.zoom = match terms.zoom {
+            Some(zoomed) if zoomed == number => None,
+            _ => Some(number),
+        };
+        self.focus_terminal_cell(number, window, cx);
+    }
+
+    // ---------- 键盘 ----------
+
+    /// 侧栏终端列表的焦点（用到时才建）。
+    fn terminal_side_focus(&mut self, cx: &mut Context<Self>) -> FocusHandle {
+        self.terminals
+            .side_focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone()
+    }
+
+    /// F6、Shift+F6：焦点在侧栏的终端列表和终端之间换。
+    pub(super) fn switch_terminal_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page != Page::Terminal {
+            return;
+        }
+        if self.terminal_focused(window, cx) {
+            let focus = self.terminal_side_focus(cx);
+            focus.focus(window, cx);
+        } else {
+            self.focus_terminal(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// F2：给选中的终端改名。
+    pub(super) fn rename_active_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page == Page::Terminal && self.terminals.renaming.is_none() {
+            let index = self.terminals.active;
+            self.start_terminal_rename(index, window, cx);
+        }
+    }
+
+    /// 侧栏终端列表上的键：↑↓ 换终端（焦点不动），Enter、→ 进去输入，空格勾上并排查看。
+    fn on_terminal_side_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let n = self.terminals.tabs.len();
+        let at = self.terminals.active;
+        match event.keystroke.key.as_str() {
+            "down" if at + 1 < n => self.terminals.active = at + 1,
+            "up" if at > 0 => self.terminals.active = at - 1,
+            "down" | "up" => {}
+            "enter" | "right" => self.focus_terminal(window, cx),
+            "space" => {
+                if let Some(number) = self.terminals.tabs.get(at).map(|tab| tab.number) {
+                    self.toggle_terminal_pick(number, window, cx);
+                }
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
     }
 
     /// 给第 `index` 个终端选图片、文件发进去，并显示它。
@@ -1131,6 +1491,47 @@ impl RepoView {
             .map(|index| self.render_terminal_row(index, cx))
             .collect();
         let empty = rows.is_empty();
+        // 勾了要并排查看的：底下一条「已选 n 个」「并排查看」「取消」
+        let picking =
+            (!self.terminals.picks.is_empty() && self.terminals.split.is_empty()).then(|| {
+                let n = self.terminals.picks.len();
+                h_flex()
+                    .flex_none()
+                    .px(px(10.))
+                    .py(px(7.))
+                    .gap(px(6.))
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .text_size(px(12.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(tf!("已选 {n} 个", n = n.to_string())),
+                    )
+                    .child(
+                        Button::new("terminal-split-go")
+                            .small()
+                            .primary()
+                            .label(tr("并排查看"))
+                            .tooltip(tr("勾选 2～4 个终端并排查看"))
+                            .disabled(n < term_split::MIN_CELLS)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.start_terminal_split(window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("terminal-split-cancel")
+                            .small()
+                            .label(tr("取消"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.terminals.picks.clear();
+                                cx.notify();
+                            })),
+                    )
+            });
+        let side_focus = self.terminals.side_focus.clone();
         v_flex()
             .flex_1()
             .min_h_0()
@@ -1142,6 +1543,10 @@ impl RepoView {
                     .min_h_0()
                     .py(px(4.))
                     .overflow_y_scroll()
+                    .when_some(side_focus, |list, focus| {
+                        list.track_focus(&focus)
+                            .on_key_down(cx.listener(Self::on_terminal_side_key))
+                    })
                     .children(rows)
                     .when(empty, |list| {
                         list.child(
@@ -1154,32 +1559,66 @@ impl RepoView {
                         )
                     }),
             )
+            .children(picking)
     }
 
-    /// 侧栏里一个终端的一行：序号、名字（程序自己设的标题），选中的和鼠标停着的行尾有结束的 ×。
-    /// 点一下切过去，右键有发文件、重开、结束。
+    /// 侧栏里一个终端的一行：序号（鼠标移上去、勾选并排时换成勾）、程序和状态的图标、名字（和会话页
+    /// 一样：起过的名字、同名加序号；双击改名）、状态，选中的和鼠标停着的行尾有结束的 ×。点一下切
+    /// 过去，右键有改名、并排查看、发文件、重开、结束。设置里开了「最后一行」的，名字下面多一行。
     fn render_terminal_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let (fg, muted, selected_bg, hover, border, close_hover) = (
+        let (fg, muted, selected_bg, hover, border, close_hover, primary, bg) = (
             theme.sidebar_foreground,
             theme.muted_foreground,
             theme.sidebar_accent,
             theme.list_hover,
             theme.input,
             theme.secondary,
+            theme.primary,
+            theme.background,
         );
         let tab = &self.terminals.tabs[index];
+        let number = tab.number;
         let selected = index == self.terminals.active;
         let terminal = tab.view.read(cx);
-        // 程序自己设了标题（多半是「用户@主机: 目录」，或者正在跑的程序的名字）就显示它；没设的、从预设
-        // 开的叫预设的名字
-        let title: SharedString = terminal.label().unwrap_or_else(|| tr("终端").into());
+        let title = self.terminal_name(index, cx);
         // 里面的程序已经结束了：名字变淡
         let running = terminal.is_running();
-        // 程序和状态的图标，和会话页的一样；还不在实时列表里的空着
-        let icon = match self.board_row(index, cx) {
-            Some(row) => crate::term_overview::TermOverview::term_icon(&row, cx),
-            None => div().flex_none().w(px(14.)),
+        let row = self.board_row(index, cx);
+        // 程序和状态的图标、状态的字，和会话页的一样；还不在实时列表里的空着
+        let (icon, state) = match &row {
+            Some(row) => (
+                TermOverview::term_icon(row, cx),
+                Some((
+                    TermOverview::state_text(row),
+                    TermOverview::state_color(row, cx),
+                )),
+            ),
+            None => (div().flex_none().w(px(14.)), None),
+        };
+        let bold = row.as_ref().is_some_and(|row| row.wants_look());
+        let last_line = self.app.read(cx).settings.term_alerts.last_line;
+        let second = row.as_ref().filter(|_| last_line).map(|row| {
+            let text: SharedString = match row.last.trim() {
+                "" => SharedString::default(),
+                last => last.to_string().into(),
+            };
+            div()
+                .w_full()
+                .h(px(15.))
+                .pl(px(52.))
+                .pr(px(6.))
+                .truncate()
+                .font_family(self.app.read(cx).settings.terminal.font.clone())
+                .text_size(px(11.))
+                .line_height(px(15.))
+                .text_color(muted)
+                .child(text)
+        });
+        let height = if second.is_some() {
+            TALL_ROW
+        } else {
+            ROW_HEIGHT
         };
         let close = div()
             .id(("terminal-end", index))
@@ -1202,49 +1641,132 @@ impl RepoView {
                 cx.stop_propagation();
                 this.end_terminal(index, window, cx);
             }));
+        // 序号那一格：勾选并排时（或者鼠标移上去时）换成勾
+        let checked = self.terminal_picked(number);
+        let picking = !self.terminals.picks.is_empty() || !self.terminals.split.is_empty();
+        let pick_tip = match checked {
+            true => tr("移出并排查看"),
+            false => tr("加入并排查看（勾选 2～4 个）"),
+        };
+        let check = div()
+            .id(("terminal-pick", index))
+            .absolute()
+            .top(px(2.))
+            .left(px(2.))
+            .size(px(14.))
+            .rounded(px(4.))
+            .border_1()
+            .border_color(if checked { primary } else { muted })
+            .bg(if checked { primary } else { bg })
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(checked, |el| {
+                el.child(
+                    Icon::new(IconName::Check)
+                        .size(px(10.))
+                        .text_color(gpui_kit::white()),
+                )
+            })
+            .when(!checked && !picking, |el| {
+                el.invisible().group_hover("terminal-row", |s| s.visible())
+            })
+            .tooltip(move |window, cx| ui::tip(pick_tip, window, cx))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.toggle_terminal_pick(number, window, cx);
+            }));
+        let badge = div()
+            .flex_none()
+            .size(px(18.))
+            .relative()
+            .child(
+                div()
+                    .size_full()
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(border)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(11.))
+                    .text_color(muted)
+                    .when(checked || picking, |el| el.invisible())
+                    .when(!checked && !picking, |el| {
+                        el.group_hover("terminal-row", |s| s.invisible())
+                    })
+                    .child(number.to_string()),
+            )
+            .child(check);
+        let name = match self.terminal_rename_box(number, cx) {
+            Some(editor) => editor,
+            None => ui::clipped(("terminal-title", index), title)
+                .flex_1()
+                .when(bold, |el| el.font_weight(FontWeight::SEMIBOLD))
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    if event.click_count() >= 2 {
+                        cx.stop_propagation();
+                        this.start_terminal_rename(index, window, cx);
+                    }
+                }))
+                .into_any_element(),
+        };
+        let tail = state.map(|(text, color)| {
+            div()
+                .flex_none()
+                .max_w(px(110.))
+                .truncate()
+                .text_size(px(11.))
+                .text_color(color)
+                .group_hover("terminal-row", |s| s.invisible())
+                .child(text)
+        });
+        let tip = row.as_ref().map(|row| {
+            tf!(
+                "{name}（{state}）",
+                name = row.label.clone(),
+                state = TermOverview::state_text(row)
+            )
+        });
         let view = cx.entity().downgrade();
+        let line = h_flex()
+            .w_full()
+            .h(px(ROW_HEIGHT - 2.))
+            .gap(px(8.))
+            .child(badge)
+            .child(icon)
+            .child(name)
+            .children(tail)
+            .child(close);
         h_flex()
             .id(("terminal-row", index))
             .group("terminal-row")
-            .h(px(ROW_HEIGHT))
+            .h(px(height))
             .w_full()
             .cursor_pointer()
             .on_click(
                 cx.listener(move |this, _, window, cx| this.select_terminal(index, window, cx)),
             )
+            .when_some(tip, |row, tip| {
+                row.tooltip(move |window, cx| ui::tip(tip.clone(), window, cx))
+            })
             .child(
-                h_flex()
+                v_flex()
                     // 要有 id：悬停样式只有带 id 的元素才会在鼠标进出时重画，不然颜色要等别的事触发重画才变
                     .id("inner")
-                    .h(px(ROW_HEIGHT - 2.))
+                    .h(px(height - 2.))
                     .flex_1()
                     .min_w_0()
                     .mx(px(6.))
                     .pl(px(6.))
                     .pr(px(5.))
-                    .gap(px(8.))
                     .rounded(px(ui::RADIUS))
                     .text_size(px(13.))
                     .text_color(if running { fg } else { muted })
                     .when(selected, |row| row.bg(selected_bg))
                     .when(!selected, |row| row.hover(|s| s.bg(hover)))
-                    .child(
-                        div()
-                            .flex_none()
-                            .size(px(18.))
-                            .rounded(px(4.))
-                            .border_1()
-                            .border_color(border)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(11.))
-                            .text_color(muted)
-                            .child(tab.number.to_string()),
-                    )
-                    .child(icon)
-                    .child(ui::clipped(("terminal-title", index), title).flex_1())
-                    .child(close),
+                    .child(line)
+                    .children(second),
             )
             .context_menu(terminal_menu(view, index))
             .into_any_element()
@@ -1316,6 +1838,9 @@ impl RepoView {
 
     /// 终端页的右边：上面一条工具栏，下面是选中的终端，占满；一个都没有时是空的样子。
     pub(super) fn render_terminal_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.terminals.split.len() >= term_split::MIN_CELLS {
+            return self.render_terminal_split(cx);
+        }
         let body = match self.active_terminal() {
             Some(view) => div()
                 .flex_1()
@@ -1330,6 +1855,141 @@ impl RepoView {
             .h_full()
             .child(self.render_terminal_toolbar(cx))
             .child(body)
+            .into_any_element()
+    }
+
+    /// 并排查看时的终端页：上面一条（并排查看、几个、退出并排），中间是格子，底下一条提示。
+    fn render_terminal_split(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (bg, border, muted, chip_bg) = (
+            theme.background,
+            theme.border,
+            theme.muted_foreground,
+            theme.secondary,
+        );
+        let terms = &self.terminals;
+        let focused = terms.tabs.get(terms.active).map(|tab| tab.number);
+        let this = cx.entity().downgrade();
+        let handler = |run: fn(&mut RepoView, u32, &mut Window, &mut Context<RepoView>),
+                       number: u32|
+         -> Handler {
+            let this = this.clone();
+            Rc::new(move |window, cx| {
+                this.update(cx, |view, cx| run(view, number, window, cx))
+                    .ok();
+            })
+        };
+        let shown: Vec<u32> = match terms.zoom {
+            Some(zoom) => vec![zoom],
+            None => terms.split.clone(),
+        };
+        let cells: Vec<AnyElement> = shown
+            .iter()
+            .filter_map(|&number| {
+                let index = terms.tabs.iter().position(|tab| tab.number == number)?;
+                let row = self.board_row(index, cx);
+                let head = term_split::Head {
+                    name: self.terminal_name(index, cx),
+                    place: tf!("终端 {n}", n = number.to_string()).into(),
+                    state: row
+                        .as_ref()
+                        .map(TermOverview::state_text)
+                        .unwrap_or_default(),
+                    state_color: row
+                        .as_ref()
+                        .map(|row| TermOverview::state_color(row, cx))
+                        .unwrap_or(muted),
+                    dot: row
+                        .as_ref()
+                        .map(|row| TermOverview::state_color(row, cx))
+                        .unwrap_or(muted),
+                    focused: focused == Some(number),
+                    zoomed: terms.zoom == Some(number),
+                };
+                let body = div()
+                    .size_full()
+                    .child(terms.tabs[index].view.clone())
+                    .into_any_element();
+                Some(
+                    term_split::cell(
+                        ("terminal-cell", number as usize),
+                        head,
+                        body,
+                        handler(Self::focus_terminal_cell, number),
+                        handler(Self::zoom_terminal_cell, number),
+                        handler(Self::remove_terminal_cell, number),
+                        cx,
+                    )
+                    .into_any_element(),
+                )
+            })
+            .collect();
+        let target = focused
+            .and_then(|number| terms.tabs.iter().position(|tab| tab.number == number))
+            .map(|index| self.terminal_name(index, cx));
+        let (w, h) = (
+            f32::from(self.viewport.width) - 280.,
+            f32::from(self.viewport.height) - TOOLBAR_HEIGHT - 26. - 52.,
+        );
+        let size = match (shown.len(), terms.split.len()) {
+            (1, _) => (w, h),
+            (_, 2) => (w / 2., h),
+            _ => (w / 2., h / 2.),
+        };
+        let bar = h_flex()
+            .h(px(TOOLBAR_HEIGHT))
+            .flex_none()
+            .px(px(12.))
+            .gap(px(8.))
+            .bg(bg)
+            .border_b_1()
+            .border_color(border)
+            .child(ui::icon(IconName::Columns2).text_color(muted))
+            .child(
+                div()
+                    .flex_none()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(tr("并排查看")),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .h(px(18.))
+                    .px(px(7.))
+                    .rounded_full()
+                    .bg(chip_bg)
+                    .text_size(px(11.))
+                    .line_height(px(18.))
+                    .text_color(muted)
+                    .child(tf!("{n} 个", n = terms.split.len().to_string())),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("terminal-split-exit")
+                    .small()
+                    .icon(ui::icon(IconName::Square))
+                    .label(tr("退出并排"))
+                    .tooltip(tr("回到单个终端，显示焦点格中的终端"))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.exit_terminal_split(window, cx)),
+                    ),
+            );
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .bg(bg)
+            .child(bar)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .p(px(6.))
+                    .flex()
+                    .child(term_split::grid(cells).size_full()),
+            )
+            .child(term_split::foot(target, Some(size), cx))
             .into_any_element()
     }
 
@@ -1359,10 +2019,9 @@ impl RepoView {
             None => tr("运行在本机，关闭 Kuai 后继续运行").into(),
         };
         let index = self.terminals.active;
-        let title = self.active_terminal().map(|view| {
-            let title: SharedString = view.read(cx).label().unwrap_or_else(|| tr("终端").into());
-            title
-        });
+        let title = self
+            .active_terminal()
+            .map(|_| self.terminal_name(index, cx));
         let shown = title.is_some();
         h_flex()
             .h(px(TOOLBAR_HEIGHT))

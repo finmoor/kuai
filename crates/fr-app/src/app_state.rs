@@ -72,6 +72,9 @@ pub struct AppState {
     /// 最近一次连接失败在登录阶段的哪一步（诊断用，见 `diagnose`）；登录上以后才失败的是空的。
     /// 开始连接时就放进来，后台线程在连接结果出来之前写好：等同一个结果的诊断框读到的一定是这一次的
     login_failures: HashMap<String, FailureSlot>,
+    /// 最近一次连接失败的原因，连上、改了设置时去掉。后台重连的那几轮在连的时候主机页照样显示它和
+    /// 「诊断…」（原来每轮重试时整个提示框都没了，点不到）
+    last_failures: HashMap<String, SharedString>,
     /// 每次连接一个「不要了」的标记（[`Self::drop_conns`] 时立起）：还在连、还在重试的那一次看到它就
     /// 停下，不再按旧的设置连；它报的进度也不再写到同一台的新连接上
     conn_dropped: HashMap<String, Arc<std::sync::atomic::AtomicBool>>,
@@ -114,6 +117,7 @@ impl AppState {
             stages: HashMap::new(),
             retrying: HashMap::new(),
             login_failures: HashMap::new(),
+            last_failures: HashMap::new(),
             conn_dropped: HashMap::new(),
             save_later: None,
             mounts: crate::mapping::Mounts::new(),
@@ -194,6 +198,11 @@ impl AppState {
     /// 最近一次连这台失败在登录阶段的哪一步；没失败、登录上以后才失败的是 None。
     pub fn last_login_failure(&self, id: &str) -> Option<fr_channel::LoginFailure> {
         self.login_failures.get(id)?.lock().unwrap().clone()
+    }
+
+    /// 最近一次连这台失败的原因（还在重连时也留着）；连上了、改过设置的是 None。
+    pub fn last_failure(&self, id: &str) -> Option<SharedString> {
+        self.last_failures.get(id).cloned()
     }
 
     /// 最近一次连这台是不是没连上（连上以后又断开的不算）。
@@ -420,6 +429,7 @@ impl AppState {
             this.update(cx, |this, cx| {
                 // 最近的错误里记一条（诊断用）
                 if let Some(Err(err)) = this.conns.get(&id).and_then(|c| c.peek()) {
+                    this.last_failures.insert(id.clone(), err.clone());
                     let name = this.machine_name(&id).to_string();
                     crate::diagnose::record_error(&name, err);
                     // 连不上（断网、电脑刚醒、启动时还没网）：过一会儿自己再连，连上以后打开着的仓库、
@@ -432,6 +442,7 @@ impl AppState {
                 // 订阅它的仓库列表和工作区
                 if let Some(Ok(conn)) = this.conns.get(&id).and_then(|c| c.peek()) {
                     let conn = conn.clone();
+                    this.last_failures.remove(&id);
                     this.learn_machine(&id, &conn.hello.machine, cx);
                     // 浏览器里开着的这台主机上的网页：之后的请求经新连接读
                     crate::web_serve::connected(&id, &Channel::Remote(conn.clone()));
@@ -557,6 +568,8 @@ impl AppState {
         for (_, dropped) in self.conn_dropped.extract_if(|key, _| gone(key)) {
             dropped.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        // 改了设置：上次按旧设置失败的原因不算数了
+        self.last_failures.retain(|key, _| !gone(key));
         let keys: Vec<String> = self.conns.keys().filter(|key| gone(key)).cloned().collect();
         for key in keys {
             let Some(connecting) = self.conns.remove(&key) else {

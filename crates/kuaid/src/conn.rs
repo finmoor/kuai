@@ -606,6 +606,11 @@ fn simple(shared: &Shared, request: &Request) -> Result<Value> {
         "state_get" => Ok(serde_json::to_value(shared.workspaces.get())?),
         "list_dir" => Ok(serde_json::to_value(crate::dirs::list_dir(
             param("path").unwrap_or(""),
+            request
+                .params
+                .get("hidden")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         )?)?),
         "term_list" => Ok(json!({ "terms": shared.terms.list() })),
         "term_programs" => Ok(json!({

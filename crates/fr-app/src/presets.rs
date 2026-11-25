@@ -49,7 +49,7 @@ pub struct Preset {
     pub name: String,
     /// 在 shell 里输入的命令
     pub command: String,
-    /// 「继续上次的会话」输入的命令；空着是没有
+    /// 「继续上次的对话」输入的命令；空着是没有
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub resume: String,
     /// 图标：[`LOGOS`] 或 [`GLYPHS`] 里的名字
@@ -159,7 +159,7 @@ impl Start {
         }
     }
 
-    /// 继续上次的会话；这个预设没有这条命令是 None。
+    /// 继续上次的对话；这个预设没有这条命令是 None。
     pub fn resume_of(preset: &Preset) -> Option<Start> {
         (!preset.resume.trim().is_empty()).then(|| Start {
             command: preset.resume.clone(),
@@ -180,7 +180,7 @@ impl Start {
 
 /// 命令运行的程序：第一个词（带空格的路径加了引号的，是引号里的）去掉目录、`.exe`，小写。
 /// `npm run dev` 是 `npm`。
-fn program_of(command: &str) -> String {
+pub fn program_of(command: &str) -> String {
     let command = command.trim_start();
     let word = match command.chars().next() {
         Some(quote @ ('"' | '\'')) => command[1..].split(quote).next().unwrap_or_default(),
@@ -582,10 +582,23 @@ pub fn ended(slot: &TermSlot, term: &str, cx: &mut App) {
 pub fn display_name(title: Option<&str>, start: Option<&Start>) -> Option<SharedString> {
     match (title, start) {
         (Some(title), Some(start)) if shell_title(title) => Some(start.name.clone().into()),
+        // shell 提示符设的「用户@主机: 目录」：同一个仓库的终端用户、主机都一样，只留目录。不然名字很长，
+        // 同一个目录开两个时区分用的序号（见 `term_board.rs` 的 `refresh_meta`）常被截掉
+        (Some(title), None) => match prompt_dir(title) {
+            Some("") => None,
+            Some(dir) => Some(dir.to_string().into()),
+            None => Some(crate::terminal::short_title(title)),
+        },
         (Some(title), _) => Some(crate::terminal::short_title(title)),
         (None, Some(start)) => Some(start.name.clone().into()),
         (None, None) => None,
     }
+}
+
+/// 「用户@主机: 目录」这种标题里的目录；不是这种写法的是 None。
+fn prompt_dir(title: &str) -> Option<&str> {
+    let (head, rest) = title.trim().split_once(':')?;
+    (head.contains('@') && !head.contains(char::is_whitespace)).then(|| rest.trim())
 }
 
 /// 这是 shell 自己设的标题：Windows 上刚启动时是它的程序路径（`C:\...\pwsh.exe`）；Linux 上常见的
@@ -753,7 +766,7 @@ pub type OnStart = Rc<dyn Fn(Option<Start>, &mut Window, &mut App)>;
 
 /// 新建终端的菜单，各处都是这一个：分体按钮的 ⌄、只有图标的「新建终端」按钮（会话页仓库行的 +、
 /// 工作区页和子仓库、工作树总览的行尾、文件页工具栏、图标栏的 +，点了就弹它）、右键菜单里「新建终端」
-/// 的子菜单。列只开 shell、各个预设（只写名字）、继续上次的会话、运行命令、管理预设。`place` 是开在
+/// 的子菜单。列只开 shell、各个预设（只写名字）、继续上次的对话、运行命令、管理预设。`place` 是开在
 /// 哪（仓库名或者仓库里的目录），写在「运行命令」对话框的标题里。
 pub fn menu(
     mut menu: PopupMenu,
@@ -798,9 +811,11 @@ pub fn menu(
         .collect();
     if !resumable.is_empty() {
         let on = on_start.clone();
+        // 叫「对话」：和标题栏的「会话」页、接回仍在运行的终端都不是一回事，这里是新开一个终端，
+        // 让程序接着上次的对话（`claude --continue` 这类）
         menu = menu.separator().submenu_with_icon(
             Some(Icon::new(IconName::Undo2)),
-            tr("继续上次的会话"),
+            tr("在新终端中继续上次的对话"),
             window,
             cx,
             move |mut sub, _, cx| {
@@ -927,8 +942,9 @@ pub fn first_buttons(place: SharedString, on_start: OnStart, cx: &App) -> impl I
         .enumerate()
         .map(|(ix, (start, glyph, name, tip))| {
             let on = on_start.clone();
+            // 带边框：原来是没有底色、没有边框的按钮，和旁边的字连在一起，看不出能点
             Button::new(("first-run", ix))
-                .ghost()
+                .outline()
                 .xsmall()
                 .icon(glyph)
                 .label(name)
@@ -1132,7 +1148,7 @@ impl Render for DragPreset {
     }
 }
 
-/// 预设表：图标、名字、命令、继续上次的会话、在菜单里显不显示、编辑、删除；拖着行排序。下面是
+/// 预设表：图标、名字、命令、继续上次的对话、在菜单里显不显示、编辑、删除；拖着行排序。下面是
 /// 「添加预设」「恢复内置预设」。
 fn table(cx: &mut App) -> AnyElement {
     let presets = all(cx);
@@ -1156,7 +1172,7 @@ fn table(cx: &mut App) -> AnyElement {
         .child(div().w(px(14.)).flex_none())
         .child(name_col(div()).child(tr("预设")))
         .child(cmd_col(div()).child(tr("命令")))
-        .child(cmd_col(div()).child(tr("继续上次的会话")))
+        .child(cmd_col(div()).child(tr("继续上次的对话")))
         .child(div().w(px(36.)).flex_none().child(tr("显示")))
         .child(div().w(px(52.)).flex_none());
     let rows = presets.iter().enumerate().map(|(index, preset)| {
@@ -1336,7 +1352,7 @@ fn restore_builtins(list: &mut Vec<Preset>, _: &mut String) {
     }
 }
 
-/// 添加、编辑预设的对话框：名称、命令、继续上次的会话、图标和颜色。
+/// 添加、编辑预设的对话框：名称、命令、继续上次的对话、图标和颜色。
 fn edit_dialog(existing: Option<Preset>, window: &mut Window, cx: &mut App) {
     ui::cancel_pending_tip(window, cx);
     let field = |value: &str, placeholder: &'static str, window: &mut Window, cx: &mut App| {
@@ -1490,7 +1506,7 @@ fn edit_dialog(existing: Option<Preset>, window: &mut Window, cx: &mut App) {
             .child(
                 v_flex()
                     .gap_1()
-                    .child(label(tr("继续上次的会话（可选）")))
+                    .child(label(tr("继续上次的对话（可选）")))
                     .child(Input::new(&resume)),
             )
             .child(
@@ -1693,6 +1709,21 @@ mod tests {
             Some("pwsh".to_string())
         );
         assert_eq!(display_name(None, None), None);
+        // 提示符设的「用户@主机: 目录」只留目录
+        assert_eq!(
+            display_name(Some("dev@box: ~/src/kuai"), None).map(|n| n.to_string()),
+            Some("~/src/kuai".to_string())
+        );
+        assert_eq!(
+            display_name(Some("me@devbox:~/proj"), None).map(|n| n.to_string()),
+            Some("~/proj".to_string())
+        );
+        assert_eq!(display_name(Some("dev@box:"), None), None);
+        // 带空格的不算（「a@b 的会话: x」是程序自己设的）
+        assert_eq!(
+            display_name(Some("fix bug @ login: done"), None).map(|n| n.to_string()),
+            Some("fix bug @ login: done".to_string())
+        );
     }
 
     #[test]

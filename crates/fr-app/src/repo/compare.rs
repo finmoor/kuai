@@ -32,7 +32,8 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
-    ActiveTheme as _, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, WindowExt as _, h_flex,
+    v_flex,
 };
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -241,6 +242,8 @@ pub(super) struct Compare {
     /// 选中的是图片时的图片对比
     image: Option<Entity<ImageDiff>>,
     whole_file: bool,
+    /// 只看「对比」引入的改动：两端都是提交时从共同祖先比（`基准...对比`），基准上后来的提交不算
+    from_base: bool,
     /// 上次读的时候两端各指着哪个提交；变了才重读
     loaded: Option<(Option<String>, Option<String>)>,
     /// 不在这一页时仓库变了：回来时重读
@@ -261,6 +264,7 @@ impl Compare {
         });
         let compare = Self {
             ends: None,
+            from_base: false,
             tab: Tab::Files,
             load: Load::Ready,
             files: Vec::new(),
@@ -362,6 +366,17 @@ fn status_color(status: char, cx: &App) -> Hsla {
 }
 
 impl RepoView {
+    /// 比较里一个文件逐行追溯时看哪个版本（见 `tracked_file_menu`）：一般是「对比」那一端；文件在
+    /// 对比那端没了（`deleted`），看基准那一端的。那一端是本地修改时就是当前版本，返回 None。
+    fn compare_blame_at(&self, deleted: bool) -> Option<(String, bool)> {
+        let (base, other) = self.compare.ends.as_ref()?;
+        let end = if deleted { base } else { other };
+        match end.rev() {
+            compare::End::Rev(rev) => Some((rev, deleted)),
+            compare::End::Worktree => None,
+        }
+    }
+
     /// 换了界面语言：过滤框里的提示文字是建的时候定的，要重新设一遍。
     pub(super) fn retranslate_compare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.compare.filter.update(cx, |state, cx| {
@@ -586,7 +601,7 @@ impl RepoView {
             self.clear_compare_diff(None, cx);
         }
         let (a, b) = (base.rev(), other.rev());
-        let Some(args) = compare::files_args(&a, &b) else {
+        let Some(args) = compare::files_args(&a, &b, self.compare.from_base) else {
             // 两端都是本地修改
             self.compare.load = Load::Ready;
             self.compare.load_task = None;
@@ -733,7 +748,13 @@ impl RepoView {
                 (Some(compare::untracked_patch_args(&path, reverse)), &[0, 1])
             }
             Origin::Git => (
-                compare::patch_args(&a, &b, &path, item.file.orig_path.as_deref()),
+                compare::patch_args(
+                    &a,
+                    &b,
+                    self.compare.from_base,
+                    &path,
+                    item.file.orig_path.as_deref(),
+                ),
                 &[0],
             ),
             Origin::Disk(blob) => {
@@ -1058,7 +1079,9 @@ impl RepoView {
         // 放不放得下是估的：这一条的宽度去掉固定的那些，剩下的够不够两个下拉加那句话
         let (title, base_label, other_label, close) =
             (tr("比较"), tr("基准"), tr("对比"), tr("关闭"));
+        // 第一项是「只看对比引入的改动」那个按钮
         let fixed = 24.
+            + 24.
             + 14.
             + text_width(title, 14.)
             + text_width(base_label, 12.)
@@ -1168,6 +1191,33 @@ impl RepoView {
             )
             .child(label(other_label))
             .child(self.end_button(Side::Other, other, cx))
+            .child({
+                // 只看对比引入的改动：两端都是提交才有共同祖先可比
+                let both_revs = !matches!(base, End::Worktree) && !matches!(other, End::Worktree);
+                let on = self.compare.from_base && both_revs;
+                let tip: SharedString = match both_revs {
+                    true => tf!(
+                        "只看 {other} 从共同祖先以来的改动，不含 {base} 上之后的提交",
+                        other = self.end_name(other),
+                        base = self.end_name(base)
+                    )
+                    .into(),
+                    false => tr("一端是本地修改时不可用").into(),
+                };
+                Button::new("compare-from-base")
+                    .ghost()
+                    .xsmall()
+                    .flex_none()
+                    .icon(ui::icon(IconName::GitMerge))
+                    .selected(on)
+                    .disabled(!both_revs)
+                    .tooltip(tip)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.compare.from_base = !this.compare.from_base;
+                        this.load_compare(true, cx);
+                        cx.notify();
+                    }))
+            })
             .child(summary)
             .child(div().flex_1())
             .child(
@@ -1610,10 +1660,12 @@ impl RepoView {
                                 row.tooltip(move |window, cx| ui::tip(full.clone(), window, cx))
                             });
                         // 没跟踪的文件没有历史可看
+                        // 逐行追溯看「对比」那一端的版本；文件在对比那端被删了，看基准那端的
+                        let at = self.compare_blame_at(item.file.status == 'D');
                         Some(match item.origin == Origin::Untracked {
                             true => row.into_any_element(),
                             false => row
-                                .context_menu(self.tracked_file_menu(path, cx))
+                                .context_menu(self.tracked_file_menu(path, at, cx))
                                 .into_any_element(),
                         })
                     }
@@ -1965,7 +2017,15 @@ impl RepoView {
             .child(bar)
             .children(search_bar)
             .children(ws_strip)
-            .child(div().flex_1().min_h_0().child(body))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(body)
+                    // 按住 Ctrl 滚滚轮调代码字号
+                    .child(crate::zoom::wheel_zoom(self.app.clone())),
+            )
             .into_any_element()
     }
 }

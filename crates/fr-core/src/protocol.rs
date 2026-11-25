@@ -487,6 +487,10 @@ pub struct DirListing {
     #[serde(default)]
     pub repo: bool,
     pub entries: Vec<DirEntry>,
+    /// 这个目录在哪个仓库里（往上找到的第一个有 `.git` 的目录，自己是仓库就是自己）；不在仓库里、
+    /// 旧版 kuaid 不报的是 None。打开仓库的对话框按它说「将打开其根目录」
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,6 +499,9 @@ pub struct DirEntry {
     /// 下面有 `.git`
     #[serde(default)]
     pub repo: bool,
+    /// 名字以 `.` 开头（只在要了隐藏目录时才列，见 `list_dir_with`）
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden: bool,
 }
 
 /// `fs_repos` 的结果：仓库目录里面的仓库。

@@ -432,6 +432,18 @@ impl RepoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.interactive_rebase_with(base, HashSet::new(), window, cx);
+    }
+
+    /// 同 [`Self::interactive_rebase`]；`squash` 里的提交一打开就设成「并入下方提交」（提交列表里
+    /// 多选以后「压缩为一个」用）。
+    pub(super) fn interactive_rebase_with(
+        &mut self,
+        base: String,
+        squash: HashSet<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(running) = &self.op {
             window.push_notification(
                 Notification::warning(tf!("请等待「{running}」完成后重试", running)),
@@ -525,8 +537,11 @@ impl RepoView {
                     rows: commits
                         .into_iter()
                         .map(|commit| Row {
+                            kind: match squash.contains(&commit.id) {
+                                true => Kind::Squash,
+                                false => Kind::Pick,
+                            },
                             commit,
-                            kind: Kind::Pick,
                             message: None,
                         })
                         .collect(),

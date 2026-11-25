@@ -10,7 +10,7 @@ use std::ops::Range;
 use fr_core::patch::{self, FileDiff, LineKind};
 use fr_core::status::Entry;
 use gpui_kit::component::Rope;
-use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+use gpui_kit::component::diff::{DiffLinePosition, DiffLineRange, DiffSide};
 use gpui_kit::component::highlighter::{HighlightTheme, SyntaxHighlighter};
 use gpui_kit::{HighlightStyle, SharedString, UniformListScrollHandle};
 
@@ -339,6 +339,35 @@ impl StageDiff {
             && !self.typechange
     }
 
+    /// 这一行在并排视图里在哪一边、第几行：删掉的在左边（旧），加上的、没变的在右边（新）。
+    fn side_line(&self, row: usize) -> Option<(DiffSide, usize)> {
+        let Row::Line(h, l) = self.rows.get(row)? else {
+            return None;
+        };
+        let line = &self.file.hunks[*h].lines[*l];
+        match line.kind {
+            LineKind::Removed => Some((DiffSide::Original, line.old_no? as usize)),
+            _ => Some((DiffSide::Modified, line.new_no? as usize)),
+        }
+    }
+
+    /// 选中的行在并排视图里的范围（在并排视图里用键盘选行时，把选中的画出来）：从第一行到最后
+    /// 一行，各在自己那一边；没选中是 None。
+    pub(super) fn split_range(&self) -> Option<DiffLineRange> {
+        let first = (0..self.rows.len()).find(|ix| self.selected[*ix])?;
+        let last = (0..self.rows.len()).rev().find(|ix| self.selected[*ix])?;
+        let (side, start) = self.side_line(first)?;
+        let (end_side, end) = self.side_line(last)?;
+        let path = self.entry.path.clone();
+        Some(DiffLineRange::new(path, side, start, end).with_end_side(end_side))
+    }
+
+    /// 并排视图滚到这一行用的位置。
+    pub(super) fn split_position(&self, row: usize) -> Option<DiffLinePosition> {
+        let (side, line) = self.side_line(row)?;
+        Some(DiffLinePosition::new(self.entry.path.clone(), side, line))
+    }
+
     fn selectable(&self, row: usize) -> bool {
         match self.rows.get(row) {
             Some(Row::Line(h, l)) => self.file.hunks[*h].lines[*l].kind != LineKind::Context,
@@ -574,16 +603,22 @@ fn language_for(path: &str) -> Option<&'static str> {
 fn display(bytes: &[u8]) -> SharedString {
     let text = crate::text::decode(bytes);
     let text = text.strip_suffix('\r').unwrap_or(&text);
+    // Tab 照设置里的宽度对齐到整数倍
+    let width = crate::text::tab_width();
     let mut out = String::with_capacity(text.len());
+    let mut column = 0;
     for (i, ch) in text.chars().enumerate() {
         if i >= MAX_CHARS {
             out.push('…');
             break;
         }
         if ch == '\t' {
-            out.push_str("    ");
+            let pad = width - column % width;
+            out.extend(std::iter::repeat_n(' ', pad));
+            column += pad;
         } else {
             out.push(ch);
+            column += 1;
         }
     }
     out.into()
@@ -614,6 +649,7 @@ mod tests {
             staged: None,
             unstaged: Some(fr_core::status::Kind::Modified),
             submodule: false,
+            index: None,
         };
         StageDiff::new(
             Area::Unstaged,
@@ -649,6 +685,7 @@ index 0000000..2222222
             staged: None,
             unstaged: Some(fr_core::status::Kind::TypeChanged),
             submodule: false,
+            index: None,
         };
         let v = StageDiff::new(
             Area::Unstaged,
@@ -742,6 +779,7 @@ index 0000000..2222222
             staged: None,
             unstaged: Some(fr_core::status::Kind::Modified),
             submodule: false,
+            index: None,
         };
         let v = StageDiff::new(
             Area::Unstaged,

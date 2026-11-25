@@ -154,23 +154,67 @@ fn item(
     .on_click(move |_, window, cx| on_click(key.clone(), window, cx))
 }
 
-/// 一组「添加到…」的项：点了放进去。
+/// 一组「添加到…」的项：点了放进去。下面是「新建工作区并添加…」（`app` 给了才有）和一句工作区是
+/// 什么。
 fn add_items(
     menu: PopupMenu,
+    app: &Entity<AppState>,
     rows: Vec<Row>,
     entry: &RepoEntry,
     add: &AddTo,
     muted: Hsla,
 ) -> PopupMenu {
-    if rows.is_empty() {
-        return menu.label(tr("没有可添加到的工作区"));
+    let menu = match rows.is_empty() {
+        true => menu.label(tr("没有可添加到的工作区")),
+        false => rows.into_iter().fold(menu, |menu, row| {
+            let (entry, add) = (entry.clone(), add.clone());
+            menu.item(item(row, muted, move |key, window, cx| {
+                add(key, entry.clone(), window, cx)
+            }))
+        }),
+    };
+    let (app, entry, add) = (app.clone(), entry.clone(), add.clone());
+    menu.separator()
+        .item(
+            PopupMenuItem::new(tr("新建工作区并添加…"))
+                .on_click(move |_, window, cx| new_and_add(&app, &entry, &add, window, cx)),
+        )
+        .label(tr("工作区是可选的分组，不影响已打开的标签页"))
+}
+
+/// 「新建工作区并添加…」：起名字、选保存在哪（本机，或仓库所在的那台主机），建好放进去。
+fn new_and_add(
+    app: &Entity<AppState>,
+    entry: &RepoEntry,
+    add: &AddTo,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let app = app.clone();
+    let state = app.read(cx);
+    let machine = crate::machines::machine_of(entry).to_string();
+    let mut places: Vec<(String, SharedString)> =
+        vec![(crate::machines::LOCAL.to_string(), tr("本机").into())];
+    if machine != crate::machines::LOCAL && state.writable(&machine) {
+        places.push((machine.clone(), state.machine_name(&machine)));
     }
-    rows.into_iter().fold(menu, |menu, row| {
-        let (entry, add) = (entry.clone(), add.clone());
-        menu.item(item(row, muted, move |key, window, cx| {
-            add(key, entry.clone(), window, cx)
-        }))
-    })
+    let default = match places.len() {
+        2 => machine,
+        _ => crate::machines::LOCAL.to_string(),
+    };
+    let (entry, add) = (entry.clone(), add.clone());
+    crate::workspace::new_workspace_dialog(
+        places,
+        default,
+        window,
+        cx,
+        move |name, machine, window, cx| {
+            let key = app.update(cx, |app, cx| app.add_workspace(&machine, &name, cx));
+            if let Some(key) = key {
+                add(key, entry.clone(), window, cx);
+            }
+        },
+    );
 }
 
 /// 「打开工作区」按钮点开的菜单：在几个工作区里时一行一个、下面「添加到其他工作区 ▸」；一个都不在
@@ -192,7 +236,7 @@ fn dropdown(
         (rows(state, homes, true, cx), rows(state, more, false, cx))
     };
     if homes.is_empty() {
-        return add_items(menu.label(tr("添加到工作区")), more, entry, add, muted);
+        return add_items(menu.label(tr("添加到工作区")), app, more, entry, add, muted);
     }
     let menu = homes.into_iter().fold(
         menu.label(tr("选择要打开的工作区")),
@@ -206,12 +250,12 @@ fn dropdown(
     if more.is_empty() {
         return menu;
     }
-    let (entry, add) = (entry.clone(), add.clone());
+    let (app, entry, add) = (app.clone(), entry.clone(), add.clone());
     menu.separator().submenu(
         tr("添加到其他工作区"),
         window,
         cx,
-        move |sub, _, _| add_items(sub, more.clone(), &entry, &add, muted),
+        move |sub, _, _| add_items(sub, &app, more.clone(), &entry, &add, muted),
     )
 }
 
@@ -249,7 +293,10 @@ pub(crate) fn button(
 pub(crate) fn tip(app: &AppState, entry: &RepoEntry, first: Option<&WorkspaceKey>) -> String {
     let homes = homes(app, entry, first);
     match homes.as_slice() {
-        [] => tr("未加入工作区，点击可添加").to_string(),
+        [] => {
+            tr("未加入工作区。工作区是可选的分组，用来把常用仓库放在一起，不影响已打开的标签页。")
+                .to_string()
+        }
         [key] => tf!("在工作区页中打开「{name}」", name = app.workspace_name(key)),
         _ => {
             let names: Vec<String> = homes
@@ -288,14 +335,16 @@ pub(crate) fn context_items(
             rows(state, others, false, cx),
         )
     };
-    // 一个能加的都没有（子仓库、都已经加了、主机断开）：不出这一项，原来是点开只有一句话的子菜单
+    // 子仓库不放进工作区（工作区页在仓库下面列出它的子仓库）：不出这一项。别的没有能加的工作区时
+    // 照样有，里面是「新建工作区并添加…」
+    let sub_repo = app.read(cx).root_of(entry).is_some();
     let add_sub = |menu: PopupMenu, label: &'static str, window: &mut Window, cx| {
-        if others.is_empty() {
+        if sub_repo {
             return menu;
         }
-        let (entry, add, others) = (entry.clone(), add.clone(), others.clone());
+        let (app, entry, add, others) = (app.clone(), entry.clone(), add.clone(), others.clone());
         menu.submenu(label, window, cx, move |sub, _, _| {
-            add_items(sub, others.clone(), &entry, &add, muted)
+            add_items(sub, &app, others.clone(), &entry, &add, muted)
         })
     };
     let menu = match homes.len() {

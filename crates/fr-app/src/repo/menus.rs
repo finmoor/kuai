@@ -19,7 +19,7 @@ use super::compare::End;
 use super::dialogs::{Ask, Hint, ref_name_error};
 use super::history::Scope;
 use super::impact::{Impact, Listed, Row, Tone, find_row, list_commits};
-use super::ops::{Step, args, failure};
+use super::ops::{Step, args};
 use super::sidebar::SideItem;
 use super::sidebar::SideSection;
 use super::{RepoEvent, RepoView};
@@ -145,7 +145,7 @@ fn copy_item(label: impl Into<SharedString>, text: String) -> PopupMenuItem {
 
 /// 推送一个本地分支的参数。强制推送时 `lease` 是远程上的那个分支应当指向哪（里面是 None 表示远程上
 /// 应当还没有它），不强推是 None。
-fn push_args(
+pub(super) fn push_args(
     name: &str,
     remote: &str,
     remote_branch: &str,
@@ -237,7 +237,7 @@ fn compare_items(menu: PopupMenu, view: &View, end: End, current: Option<End>) -
 
 impl RepoView {
     /// 当前分支的名字；分离的 HEAD 时是「HEAD」。
-    fn current_label(&self) -> String {
+    pub(super) fn current_label(&self) -> String {
         self.status
             .as_ref()
             .and_then(|s| s.branch.clone())
@@ -391,7 +391,7 @@ impl RepoView {
                 let this_one = id.clone();
                 menu = menu.item(item(
                     &view,
-                    tf!("与选中的提交（{id}）比较", id = short(&marked)),
+                    tf!("与刚才选中的提交（{id}）比较", id = short(&marked)),
                     move |this, w, cx| {
                         this.compare_commits(marked.clone(), this_one.clone(), w, cx)
                     },
@@ -526,7 +526,7 @@ impl RepoView {
                     // 拉取：当前分支和工具栏上的「拉取」一样；别的分支不用切过去，只在能快进时更新
                     if branch.current {
                         menu = menu.item(item(&view, tf!("拉取 {name}", name), |this, w, cx| {
-                            this.pull(false, w, cx)
+                            this.pull(super::ops::PullMode::Default, w, cx)
                         }));
                     } else if let Some(upstream) = pull_from.clone() {
                         let branch = name.clone();
@@ -807,18 +807,23 @@ impl RepoView {
             .map(|server| server.destination.clone());
         let conflicted = entry.unstaged == Some(Kind::Conflicted);
         let (ours, theirs) = self.side_labels();
+        let ext_diff = self.ext_label(crate::ext_tools::Kind::Diff, cx);
+        let ext_merge = self.ext_label(crate::ext_tools::Kind::Merge, cx);
         Box::new(move |mut menu, _, _| {
             match area {
                 Area::Unstaged => {
                     if conflicted {
                         let (a, b) = (entry.path.clone(), entry.path.clone());
-                        let path = entry.path.clone();
+                        let (path, ext) = (entry.path.clone(), entry.path.clone());
                         menu = menu
                             .item(item(
                                 &view,
                                 tr("在合并编辑器中解决…"),
                                 move |this, w, cx| this.open_merge_editor(path.clone(), w, cx),
                             ))
+                            .item(item(&view, ext_merge.clone(), move |this, w, cx| {
+                                this.external_merge(ext.clone(), w, cx)
+                            }))
                             .separator();
                         menu = menu
                             .item(item(
@@ -866,6 +871,15 @@ impl RepoView {
                 }
             }
             menu = menu.separator();
+            // 外部比较工具：未暂存的比暂存区和工作区，已暂存的比 HEAD 和暂存区
+            if !conflicted {
+                let ext = entry.clone();
+                menu = menu
+                    .item(item(&view, ext_diff.clone(), move |this, w, cx| {
+                        this.external_diff_change(area, ext.clone(), w, cx)
+                    }))
+                    .separator();
+            }
             // 交给编辑器：解决冲突、细改都在那边做
             let exists = entry.unstaged != Some(Kind::Deleted);
             if exists {
@@ -932,26 +946,55 @@ impl RepoView {
         })
     }
 
-    /// 提交详情里一个文件的菜单：看它的历史、逐行追溯。
-    pub(super) fn tracked_file_menu(&self, path: String, cx: &mut Context<Self>) -> MenuFn {
+    /// 提交详情、比较里一个文件的菜单：看它的历史、逐行追溯。`at` 是正在看的那个版本（提交号，
+    /// 和文件是不是在这个提交里被删掉了，删掉的话提交号是删除前的那个）：逐行追溯先给这个版本，
+    /// 另有一项追溯当前版本。原来只追溯工作区，从旧提交点进去看到的不是那个提交里的样子。
+    pub(super) fn tracked_file_menu(
+        &self,
+        path: String,
+        at: Option<(String, bool)>,
+        cx: &mut Context<Self>,
+    ) -> MenuFn {
         let view = cx.entity().downgrade();
         Box::new(move |menu, _, _| {
             let (a, b, open) = (path.clone(), path.clone(), path.clone());
-            menu.item(item(
-                &view,
-                tr("在文件页中打开"),
-                move |this, w, cx| this.show_file(open.clone(), w, cx),
-            ))
-            .item(item(&view, tr("文件历史"), move |this, w, cx| {
-                this.show_file_history(a.clone(), w, cx)
-            }))
-            .item(item(
-                &view,
-                tr("逐行追溯（blame）"),
-                move |this, _, cx| this.show_blame(b.clone(), cx),
-            ))
-            .separator()
-            .item(copy_item(tr("复制路径"), path.clone()))
+            let menu = menu
+                .item(item(
+                    &view,
+                    tr("在文件页中打开"),
+                    move |this, w, cx| this.show_file(open.clone(), w, cx),
+                ))
+                .item(item(&view, tr("文件历史"), move |this, w, cx| {
+                    this.show_file_history(a.clone(), w, cx)
+                }));
+            let menu = match at.clone() {
+                Some((rev, deleted)) => {
+                    let label = match deleted {
+                        true => tr("逐行追溯删除前的版本"),
+                        false => tr("逐行追溯此版本"),
+                    };
+                    let at_path = path.clone();
+                    let menu = menu.item(item(&view, label, move |this, _, cx| {
+                        this.show_blame_at(at_path.clone(), Some(rev.clone()), cx)
+                    }));
+                    // 删掉的文件工作区里一般没有，不给「当前版本」
+                    match deleted {
+                        true => menu,
+                        false => menu.item(item(
+                            &view,
+                            tr("逐行追溯当前版本"),
+                            move |this, _, cx| this.show_blame(b.clone(), cx),
+                        )),
+                    }
+                }
+                None => menu.item(item(
+                    &view,
+                    tr("逐行追溯（blame）"),
+                    move |this, _, cx| this.show_blame(b.clone(), cx),
+                )),
+            };
+            menu.separator()
+                .item(copy_item(tr("复制路径"), path.clone()))
         })
     }
 
@@ -991,60 +1034,124 @@ impl RepoView {
         })
     }
 
-    /// 工具栏上「获取」「拉取」的右键菜单：不常用的选项。
+    /// 工具栏上「获取」的菜单（⌄ 和右键是同一份）。
     pub(super) fn fetch_menu(&self, cx: &mut Context<Self>) -> MenuFn {
         let view = cx.entity().downgrade();
-        Box::new(move |menu, _, _| {
-            menu.item(item(
-                &view,
-                tr("获取，并清理远程已删除的分支（--prune）"),
-                |this, w, cx| this.fetch_prune(w, cx),
-            ))
+        let remotes = self.remote_names.clone();
+        let upstream = self.upstream_remote();
+        Box::new(move |menu, window, cx| {
+            let mut menu = menu
+                .item(item(&view, tr("获取全部远程"), |this, w, cx| {
+                    this.fetch(w, cx)
+                }))
+                .item(item(
+                    &view,
+                    tr("获取，并清理远程已删除的分支（--prune）"),
+                    |this, w, cx| this.fetch_prune(w, cx),
+                ));
+            menu = match upstream.clone() {
+                Some(remote) => menu.item(item(
+                    &view,
+                    tf!("获取当前分支的上游（{remote}）", remote = remote.as_str()),
+                    move |this, w, cx| this.fetch_remote(remote.clone(), w, cx),
+                )),
+                None => menu.item(PopupMenuItem::new(tr("获取当前分支的上游")).disabled(true)),
+            };
+            // 只有一个远程时和「获取全部远程」一样，不列
+            if remotes.len() > 1 {
+                let (view, remotes) = (view.clone(), remotes.clone());
+                menu = menu.submenu(tr("选择远程"), window, cx, move |sub, _, _| {
+                    remotes.iter().fold(sub, |sub, remote| {
+                        let name = remote.clone();
+                        sub.item(item(&view, remote.clone(), move |this, w, cx| {
+                            this.fetch_remote(name.clone(), w, cx)
+                        }))
+                    })
+                });
+            }
+            menu
         })
     }
 
+    /// 工具栏上「拉取」的菜单。
     pub(super) fn pull_menu(&self, cx: &mut Context<Self>) -> MenuFn {
         let view = cx.entity().downgrade();
+        let autostash = self.app.read(cx).settings.pull_autostash;
         Box::new(move |menu, _, _| {
-            menu.item(item(
+            menu.item(item(&view, tr("拉取"), |this, w, cx| {
+                this.pull(super::ops::PullMode::Default, w, cx)
+            }))
+            .item(item(
                 &view,
                 tr("拉取，以变基代替合并（--rebase）"),
-                |this, w, cx| this.pull(true, w, cx),
-            ))
-        })
-    }
-
-    pub(super) fn push_menu(&self, cx: &mut Context<Self>) -> MenuFn {
-        let view = cx.entity().downgrade();
-        Box::new(move |menu, _, _| {
-            menu.item(item(
-                &view,
-                tr("强制推送（--force-with-lease）…"),
-                |this, w, cx| {
-                    let current = this.refs.branches.iter().find(|b| b.current).cloned();
-                    match current {
-                        Some(branch) => this.push_branch(&branch, true, w, cx),
-                        None => w.push_notification(
-                            Notification::warning(tr(
-                                "当前处于分离的 HEAD 状态，请先切换到分支再推送",
-                            )),
-                            cx,
-                        ),
-                    }
-                },
+                |this, w, cx| this.pull(super::ops::PullMode::Rebase, w, cx),
             ))
             .item(item(
                 &view,
-                tr("推送所有标签（--tags）"),
-                |this, w, cx| {
-                    let remote = this.default_remote();
-                    let mut push = args(&["push", "--progress", "--tags", "--"]);
-                    push.push(remote);
-                    this.run_net_op(tr("推送"), push, w, cx, |_, _, w, cx| {
-                        w.push_notification(Notification::success(tr("标签已推送")), cx);
-                    });
-                },
+                tr("仅快进（--ff-only）"),
+                |this, w, cx| this.pull(super::ops::PullMode::FfOnly, w, cx),
             ))
+            .separator()
+            .item(
+                item(
+                    &view,
+                    tr("拉取前自动贮藏本地修改"),
+                    |this, _, cx| this.toggle_pull_autostash(cx),
+                )
+                .checked(autostash),
+            )
+        })
+    }
+
+    /// 工具栏上「推送」的菜单。
+    pub(super) fn push_menu(&self, cx: &mut Context<Self>) -> MenuFn {
+        let view = cx.entity().downgrade();
+        let last_push = self.output.last_push();
+        Box::new(move |menu, _, _| {
+            let last = last_push.clone();
+            menu.item(item(&view, tr("推送"), |this, w, cx| this.push(w, cx)))
+                .item(item(
+                    &view,
+                    tr("推送并设置上游…"),
+                    |this, w, cx| this.push_set_upstream(w, cx),
+                ))
+                .item(item(
+                    &view,
+                    tr("强制推送（--force-with-lease）…"),
+                    |this, w, cx| {
+                        let current = this.refs.branches.iter().find(|b| b.current).cloned();
+                        match current {
+                            Some(branch) => this.push_branch(&branch, true, w, cx),
+                            None => w.push_notification(
+                                Notification::warning(tr(
+                                    "当前处于分离的 HEAD 状态，请先切换到分支再推送",
+                                )),
+                                cx,
+                            ),
+                        }
+                    },
+                ))
+                .item(item(
+                    &view,
+                    tr("推送所有标签（--tags）"),
+                    |this, w, cx| {
+                        let remote = this.default_remote();
+                        let mut push = args(&["push", "--progress", "--tags", "--"]);
+                        push.push(remote);
+                        this.run_net_op(tr("推送"), push, w, cx, |this, _, w, cx| {
+                            this.notify_net(Notification::success(tr("标签已推送")), w, cx);
+                        });
+                    },
+                ))
+                .separator()
+                .item(
+                    item(
+                        &view,
+                        tr("查看上次推送的输出"),
+                        move |this, _, cx| this.open_output(last.clone(), cx),
+                    )
+                    .disabled(last_push.is_none()),
+                )
         })
     }
 
@@ -1248,7 +1355,13 @@ impl RepoView {
 
     /// 合并：先问怎么合（默认、总是生成合并提交、只快进、压缩成一份改动），要不要先不提交。
     /// 把 `name`（完整引用名是 `full`）合并到当前分支。
-    fn merge(&mut self, name: String, full: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn merge(
+        &mut self,
+        name: String,
+        full: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let cur = self.current_label();
         let rev = merge_rev(&name, &full, &self.refs);
         let choose = super::dialogs::Choose {
@@ -1304,7 +1417,7 @@ impl RepoView {
     }
 
     /// 把当前分支变基到 `target`（完整引用名或提交，短名可能认成同名的标签）；`shown` 是给用户看的名字。
-    fn rebase_onto(
+    pub(super) fn rebase_onto(
         &mut self,
         target: String,
         shown: String,
@@ -1365,6 +1478,15 @@ impl RepoView {
                 tr("变基前的位置记在侧栏的「找回提交」里。"),
             ));
         }
+        // 工作区有改动时 git 不肯变基：和交互式变基一样带上 --autostash，先贮藏、完成后恢复
+        if self.has_tracked_changes() {
+            rows.push(Row::new(
+                Tone::Plain,
+                IconName::Archive,
+                "本地修改",
+                tr("未提交的改动将先贮藏，完成后自动恢复（--autostash）。"),
+            ));
+        }
         let impact = Impact {
             description: tf!(
                 "{cur} 独有的提交将在 {shown} 之后重新生成。",
@@ -1383,7 +1505,8 @@ impl RepoView {
             cx,
             move |this, window, cx| {
                 let shown = shown.clone();
-                let rebase = vec!["rebase".into(), target.clone()];
+                // 参数里总带着 --autostash：不按确认框打开时的状态决定，开着的这一会儿工作区可能变了
+                let rebase = vec!["rebase".into(), "--autostash".into(), target.clone()];
                 this.run_op(
                     tr("变基"),
                     rebase,
@@ -1424,10 +1547,10 @@ impl RepoView {
             vec![Step::net(fetch)],
             window,
             cx,
-            Box::new(move |_, result, window, cx| match result {
+            Box::new(move |this, result, window, cx| match result {
                 Ok(_) => {
                     let text = tf!("{name} 已更新到 {upstream}", name, upstream);
-                    window.push_notification(Notification::success(text), cx);
+                    this.notify_net(Notification::success(text), window, cx);
                 }
                 Err(text) if text.contains("non-fast-forward") => {
                     let text = tf!(
@@ -1437,7 +1560,7 @@ impl RepoView {
                     );
                     window.push_notification(Notification::warning(text).autohide(false), cx);
                 }
-                Err(text) => failure(window, cx, tr("拉取"), text),
+                Err(text) => this.failure(tr("拉取"), text, window, cx),
             }),
         );
     }
@@ -1461,10 +1584,14 @@ impl RepoView {
         if force {
             return self.force_push(name, remote, remote_branch, set_upstream, window, cx);
         }
+        // 还没有上游：先说清推到哪里（同工具栏的「推送」）
+        if set_upstream {
+            return self.push_new_branch(name, window, cx);
+        }
         let text = tf!("{name} 已推送到 {to}", name, to);
         let push = push_args(&name, &remote, &remote_branch, set_upstream, None);
-        self.run_net_op(tr("推送"), push, window, cx, move |_, _, w, cx| {
-            w.push_notification(Notification::success(text), cx);
+        self.run_net_op(tr("推送"), push, window, cx, move |this, _, w, cx| {
+            this.notify_net(Notification::success(text), w, cx);
         });
     }
 
@@ -1654,8 +1781,8 @@ impl RepoView {
                     push.clone(),
                     window,
                     cx,
-                    move |_, _, w, cx| {
-                        w.push_notification(Notification::success(text), cx);
+                    move |this, _, w, cx| {
+                        this.notify_net(Notification::success(text), w, cx);
                     },
                 );
             },
@@ -1729,8 +1856,8 @@ impl RepoView {
                     delete.clone(),
                     window,
                     cx,
-                    move |_, _, w, cx| {
-                        w.push_notification(Notification::success(tf!("已删除 {full}", full)), cx);
+                    move |this, _, w, cx| {
+                        this.notify_net(Notification::success(tf!("已删除 {full}", full)), w, cx);
                     },
                 );
             },
@@ -1798,10 +1925,16 @@ impl RepoView {
             remote.clone(),
             format!("refs/tags/{name}"),
         ];
-        self.run_net_op(tr("推送标签"), push, window, cx, move |_, _, w, cx| {
-            let text = tf!("标签 {name} 已推送到 {remote}", name, remote);
-            w.push_notification(Notification::success(text), cx);
-        });
+        self.run_net_op(
+            tr("推送标签"),
+            push,
+            window,
+            cx,
+            move |this, _, w, cx| {
+                let text = tf!("标签 {name} 已推送到 {remote}", name, remote);
+                this.notify_net(Notification::success(text), w, cx);
+            },
+        );
     }
 
     /// 删除标签：`on_remote` 为真时删的是远程上的，本地的留着。
@@ -1850,11 +1983,9 @@ impl RepoView {
                         delete,
                         window,
                         cx,
-                        move |_, _, w, cx| {
-                            w.push_notification(
-                                Notification::success(tf!("已从远程删除 {name}", name)),
-                                cx,
-                            );
+                        move |this, _, w, cx| {
+                            let note = Notification::success(tf!("已从远程删除 {name}", name));
+                            this.notify_net(note, w, cx);
                         },
                     );
                 } else {
@@ -1879,18 +2010,20 @@ impl RepoView {
 
     fn fetch_prune(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let fetch = args(&["fetch", "--all", "--prune", "--progress"]);
-        self.run_net_op(tr("获取"), fetch, window, cx, |_, _, w, cx| {
-            w.push_notification(
-                Notification::success(tr("获取完成，已清理远程已删除的分支")),
-                cx,
-            );
+        self.run_net_op(tr("获取"), fetch, window, cx, |this, _, w, cx| {
+            let note = Notification::success(tr("获取完成，已清理远程已删除的分支"));
+            this.notify_net(note, w, cx);
         });
     }
 
     fn fetch_remote(&mut self, remote: String, window: &mut Window, cx: &mut Context<Self>) {
         let fetch = vec!["fetch".into(), "--progress".into(), remote.clone()];
-        self.run_net_op(tr("获取"), fetch, window, cx, move |_, _, w, cx| {
-            w.push_notification(Notification::success(tf!("已从 {remote} 获取", remote)), cx);
+        self.run_net_op(tr("获取"), fetch, window, cx, move |this, _, w, cx| {
+            this.notify_net(
+                Notification::success(tf!("已从 {remote} 获取", remote)),
+                w,
+                cx,
+            );
         });
     }
 
@@ -1931,6 +2064,8 @@ impl RepoView {
             "{path} 中的所有冲突将采用此版本并标记为已解决，另一方的改动和手动编辑的内容将被覆盖。",
             path
         );
+        // 确认框开着时文件又被编辑过（合并编辑器之外、agent 在改），覆盖前先核对
+        let guard = self.guard_content(vec![path.clone()], Vec::new(), cx);
         self.confirm(
             tf!("整个文件采用{which}？", which),
             description,
@@ -1939,19 +2074,26 @@ impl RepoView {
             cx,
             move |this, window, cx| {
                 let path = path.clone();
-                let steps = vec![
-                    Step::local(vec![
-                        "checkout".into(),
-                        side.into(),
-                        "--".into(),
-                        path.clone(),
-                    ]),
-                    Step::local(vec!["add".into(), "--".into(), path.clone()]),
-                ];
-                this.run_seq(tr("解决冲突"), steps, window, cx, move |_, _, w, cx| {
-                    let text = tf!("{path} 已采用{which}，并标记为已解决", path, which);
-                    w.push_notification(Notification::success(text), cx);
-                });
+                let run = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                    let steps = vec![
+                        Step::local(vec![
+                            "checkout".into(),
+                            side.into(),
+                            "--".into(),
+                            path.clone(),
+                        ]),
+                        Step::local(vec!["add".into(), "--".into(), path.clone()]),
+                    ];
+                    this.run_seq(tr("解决冲突"), steps, window, cx, move |_, _, w, cx| {
+                        let text = tf!("{path} 已采用{which}，并标记为已解决", path, which);
+                        w.push_notification(Notification::success(text), cx);
+                    });
+                };
+                let changed = tr("文件在确认期间有新的改动，未覆盖。请查看最新改动后重试。");
+                match guard.clone() {
+                    Some(guard) => this.verify_content_then(guard, changed, window, cx, run),
+                    None => run(this, window, cx),
+                }
             },
         );
     }

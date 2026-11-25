@@ -41,14 +41,14 @@ pub fn home() -> String {
 }
 
 /// `list_dir`：列出子目录。
-pub fn list_dir(path: &str) -> Result<DirListing> {
+pub fn list_dir(path: &str, hidden: bool) -> Result<DirListing> {
     #[cfg(windows)]
     {
-        windows::list_dir(path)
+        windows::list_dir(path, hidden)
     }
     #[cfg(not(windows))]
     {
-        fr_core::dir::list_dir(path)
+        fr_core::dir::list_dir_with(path, hidden)
     }
 }
 
@@ -57,13 +57,14 @@ mod windows {
     use super::*;
     use fr_core::protocol::DirEntry;
 
-    pub fn list_dir(path: &str) -> Result<DirListing> {
+    pub fn list_dir(path: &str, hidden: bool) -> Result<DirListing> {
         let path = path.trim();
         if path == "/" {
             return Ok(drives());
         }
-        let mut listing = fr_core::dir::list_dir(&real(path))?;
+        let mut listing = fr_core::dir::list_dir_with(&real(path), hidden)?;
         listing.path = shown(&listing.path);
+        listing.root = listing.root.as_deref().map(shown);
         // 盘的根目录再往上是列着各个盘的那一层
         listing.parent = Some(
             listing
@@ -95,6 +96,7 @@ mod windows {
             .map(|bit| DirEntry {
                 name: format!("{}:", (b'A' + bit) as char),
                 repo: false,
+                hidden: false,
             })
             .collect();
         DirListing {
@@ -102,6 +104,7 @@ mod windows {
             parent: None,
             repo: false,
             entries,
+            root: None,
         }
     }
 
@@ -122,14 +125,14 @@ mod windows {
         #[test]
         fn 盘的根目录往上是列着各个盘的那一层() {
             let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
-            let root = list_dir(&format!("/{drive}")).unwrap();
+            let root = list_dir(&format!("/{drive}"), false).unwrap();
             assert_eq!(root.path, format!("{drive}/"));
             assert_eq!(root.parent.as_deref(), Some("/"));
-            let top = list_dir("/").unwrap();
+            let top = list_dir("/", false).unwrap();
             assert!(top.parent.is_none());
             assert!(top.entries.iter().any(|entry| entry.name == drive));
             // 主目录：正斜杠
-            let home = list_dir("~").unwrap();
+            let home = list_dir("~", false).unwrap();
             assert!(!home.path.contains('\\'), "{}", home.path);
             assert!(home.parent.is_some_and(|parent| !parent.contains('\\')));
         }

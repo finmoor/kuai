@@ -18,12 +18,21 @@ use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::RepoView;
 use super::impact::{Impact, Row, Tone, list_commits};
 
 /// 写操作里的一步。
+/// 怎么拉取：照配置（合并或变基）、用变基、只快进。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PullMode {
+    Default,
+    Rebase,
+    FfOnly,
+}
+
 #[derive(Clone)]
 pub(super) struct Step {
     pub args: Vec<String>,
@@ -93,6 +102,73 @@ type OnDone =
 /// （去掉首尾空白；命令失败算 None）。
 pub(super) type Check = (Vec<String>, Option<String>);
 
+/// 要丢弃、覆盖的几个文件在确认框打开时的内容（见 [`RepoView::guard_content`]）。
+#[derive(Clone)]
+pub(super) struct ContentGuard {
+    tracked: Vec<String>,
+    untracked: Vec<String>,
+    first: futures::future::Shared<Task<Result<u64, String>>>,
+}
+
+/// 几个文件内容的指纹，只用来比较前后两次是否一样。已跟踪的看工作区对暂存区的差异（`--full-index`
+/// 让二进制文件的内容也体现在对象号上），这正是丢弃、覆盖会去掉的东西；未跟踪的看文件列表（目录
+/// 展开成里面的文件）和每个文件的对象号。git 的退出码和报错也算进去：两次报同样的错算一样，交给后面
+/// 真正执行时报。连接出错才返回 Err。
+async fn content_fingerprint(
+    channel: &Channel,
+    repo: &str,
+    tracked: &[String],
+    untracked: &[String],
+) -> Result<u64, String> {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut feed = |out: &GitOutput| {
+        out.code.hash(&mut hasher);
+        out.stdout.hash(&mut hasher);
+        out.stderr.hash(&mut hasher);
+    };
+    if !tracked.is_empty() {
+        let mut list = args(&[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--full-index",
+            "--",
+        ]);
+        list.extend(tracked.iter().cloned());
+        let out = channel
+            .git(repo, list)
+            .await
+            .map_err(|err| format!("{err:#}"))?;
+        feed(&out);
+    }
+    if !untracked.is_empty() {
+        let mut list = args(&["ls-files", "--others", "--exclude-standard", "-z", "--"]);
+        list.extend(untracked.iter().cloned());
+        let listed = channel
+            .git(repo, list)
+            .await
+            .map_err(|err| format!("{err:#}"))?;
+        feed(&listed);
+        // 换行分隔的路径列表：名字里带换行的文件对不上，它的增删照样体现在上面的列表里
+        let files: Vec<&[u8]> = listed
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|name| !name.is_empty() && !name.contains(&b'\n'))
+            .collect();
+        if listed.success() && !files.is_empty() {
+            let stdin = files.join(&b'\n');
+            let hashed = channel
+                .git_with_input(repo, args(&["hash-object", "--stdin-paths"]), Some(stdin))
+                .await
+                .map_err(|err| format!("{err:#}"))?;
+            feed(&hashed);
+        }
+    }
+    Ok(hasher.finish())
+}
+
 impl RepoView {
     /// HEAD 现在的样子：在哪个分支上、指向哪个提交（按读到的状态）。给 [`Self::verify_then`] 核对用。
     pub(super) fn head_checks(&self) -> Vec<Check> {
@@ -148,6 +224,63 @@ impl RepoView {
         })
         .detach();
     }
+
+    /// 打开丢弃、覆盖的确认框时调用：开始读这几个文件现在的内容，确认后交给
+    /// [`Self::verify_content_then`] 再核对一遍。`untracked` 是未跟踪的文件和目录。
+    pub(super) fn guard_content(
+        &self,
+        tracked: Vec<String>,
+        untracked: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> Option<ContentGuard> {
+        use futures::FutureExt as _;
+        let channel = self.channel.clone()?;
+        let repo = self.entry.path.clone();
+        let (t, u) = (tracked.clone(), untracked.clone());
+        let first = cx
+            .spawn(async move |_, _| content_fingerprint(&channel, &repo, &t, &u).await)
+            .shared();
+        Some(ContentGuard {
+            tracked,
+            untracked,
+            first,
+        })
+    }
+
+    /// 确认之后：在主机上再读一遍这几个文件的内容，和确认框打开时一样才做 `then`。不一样说明确认框
+    /// 开着时文件又被改了（agent 还在写、在别处编辑），照旧执行会把没看过的内容一起丢掉，所以不做，
+    /// 提示 `changed`，重新读状态。读和做之间仍有很短的空当，没有锁。
+    pub(super) fn verify_content_then(
+        &mut self,
+        guard: ContentGuard,
+        changed: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        let repo = self.entry.path.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let first = guard.first.await;
+            let now = content_fingerprint(&channel, &repo, &guard.tracked, &guard.untracked).await;
+            this.update_in(cx, |this, window, cx| match (first, now) {
+                (Ok(before), Ok(now)) if before == now => then(this, window, cx),
+                (Ok(_), Ok(_)) => {
+                    window.push_notification(Notification::warning(changed), cx);
+                    this.refresh(cx);
+                }
+                (Err(err), _) | (_, Err(err)) => {
+                    let text = tf!("无法核对文件内容，未执行：{err}", err);
+                    window.push_notification(Notification::error(text), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// 执行一个写操作。成功时调用 `on_success`，失败时弹出 git 的报错；无论成败都刷新状态。
     pub(super) fn run_op(
         &mut self,
@@ -196,9 +329,27 @@ impl RepoView {
             cx,
             Box::new(move |this, result, window, cx| match result {
                 Ok(out) => on_success(this, &out, window, cx),
-                Err(text) => failure(window, cx, &name, text),
+                Err(text) => this.failure(&name, text, window, cx),
             }),
         );
+    }
+
+    /// 操作失败的通知（见 [`failure_note`]）；联过网的在「复制全部」旁边带「查看输出」，底部能看
+    /// 完整的输出。
+    pub(super) fn failure(
+        &self,
+        label: &str,
+        detail: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let hint = explain(&detail).unwrap_or(tr("git 返回的错误信息如下。"));
+        let title = tf!("{label}失败", label);
+        let note = Notification::error(hint)
+            .title(title.clone())
+            .autohide(false);
+        let note = with_detail_and(note, &title, &detail, self.output_opener(cx));
+        window.push_notification(note, cx);
     }
 
     /// 执行一个写操作，做完把结果交给 `on_done`（失败时是给用户看的报错），然后刷新状态。
@@ -301,6 +452,11 @@ impl RepoView {
                     || label.as_ref() == tr("跳过")
             });
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        let net_op = steps.iter().any(|step| step.net);
+        let push_op = steps
+            .iter()
+            .any(|step| step.net && step.args.iter().any(|arg| arg == "push"));
+        self.output_start(label.clone(), net_op, push_op);
         self.op = Some(label.clone());
         self.op_writing = Some(writing);
         self.op_progress = None;
@@ -322,7 +478,11 @@ impl RepoView {
             let mut done: Vec<String> = Vec::new();
             let mut failed_step = String::new();
             let mut cancelled = false;
+            // 推送途中连接断了：推送可能已经完成，结果不能当成失败报
+            let mut push_unknown = false;
             for step in steps {
+                let is_push = step.net && step.args.iter().any(|arg| arg == "push");
+                let is_fetch = step.net && step.args.iter().any(|arg| arg == "fetch");
                 let shown = match &step.shown {
                     Some(text) => clip(text.clone()),
                     None => command_line(&step.args),
@@ -332,7 +492,9 @@ impl RepoView {
                 let marked = this.update(cx, |this, cx| {
                     this.op_progress = net.then(SharedString::default);
                     cx.notify();
-                    this.activity.begin(label.clone(), step.logged())
+                    let id = this.activity.begin(label.clone(), step.logged());
+                    this.output.step(id);
+                    id
                 });
                 let Ok(activity) = marked else {
                     return;
@@ -340,6 +502,8 @@ impl RepoView {
                 result = if step.net {
                     let mut stream = channel.git_progress(&repo, step.args);
                     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+                    // 底部的输出隔一会儿更新一次：大仓库的进度一秒刷几十次，每次都整理全部输出太费
+                    let mut shown_at: Option<std::time::Instant> = None;
                     loop {
                         let next = futures::select_biased! {
                             stop = cancel_rx => Err(stop.is_ok()),
@@ -359,8 +523,21 @@ impl RepoView {
                             Some(Ok(StreamItem::Progress(chunk))) => {
                                 stderr.extend_from_slice(&chunk);
                                 let line = last_progress_line(&stderr);
+                                // 进度（回车刷新的）隔一会儿更新一次；换了行的（远程说的话）马上更新，
+                                // 不然 hook 说完一句停下来等的时候，底部的输出里还看不到这一句
+                                let live = chunk.contains(&b'\n')
+                                    || shown_at.is_none_or(|at| {
+                                        at.elapsed() >= std::time::Duration::from_millis(200)
+                                    });
+                                if live {
+                                    shown_at = Some(std::time::Instant::now());
+                                }
+                                let text = live.then(|| String::from_utf8_lossy(&stderr).into_owned());
                                 let shown = this.update(cx, |this, cx| {
                                     this.op_progress = Some(line.into());
+                                    if let Some(text) = &text {
+                                        this.activity.live(activity, text);
+                                    }
                                     cx.notify();
                                 });
                                 if shown.is_err() {
@@ -371,8 +548,14 @@ impl RepoView {
                                 out.stdout = stdout;
                                 break Ok(out);
                             }
-                            Some(Err(err)) => break Err(err),
-                            None => break Err(anyhow::anyhow!(tr("连接中断"))),
+                            Some(Err(err)) => {
+                                push_unknown = is_push;
+                                break Err(err);
+                            }
+                            None => {
+                                push_unknown = is_push;
+                                break Err(anyhow::anyhow!(tr("连接中断")));
+                            }
                         }
                     }
                 } else {
@@ -384,6 +567,13 @@ impl RepoView {
                     // 刚联过网：自动获取从现在重新计时
                     if net && ok {
                         this.auto_fetch.last = std::time::Instant::now();
+                    }
+                    // 获取（拉取的第一步也是）：工具栏上「上次获取」跟着变
+                    match &result {
+                        _ if !is_fetch || cancelled => {}
+                        Ok(out) if out.success() => this.fetch_succeeded(),
+                        Ok(out) => this.fetch_failed(&output_text(out), false),
+                        Err(err) => this.fetch_failed(&format!("{err:#}"), false),
                     }
                 });
                 if logged.is_err() {
@@ -419,6 +609,8 @@ impl RepoView {
                 this.op_writing = None;
                 this.op_progress = None;
                 this.op_cancel = None;
+                // 先收进「最近的操作」：下面的通知要带「查看输出」时认的是它
+                this.output.finish();
                 this.changes.mark_stale();
                 let result = match result {
                     Ok(out) if out.success() => Ok(out),
@@ -456,6 +648,19 @@ impl RepoView {
                         ))
                         .title(tf!("{name}遇到冲突，已暂停", name = state.name()))
                         .id::<StoppedNote>();
+                        window.push_notification(note, cx);
+                    }
+                    // 推送时连接断了：远程可能已经收到了。不说「失败」（照着重推、强推可能出错），
+                    // 说结果未知，请重新连上以后获取、核对远程分支
+                    (_, Err(text)) if push_unknown => {
+                        let note = Notification::warning(tr(
+                            "推送过程中连接中断，提交可能已推送到远程。请在重新连接后点击「获取」，核对远程分支后再操作。",
+                        ))
+                        .title(tr("推送结果未知"))
+                        .autohide(false);
+                        // 断开前远程说过的话（hook 的输出）在「查看输出」里
+                        let note =
+                            with_detail_and(note, tr("推送结果未知"), &text, this.output_opener(cx));
                         window.push_notification(note, cx);
                     }
                     (_, result) => {
@@ -591,19 +796,19 @@ impl RepoView {
             args(&["fetch", "--all", "--progress"]),
             window,
             cx,
-            |_, _, window, cx| {
-                window.push_notification(Notification::success(tr("获取完成")), cx);
+            |this, _, window, cx| {
+                this.notify_net(Notification::success(tr("获取完成")), window, cx);
             },
         );
     }
 
-    /// 拉取。`rebase` 为真时用变基代替合并。
-    pub(super) fn pull(&mut self, rebase: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// 拉取，`mode` 是合并、变基还是只快进（见 [`PullMode`]）。
+    pub(super) fn pull(&mut self, mode: PullMode, window: &mut Window, cx: &mut Context<Self>) {
         let Some(status) = &self.status else {
             return;
         };
         if status.upstream.is_some() {
-            self.run_pull(Vec::new(), rebase, window, cx);
+            self.run_pull(Vec::new(), mode, window, cx);
             return;
         }
         // 没有上游：远程上有同名分支就问要不要设成上游，没有就告诉用户该怎么办
@@ -632,7 +837,7 @@ impl RepoView {
                         "branch".into(),
                         format!("--set-upstream-to={candidate}"),
                     ]);
-                    this.run_pull(vec![set], rebase, window, cx);
+                    this.run_pull(vec![set], mode, window, cx);
                 },
             );
         } else {
@@ -645,23 +850,35 @@ impl RepoView {
     }
 
     /// 拉取。工作区有改动时先问要不要贮藏（git 自己的 `--autostash`：拉完自动放回来，
-    /// 合并遇到冲突停下时，等合并提交或中止以后再放回来）。
+    /// 合并遇到冲突停下时，等合并提交或中止以后再放回来）；拉取菜单里勾了「拉取前自动贮藏本地
+    /// 修改」的不问，直接贮藏。
     fn run_pull(
         &mut self,
         steps: Vec<Step>,
-        rebase: bool,
+        mode: PullMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.app.read(cx).settings.pull_autostash && self.has_tracked_changes() {
+            self.run_pull_now(steps, mode, true, window, cx);
+            return;
+        }
         self.with_local_changes(
             tr("拉取"),
             tr("不贮藏，直接拉取"),
             window,
             cx,
             move |this, stash, window, cx| {
-                this.run_pull_now(steps.clone(), rebase, stash, window, cx)
+                this.run_pull_now(steps.clone(), mode, stash, window, cx)
             },
         );
+    }
+
+    /// 拉取菜单里的「拉取前自动贮藏本地修改」：开、关。
+    pub(super) fn toggle_pull_autostash(&mut self, cx: &mut Context<Self>) {
+        self.app.update(cx, |app, cx| {
+            app.update_settings(cx, |s| s.pull_autostash = !s.pull_autostash)
+        });
     }
 
     /// 拉取分两步：先获取（联网，可以取消），再照配置合并或变基（改工作区，不能中途杀掉，也不再
@@ -669,7 +886,7 @@ impl RepoView {
     fn run_pull_now(
         &mut self,
         mut steps: Vec<Step>,
-        rebase: bool,
+        mode: PullMode,
         autostash: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -682,7 +899,11 @@ impl RepoView {
         cx.spawn_in(window, async move |this, cx| {
             // 什么都没配时 git config 以 1 退出：按空的算
             let config = read.await.map(|out| out.stdout).unwrap_or_default();
-            let finish = pull::decide(&config, branch.as_deref().unwrap_or_default(), rebase);
+            let branch = branch.as_deref().unwrap_or_default();
+            let finish = match mode {
+                PullMode::FfOnly => pull::Finish::FfOnly,
+                _ => pull::decide(&config, branch, mode == PullMode::Rebase),
+            };
             this.update_in(cx, |this, window, cx| {
                 steps.push(Step::net(pull::fetch_args()));
                 let missing = tr("远程上找不到上游分支（可能已被删除），未合并。");
@@ -694,14 +915,15 @@ impl RepoView {
                     steps,
                     window,
                     cx,
-                    move |_, out, window, cx| {
+                    move |this, out, window, cx| {
                         let title = if rebased {
                             tr("拉取完成（变基）")
                         } else {
                             tr("拉取完成")
                         };
-                        window.push_notification(
+                        this.notify_net(
                             Notification::success(summary(out)).title(title),
+                            window,
                             cx,
                         );
                     },
@@ -725,12 +947,51 @@ impl RepoView {
         };
         if status.upstream.is_some() {
             let push = args(&["push", "--progress"]);
-            self.run_net_op(tr("推送"), push, window, cx, |_, _, window, cx| {
-                window.push_notification(Notification::success(tr("推送完成")), cx);
+            self.run_net_op(tr("推送"), push, window, cx, |this, _, window, cx| {
+                this.notify_net(Notification::success(tr("推送完成")), window, cx);
             });
             return;
         }
-        // 还没有上游：推到默认远程的同名分支并设为上游
+        // 还没有上游：先确认推到哪个远程
+        self.push_new_branch(branch, window, cx);
+    }
+
+    /// 推送菜单的「推送并设置上游…」：选远程，推到那里的同名分支并设为上游（已经有上游的也能换）。
+    pub(super) fn push_set_upstream(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(branch) = self.status.as_ref().and_then(|s| s.branch.clone()) else {
+            window.push_notification(
+                Notification::warning(tr("当前处于分离的 HEAD 状态，请先切换到分支再推送")),
+                cx,
+            );
+            return;
+        };
+        self.push_to_remote(branch, false, window, cx);
+    }
+
+    /// 第一次推送一个还没有上游的分支：先说清推到哪个远程（地址）的哪个分支，可以换远程、
+    /// 选要不要设为上游，确认后才推。工具栏的「推送」、提交并推送、侧栏分支菜单的「推送」共用。
+    /// 原来直接推到 origin（没有就第一个远程），推完才说推到了哪里；fork 的仓库里两个远程都在时容易推错。
+    pub(super) fn push_new_branch(
+        &mut self,
+        branch: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.push_to_remote(branch, true, window, cx);
+    }
+
+    /// 选远程推送 `branch`：`fresh` 是从没推送过的（[`Self::push_new_branch`]），否则是「推送并设置
+    /// 上游…」，默认选现在的上游所在的远程。
+    fn push_to_remote(
+        &mut self,
+        branch: String,
+        fresh: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
         if self.remote_names.is_empty() {
             window.push_notification(
                 Notification::warning(tr(
@@ -741,24 +1002,109 @@ impl RepoView {
             );
             return;
         }
-        let remote = self.default_remote();
-        // 完整引用名：本地有同名的标签时短名会认错
-        let push = vec![
-            "push".into(),
-            "--progress".into(),
-            "--set-upstream".into(),
-            "--".into(),
-            remote.clone(),
-            format!("refs/heads/{branch}"),
-        ];
-        self.run_net_op(tr("推送"), push, window, cx, move |_, _, window, cx| {
-            let text = tf!(
-                "已推送，{branch} 的上游已设为 {remote}/{branch}",
-                branch,
-                remote
-            );
-            window.push_notification(Notification::success(text), cx);
-        });
+        let remotes = self.remote_names.clone();
+        let default = match fresh {
+            true => self.default_remote(),
+            false => self
+                .upstream_remote()
+                .unwrap_or_else(|| self.default_remote()),
+        };
+        let read = channel.git(
+            &self.entry.path,
+            args(&["config", "--get-regexp", r"^remote\..*\.(push)?url$"]),
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            // 推送地址：单独配了 pushurl 用它，没有就是 url
+            let config = read.await.map(|out| out.stdout).unwrap_or_default();
+            let text = String::from_utf8_lossy(&config);
+            let url_of = |remote: &str| {
+                let find = |key: &str| {
+                    let key = format!("remote.{remote}.{key} ");
+                    text.lines()
+                        .find_map(|line| line.strip_prefix(key.as_str()).map(str::to_string))
+                };
+                find("pushurl").or_else(|| find("url")).unwrap_or_default()
+            };
+            let options: Vec<(SharedString, SharedString)> = remotes
+                .iter()
+                .map(|remote| {
+                    let url = url_of(remote);
+                    let shown = fr_core::git::redact_urls(&url).into_owned();
+                    (remote.clone().into(), shown.into())
+                })
+                .collect();
+            let selected = remotes.iter().position(|r| *r == default).unwrap_or(0);
+            this.update_in(cx, |this, window, cx| {
+                let (title, description) = match fresh {
+                    true => (
+                        tf!("推送新分支 {branch}？", branch = branch.as_str()),
+                        tf!(
+                            "{branch} 尚未推送过，将在所选远程上创建同名分支。",
+                            branch = branch.as_str()
+                        ),
+                    ),
+                    false => (
+                        tf!("推送 {branch} 并设置上游", branch = branch.as_str()),
+                        tf!(
+                            "将 {branch} 推送到所选远程的同名分支，并设为它的上游。",
+                            branch = branch.as_str()
+                        ),
+                    ),
+                };
+                let choose = super::dialogs::Choose {
+                    title: title.into(),
+                    description: description.into(),
+                    options,
+                    selected,
+                    checks: vec![(tr("设为上游（以后直接推送、拉取此分支）"), true)],
+                    ok: tr("推送"),
+                };
+                this.choose(choose, window, cx, move |this, ix, checks, window, cx| {
+                    let Some(remote) = remotes.get(ix).cloned() else {
+                        return;
+                    };
+                    let upstream = checks.first().copied().unwrap_or(true);
+                    let push = super::menus::push_args(&branch, &remote, &branch, upstream, None);
+                    let text = match upstream {
+                        true => tf!(
+                            "已推送，{branch} 的上游已设为 {remote}/{branch}",
+                            branch = branch.as_str(),
+                            remote = remote.as_str()
+                        ),
+                        false => tf!(
+                            "{name} 已推送到 {to}",
+                            name = branch.as_str(),
+                            to = format!("{remote}/{branch}")
+                        ),
+                    };
+                    this.run_net_op(
+                        tr("推送"),
+                        push,
+                        window,
+                        cx,
+                        move |this, _, window, cx| {
+                            this.notify_net(Notification::success(text), window, cx);
+                        },
+                    );
+                });
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 当前分支的上游在哪个远程（远程的名字里可以有 `/`：取最长的那个前缀）。
+    pub(super) fn upstream_remote(&self) -> Option<String> {
+        let upstream = self.status.as_ref()?.upstream.as_deref()?;
+        self.remote_names
+            .iter()
+            .filter(|remote| {
+                upstream
+                    .strip_prefix(remote.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+            .max_by_key(|remote| remote.len())
+            .cloned()
     }
 
     pub(super) fn checkout_branch(
@@ -1451,12 +1797,17 @@ const DETAIL_HEIGHT: f32 = 96.;
 /// 操作失败的通知：常见的情况先用中文说原因和下一步，下面一个小块放 git 的原文（太长只留末尾，
 /// 块里可以滚动），「复制全部」把完整的报错放进剪贴板。通知不会自己消失。
 pub(super) fn failure(window: &mut Window, cx: &mut App, label: &str, detail: String) {
+    window.push_notification(failure_note(label, detail), cx);
+}
+
+/// 操作失败的通知：认得出的写中文说明，下面是 git 的原文。
+pub(super) fn failure_note(label: &str, detail: String) -> Notification {
     let hint = explain(&detail).unwrap_or(tr("git 返回的错误信息如下。"));
     let title = tf!("{label}失败", label);
     let note = Notification::error(hint)
         .title(title.clone())
         .autohide(false);
-    window.push_notification(with_detail(note, &title, &detail), cx);
+    with_detail(note, &title, &detail)
 }
 
 /// 给通知加上 git 的原文：放在一个最高 `DETAIL_HEIGHT` 的小块里，下面是「复制全部」
@@ -1465,11 +1816,26 @@ pub(super) fn failure(window: &mut Window, cx: &mut App, label: &str, detail: St
 struct StoppedNote;
 
 pub(super) fn with_detail(note: Notification, title: &str, detail: &str) -> Notification {
+    with_detail_and(note, title, detail, None)
+}
+
+/// 点了打开底部「输出」的按钮（见 `output.rs` 的 `output_opener`）。
+pub(super) type OpenOutput = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// 同 [`with_detail`]；给了 `open` 时「复制全部」旁边多一个「查看输出」，点了收起这条通知。
+pub(super) fn with_detail_and(
+    note: Notification,
+    title: &str,
+    detail: &str,
+    open: Option<OpenOutput>,
+) -> Notification {
     let shown = SharedString::from(tail(detail, SHOWN_LINES));
     let full = format!("{title}\n{detail}");
     note.content(move |_, _, cx| {
         let theme = cx.theme();
         let full = full.clone();
+        let me = cx.entity().downgrade();
+        let open = open.clone();
         v_flex()
             .mt_2()
             .gap_2()
@@ -1487,14 +1853,27 @@ pub(super) fn with_detail(note: Notification, title: &str, detail: &str) -> Noti
                     .child(shown.clone()),
             )
             .child(
-                h_flex().child(
-                    Button::new("copy-error")
-                        .xsmall()
-                        .label(tr("复制全部"))
-                        .on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(full.clone()));
-                        }),
-                ),
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("copy-error")
+                            .xsmall()
+                            .label(tr("复制全部"))
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(full.clone()));
+                            }),
+                    )
+                    .when_some(open, |row, open| {
+                        row.child(
+                            Button::new("view-output")
+                                .xsmall()
+                                .label(tr("查看输出"))
+                                .on_click(move |_, window, cx| {
+                                    open(window, cx);
+                                    me.update(cx, |note, cx| note.dismiss(window, cx)).ok();
+                                }),
+                        )
+                    }),
             )
             .into_any_element()
     })
@@ -1504,12 +1883,25 @@ pub(super) fn with_detail(note: Notification, title: &str, detail: &str) -> Noti
 pub(crate) fn explain(detail: &str) -> Option<&'static str> {
     let text = detail.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| text.contains(w));
-    if has(&["not possible to fast-forward", "can't be fast-forwarded"]) {
+    if has(&[
+        "hook declined",
+        "protected branch",
+        "gh006",
+        "[remote rejected]",
+    ]) {
+        Some(tr(
+            "远程拒绝了这次推送（服务器上的检查未通过，例如受保护的分支）。原因见输出中 remote: 开头的行。",
+        ))
+    } else if has(&["not possible to fast-forward", "can't be fast-forwarded"]) {
         Some(tr(
             "双方都有新提交，无法快进，未执行任何操作。请选择其他合并方式。",
         ))
     } else if has(&["non-fast-forward", "fetch first", "stale info"]) {
         Some(tr("推送被拒绝：远程有本地没有的提交。请先拉取。"))
+    } else if has(&["unable to read askpass response"]) {
+        // 要用户名、密码的框没得到回答：用户点了取消，或者在后台、弹不出框。说「认证失败、检查密码」
+        // 不对，根本没输
+        Some(tr("未输入登录信息，操作未执行。"))
     } else if has(&[
         "authentication failed",
         "permission denied",
@@ -1964,6 +2356,9 @@ mod tests {
                 .unwrap()
                 .contains("认证")
         );
+        // 要用户名的框被取消了：不说「认证失败」
+        let cancelled = "error: unable to read askpass response from '/home/u/.kuai/x/kuaid'\nfatal: could not read Username for 'http://127.0.0.1:8899': terminal prompts disabled";
+        assert!(explain(cancelled).unwrap().contains("未输入登录信息"));
         assert!(
             explain("fatal: unable to access 'https://example.com/': Could not resolve host")
                 .unwrap()

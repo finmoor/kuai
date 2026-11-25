@@ -34,19 +34,21 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, TitleBar, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, TitleBar, WindowExt as _, h_flex,
+    v_flex,
 };
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::app_state::AppState;
 use crate::history::History;
-use crate::machines::{LOCAL, WorkspaceKey};
+use crate::machines::{LOCAL, WorkspaceKey, machine_of};
 use crate::manager::{ManagerEvent, ManagerView};
 use crate::prompt::{self, Prompts};
 use crate::repo::{RepoEvent, RepoView};
@@ -54,7 +56,9 @@ use crate::repo_scan::RepoScan;
 use crate::settings::{Front, RepoEntry};
 use crate::settings_page::SettingsPage;
 use crate::tab_fit::{self, Segment};
-use crate::term_board::{BoardHandle, Row as TermRow, Shown, Stopped, TermBoard, TermId};
+use crate::term_board::{
+    AwayUpdates, BoardHandle, Row as TermRow, Shown, TermBoard, TermId, Waiting,
+};
 use crate::term_overview::{Go, TermOverview};
 use crate::toast::Toasts;
 use crate::tray::{Tray, TrayAction};
@@ -216,6 +220,8 @@ struct Applied {
     palette: &'static str,
     lang: i18n::Lang,
     tray: bool,
+    /// 代码字号、Tab 宽度
+    code: (u8, u8),
 }
 
 pub struct Workspace {
@@ -374,8 +380,11 @@ impl Workspace {
                     } => this.open_repo_path(entry, path.clone(), *at, *dir, window, cx),
                 },
             ),
-            cx.subscribe_in(&board, window, |this, _, event: &Stopped, window, cx| {
-                this.terminal_stopped(&event.0, window, cx)
+            cx.subscribe_in(&board, window, |this, _, event: &Waiting, window, cx| {
+                this.terminal_waiting(&event.0, window, cx)
+            }),
+            cx.subscribe_in(&board, window, |this, _, event: &AwayUpdates, window, cx| {
+                this.away_updates(event.0, window, cx)
             }),
             // 升级：小牌跟着检查、下载的进度变；点了「重启完成升级」先问一下再重启
             cx.observe(&updater, |_, _, cx| cx.notify()),
@@ -395,6 +404,10 @@ impl Workspace {
                 }
                 // 映射到本机的目录都断开（等在路上的写入落到服务器）
                 this.app.update(cx, |app, _| app.unmount_all());
+                // 端口转发的 ssh 都结束，不留在后台
+                crate::port_forward::stop_all(cx);
+                // 终端看过的时刻、各台主机最后一次连着的时刻存盘：下次启动认得出离开期间的新输出
+                this.board.update(cx, |board, _| board.save_memory());
                 async {}
             }),
             // 映射那边要说的话（映射上了、没成、写入落不到服务器）
@@ -602,6 +615,7 @@ impl Workspace {
             // Wayland 上藏不起来，「最小化到托盘」不显示，存着的值（X11 上开的）也不算：不然设置页
             // 上关不掉它，开机自启照样最小化
             tray: (settings.minimize_to_tray && crate::tray::can_hide()) || settings.close_to_tray,
+            code: (settings.code_font_size, settings.tab_width),
         };
         let before = self.applied.clone();
         if before.as_ref() == Some(&wanted) {
@@ -618,8 +632,22 @@ impl Workspace {
                 }
             }
         }
-        if before.as_ref().map(|a| a.palette) != Some(palette.id) {
+        let palette_changed = before.as_ref().map(|a| a.palette) != Some(palette.id);
+        if palette_changed {
             crate::appearance::apply_theme(&settings, window, cx);
+        }
+        // 代码字号写进主题（组件库的改动视图、编辑器都按它）；换主题时主题会重置，再写一次
+        let code_changed = before.as_ref().map(|a| a.code) != Some(wanted.code);
+        if code_changed || palette_changed {
+            crate::zoom::apply(&settings, cx);
+            // Tab 宽度变了：开着的改动按新的宽度重新排
+            let tab_changed = before.as_ref().map(|a| a.code.1) != Some(wanted.code.1);
+            if before.is_some() && tab_changed {
+                let views: Vec<_> = self.tabs.iter().map(|tab| tab.view.clone()).collect();
+                for view in views {
+                    view.update(cx, |view, cx| view.tab_width_changed(cx));
+                }
+            }
         }
         // 托盘：开关变了，或者语言变了（菜单上的字要换）就重建
         let rebuild_tray = before.as_ref().map(|a| (a.tray, a.lang)) != Some((wanted.tray, lang));
@@ -750,7 +778,180 @@ impl Workspace {
             self.hide_window(window, cx);
             return false;
         }
+        if self.confirm_agents(window, cx) {
+            return false;
+        }
         !self.confirm_quit(window, cx)
+    }
+
+    /// 点了关闭、没设关闭到托盘，又有 AI 终端在跑：终端会接着在主机上跑，但退出以后它们
+    /// 停下了不会再提醒，先问一句。可以最小化到托盘（顺便记成以后关闭都这样）、取消、仍要退出。
+    /// 问了返回真（先不关，选了再说）。
+    fn confirm_agents(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let agents = self.board.read(cx).agents();
+        if agents.is_empty() {
+            return false;
+        }
+        let app = self.app.read(cx);
+        let lines: Vec<(SharedString, SharedString, Hsla)> = agents
+            .iter()
+            .take(4)
+            .map(|row| {
+                let place = tf!(
+                    "{repo} · {state}",
+                    repo = app.repo_name(&row.entry),
+                    state = crate::term_overview::TermOverview::state_text(row)
+                );
+                let color = crate::term_overview::TermOverview::state_color(row, cx);
+                (row.label.clone(), place.into(), color)
+            })
+            .collect();
+        let more = agents.len().saturating_sub(lines.len());
+        // 窗口藏得进托盘（Windows、X11 上有托盘）：给「最小化到托盘」，没开托盘的也给，点了再建托盘
+        // 图标（见 `ensure_tray`）。藏不起来（Wayland）或者没有托盘：给「最小化窗口」，Kuai 不退出，
+        // 终端停下了照样提醒（原来只剩「仍要退出」「取消」）
+        let tray = crate::tray::available();
+        let hide = tray && crate::tray::can_hide();
+        let remember = Rc::new(Cell::new(false));
+        let this = cx.entity().downgrade();
+        let description = tf!(
+            "{n} 个 AI 终端正在运行。终端将继续在主机上运行，但退出后不再提醒它们停下。",
+            n = agents.len().to_string()
+        );
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let (muted, border) = (cx.theme().muted_foreground, cx.theme().border);
+            let save = {
+                let (this, remember) = (this.clone(), remember.clone());
+                move |cx: &mut App| {
+                    if remember.get() {
+                        this.update(cx, |this, cx| {
+                            this.app.update(cx, |app, cx| {
+                                app.update_settings(cx, |s| s.close_to_tray = true)
+                            })
+                        })
+                        .ok();
+                    }
+                }
+            };
+            let (quit_save, tray_save) = (save.clone(), save);
+            let (quit_this, tray_this) = (this.clone(), this.clone());
+            let list = v_flex()
+                .gap(px(4.))
+                .p(px(8.))
+                .rounded(px(ui::RADIUS))
+                .border_1()
+                .border_color(border)
+                .children(lines.iter().map(|(name, place, color)| {
+                    h_flex()
+                        .gap(px(8.))
+                        .text_sm()
+                        .child(div().flex_none().size(px(7.)).rounded_full().bg(*color))
+                        .child(
+                            div()
+                                .flex_shrink(1.)
+                                .min_w_0()
+                                .truncate()
+                                .child(name.clone()),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .flex_shrink(10.)
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(place.clone()),
+                        )
+                }))
+                .when(more > 0, |list| {
+                    list.child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(tf!("另有 {n} 个", n = more.to_string())),
+                    )
+                });
+            // 「以后也这样」记成关闭到托盘：要有托盘才管用（Wayland 上是关闭时最小化）
+            let remember_box = tray.then(|| {
+                let remember = remember.clone();
+                Checkbox::new("close-remember")
+                    .label(match hide {
+                        true => tr("以后关闭窗口时最小化到托盘"),
+                        false => tr("以后关闭窗口时最小化"),
+                    })
+                    .checked(remember.get())
+                    .on_click(move |checked: &bool, window, _| {
+                        remember.set(*checked);
+                        window.refresh();
+                    })
+            });
+            dialog
+                .title(tr("退出 Kuai？"))
+                .w(px(460.))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(div().text_sm().child(description.clone()))
+                        .child(list)
+                        .children(remember_box),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("quit")
+                                .label(tr("仍要退出"))
+                                .with_variant(ButtonVariant::Danger)
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    quit_save(cx);
+                                    quit_this
+                                        .update(cx, |this, cx| {
+                                            if !this.confirm_quit(window, cx) {
+                                                this.quitting.set(true);
+                                                cx.quit();
+                                            }
+                                        })
+                                        .ok();
+                                }),
+                        )
+                        .child(
+                            Button::new("cancel")
+                                .label(tr("取消"))
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("tray")
+                                .primary()
+                                .label(match hide {
+                                    true => tr("最小化到托盘"),
+                                    false => tr("最小化窗口"),
+                                })
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    tray_save(cx);
+                                    tray_this
+                                        .update(cx, |this, cx| {
+                                            // 藏不起来的 hide_window 就是最小化
+                                            if tray {
+                                                this.ensure_tray(cx);
+                                            }
+                                            this.hide_window(window, cx)
+                                        })
+                                        .ok();
+                                }),
+                        ),
+                )
+        });
+        true
+    }
+
+    /// 设置里没开托盘时也要收进托盘（关窗口的确认框里点了「最小化到托盘」）：先建托盘图标，之后照常
+    /// 由设置管（改了托盘、语言时重建）。
+    fn ensure_tray(&mut self, cx: &mut Context<Self>) {
+        if self.tray.is_none() {
+            self.tray = Tray::new(cx, |this, action, cx| this.on_tray(action, cx));
+        }
     }
 
     /// 托盘图标在，窗口可以收进去（Linux 上托盘可能还没起来，或者中途下线了）。
@@ -1152,6 +1353,17 @@ impl Workspace {
     fn show_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         let from = self.here(cx);
         self.show_page_from(from, page, window, cx);
+    }
+
+    /// 点了标题栏的「工作区」：从仓库标签页过来的，左边的主机跟着这个仓库所在的主机。
+    /// 后退、前进回到工作区页的不跟（回到的是当时看的那台）。
+    fn show_workspaces_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(entry) = self.active_repo().map(|tab| tab.entry.clone()) {
+            let machine = machine_of(&entry).to_string();
+            self.workspaces
+                .update(cx, |page, cx| page.follow(machine, cx));
+        }
+        self.show_page(Page::Workspaces, window, cx);
     }
 
     /// 同 [`Self::show_page`]。`from` 是换页之前在哪：换页前已经改了要去的那一页的样子（选中了别的
@@ -1687,9 +1899,17 @@ impl Workspace {
         let home = self.overview.read(cx).listed_under(entry, cx);
         self.open(entry.clone(), window, cx);
         self.hint_home(home, cx);
-        if let Some(tab) = self.active_repo() {
-            tab.shown(cx)
-                .update(cx, |view, cx| view.show_git_page(window, cx));
+        // 这个标签页里之前进了子仓库、别的工作树：先退回这个仓库本身，不然显示的是里面那一层的
+        // Git 页，和会话页里那个终端所在的仓库对不上（同 `open_repo_path`）
+        if let Some(view) = self.active_repo().map(|tab| tab.view.clone()) {
+            view.update(cx, |view, cx| {
+                for _ in 0..4 {
+                    if !view.back_to_root(window, cx) {
+                        break;
+                    }
+                }
+                view.show_git_page(window, cx);
+            });
         }
     }
 
@@ -1729,6 +1949,10 @@ impl Workspace {
         let tag = click.tag.as_str();
         log::info!("点了系统通知：{tag}（激活令牌：{}）", click.token.is_some());
         self.bring_to_front(click.token.clone(), window, cx);
+        if tag == AWAY_TOAST {
+            self.show_waiting(window, cx);
+            return;
+        }
         let row = tag.rsplit_once('/').and_then(|(machine, term)| {
             let id = TermId {
                 machine: machine.to_string(),
@@ -1741,23 +1965,37 @@ impl Workspace {
         }
     }
 
-    /// 一个不在眼前的终端停下了：右下角说一声，带「前往」；Kuai 不在前台时任务栏上的按钮闪，
-    /// 再发一条系统通知（设置里可以关）。
-    fn terminal_stopped(&mut self, row: &TermRow, window: &mut Window, cx: &mut Context<Self>) {
+    /// 一个不在眼前的 AI 终端静默久了（待查看）：右下角说一声，带「前往」；Kuai 不在前台时任务栏上的
+    /// 按钮闪，再发一条系统通知（设置里可以关）。
+    fn terminal_waiting(&mut self, row: &TermRow, window: &mut Window, cx: &mut Context<Self>) {
         if !self.app.read(cx).settings.notify_terminal_stopped {
             return;
         }
-        let repo = self.app.read(cx).repo_name(&row.entry);
-        let text = match &row.title {
-            Some(title) => {
-                let title = crate::terminal::short_title(title);
-                tf!("{repo} 的终端已停下：{title}", repo, title)
-            }
-            None => tf!("{repo} 的终端已停下", repo),
+        let app = self.app.read(cx);
+        let repo = app.repo_name(&row.entry);
+        let wait = match row.kind {
+            crate::term_board::Kind::Agent(agent) => agent.wait(&app.settings.term_alerts),
+            _ => crate::term_board::QUIET,
         };
-        // 系统通知：标题同右下角那条，正文是屏幕上最后一行（多半是程序在问什么）
+        let name = row.label.clone();
+        let text = tf!(
+            "{name} 待查看（{repo}）",
+            name = name.clone(),
+            repo = repo.clone()
+        );
+        let line = tf!(
+            "{repo} · 静默超过 {span}，可能在等你确认",
+            repo,
+            span = crate::term_board::span(wait)
+        );
+        let body = match row.last.trim() {
+            "" => line,
+            last => format!("{line}\n{last}"),
+        };
+        // 系统通知：标题是谁待查看，正文是在哪、静默多久，和屏幕上最后一行（多半是程序在问什么）
         let (toast_key, toast_title, toast_body) =
-            (stopped_note_key(&row.id), text.clone(), row.last.clone());
+            (stopped_note_key(&row.id), tf!("{name} 待查看", name), body);
+        let path = row.entry.path.clone();
         let (this, key, row) = (
             cx.entity().downgrade(),
             stopped_note_key(&row.id),
@@ -1779,7 +2017,8 @@ impl Workspace {
             })
             .autohide(true);
         log::info!(
-            "提醒终端已停下：{repo}，窗口{}",
+            "提醒终端待查看：{}，窗口{}",
+            path,
             if window.is_window_active() {
                 "在前台"
             } else {
@@ -1809,6 +2048,47 @@ impl Workspace {
         }
     }
 
+    /// 重开 Kuai、重新连上主机以后，离开期间有新输出的终端：合成一条提醒，带「查看」（到会话页只看
+    /// 待查看的）；Kuai 不在前台时再发一条系统通知。
+    fn away_updates(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = &self.app.read(cx).settings;
+        if !settings.notify_terminal_stopped {
+            return;
+        }
+        let system = settings.notify_terminal_system;
+        let text = tf!("离开期间 {n} 个终端有新输出", n = n.to_string());
+        let this = cx.entity().downgrade();
+        let note = Notification::info(text.clone())
+            .id::<AwayNote>()
+            .action(move |_, _, _| {
+                let this = this.clone();
+                Button::new("away-go")
+                    .small()
+                    .primary()
+                    .label(tr("查看"))
+                    .on_click(move |_, window, cx| {
+                        this.update(cx, |this, cx| this.show_waiting(window, cx))
+                            .ok();
+                    })
+            })
+            .autohide(true);
+        window.push_notification(note, cx);
+        if !window.is_window_active() && system {
+            self.toast_job(ToastJob::Show {
+                key: AWAY_TOAST.to_string(),
+                title: text,
+                body: tr("已在会话页标出，不逐个发送通知。").to_string(),
+            });
+        }
+    }
+
+    /// 到会话页、只看待查看的（离开期间有更新的那条提醒里点「查看」）。
+    fn show_waiting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_terms(window, cx);
+        self.overview
+            .update(cx, |overview, cx| overview.show_waiting(cx));
+    }
+
     /// 交给发系统通知的那个任务去做（见 `toasts`）。
     fn toast_job(&self, job: ToastJob) {
         self.toast_jobs.unbounded_send(job).ok();
@@ -1821,14 +2101,25 @@ impl Workspace {
             return None;
         }
         if self.page == Page::Terms {
-            let overview = self.overview.read(cx);
-            let shown = match overview.typing(window, cx) {
-                true => Shown::Typing,
-                false => Shown::Term,
-            };
-            return overview.shown_id(cx).map(shown);
+            return self.overview.read(cx).shown_for_board(window, cx);
         }
-        let (entry, number) = self.active_repo()?.shown(cx).read(cx).shown_terminal()?;
+        let view = self.active_repo()?.shown(cx);
+        let view = view.read(cx);
+        // 仓库终端页并排着：那几格都算显示着
+        let split = view.split_terminals();
+        if split.len() > 1 {
+            let board = self.board.read(cx);
+            let ids = split
+                .iter()
+                .filter_map(|(entry, number)| {
+                    let rows = board.terms_of(entry)?;
+                    let row = rows.into_iter().find(|row| row.number == *number)?;
+                    Some(row.id)
+                })
+                .collect();
+            return Some(Shown::Split(ids));
+        }
+        let (entry, number) = view.shown_terminal()?;
         Some(Shown::Repo(entry, number))
     }
 
@@ -1836,6 +2127,24 @@ impl Workspace {
         match self.page {
             Page::Repo(ix) if !self.showing_settings => self.tabs.get(ix),
             _ => None,
+        }
+    }
+
+    /// 应用状态（主机、设置）。
+    pub fn app_entity(&self) -> Entity<AppState> {
+        self.app.clone()
+    }
+
+    /// 获取、拉取、推送这些操作的快捷键：交给当前仓库（在子仓库里就是子仓库）。
+    pub fn git_in_active(
+        &mut self,
+        op: crate::repo::GitShortcut,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.active_repo() {
+            tab.shown(cx)
+                .update(cx, |view, cx| view.git_shortcut(op, window, cx));
         }
     }
 
@@ -2277,6 +2586,192 @@ impl Workspace {
     /// 标题栏最左边的一个页面入口（服务器、终端、工作区）：长得和标签页一样，名字固定，不跟着选了
     /// 哪台服务器、哪个工作区变。窗口窄时
     /// 只留图标，悬停看名字。
+    /// 第一次用（`docs/design/first-run/` 方向 B）：没有远程主机、本机也没有仓库、没开
+    /// 标签页，也没点过「暂时跳过」时，整个窗口是欢迎页。本机的仓库列表还没读到时不算（不然老用户
+    /// 启动的那一下会闪出欢迎页）。添加了主机、打开了仓库，它就不再出现。
+    fn welcome(&self, cx: &App) -> bool {
+        let app = self.app.read(cx);
+        !self.showing_settings
+            && !app.settings.welcome_skipped
+            && app.settings.servers.is_empty()
+            && self.tabs.is_empty()
+            && app
+                .repos_on(crate::machines::LOCAL)
+                .is_some_and(|repos| repos.is_empty())
+    }
+
+    /// 欢迎页：两张卡片（连接远程主机、打开本机仓库），底下「暂时跳过」。
+    fn render_welcome(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (primary, border, muted, fg, bg, secondary) = (
+            theme.primary,
+            theme.border,
+            theme.muted_foreground,
+            theme.foreground,
+            theme.background,
+            theme.secondary,
+        );
+        let card = |id: &'static str,
+                    icon: IconName,
+                    title: &'static str,
+                    desc: &'static str,
+                    go: &'static str,
+                    main: bool| {
+            div()
+                .id(id)
+                .relative()
+                .w(px(290.))
+                .p(px(20.))
+                .rounded(px(14.))
+                .border_1()
+                .border_color(if main { primary.opacity(0.55) } else { border })
+                .bg(if main { primary.opacity(0.06) } else { bg })
+                .cursor_pointer()
+                .hover(|s| s.border_color(primary))
+                .when(main, |card| {
+                    card.child(
+                        div()
+                            .absolute()
+                            .top(px(14.))
+                            .right(px(14.))
+                            .px(px(8.))
+                            .rounded(px(9.))
+                            .bg(primary.opacity(0.14))
+                            .text_size(px(11.))
+                            .text_color(primary)
+                            .child(tr("推荐")),
+                    )
+                })
+                .child(
+                    div()
+                        .size(px(42.))
+                        .mb(px(14.))
+                        .rounded(px(11.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(if main { primary } else { secondary })
+                        .text_color(if main { gpui_kit::white() } else { fg })
+                        .child(Icon::new(icon).size(px(22.))),
+                )
+                .child(
+                    div()
+                        .text_size(px(15.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .mb(px(4.))
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .min_h(px(40.))
+                        .text_size(px(12.5))
+                        .text_color(muted)
+                        .whitespace_normal()
+                        .child(desc),
+                )
+                .child(
+                    h_flex()
+                        .mt(px(14.))
+                        .gap(px(4.))
+                        .text_size(px(12.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(primary)
+                        .child(go)
+                        .child(Icon::new(IconName::ChevronRight).size(px(14.))),
+                )
+        };
+        v_flex()
+            .id("welcome")
+            .size_full()
+            .items_center()
+            .pt(px(56.))
+            .px(px(16.))
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .size(px(68.))
+                    .mb(px(14.))
+                    .rounded(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(primary.opacity(0.13))
+                    .text_color(primary)
+                    .child(Icon::new(IconName::Server).size(px(30.))),
+            )
+            .child(
+                div()
+                    .text_size(px(24.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .mb(px(6.))
+                    .child(tr("欢迎使用 Kuai")),
+            )
+            .child(
+                div()
+                    .text_size(px(13.5))
+                    .text_color(muted)
+                    .mb(px(26.))
+                    .text_center()
+                    .child(tr(
+                        "在远程主机上用 Git、终端和文件，运行 Claude Code 等 agent。",
+                    )),
+            )
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .justify_center()
+                    .items_start()
+                    .gap(px(16.))
+                    .child(
+                        card(
+                            "welcome-host",
+                            IconName::Server,
+                            tr("连接远程主机"),
+                            tr("通过 SSH 连接 VPS 或开发机，仓库和终端都在主机上。"),
+                            tr("添加主机…"),
+                            true,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.show_page(Page::Servers, window, cx);
+                            this.manager
+                                .update(cx, |manager, cx| manager.add_host(window, cx));
+                        })),
+                    )
+                    .child(
+                        card(
+                            "welcome-local",
+                            IconName::FolderGit2,
+                            tr("打开本机仓库"),
+                            tr("只使用本机上的 Git 仓库。"),
+                            tr("打开仓库…"),
+                            false,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.show_page(Page::Servers, window, cx);
+                            this.manager
+                                .update(cx, |manager, cx| manager.open_local(window, cx));
+                        })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("welcome-skip")
+                    .mt(px(22.))
+                    .text_size(px(12.5))
+                    .text_color(muted)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(fg).underline())
+                    .child(tr("暂时跳过"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.app.update(cx, |app, cx| {
+                            app.update_settings(cx, |settings| settings.welcome_skipped = true)
+                        });
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn render_page_entry(
         &self,
         page: Page,
@@ -2292,6 +2787,7 @@ impl Workspace {
             .when(narrow, |tab| tab.px(px(8.)))
             .on_click(cx.listener(move |this, _, window, cx| match page {
                 Page::Terms => this.show_terms(window, cx),
+                Page::Workspaces => this.show_workspaces_page(window, cx),
                 _ => this.show_page(page, window, cx),
             }))
             .child(ui::icon(icon).flex_none())
@@ -2321,6 +2817,7 @@ impl Workspace {
                 }
             });
         }
+        let welcome = self.welcome(cx);
         let theme = cx.theme();
         let (border, muted, warning) = (theme.border, theme.muted_foreground, theme.warning);
         // 窗口窄的时候三个页面只留图标，给标签页腾地方
@@ -2339,8 +2836,26 @@ impl Workspace {
             .when(narrow, |tab| {
                 tab.tooltip(move |window, cx| ui::tip(servers_label, window, cx))
             });
-        // 所有电脑上的终端：已停下、还没看过的有几个就标几个
+        // 所有电脑上的终端：待查看、离开期间有更新的有几个就标几个；断开了的主机另标「N 台未连接」
         let waiting = self.board.read(cx).attention();
+        let offline: Vec<SharedString> = {
+            let (board, app) = (self.board.read(cx), self.app.read(cx));
+            board
+                .offline_machines()
+                .iter()
+                .map(|key| app.machine_name(key))
+                .collect()
+        };
+        let offline_tip: Option<String> = (!offline.is_empty()).then(|| {
+            tf!(
+                "{names} 未连接，其终端状态未知",
+                names = offline
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect::<Vec<_>>()
+                    .join(tr("、"))
+            )
+        });
         let terms = self
             .render_page_entry(
                 Page::Terms,
@@ -2367,15 +2882,36 @@ impl Workspace {
                         .child(waiting.to_string()),
                 )
             })
+            .when(!offline.is_empty(), |tab| {
+                let label = match narrow {
+                    true => offline.len().to_string(),
+                    false => tf!("{n} 台未连接", n = offline.len().to_string()),
+                };
+                tab.child(
+                    h_flex()
+                        .flex_none()
+                        .h(px(16.))
+                        .px(px(5.))
+                        .gap(px(3.))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(border)
+                        .text_size(px(10.5))
+                        .text_color(muted)
+                        .child(Icon::new(IconName::Unplug).size(px(10.)))
+                        .child(label),
+                )
+            })
             .tooltip(move |window, cx| {
                 let text = match waiting {
                     0 => tr("会话（Ctrl+Shift+A）").to_string(),
-                    n => tf!(
-                        "会话（Ctrl+Shift+A）：{n} 个终端已停下，尚未查看",
-                        n = n.to_string()
-                    ),
+                    n => tf!("会话（Ctrl+Shift+A）：{n} 个终端待查看", n = n.to_string()),
                 };
-                ui::tip(crate::keymap::with_key(&text, "page.hub", cx), window, cx)
+                let text = crate::keymap::with_key(&text, "page.hub", cx);
+                match &offline_tip {
+                    Some(offline) => ui::two_line_tip(text, offline.clone().into(), window, cx),
+                    None => ui::tip(text, window, cx),
+                }
             });
         let workspaces_label = trc("页面", "工作区");
         let workspaces = self
@@ -2534,14 +3070,26 @@ impl Workspace {
                     .flex_1()
                     .min_w_0()
                     .gap(px(4.))
+                    // 欢迎页：只有「开始使用」
+                    .when(welcome, |bar| {
+                        bar.child(
+                            tab_shell("page-welcome", true, cx)
+                                .flex_none()
+                                .ml(px(8.))
+                                .child(ui::icon(IconName::Sparkles).flex_none())
+                                .child(tr("开始使用")),
+                        )
+                    })
                     // 最前面是后退、前进，然后是三个页面，后面是标签页
-                    .child(back)
-                    .child(forward)
-                    .child(div().flex_none().w(px(1.)).h(px(16.)).mx(px(2.)).bg(border))
-                    .child(servers)
-                    .child(terms)
-                    .child(workspaces)
-                    .child(div().flex_none().w(px(1.)).h(px(16.)).mx(px(4.)).bg(border))
+                    .when(!welcome, |bar| {
+                        bar.child(back)
+                            .child(forward)
+                            .child(div().flex_none().w(px(1.)).h(px(16.)).mx(px(2.)).bg(border))
+                            .child(servers)
+                            .child(terms)
+                            .child(workspaces)
+                            .child(div().flex_none().w(px(1.)).h(px(16.)).mx(px(4.)).bg(border))
+                    })
                     // 标签页那一块画在这个占位的块里面（绝对定位）。标题栏的宽度按里面内容的
                     // 最小宽度算，直接把标签页排在这一行里的话，开多了会把整行撑宽，
                     // 右边的设置和窗口按钮被挤出窗口
@@ -2551,8 +3099,8 @@ impl Workspace {
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .child(measure)
-                            .child(strip),
+                            // 欢迎页没有标签页，也不给「打开仓库」：这一块只是拖窗口的空白
+                            .when(!welcome, |region| region.child(measure).child(strip)),
                     )
                     // 有新版本、正在下、下好了：齿轮左边一个小牌，点开看说明、升级
                     .children(
@@ -2859,11 +3407,11 @@ pub(crate) fn ask_name<T: 'static>(
 
 /// 新建工作区的对话框：名称，和保存在哪台电脑上（`places` 是本机和各台服务器：键和名字，
 /// `default` 是一开始选中的）。点「新建」或回车时关掉并调用 `on_ok(名称, 电脑)`。
-pub(crate) fn new_workspace_dialog<T: 'static>(
+pub(crate) fn new_workspace_dialog(
     places: Vec<(String, SharedString)>,
     default: String,
     window: &mut Window,
-    cx: &mut Context<T>,
+    cx: &mut App,
     on_ok: impl Fn(String, String, &mut Window, &mut App) + 'static,
 ) {
     let input = cx
@@ -3003,8 +3551,14 @@ fn path_row(path: SharedString, cx: &App) -> impl IntoElement {
         )
 }
 
-/// 「终端已停下」那条提醒的类别（同一个终端只留一条，前往以后去掉）。
+/// 「终端待查看」那条提醒的类别（同一个终端只留一条，前往以后去掉）。
 struct TerminalStopped;
+
+/// 「离开期间有新输出」那条提醒的类别（只留一条）。
+struct AwayNote;
+
+/// 「离开期间有新输出」那条系统通知的键（点了到会话页只看待查看的）。
+const AWAY_TOAST: &str = "away";
 
 /// 交给发系统通知的那个任务做的事（见 `Workspace::toasts`）。
 enum ToastJob {
@@ -3034,7 +3588,9 @@ impl Render for Workspace {
         }
         let theme = cx.theme();
         let (bg, fg) = (theme.background, theme.foreground);
-        let content = if self.showing_settings {
+        let content = if self.welcome(cx) {
+            self.render_welcome(cx)
+        } else if self.showing_settings {
             self.settings_page.clone().into_any_element()
         } else {
             match self.page {
@@ -3064,6 +3620,17 @@ impl Render for Workspace {
             .child(title_bar)
             .child(div().flex_1().min_h_0().child(content))
     }
+}
+
+/// 到主机页（工作区页空状态的「前往主机页」）。
+pub(crate) fn go_to_hosts(window: &mut Window, cx: &mut App) {
+    let Some(this) = cx.try_global::<Navigator>().map(|nav| nav.0.clone()) else {
+        return;
+    };
+    window.defer(cx, move |window, cx| {
+        this.update(cx, |this, cx| this.show_page(Page::Servers, window, cx))
+            .ok();
+    });
 }
 
 /// 选仓库的框里选中了一个仓库。

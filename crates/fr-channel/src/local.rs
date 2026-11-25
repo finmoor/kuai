@@ -218,9 +218,9 @@ pub(crate) fn watch(repo: &str) -> ChangeStream {
     }
 }
 
-pub(crate) fn list_dir(path: &str) -> BoxFuture<'static, Result<DirListing>> {
+pub(crate) fn list_dir(path: &str, hidden: bool) -> BoxFuture<'static, Result<DirListing>> {
     let path = path.to_string();
-    blocking(move || fr_core::dir::list_dir(&path))
+    blocking(move || fr_core::dir::list_dir_with(&path, hidden))
 }
 
 /// 在另一个线程里做：网络盘上读写可能很慢，不占调用方的线程。
