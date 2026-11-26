@@ -10,7 +10,8 @@
 
 <p>
 A desktop client for Windows and Linux, for people who run Claude Code or Codex on a VPS.<br>
-Terminals that survive disconnects, line-by-line review, in-place file editing, in one window.
+Terminals that survive disconnects, line-by-line review, in-place file editing, in one window.<br>
+Builds, tests and several Claude Code sessions at once use the server's CPU and memory; your computer only draws the screen.
 </p>
 
 <p><sub>Connects over SSH · no relay server, no account · no root and no open port on the server · open source</sub></p>
@@ -50,9 +51,21 @@ Terminals that survive disconnects, line-by-line review, in-place file editing, 
 
 </div>
 
+## Leave the heavy lifting to the server
+
+Running Claude Code on your own computer takes more than a terminal window: each Claude Code process uses a few hundred MB of memory, and the installs, builds, tests and dev servers it starts each take their share. Run several tasks at once and the laptop runs hot, the fans stay on, and everything else slows down.
+
+Put them on a server and drive them from Kuai:
+
+- **The CPU, memory and battery in use are the server's.** Your computer runs one native program, Kuai (written in Rust, not Electron, about 150 MB of memory); a thin or ageing laptop is enough.
+- **How many tasks run at once depends on the server, not on your computer.** When that is not enough, resize the server and keep the laptop.
+- **The development environment stays off your computer.** Node, dependencies, Docker and databases live on the server and can be rebuilt when they get messy; besides Kuai, your computer only needs git and ssh.
+- **All it can touch is that server.** Claude Code has every right of the signed-in user on the server, and its reach ends there: the files on your computer, your SSH private keys and your browser sessions are out of its sight and out of its hands. If you want it to skip permission prompts and just get on with it, a VPS you can rebuild at any time is a safer place for that than your own computer; the limits and the one exception are under [Security](#security).
+- **Light on the server too.** `kuaid` is a single program of about 3 MB that stays resident in a few MB of memory and needs no runtime such as Node, so a small VPS keeps its resources for Claude Code.
+
 ## Claude Code on a server, before and after
 
-Plenty of people rent a VPS just to run Claude Code or Codex: a task can run for hours, your own computer stays free, and a messed-up environment can simply be rebuilt. The awkward part is working with it.
+That is why plenty of people rent a VPS just to run Claude Code or Codex, where a task can run for hours. The awkward part is working with it.
 
 | With SSH alone | With Kuai |
 |---|---|
@@ -232,12 +245,13 @@ Kuai does not implement its own connection or authentication; it leaves both to 
 - **The connection is SSH.** Kuai runs the system OpenSSH client (the one that ships with Windows, or ssh on Linux), which does the authentication and encryption with your `~/.ssh/config`, keys and ssh-agent. Everything between Kuai and `kuaid` travels through the stdin and stdout of that SSH connection.
 - **No relay server, no account.** Data moves only between your computer and your host, never through a third-party server. Kuai collects no usage data; apart from the SSH connections and git's own operations, it only contacts GitHub to check for and download updates, which you can turn off in Settings.
 - **No root and no port open to the network on the host.** `kuaid` lives in the user's home directory and runs as the signed-in user, with no more rights than that user already has over SSH. On Linux hosts it listens on no port at all, only on a Unix socket in `~/.kuai/run`; the directory and the socket are accessible to that user alone. On Windows hosts it listens only on a random port on 127.0.0.1 and requires a random token stored in the user's profile.
+- **Programs on the host cannot reach your computer.** In Kuai's protocol only your computer sends requests to the host (the host side only ever asks you to type a password when one is needed), so programs on the host, Claude Code included, cannot read or write files on your computer; files on the host arrive on your computer only when you open, download or map them. Clipboard read requests from the terminal (OSC 52) go unanswered: a program can write to the clipboard but cannot read what is in it. URLs and paths printed in a terminal open only when you click them, and Kuai asks before forwarding a `localhost` port from the host. The exception is ssh-agent forwarding: when it is on (the option in the host's settings, or `ForwardAgent yes` in `~/.ssh/config`), programs on the host can use your keys to sign in to other machines for as long as you are connected, so leave it off unless you need it.
 - **Host keys.** The first time you connect to a host, Kuai shows its key fingerprint and records it in `known_hosts` only after you confirm; if the key later changes, Kuai refuses to connect. To look up a fingerprint, run `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the host (the file name depends on the key type).
 - **Passwords and key passphrases** are kept in Windows Credential Manager or the Linux keyring (Secret Service), not in the settings file, and never appear on a command line or in logs. ssh-agent forwarding is off by default and can be enabled per host.
 - **Updates.** New versions are downloaded from GitHub Releases and checked against their SHA-256 before installing; a file that does not match is not installed. `kuaid` ships inside the client and is uploaded over SSH, so the host downloads nothing. The installers are not code-signed yet.
 - **Open source.** The client and `kuaid` are both in this repository, to read and to build yourself.
 
-Keep in mind: Kuai does not restrict what programs in a terminal do. Claude Code and the like have all the rights of the signed-in user on the host, exactly as when you run them over plain SSH.
+Keep in mind: Kuai does not restrict what programs in a terminal do on the host. Claude Code and the like have all the rights of the signed-in user there, exactly as when you run them over plain SSH; keys and tokens stored on the host (git credentials, API keys and so on) are theirs to use as well, so keep only what the project needs on the host.
 
 Found a security issue? Please report it privately through [Report a vulnerability](https://github.com/finmoor/kuai/security/advisories/new) on the Security tab rather than in a public issue.
 
