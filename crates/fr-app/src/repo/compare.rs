@@ -985,8 +985,9 @@ impl RepoView {
         let Some((base, other)) = self.compare.ends.clone() else {
             return div().size_full().bg(bg).into_any_element();
         };
-        // 并排还是上下排跟着设置走：别处改了，这里重画时跟上
-        let split = self.app.read(cx).settings.diff_split;
+        // 并排还是上下排跟着设置走：别处改了，这里重画时跟上。改动区不够宽时暂以上下排显示
+        let split_wanted = self.app.read(cx).settings.diff_split;
+        let split = split_wanted && self.split_fits(self.details_diff_width(cx));
         let mode = if split {
             DiffMode::Split
         } else {
@@ -1000,7 +1001,7 @@ impl RepoView {
         let left_width = px(self.sizes(cx).details_width);
         let bar = self.render_compare_bar(&base, &other, cx);
         let left = self.render_compare_left(&base, &other, cx);
-        let right = self.render_compare_diff(split, cx);
+        let right = self.render_compare_diff(split_wanted, split, cx);
         v_flex()
             .size_full()
             .bg(bg)
@@ -1852,7 +1853,15 @@ impl RepoView {
     }
 
     /// 右边：选中的文件的改动。
-    fn render_compare_diff(&mut self, split: bool, cx: &mut Context<Self>) -> AnyElement {
+    /// 右边选中文件的改动。`split_wanted`：并排的设置开着；`split`：现在真的并排着（改动区够宽）。
+    fn render_compare_diff(
+        &mut self,
+        split_wanted: bool,
+        split: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let narrow_strip =
+            (split_wanted && !split).then(|| self.narrow_split_strip("compare-narrow-split", cx));
         let theme = cx.theme();
         let (border, muted) = (theme.border, theme.muted_foreground);
         let (added_color, removed_color) = (theme.success, theme.danger);
@@ -1972,9 +1981,9 @@ impl RepoView {
                     .xsmall()
                     .ghost()
                     .icon(ui::icon(IconName::Columns2))
-                    .selected(split)
+                    .selected(split_wanted)
                     .tooltip(tr("并排显示：左侧为旧版本，右侧为新版本"))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_split(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_split(window, cx))),
             );
         let note = match (&self.compare.diff_note, item.is_some()) {
             (Some(note), _) => Some(note.clone()),
@@ -2005,6 +2014,8 @@ impl RepoView {
             None => Diff::new(&self.compare.diff)
                 .line_number(true)
                 .syntax_highlight(true)
+                // 并排时两侧各占一半、长行折行
+                .soft_wrap(split)
                 .decorations(search_marks)
                 .header_visible(false)
                 .size_full()
@@ -2016,6 +2027,7 @@ impl RepoView {
             .h_full()
             .child(bar)
             .children(search_bar)
+            .children(narrow_strip)
             .children(ws_strip)
             .child(
                 div()
@@ -2023,6 +2035,7 @@ impl RepoView {
                     .flex_1()
                     .min_h_0()
                     .child(body)
+                    .children(split.then(|| self.rewrap_guard(super::diff_tools::SplitAt::Compare)))
                     // 按住 Ctrl 滚滚轮调代码字号
                     .child(crate::zoom::wheel_zoom(self.app.clone())),
             )

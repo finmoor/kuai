@@ -86,7 +86,85 @@ pub(super) fn info_strip(id: &'static str, text: SharedString, cx: &App) -> AnyE
         .into_any_element()
 }
 
+/// 折行的并排对比在哪一处（各记各上一次画出来多宽，见 [`RepoView::rewrap_guard`]）。
+#[derive(Clone, Copy)]
+pub(super) enum SplitAt {
+    Changes = 0,
+    History = 1,
+    Compare = 2,
+}
+
 impl RepoView {
+    /// 并排的设置开着时，这么宽的改动区真的并排（true），还是暂以上下排显示（false）：两侧各占一半，
+    /// 不足 [`super::layout::SPLIT_MIN`] 时每侧放不下几个字。点过「仍然并排」的照并排。
+    pub(super) fn split_fits(&self, width: f32) -> bool {
+        self.split_forced || width >= super::layout::SPLIT_MIN
+    }
+
+    /// 提交详情、比较页右边的改动区多宽（左边是侧栏和文件清单）。
+    pub(super) fn details_diff_width(&self, cx: &App) -> f32 {
+        let sizes = self.sizes(cx);
+        f32::from(self.viewport.width) - sizes.sidebar - sizes.details_width
+    }
+
+    /// 垫在折行的并排对比上的一层，只量宽度：和上一次画出来的不一样就再画一帧。
+    ///
+    /// 组件按它上一次画出来的宽度折行，宽度要到画的时候才知道；它在画的过程中发的重画通知不起作用
+    /// （gpui 在画的过程中不安排下一帧）。平时拖窗口、动鼠标会接着画，看不出来；从上下排换回并排
+    /// （点「仍然并排」、点「并排」）只画一帧，不补的话这一帧是按旧宽度折的，一侧被挤出画面，
+    /// 要等鼠标动一下才对。
+    pub(super) fn rewrap_guard(&self, at: SplitAt) -> AnyElement {
+        let seen = self.split_seen[at as usize].clone();
+        canvas(
+            move |bounds, window, _| {
+                let width = f32::from(bounds.size.width);
+                if (seen.replace(width) - width).abs() >= 1. {
+                    window.request_animation_frame();
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full()
+        .into_any_element()
+    }
+
+    /// 并排开着、改动区却不够宽时改动上面的那一行：说明为什么是上下排，给「仍然并排」。
+    pub(super) fn narrow_split_strip(
+        &self,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        h_flex()
+            .h(px(28.))
+            .flex_none()
+            .px_3()
+            .gap_2()
+            .bg(theme.warning.opacity(0.1))
+            .border_b_1()
+            .border_color(theme.border)
+            .text_xs()
+            .child(
+                ui::icon_small(IconName::Info)
+                    .flex_none()
+                    .text_color(theme.warning),
+            )
+            .child(
+                ui::clipped(id, tr("改动区不够宽，暂以上下排显示；加宽窗口后恢复并排。")).flex_1(),
+            )
+            .child(
+                Button::new((id, 1usize))
+                    .xsmall()
+                    .label(tr("仍然并排"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.split_forced = true;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
     /// 「忽略空白」开着时把参数改成带 `-w` 的，并另外发一个不带的请求（数少显示了多少行用）。
     pub(super) fn ws_plain(&self, channel: &Channel, args: &mut Vec<String>) -> Plain {
         if !self.ignore_ws {

@@ -281,7 +281,10 @@ fn open_host_key(
     cx: &mut App,
 ) {
     let key = fr_core::askpass::host_key_prompt(prompt);
-    let raw: SharedString = prompt.trim().to_string().into();
+    let raw: Vec<SharedString> = fr_core::askpass::host_key_raw_lines(prompt)
+        .into_iter()
+        .map(SharedString::from)
+        .collect();
     window.open_dialog(cx, move |dialog, _, cx| {
         let (muted, border) = (cx.theme().muted_foreground, cx.theme().border);
         let (trust, cancel, dismiss) = (reply.clone(), reply.clone(), reply.clone());
@@ -352,8 +355,26 @@ fn open_host_key(
                     )
                 })
             }
-            // 拆不出主机和指纹：照 ssh 的原文显示
-            None => body.child(div().text_sm().child(raw.clone())),
+            // 拆不出主机和指纹（ssh 换了说法）：仍给一句说明，原文放进框里。问 yes/no 的那一句
+            // 和按钮对不上，不显示
+            None => body
+                .child(div().text_sm().child(tr(
+                    "首次连接此主机。ssh 的提示如下，请核对其中的密钥指纹。",
+                )))
+                .child(
+                    v_flex()
+                        .px_3()
+                        .py_2()
+                        .rounded(px(crate::ui::RADIUS))
+                        .border_1()
+                        .border_color(border)
+                        .text_xs()
+                        .font_family(crate::fonts::mono())
+                        .children(raw.iter().map(|line| div().child(line.clone()))),
+                )
+                .child(div().text_xs().text_color(muted).child(tr(
+                    "核对方法：在主机上运行 ssh-keygen -lf 查看主机密钥的指纹，或查看云服务商控制台。无法核对时，请确认主机地址填写正确后再信任。",
+                ))),
         };
         dialog
             .title(tr("确认主机密钥"))

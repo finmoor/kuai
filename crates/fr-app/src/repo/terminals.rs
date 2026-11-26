@@ -38,7 +38,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use super::{Page, RepoView, TOOLBAR_HEIGHT, tool_button};
+use super::{Page, RepoView, TOOLBAR_HEIGHT, tool_button, tool_menu_button};
 use crate::presets::{self, Start};
 use crate::settings::{RepoEntry, TermSlot};
 use crate::term_board::{BoardHandle, Row as TermRow, TermBoard, free_number};
@@ -203,50 +203,43 @@ fn terminal_menu(
 ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
     move |menu, window, cx| {
         let (attach, restart, end) = (view.clone(), view.clone(), view.clone());
-        let (rename, pick) = (view.clone(), view.clone());
+        let rename = view.clone();
         // 和会话页终端行的右键一样，先是「新建终端 ▸」（在这个仓库里）
         let place = view
             .upgrade()
             .map(|this| this.read(cx).launch_place("", cx))
             .unwrap_or_default();
-        let (number, picked, nameable) = view
+        let (split, nameable) = view
             .upgrade()
             .map(|this| {
                 let this = this.read(cx);
                 let number = this.terminals.tabs.get(index).map(|tab| tab.number);
-                let picked = number.is_some_and(|number| this.terminal_picked(number));
-                (number, picked, this.board_row(index, cx).is_some())
+                let split = number.map(|number| (number, this.terminal_split_entry(number, cx)));
+                (split, this.board_row(index, cx).is_some())
             })
-            .unwrap_or((None, false, false));
+            .unwrap_or((None, false));
         let rename_label = crate::keymap::with_key(tr("重命名…（F2）"), "hub.rename", cx);
-        menu.submenu(
-            tr("新建终端"),
-            window,
-            cx,
-            launch_menu(view.clone(), place, String::new()),
-        )
-        .item(
-            PopupMenuItem::new(rename_label)
-                .disabled(!nameable)
-                .on_click(move |_, window, cx| {
-                    rename
-                        .update(cx, |this, cx| this.start_terminal_rename(index, window, cx))
-                        .ok();
-                }),
-        )
-        .item(
-            PopupMenuItem::new(match picked {
-                true => tr("移出并排查看"),
-                false => tr("加入并排查看"),
-            })
-            .on_click(move |_, window, cx| {
-                if let Some(number) = number {
-                    pick.update(cx, |this, cx| this.toggle_terminal_pick(number, window, cx))
-                        .ok();
-                }
-            }),
-        )
-        .item(
+        let menu = menu
+            .submenu(
+                tr("新建终端"),
+                window,
+                cx,
+                launch_menu(view.clone(), place, String::new()),
+            )
+            .item(
+                PopupMenuItem::new(rename_label)
+                    .disabled(!nameable)
+                    .on_click(move |_, window, cx| {
+                        rename
+                            .update(cx, |this, cx| this.start_terminal_rename(index, window, cx))
+                            .ok();
+                    }),
+            );
+        let menu = match split {
+            Some((number, entry)) => terminal_split_item(menu, entry, &view, number, window, cx),
+            None => menu,
+        };
+        menu.item(
             PopupMenuItem::new(tr("发送图片或文件…")).on_click(move |_, window, cx| {
                 attach
                     .update(cx, |this, cx| this.attach_to_terminal(index, window, cx))
@@ -267,6 +260,98 @@ fn terminal_menu(
                     .ok();
             }),
         )
+    }
+}
+
+/// 终端的右键菜单里并排查看的那一项（和会话页的一样）。
+enum SplitEntry {
+    /// 并排着，它在里面：「移出并排」
+    Remove,
+    /// 并排着，它不在里面：「加入并排」
+    Add,
+    /// 没并排，右键的不是选中的那个：「与「选中的」并排」
+    With { base: u32, name: SharedString },
+    /// 没并排，右键的就是选中的那个：「并排查看 ▸」里挑一个
+    Choose,
+    /// 没有别的终端
+    Nothing,
+}
+
+/// 右键菜单里并排查看的那一项（见 [`SplitEntry`]）。
+fn terminal_split_item(
+    menu: PopupMenu,
+    entry: SplitEntry,
+    view: &WeakEntity<RepoView>,
+    number: u32,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let view = view.clone();
+    match entry {
+        SplitEntry::Remove => menu.item(PopupMenuItem::new(tr("移出并排")).on_click(
+            move |_, window, cx| {
+                view.update(cx, |this, cx| this.toggle_terminal_pick(number, window, cx))
+                    .ok();
+            },
+        )),
+        SplitEntry::Add => menu.item(PopupMenuItem::new(tr("加入并排")).on_click(
+            move |_, window, cx| {
+                view.update(cx, |this, cx| {
+                    this.split_terminal_pair(None, number, window, cx)
+                })
+                .ok();
+            },
+        )),
+        SplitEntry::With { base, name } => menu.item(
+            PopupMenuItem::new(tf!("与「{name}」并排", name = name)).on_click(
+                move |_, window, cx| {
+                    view.update(cx, |this, cx| {
+                        this.split_terminal_pair(Some(base), number, window, cx)
+                    })
+                    .ok();
+                },
+            ),
+        ),
+        SplitEntry::Choose => menu.submenu(
+            tr("并排查看"),
+            window,
+            cx,
+            terminal_split_menu(view, Some(number)),
+        ),
+        SplitEntry::Nothing => menu,
+    }
+}
+
+/// 挑一个终端来并排的菜单（工具栏的「并排」、并排时的「添加」、右键的「并排查看 ▸」），行尾写状态。
+/// `base`：要和它并排的那个；没有时是选中的那个。
+fn terminal_split_menu(
+    view: WeakEntity<RepoView>,
+    base: Option<u32>,
+) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+    move |mut menu, _, cx| {
+        let choices = view
+            .upgrade()
+            .map(|this| this.read(cx).terminal_split_choices(base, cx))
+            .unwrap_or_default();
+        if choices.is_empty() {
+            return menu.item(PopupMenuItem::new(tr("没有其他终端")).disabled(true));
+        }
+        menu = menu.min_w(px(220.)).max_w(px(400.));
+        if choices.len() > 14 {
+            menu = menu.max_h(px(440.)).scrollable(true);
+        }
+        for (number, name, state, color) in choices {
+            let view = view.clone();
+            menu = menu.item(term_split::choice(name, state, color).on_click(
+                move |_, window, cx| {
+                    view.update(cx, |this, cx| {
+                        this.split_terminal_pair(base, number, window, cx)
+                    })
+                    .ok();
+                },
+            ));
+        }
+        menu
     }
 }
 
@@ -1273,6 +1358,91 @@ impl RepoView {
         cx.notify();
     }
 
+    /// 右键菜单里并排查看的那一项怎么写（见 [`terminal_split_item`]）。
+    fn terminal_split_entry(&self, number: u32, cx: &App) -> SplitEntry {
+        let terms = &self.terminals;
+        if !terms.split.is_empty() {
+            return match terms.split.contains(&number) {
+                true => SplitEntry::Remove,
+                false => SplitEntry::Add,
+            };
+        }
+        match terms.tabs.get(terms.active).map(|tab| tab.number) {
+            Some(base) if base != number => SplitEntry::With {
+                base,
+                name: term_split::menu_name(&self.terminal_name(terms.active, cx)),
+            },
+            _ if terms.tabs.len() < term_split::MIN_CELLS => SplitEntry::Nothing,
+            _ => SplitEntry::Choose,
+        }
+    }
+
+    /// 能拿来并排的终端（序号、名字、状态和它的颜色）：`base` 以外的（没有时是选中的那个）；并排着时是
+    /// 还没在并排里的。
+    fn terminal_split_choices(
+        &self,
+        base: Option<u32>,
+        cx: &App,
+    ) -> Vec<(u32, SharedString, SharedString, Hsla)> {
+        let terms = &self.terminals;
+        let base = base.or(terms.tabs.get(terms.active).map(|tab| tab.number));
+        let muted = cx.theme().muted_foreground;
+        terms
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| match terms.split.is_empty() {
+                true => Some(tab.number) != base,
+                false => !terms.split.contains(&tab.number),
+            })
+            .map(|(index, tab)| {
+                let row = self.board_row(index, cx);
+                (
+                    tab.number,
+                    self.terminal_name(index, cx),
+                    row.as_ref()
+                        .map(TermOverview::state_text)
+                        .unwrap_or_default(),
+                    row.as_ref()
+                        .map(|row| TermOverview::state_color(row, cx))
+                        .unwrap_or(muted),
+                )
+            })
+            .collect()
+    }
+
+    /// 把序号是 `number` 的终端和 `base` 并排查看（`base` 没有时是选中的那个）：右键「与「…」并排」、
+    /// 工具栏的「并排」里挑的。并排着时是加一格（用不到 `base`）。新加的那一格拿到输入焦点。
+    fn split_terminal_pair(
+        &mut self,
+        base: Option<u32>,
+        number: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let max = term_split::MAX_CELLS;
+        let terms = &mut self.terminals;
+        if !terms.split.is_empty() {
+            if !terms.split.contains(&number) {
+                if terms.split.len() >= max {
+                    let text = tf!("最多并排查看 {n} 个终端", n = max.to_string());
+                    window.push_notification(Notification::info(text), cx);
+                    return;
+                }
+                terms.split.push(number);
+            }
+            terms.zoom = None;
+            return self.focus_terminal_cell(number, window, cx);
+        }
+        let active = terms.tabs.get(terms.active).map(|tab| tab.number);
+        if let Some(base) = base.or(active).filter(|base| *base != number) {
+            terms.picks.clear();
+            terms.split = vec![base, number];
+            terms.zoom = None;
+        }
+        self.focus_terminal_cell(number, window, cx);
+    }
+
     /// 并排查看勾上的那几个，焦点进第一格。
     fn start_terminal_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let terms = &mut self.terminals;
@@ -1503,13 +1673,15 @@ impl RepoView {
                     .border_t_1()
                     .border_color(cx.theme().border)
                     .text_size(px(12.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .child(tf!("已选 {n} 个", n = n.to_string())),
-                    )
+                    .child(div().flex_1().min_w_0().truncate().child(
+                        match n < term_split::MIN_CELLS {
+                            true => tf!(
+                                "再选 {more} 个",
+                                more = (term_split::MIN_CELLS - n).to_string()
+                            ),
+                            false => tf!("已选 {n} 个", n = n.to_string()),
+                        },
+                    ))
                     .child(
                         Button::new("terminal-split-go")
                             .small()
@@ -1966,6 +2138,17 @@ impl RepoView {
             )
             .child(div().flex_1())
             .child(
+                term_split::add_button(
+                    "terminal-split-add",
+                    terms.split.len() >= term_split::MAX_CELLS,
+                    terms
+                        .tabs
+                        .iter()
+                        .any(|tab| !terms.split.contains(&tab.number)),
+                )
+                .dropdown_menu(terminal_split_menu(this.clone(), None)),
+            )
+            .child(
                 Button::new("terminal-split-exit")
                     .small()
                     .icon(ui::icon(IconName::Square))
@@ -2023,6 +2206,8 @@ impl RepoView {
             .active_terminal()
             .map(|_| self.terminal_name(index, cx));
         let shown = title.is_some();
+        let view = cx.entity().downgrade();
+        let can_split = self.terminals.tabs.len() >= term_split::MIN_CELLS;
         h_flex()
             .h(px(TOOLBAR_HEIGHT))
             .px(px(10.))
@@ -2065,6 +2250,16 @@ impl RepoView {
             .child(div().flex_1().min_w(px(4.)))
             .when(shown, |bar| {
                 bar.child(
+                    tool_menu_button(
+                        "terminal-split",
+                        IconName::Columns2,
+                        tr("并排"),
+                        (!can_split).then(|| tr("没有其他终端可并排查看")),
+                        cx,
+                    )
+                    .dropdown_menu(terminal_split_menu(view.clone(), None)),
+                )
+                .child(
                     tool_button(
                         "terminal-attach",
                         IconName::Paperclip,

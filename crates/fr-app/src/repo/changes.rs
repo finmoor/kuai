@@ -83,6 +83,8 @@ pub(super) struct Changes {
     diff: Option<StageDiff>,
     /// 并排着看时用组件库的改动视图，这是它的状态；内容和 `diff` 是同一份补丁
     split: Entity<DiffState>,
+    /// 上一次画的时候是不是真的并排着（设置开着、改动区也够宽），见 `note_split_on`
+    split_on: bool,
     /// 并排视图里选中的行
     split_selection: Option<DiffLineRange>,
     /// 刚在选行那一条上按下了鼠标：接下来组件库清选中的行那一下不算数
@@ -203,6 +205,7 @@ impl Changes {
             folded: HashSet::new(),
             diff: None,
             split,
+            split_on: false,
             split_selection: None,
             hold_selection: false,
             whole_file: false,
@@ -770,7 +773,7 @@ impl RepoView {
             .diff
             .as_ref()
             .is_some_and(|diff| diff.editable());
-        if !(self.split_mode(cx) && editable && self.step_diff_row(down, extend, cx)) {
+        if !(self.split_on(cx) && editable && self.step_diff_row(down, extend, cx)) {
             cx.propagate();
         }
     }
@@ -778,7 +781,7 @@ impl RepoView {
     /// 上下键在改动行之间走（Shift 连选）。并排看时把选中的行画到并排视图上，并滚到那一行。
     /// 走动了返回 true。
     fn step_diff_row(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) -> bool {
-        let split = self.split_mode(cx);
+        let split = self.split_on(cx);
         let Some(diff) = &mut self.changes.diff else {
             return false;
         };
@@ -1127,7 +1130,7 @@ impl RepoView {
 
     /// 现在是不是用组件库的并排视图在显示。
     pub(super) fn changes_split_showing(&self, cx: &App) -> bool {
-        self.split_mode(cx)
+        self.split_on(cx)
             && self
                 .changes
                 .diff
@@ -1143,9 +1146,42 @@ impl RepoView {
         self.changes.diff_focus.focus(window, cx);
     }
 
-    /// 改动是不是并排着看（所有标签页共用的设置）。
+    /// 改动是不是设成了并排着看（所有标签页共用的设置）。
     fn split_mode(&self, cx: &App) -> bool {
         self.app.read(cx).settings.diff_split
+    }
+
+    /// 本地修改里右边的改动区多宽。
+    fn changes_diff_width(&self, cx: &App) -> f32 {
+        let sizes = self.sizes(cx);
+        let vw = f32::from(self.viewport.width);
+        match self.stacked_changes() {
+            true => vw - sizes.sidebar,
+            false => vw - sizes.sidebar - sizes.changes_list,
+        }
+    }
+
+    /// 本地修改现在真的并排着：设置开着，改动区也够宽（不够宽时暂以上下排显示，见
+    /// [`Self::split_fits`]）。
+    fn split_on(&self, cx: &App) -> bool {
+        self.split_mode(cx) && self.split_fits(self.changes_diff_width(cx))
+    }
+
+    /// 窗口宽窄变了，并排和上下排互换：两种看法各记各的选中行，换的时候清掉（同点「并排」按钮）。
+    /// 画之前调。
+    fn note_split_on(&mut self, cx: &mut Context<Self>) {
+        let on = self.split_on(cx);
+        if std::mem::replace(&mut self.changes.split_on, on) == on {
+            return;
+        }
+        if let Some(diff) = &mut self.changes.diff {
+            diff.select_lines(None);
+        }
+        self.changes
+            .split
+            .update(cx, |state, cx| state.set_selected_lines(None, cx));
+        self.changes.split_selection = None;
+        self.changes.hold_selection = false;
     }
 
     /// 并排视图显示的内容跟上 `diff`：同一份补丁交给组件库再解析一遍。不能按行操作的
@@ -1177,10 +1213,19 @@ impl RepoView {
     }
 
     /// 切换并排和上下排（所有标签页共用的设置；提交详情里的改动视图在重画时跟上）。
-    pub(super) fn toggle_split(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// 在本地修改页打开并排、改动区不够宽时侧栏会自动收成图标栏（见 `layout::auto_rail`）：说一声，
+    /// 不然侧栏像是自己没了。
+    pub(super) fn toggle_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let railed = self.sidebar_collapsed(cx);
         self.app.update(cx, |app, cx| {
             app.update_settings(cx, |s| s.diff_split = !s.diff_split)
         });
+        // 「仍然并排」只管到下一次点这个按钮
+        self.split_forced = false;
+        if !railed && self.sidebar_collapsed(cx) {
+            window.push_notification(Notification::info(tr("已收起侧栏，以便并排对比。")), cx);
+        }
         if let Some(diff) = &mut self.changes.diff {
             diff.select_lines(None);
         }
@@ -2790,18 +2835,22 @@ impl RepoView {
                 .child(text)
                 .into_any_element();
         }
+        self.note_split_on(cx);
         let idle = self.op.is_none();
         let ws = self.ignore_ws;
         let line_ops = idle && !self.changes.diff_stale && !ws;
         // 改动区多宽（提示按它换短写）
-        let diff_width = {
-            let sizes = self.sizes(cx);
-            let vw = f32::from(self.viewport.width);
-            match self.stacked_changes() {
-                true => vw - sizes.sidebar,
-                false => vw - sizes.sidebar - sizes.changes_list,
-            }
-        };
+        let diff_width = self.changes_diff_width(cx);
+        let split_on = self.split_on(cx);
+        // 并排开着，改动区却不够宽：暂以上下排显示，上面说一句
+        let narrow_strip = (self.split_mode(cx)
+            && !split_on
+            && self
+                .changes
+                .diff
+                .as_ref()
+                .is_some_and(|diff| diff.editable()))
+        .then(|| self.narrow_split_strip("changes-narrow-split", cx));
         let ws_strip = self
             .changes
             .ws_note
@@ -2834,7 +2883,7 @@ impl RepoView {
         let scroll = diff.scroll.clone();
         let notice = diff.notice.clone();
         let error = diff.error.clone();
-        let split = self.split_mode(cx) && diff.editable();
+        let split = split_on && diff.editable();
         let split_state = self.changes.split.clone();
         // 图片不显示「二进制文件有差异」那一行，显示两张图
         let image = self.changes.image.clone().filter(|_| !diff.editable());
@@ -2869,7 +2918,7 @@ impl RepoView {
                     .icon(crate::ui::icon(IconName::Columns2))
                     .selected(self.split_mode(cx))
                     .tooltip(tr("并排显示：左侧为旧版本，右侧为新版本"))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_split(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_split(window, cx))),
             );
 
         let mut bar = h_flex()
@@ -3084,10 +3133,12 @@ impl RepoView {
                 .child(err)
                 .into_any_element(),
             None if image.is_some() => div().size_full().children(image).into_any_element(),
-            // 并排：组件库的改动视图，文件名那一条我们自己已经有了
+            // 并排：组件库的改动视图，文件名那一条我们自己已经有了。两侧各占一半，长行在本侧折行
+            // （不折的话两侧各按最长一行的宽度排，行一长画面里只剩左边那一侧）
             None if split => Diff::new(&split_state)
                 .line_number(true)
                 .syntax_highlight(true)
+                .soft_wrap(true)
                 .decorations(search_marks)
                 .header_visible(false)
                 .size_full()
@@ -3130,6 +3181,7 @@ impl RepoView {
             .child(bar)
             .children(select_bar)
             .children(search_bar)
+            .children(narrow_strip)
             .children(ws_strip)
             .when_some(notice, |d, notice| {
                 d.child(
@@ -3150,6 +3202,7 @@ impl RepoView {
                     .flex_1()
                     .min_h_0()
                     .child(body)
+                    .children(split.then(|| self.rewrap_guard(super::diff_tools::SplitAt::Changes)))
                     .child(crate::zoom::wheel_zoom(self.app.clone())),
             )
             .into_any_element()

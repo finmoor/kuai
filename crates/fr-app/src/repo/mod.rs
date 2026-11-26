@@ -230,6 +230,12 @@ pub struct RepoView {
     recover: recover::Recover,
     /// 看改动时忽略空白（这个标签页里三处共用，不存盘），见 [`diff_tools`]
     ignore_ws: bool,
+    /// 并排对比时改动区不够宽、暂以上下排显示，用户点了「仍然并排」（这个标签页里三处共用，不存盘；
+    /// 再点一次「并排」按钮就清掉），见 [`diff_tools`]
+    split_forced: bool,
+    /// 折行的并排对比上一次画出来多宽（本地修改、提交详情、比较各记各的，见
+    /// [`RepoView::rewrap_guard`]）
+    split_seen: [std::rc::Rc<std::cell::Cell<f32>>; 3],
     /// 在改动中搜索：三处各一个搜索条，见 [`diff_search`]
     diff_search: diff_search::DiffSearches,
     _subscriptions: Vec<Subscription>,
@@ -322,6 +328,8 @@ impl RepoView {
             compare,
             recover,
             ignore_ws: false,
+            split_forced: false,
+            split_seen: Default::default(),
             diff_search,
             _subscriptions: subscriptions,
         };
@@ -1423,6 +1431,22 @@ pub(crate) fn tool_button(
     tool_button_bare(id, icon, label, running, badge, cx)
         .tooltip(tooltip)
         .disabled(!enabled)
+}
+
+/// 点开是菜单的工具栏按钮：图标旁边多一个小 ⌄。点得了时不加悬停提示（提示也出现在按钮下面，会把弹出
+/// 的菜单第一项盖住）；点不了时用 `why_not` 说为什么。
+pub(crate) fn tool_menu_button(
+    id: &'static str,
+    icon: IconName,
+    label: &'static str,
+    why_not: Option<&'static str>,
+    cx: &App,
+) -> Button {
+    let button = tool_button_with(id, icon, label, false, 0, true, cx);
+    match why_not {
+        Some(why) => button.tooltip(why).disabled(true),
+        None => button,
+    }
 }
 
 thread_local! {

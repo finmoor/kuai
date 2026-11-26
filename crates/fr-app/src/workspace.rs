@@ -2600,7 +2600,8 @@ impl Workspace {
                 .is_some_and(|repos| repos.is_empty())
     }
 
-    /// 欢迎页：两张卡片（连接远程主机、打开本机仓库），底下「暂时跳过」。
+    /// 欢迎页：两张卡片，底下「暂时跳过」。「连接远程主机」整张可点；「在本机开始」里列三件事
+    /// （打开仓库、新建项目、克隆），各点各的（`docs/design/sandbox-1126/` 第 3 题方向 A）。
     fn render_welcome(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let (primary, border, muted, fg, bg, secondary) = (
@@ -2611,23 +2612,18 @@ impl Workspace {
             theme.background,
             theme.secondary,
         );
-        let card = |id: &'static str,
-                    icon: IconName,
-                    title: &'static str,
-                    desc: &'static str,
-                    go: &'static str,
-                    main: bool| {
+        // 卡片的壳：宽度、边框；推荐的那张带主色的边和「推荐」
+        let shell = |main: bool| {
             div()
-                .id(id)
                 .relative()
+                .flex()
+                .flex_col()
                 .w(px(290.))
                 .p(px(20.))
                 .rounded(px(14.))
                 .border_1()
                 .border_color(if main { primary.opacity(0.55) } else { border })
                 .bg(if main { primary.opacity(0.06) } else { bg })
-                .cursor_pointer()
-                .hover(|s| s.border_color(primary))
                 .when(main, |card| {
                     card.child(
                         div()
@@ -2642,42 +2638,56 @@ impl Workspace {
                             .child(tr("推荐")),
                     )
                 })
+        };
+        // 卡片上面的三样：图标、标题、一句说明
+        let head = |icon: IconName, title: &'static str, desc: &'static str, main: bool| {
+            [
+                div()
+                    .size(px(42.))
+                    .mb(px(14.))
+                    .rounded(px(11.))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .bg(if main { primary } else { secondary })
+                    .text_color(if main { gpui_kit::white() } else { fg })
+                    .child(Icon::new(icon).size(px(22.)))
+                    .into_any_element(),
+                div()
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .mb(px(4.))
+                    .child(title)
+                    .into_any_element(),
+                div()
+                    .text_size(px(12.5))
+                    .text_color(muted)
+                    .whitespace_normal()
+                    .child(desc)
+                    .into_any_element(),
+            ]
+        };
+        // 「在本机开始」里的一行：点了做一件事
+        let local_row = |id: &'static str, icon: IconName, label: &'static str, first: bool| {
+            h_flex()
+                .id(id)
+                .h(px(32.))
+                .px(px(8.))
+                .gap(px(9.))
+                .rounded(px(7.))
+                .text_size(px(13.))
+                .cursor_pointer()
+                .hover(|s| s.bg(secondary))
+                .when(first, |row| {
+                    row.text_color(primary).font_weight(FontWeight::SEMIBOLD)
+                })
+                .child(Icon::new(icon).size(px(15.)))
+                .child(div().flex_1().child(label))
                 .child(
-                    div()
-                        .size(px(42.))
-                        .mb(px(14.))
-                        .rounded(px(11.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(if main { primary } else { secondary })
-                        .text_color(if main { gpui_kit::white() } else { fg })
-                        .child(Icon::new(icon).size(px(22.))),
-                )
-                .child(
-                    div()
-                        .text_size(px(15.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .mb(px(4.))
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .min_h(px(40.))
-                        .text_size(px(12.5))
-                        .text_color(muted)
-                        .whitespace_normal()
-                        .child(desc),
-                )
-                .child(
-                    h_flex()
-                        .mt(px(14.))
-                        .gap(px(4.))
-                        .text_size(px(12.5))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(primary)
-                        .child(go)
-                        .child(Icon::new(IconName::ChevronRight).size(px(14.))),
+                    Icon::new(IconName::ChevronRight)
+                        .size(px(14.))
+                        .text_color(muted),
                 )
         };
         v_flex()
@@ -2720,37 +2730,99 @@ impl Workspace {
                 h_flex()
                     .flex_wrap()
                     .justify_center()
-                    .items_start()
+                    // 两张一样高：短的那张把最后一行压到底
+                    .items_stretch()
                     .gap(px(16.))
                     .child(
-                        card(
-                            "welcome-host",
-                            IconName::Server,
-                            tr("连接远程主机"),
-                            tr("通过 SSH 连接 VPS 或开发机，仓库和终端都在主机上。"),
-                            tr("添加主机…"),
-                            true,
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.show_page(Page::Servers, window, cx);
-                            this.manager
-                                .update(cx, |manager, cx| manager.add_host(window, cx));
-                        })),
+                        shell(true)
+                            .id("welcome-host")
+                            .cursor_pointer()
+                            .hover(|s| s.border_color(primary))
+                            .children(head(
+                                IconName::Server,
+                                tr("连接远程主机"),
+                                tr("通过 SSH 连接 VPS 或开发机，仓库和终端都在主机上。"),
+                                true,
+                            ))
+                            .child(div().flex_1().min_h(px(14.)))
+                            .child(
+                                h_flex()
+                                    .gap(px(4.))
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(primary)
+                                    .child(tr("添加主机…"))
+                                    .child(Icon::new(IconName::ChevronRight).size(px(14.))),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_page(Page::Servers, window, cx);
+                                this.manager
+                                    .update(cx, |manager, cx| manager.add_host(window, cx));
+                            })),
                     )
                     .child(
-                        card(
-                            "welcome-local",
-                            IconName::FolderGit2,
-                            tr("打开本机仓库"),
-                            tr("只使用本机上的 Git 仓库。"),
-                            tr("打开仓库…"),
-                            false,
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.show_page(Page::Servers, window, cx);
-                            this.manager
-                                .update(cx, |manager, cx| manager.open_local(window, cx));
-                        })),
+                        shell(false)
+                            .children(head(
+                                IconName::Monitor,
+                                tr("在本机开始"),
+                                tr("不连接主机，使用本机上的 Git 仓库。"),
+                                false,
+                            ))
+                            .child(
+                                v_flex()
+                                    .mt(px(10.))
+                                    .mx(px(-8.))
+                                    .mb(px(-8.))
+                                    .gap(px(1.))
+                                    .child(
+                                        local_row(
+                                            "welcome-open",
+                                            IconName::FolderGit2,
+                                            tr("打开仓库…"),
+                                            true,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                this.show_page(Page::Servers, window, cx);
+                                                this.manager.update(cx, |manager, cx| {
+                                                    manager.open_local(window, cx)
+                                                });
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        local_row(
+                                            "welcome-new",
+                                            IconName::FolderPlus,
+                                            tr("新建项目…"),
+                                            false,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                this.show_page(Page::Servers, window, cx);
+                                                this.manager.update(cx, |manager, cx| {
+                                                    manager.new_local_project(window, cx)
+                                                });
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        local_row(
+                                            "welcome-clone",
+                                            IconName::Download,
+                                            tr("克隆…"),
+                                            false,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                this.show_page(Page::Servers, window, cx);
+                                                this.manager.update(cx, |manager, cx| {
+                                                    manager.clone_local(window, cx)
+                                                });
+                                            }),
+                                        ),
+                                    ),
+                            ),
                     ),
             )
             .child(

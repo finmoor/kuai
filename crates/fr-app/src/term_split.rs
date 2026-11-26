@@ -1,5 +1,7 @@
 //! 并排查看几个终端（会话页、仓库终端页；`docs/design/sessions-status/` 第 5 节方向 C）：
-//! 侧栏里勾上 2～4 个，点「并排查看」。2 个左右分，3 个左边一大、右边两小，4 个四格；双击格头放大、
+//! 侧栏里勾上 2～4 个，点「并排查看」；或者右键一个终端「与「…」并排」、点工具栏的「并排」挑一个，
+//! 直接并排（并排着时用「添加」、右键「加入并排」再加，见 `docs/design/sandbox-1126/` 第 2 题方向 B）。
+//! 2 个左右分，3 个左边一大、右边两小，4 个四格；双击格头放大、
 //! 再双击还原；格头的 × 把它移出，只剩一个时回到单个。焦点格蓝框，输入只进焦点格（点格子、
 //! Ctrl+Alt+方向键换）。
 //!
@@ -10,7 +12,9 @@ use std::rc::Rc;
 use fr_core::i18n::tr;
 use fr_core::tf;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::component::button::Button;
+use gpui_kit::component::menu::PopupMenuItem;
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
@@ -28,6 +32,49 @@ const HEAD: f32 = 26.;
 const SMALL: (f32, f32) = (420., 260.);
 
 pub type Handler = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// 菜单里写的终端名字（「与「…」并排」）：太长的截短。
+pub fn menu_name(name: &str) -> SharedString {
+    const MAX: usize = 24;
+    match name.chars().count() > MAX {
+        true => format!("{}…", name.chars().take(MAX).collect::<String>()).into(),
+        false => name.to_string().into(),
+    }
+}
+
+/// 挑一个终端来并排的菜单里的一项：左边名字，右边状态。
+pub fn choice(name: SharedString, state: SharedString, color: Hsla) -> PopupMenuItem {
+    PopupMenuItem::element(move |_, _| {
+        h_flex()
+            .w_full()
+            .gap(px(16.))
+            .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(color)
+                    .child(state.clone()),
+            )
+    })
+}
+
+/// 并排时上面那一条里的「添加」：再挑一个终端加进来（点开的菜单由各页接上）。满了（`full`）、没有
+/// 别的终端（`more` 为假）时点不了，悬停说为什么。
+pub fn add_button(id: &'static str, full: bool, more: bool) -> Button {
+    let button = Button::new(id)
+        .small()
+        .flex_none()
+        .icon(ui::icon(IconName::Plus))
+        .label(tr("添加"));
+    match (full, more) {
+        (true, _) => button
+            .disabled(true)
+            .tooltip(tf!("最多并排查看 {n} 个终端", n = MAX_CELLS.to_string())),
+        (_, false) => button.disabled(true).tooltip(tr("没有其他终端可并排查看")),
+        _ => button,
+    }
+}
 
 /// Ctrl+Alt+方向键：换到哪一格（`n` 格，现在是 `at`）。不是这几个键是 None。
 pub fn step(key: &str, at: usize, n: usize) -> Option<usize> {

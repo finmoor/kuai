@@ -12,6 +12,10 @@
 //! 图标栏（手动展开的在这次运行里保持展开，见 [`rail_shown`]）、文件列表最多 300；窄于 900 时文件列表
 //! 最多 240、提交框收成一行；窄于 760 时文件列表和改动上下排；矮于 640 时提交框也收成一行；窄于
 //! 1000 时工具栏只留图标（[`super::compact_toolbar`]）。
+//!
+//! 并排对比再让一级（`docs/design/sandbox-1126/` 第 1 题方向 C）：本地修改页并排着看时，侧栏展开着
+//! 改动区不足 680，侧栏也自动收成图标栏（[`auto_rail`]）；收了仍不足 560，暂以上下排显示
+//! （[`super::diff_tools`] 的 `split_fits`）。
 
 use gpui_kit::component::InteractiveElementExt as _;
 use gpui_kit::component::resizable::{HandleEdge, resize_handle};
@@ -53,6 +57,10 @@ pub(super) const STACK_BELOW: f32 = 760.;
 /// 窗口窄于这么多（或者矮于 [`COMPACT_COMMIT_LOWER`]）时提交框收成一行
 pub(super) const COMPACT_COMMIT_BELOW: f32 = 900.;
 pub(super) const COMPACT_COMMIT_LOWER: f32 = 640.;
+/// 本地修改页并排对比时，侧栏展开着改动区不足这么宽，侧栏自动收成图标栏
+pub(super) const SPLIT_RAIL_BELOW: f32 = 680.;
+/// 并排对比时改动区不足这么宽（每侧不到一半），暂以上下排显示
+pub(super) const SPLIT_MIN: f32 = 560.;
 /// 侧栏收起后图标栏的宽度
 pub(super) const RAIL_WIDTH: f32 = 48.;
 /// 拖侧栏的分隔条：离左边不到这么远就收成图标栏，收着时拖过这么远就展开
@@ -83,33 +91,55 @@ pub(super) struct Sizes {
     pub details_width: f32,
 }
 
-/// 侧栏现在是不是图标栏：手动收起的，或者窗口窄于 [`AUTO_RAIL_BELOW`]、又没手动展开的。
-pub(super) fn rail_shown(layout: &Layout, vw: f32) -> bool {
-    layout.sidebar_collapsed || (vw < AUTO_RAIL_BELOW && !layout.narrow_open)
+/// 该不该自动收成图标栏（不看手动收起、展开）：窗口窄于 [`AUTO_RAIL_BELOW`]；或者本地修改页正并排着
+/// 对比（`split`），侧栏展开着的话改动区不足 [`SPLIT_RAIL_BELOW`]。
+pub(super) fn auto_rail(layout: &Layout, vw: f32, split: bool) -> bool {
+    vw < AUTO_RAIL_BELOW
+        || (split && changes_diff(layout, vw, sidebar_open(layout, vw)) < SPLIT_RAIL_BELOW)
 }
 
-/// 按设置里存的数和窗口的大小算各块的大小。没拖过的用默认值（详情区按窗口的比例）；
-/// 每一块都夹在「自己还看得清」和「别的块还看得清」之间。
-pub(super) fn sizes(layout: &Layout, viewport: Size<Pixels>) -> Sizes {
-    let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
-    let fit = |value: f32, min: f32, max: f32| value.clamp(min, max.max(min));
-    // 侧栏：收着时是图标栏
-    let sidebar = match rail_shown(layout, vw) {
-        true => RAIL_WIDTH,
-        false => sidebar_open(layout, vw),
-    };
-    let main = vw - sidebar;
-    // 文件列表：右边至少留 300 看改动；窗口窄时再收一收（存的宽度不动）
+/// 侧栏现在是不是图标栏：手动收起的，或者该自动收起（见 [`auto_rail`]）、又没手动展开的。
+pub(super) fn rail_shown(layout: &Layout, vw: f32, split: bool) -> bool {
+    layout.sidebar_collapsed || (auto_rail(layout, vw, split) && !layout.narrow_open)
+}
+
+/// 本地修改的文件列表多宽（侧栏占 `sidebar` 时）：右边至少留 300 看改动；窗口窄时再收一收
+/// （存的宽度不动）。
+fn changes_list(layout: &Layout, vw: f32, sidebar: f32) -> f32 {
     let cap = match vw {
         w if w < COMPACT_COMMIT_BELOW => 240.,
         w if w < AUTO_RAIL_BELOW => 300.,
         _ => f32::MAX,
     };
-    let changes_list = fit(
-        layout.changes_list.unwrap_or(CHANGES_LIST_DEFAULT).min(cap),
-        220.,
-        main - 300.,
-    );
+    let max = vw - sidebar - 300.;
+    layout
+        .changes_list
+        .unwrap_or(CHANGES_LIST_DEFAULT)
+        .min(cap)
+        .clamp(220., max.max(220.))
+}
+
+/// 本地修改里右边的改动区多宽（侧栏占 `sidebar` 时）；文件列表和改动上下排时占满右边。
+pub(super) fn changes_diff(layout: &Layout, vw: f32, sidebar: f32) -> f32 {
+    match vw < STACK_BELOW {
+        true => vw - sidebar,
+        false => vw - sidebar - changes_list(layout, vw, sidebar),
+    }
+}
+
+/// 按设置里存的数和窗口的大小算各块的大小。没拖过的用默认值（详情区按窗口的比例）；
+/// 每一块都夹在「自己还看得清」和「别的块还看得清」之间。`split`：本地修改页正并排着对比
+/// （侧栏据此让位，见 [`auto_rail`]）。
+pub(super) fn sizes(layout: &Layout, viewport: Size<Pixels>, split: bool) -> Sizes {
+    let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
+    let fit = |value: f32, min: f32, max: f32| value.clamp(min, max.max(min));
+    // 侧栏：收着时是图标栏
+    let sidebar = match rail_shown(layout, vw, split) {
+        true => RAIL_WIDTH,
+        false => sidebar_open(layout, vw),
+    };
+    let main = vw - sidebar;
+    let changes_list = changes_list(layout, vw, sidebar);
     // 详情区左边一栏：默认占窗口宽度的三成
     let details_width = fit(
         layout.details_width.unwrap_or((vw * 0.3).clamp(250., 380.)),
@@ -135,7 +165,27 @@ pub(super) fn sizes(layout: &Layout, viewport: Size<Pixels>) -> Sizes {
 impl RepoView {
     /// 各块现在的大小。
     pub(super) fn sizes(&self, cx: &App) -> Sizes {
-        sizes(&self.app.read(cx).settings.layout, self.content_viewport())
+        sizes(
+            &self.app.read(cx).settings.layout,
+            self.content_viewport(),
+            self.split_gives_way(cx),
+        )
+    }
+
+    /// 本地修改页正并排着对比（设置开着、现在显示的是本地修改）：侧栏据此让位。
+    pub(super) fn split_gives_way(&self, cx: &App) -> bool {
+        self.page == super::Page::Git
+            && self.mode == super::Mode::Changes
+            && self.app.read(cx).settings.diff_split
+    }
+
+    /// 侧栏现在该不该自动收成图标栏（窗口窄，或并排对比要地方）。
+    fn auto_rail(&self, cx: &App) -> bool {
+        auto_rail(
+            &self.app.read(cx).settings.layout,
+            f32::from(self.viewport.width),
+            self.split_gives_way(cx),
+        )
     }
 
     /// 窗口内容区扣掉底部的「输出」（开着时）：各块的大小按它算。
@@ -175,10 +225,10 @@ impl RepoView {
         // 侧栏往左拖到头就收成图标栏；收着时往右拖开就展开
         if split == Split::Sidebar {
             let collapse = from_left < COLLAPSE_AT;
-            let narrow = f32::from(self.viewport.width) < AUTO_RAIL_BELOW;
+            let narrow = self.auto_rail(cx);
             self.app.update(cx, |app, cx| {
                 app.edit_layout(cx, |layout| {
-                    // 窗口窄、自动收起时：拖开只在这次运行里记着，拖回去回到自动收起
+                    // 自动收起时（窗口窄，或并排对比要地方）：拖开只在这次运行里记着，拖回去回到自动收起
                     match narrow {
                         true => layout.narrow_open = !collapse,
                         false => layout.sidebar_collapsed = collapse,
@@ -205,7 +255,7 @@ impl RepoView {
         // 存之前先按现在的窗口收一下：拖到头以后再往回拖，马上就跟手
         let mut layout = self.app.read(cx).settings.layout;
         set(&mut layout, split, Some(value.max(0.)));
-        let fitted = sizes(&layout, self.content_viewport());
+        let fitted = sizes(&layout, self.content_viewport(), self.split_gives_way(cx));
         let value = match split {
             Split::Sidebar => fitted.sidebar,
             Split::ChangesList => fitted.changes_list,
@@ -237,6 +287,7 @@ impl RepoView {
         rail_shown(
             &self.app.read(cx).settings.layout,
             f32::from(self.viewport.width),
+            self.split_gives_way(cx),
         )
     }
 
@@ -247,8 +298,8 @@ impl RepoView {
         if collapse && self.sidebar_has_focus(window, cx) {
             window.blur(cx);
         }
-        // 窗口窄、自动收起时：展开只在这次运行里记着，收起回到自动收起，不改存着的
-        let narrow = f32::from(self.viewport.width) < AUTO_RAIL_BELOW;
+        // 自动收起时（窗口窄，或并排对比要地方）：展开只在这次运行里记着，收起回到自动收起，不改存着的
+        let narrow = self.auto_rail(cx);
         self.app.update(cx, |app, cx| {
             app.edit_layout(cx, |layout| match narrow {
                 true => {
@@ -264,8 +315,16 @@ impl RepoView {
     }
 
     /// 窗口宽到不用自动收起了：清掉「窄时手动展开」，下次变窄照样自动收起。画之前调。
+    ///
+    /// 并排对比让位的那一档不看现在在哪一页（只看设置和宽度）：不然在本地修改页手动展开了侧栏，
+    /// 去别的页转一圈回来又被收起。
     pub(super) fn forget_narrow_open(&mut self, cx: &mut Context<Self>) {
-        let wide = f32::from(self.viewport.width) >= AUTO_RAIL_BELOW;
+        let settings = &self.app.read(cx).settings;
+        let wide = !auto_rail(
+            &settings.layout,
+            f32::from(self.viewport.width),
+            settings.diff_split,
+        );
         if wide && self.app.read(cx).settings.layout.narrow_open {
             let app = self.app.clone();
             cx.defer(move |cx| {
@@ -299,12 +358,53 @@ fn set(layout: &mut Layout, split: Split, value: Option<f32>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{COMMIT_LIST_MIN, HISTORY_CHROME, RAIL_WIDTH, Sizes, sizes};
+    use super::{
+        COMMIT_LIST_MIN, HISTORY_CHROME, RAIL_WIDTH, SPLIT_MIN, Sizes, changes_diff, sizes,
+    };
     use crate::settings::Layout;
     use gpui_kit::{px, size};
 
     fn at(layout: Layout, width: f32, height: f32) -> Sizes {
-        sizes(&layout, size(px(width), px(height)))
+        sizes(&layout, size(px(width), px(height)), false)
+    }
+
+    /// 本地修改页并排着对比时各块的大小，和改动区的宽度。
+    fn split_at(layout: Layout, width: f32) -> (Sizes, f32) {
+        let s = sizes(&layout, size(px(width), px(752.)), true);
+        (s, changes_diff(&layout, width, s.sidebar))
+    }
+
+    #[test]
+    fn 并排对比时改动区不够宽_侧栏先收成图标栏() {
+        // 1280 宽：侧栏 240、文件列表 340，改动区 700，够，不动
+        let (s, diff) = split_at(Layout::default(), 1280.);
+        assert_eq!((s.sidebar, diff), (240., 700.));
+        // 1180 宽：改动区本来只有 600，侧栏收成图标栏后 792
+        let (s, diff) = split_at(Layout::default(), 1180.);
+        assert_eq!((s.sidebar, diff), (RAIL_WIDTH, 792.));
+        // 不并排时 1180 宽不收
+        assert_eq!(at(Layout::default(), 1180., 752.).sidebar, 240.);
+        // 手动展开了就不再收（只在这次运行里记着）
+        let open = Layout {
+            narrow_open: true,
+            ..Layout::default()
+        };
+        assert_eq!(split_at(open, 1180.).0.sidebar, 240.);
+        // 900 宽：侧栏本来就是图标栏，改动区 552，不足并排的下限（暂以上下排显示）
+        let (s, diff) = split_at(Layout::default(), 900.);
+        assert_eq!((s.sidebar, diff), (RAIL_WIDTH, 552.));
+        assert!(diff < SPLIT_MIN);
+        // 窄到上下排：改动区占满右边，又够并排了
+        let (_, diff) = split_at(Layout::default(), 750.);
+        assert_eq!(diff, 750. - RAIL_WIDTH);
+        // 侧栏、文件列表拖宽了：1280 也要收
+        let wide = Layout {
+            sidebar: Some(300.),
+            changes_list: Some(400.),
+            ..Layout::default()
+        };
+        let (s, diff) = split_at(wide, 1280.);
+        assert_eq!((s.sidebar, diff), (RAIL_WIDTH, 1280. - RAIL_WIDTH - 400.));
     }
 
     #[test]

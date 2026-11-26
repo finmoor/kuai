@@ -220,9 +220,19 @@ impl ManagerView {
         self.server_dialog(None, window, cx);
     }
 
-    /// 欢迎页的「打开本机仓库」：选本机的目录（同「添加本机仓库…」）。
+    /// 欢迎页「在本机开始」的「打开仓库…」：选本机的目录（同「添加本机仓库…」）。
     pub fn open_local(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.add_local(window, cx);
+    }
+
+    /// 欢迎页「在本机开始」的「新建项目…」：在本机新建文件夹、初始化成仓库（同本机那一页的「新建项目…」）。
+    pub fn new_local_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_project_dialog(None, window, cx);
+    }
+
+    /// 欢迎页「在本机开始」的「克隆…」：克隆到本机（同本机那一页的「克隆…」）。
+    pub fn clone_local(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.clone_dialog(None, window, cx);
     }
 
     /// 选本机的目录，可以一次选几个；在仓库中就找到仓库根目录加进列表。
@@ -370,6 +380,15 @@ impl ManagerView {
         let forward_agent = Rc::new(Cell::new(old.forward_agent));
         // 新加的默认勾着
         let auto_connect = Rc::new(Cell::new(!old.manual_connect));
+        // 「高级选项」（跳板机、初始目录、转发 ssh-agent、启动时自动连接）平时收着；改一台这几项
+        // 不是默认值的主机时展开着，免得看不到它设了什么（`docs/design/sandbox-1126/` 第 4 题方向 A）
+        let advanced = Rc::new(Cell::new(
+            editing
+                && (jump.borrow().is_some()
+                    || old.start_dir.as_deref().is_some_and(|dir| !dir.is_empty())
+                    || old.forward_agent
+                    || old.manual_connect),
+        ));
         // 点了「清除」：存着的密码、口令不要了
         let forget = Rc::new(Cell::new(false));
         // 没填对时的提示，显示在对话框里
@@ -751,6 +770,63 @@ impl ManagerView {
                 }
                 line
             });
+            // 高级选项：收着时在那一行上写出改过的几项，都没改就列出里面有什么
+            let advanced_now = advanced.get();
+            let advanced_summary: Option<SharedString> = {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(choice) = &chosen {
+                    parts.push(tf!("经 {name} 连接", name = choice.name));
+                }
+                let dir = start_dir.read(cx).value().trim().to_string();
+                if !dir.is_empty() {
+                    parts.push(tf!("初始目录 {dir}", dir));
+                }
+                if forward_agent.get() {
+                    parts.push(tr("转发 ssh-agent").to_string());
+                }
+                if !auto_connect.get() {
+                    parts.push(tr("启动时不自动连接").to_string());
+                }
+                (!parts.is_empty()).then(|| parts.join(tr("，")).into())
+            };
+            let advanced_toggle = {
+                let advanced = advanced.clone();
+                let primary = cx.theme().primary;
+                h_flex()
+                    .gap_2()
+                    // 按钮自己有内边距：往左挪一点，字和上面各格的标题对齐
+                    .ml(px(-8.))
+                    .child(
+                        Button::new("advanced")
+                            .ghost()
+                            .small()
+                            .icon(ui::icon(match advanced_now {
+                                true => IconName::ChevronDown,
+                                false => IconName::ChevronRight,
+                            }))
+                            .label(tr("高级选项"))
+                            .on_click(move |_, window, _| {
+                                advanced.set(!advanced.get());
+                                window.refresh();
+                            }),
+                    )
+                    .when(!advanced_now, |row| {
+                        row.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(match advanced_summary {
+                                    Some(_) => primary,
+                                    None => muted,
+                                })
+                                .child(advanced_summary.clone().unwrap_or_else(|| {
+                                    tr("跳板机、初始目录、ssh-agent 转发、启动时自动连接").into()
+                                })),
+                        )
+                    })
+            };
             // 映射到本机：已经添加的服务器才有（映射是挂在服务器的 id 上的）
             let mapping_section = editing.then(|| crate::mapping::section(&app, &old, cx));
             dialog
@@ -826,7 +902,6 @@ impl ManagerView {
                                         .child(field(tr("端口"), Input::new(&port))),
                                 ),
                         )
-                        .child(v_flex().gap_2().child(jump_field).children(route_line))
                         .child(field(tr("用户名"), Input::new(&user)))
                         .child(
                             h_flex()
@@ -862,47 +937,46 @@ impl ManagerView {
                                 .child(secret_field(tr("私钥口令"), &passphrase)),
                             Auth::Password => body.child(secret_field(tr("密码"), &password)),
                         })
-                        .child(
-                            h_flex()
-                                .gap_3()
-                                .items_start()
-                                .child(
-                                    div()
-                                        .w(px(190.))
-                                        .flex_none()
-                                        .child(field(tr("名称"), Input::new(&name))),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .child(field(tr("初始目录"), Input::new(&start_dir))),
-                                ),
-                        )
-                        .child(
-                            Checkbox::new("forward-agent")
-                                .label(tr("转发本机的 ssh-agent（仅对受信任的主机启用）"))
-                                .checked(forward_agent.get())
-                                .on_click({
-                                    let forward_agent = forward_agent.clone();
-                                    move |checked, window, _| {
-                                        forward_agent.set(*checked);
-                                        window.refresh();
-                                    }
-                                }),
-                        )
-                        .child(
-                            Checkbox::new("auto-connect")
-                                .label(tr("启动时自动连接"))
-                                .checked(auto_connect.get())
-                                .on_click({
-                                    let auto_connect = auto_connect.clone();
-                                    move |checked, window, _| {
-                                        auto_connect.set(*checked);
-                                        window.refresh();
-                                    }
-                                }),
-                        )
+                        .child(field(tr("名称"), Input::new(&name)))
+                        .child(advanced_toggle)
+                        .when(advanced_now, |body| {
+                            body.child(
+                                v_flex()
+                                    .gap_3()
+                                    .p_3()
+                                    .rounded(px(crate::ui::RADIUS))
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .child(v_flex().gap_2().child(jump_field).children(route_line))
+                                    .child(field(tr("初始目录"), Input::new(&start_dir)))
+                                    .child(
+                                        Checkbox::new("forward-agent")
+                                            .label(tr(
+                                                "转发本机的 ssh-agent（仅对受信任的主机启用）",
+                                            ))
+                                            .checked(forward_agent.get())
+                                            .on_click({
+                                                let forward_agent = forward_agent.clone();
+                                                move |checked, window, _| {
+                                                    forward_agent.set(*checked);
+                                                    window.refresh();
+                                                }
+                                            }),
+                                    )
+                                    .child(
+                                        Checkbox::new("auto-connect")
+                                            .label(tr("启动时自动连接"))
+                                            .checked(auto_connect.get())
+                                            .on_click({
+                                                let auto_connect = auto_connect.clone();
+                                                move |checked, window, _| {
+                                                    auto_connect.set(*checked);
+                                                    window.refresh();
+                                                }
+                                            }),
+                                    ),
+                            )
+                        })
                         .when_some(problem.borrow().clone(), |body, found| {
                             body.child(div().text_sm().text_color(danger).child(found))
                         })

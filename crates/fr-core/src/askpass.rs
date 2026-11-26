@@ -403,11 +403,10 @@ pub fn host_key_prompt(prompt: &str) -> Option<HostKeyPrompt> {
                 .filter(|address| *address != name && !address.starts_with('<'))
                 .map(str::to_string);
             host = Some((name.to_string(), address));
-        } else if let Some((kind, print)) = line.split_once(" key fingerprint is ") {
-            key = Some((
-                kind.trim().to_string(),
-                print.trim().trim_end_matches('.').to_string(),
-            ));
+        } else if let Some((kind, print)) = line.split_once(" key fingerprint is") {
+            // OpenSSH 10 起这一行写成「… key fingerprint is: SHA256:…」：多一个冒号，句尾没有句点
+            let print = print.trim_start_matches(':').trim().trim_end_matches('.');
+            key = Some((kind.trim().to_string(), print.to_string()));
         } else if is_confirm(line)
             || line.starts_with("This key is not known by any other names")
             // 设了 `VisualHostKey yes` 时提示里带一幅字符画
@@ -432,9 +431,40 @@ pub fn host_key_prompt(prompt: &str) -> Option<HostKeyPrompt> {
     })
 }
 
+/// 拆不出主机和指纹时（[`host_key_prompt`] 返回 None）照原文显示用的几行：去掉空行，也去掉问
+/// yes/no 的那一句（界面上是「信任并连接」「取消」两个按钮，那一问对不上）。
+pub fn host_key_raw_lines(prompt: &str) -> Vec<String> {
+    prompt
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !is_confirm(line))
+        .map(str::to_string)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 拆不出时照原文显示_不带那一问() {
+        // 假想 ssh 以后换了说法：指纹那一行认不出来
+        let odd = [
+            "The authenticity of host 'dev (203.0.113.7)' can't be established.",
+            "",
+            "ED25519 host key has fingerprint SHA256:abc",
+            "Are you sure you want to continue connecting (yes/no/[fingerprint])? ",
+        ]
+        .join("\r\n");
+        assert_eq!(host_key_prompt(&odd), None);
+        assert_eq!(
+            host_key_raw_lines(&odd),
+            [
+                "The authenticity of host 'dev (203.0.113.7)' can't be established.",
+                "ED25519 host key has fingerprint SHA256:abc"
+            ]
+        );
+    }
 
     #[test]
     fn 拆出主机和指纹() {
@@ -491,6 +521,23 @@ mod tests {
         let key = host_key_prompt(&proxied).unwrap();
         assert_eq!((key.host.as_str(), key.address), ("inner", None));
         assert_eq!(key.fingerprint, "SHA256:xyz");
+        assert!(key.notes.is_empty());
+
+        // OpenSSH 10 的写法（10.2 的原话）：is 后面多一个冒号，指纹后面没有句点
+        let colon = [
+            "The authenticity of host '203.0.113.7 (203.0.113.7)' can't be established.",
+            "ED25519 key fingerprint is: SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU",
+            "This key is not known by any other names.",
+            ask,
+        ]
+        .join("\n");
+        let key = host_key_prompt(&colon).unwrap();
+        assert_eq!((key.host.as_str(), key.address), ("203.0.113.7", None));
+        assert_eq!(key.key_type, "ED25519");
+        assert_eq!(
+            key.fingerprint,
+            "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU"
+        );
         assert!(key.notes.is_empty());
 
         // 不是这一问的、拆不出来的

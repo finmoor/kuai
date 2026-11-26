@@ -33,7 +33,8 @@
 //!
 //! 状态（运行中、静默、待查看、空闲、已退出、状态未知）见 [`TermBoard`]；主机断开时它的终端留在侧栏里
 //! 灰掉，分节头写「未连接」带「重新连接」。终端可以改名（右键「重命名…」、双击名字、F2），同一个仓库
-//! 里重名的自动加序号。侧栏里勾上 2～4 个可以并排查看（[`crate::term_split`]）。
+//! 里重名的自动加序号。侧栏里勾上 2～4 个可以并排查看（[`crate::term_split`]）；右键一个终端「与「…」
+//! 并排」、工具栏的「并排」是直接和显示着的那个并排，并排着时用「添加」、右键「加入并排」再加。
 //!
 //! 侧栏和仓库页的侧栏一样宽、一样的底色和字号，右边上面一条和仓库终端页的工具栏一样高，下面全是画面：
 //! 这样画面和仓库的终端页一样大，终端是几行几列就正好放得下，字不用缩小。侧栏右边有分隔条，拖它改的
@@ -60,7 +61,7 @@ use gpui_kit::*;
 use crate::app_state::AppState;
 use crate::machines::{LOCAL, WorkspaceKey, machine_of, split_relay};
 use crate::presets;
-use crate::repo::tool_button;
+use crate::repo::{tool_button, tool_menu_button};
 use crate::settings::{RepoEntry, TermSlot};
 use crate::term_board::{
     GroupKey, Program, RepoGroup, Row, Shown, TermBoard, TermId, TermState, free_number,
@@ -329,10 +330,11 @@ fn term_menu(
             at(&view),
             at(&view),
         );
-        let (rename, pick) = (at(&view), at(&view));
-        let picked = view
+        let rename = at(&view);
+        let split = view
             .upgrade()
-            .is_some_and(|view| view.read(cx).picked(&slot));
+            .map(|view| view.read(cx).split_entry(&slot, cx))
+            .unwrap_or(SplitEntry::Nothing);
         let rename_label = crate::keymap::with_key(tr("重命名…（F2）"), "hub.rename", cx);
         let menu = menu
             .item(
@@ -348,18 +350,8 @@ fn term_menu(
                         .update(cx, |this, cx| this.start_rename(&rename.1, window, cx))
                         .ok();
                 }),
-            )
-            .item(
-                PopupMenuItem::new(match picked {
-                    true => tr("移出并排查看"),
-                    false => tr("加入并排查看"),
-                })
-                .on_click(move |_, window, cx| {
-                    pick.0
-                        .update(cx, |this, cx| this.toggle_pick(&pick.1, window, cx))
-                        .ok();
-                }),
             );
+        let menu = split_item(menu, split, &view, &slot, window, cx);
         workspace_items(menu, &view, &slot.entry, false, window, cx)
             .item(
                 PopupMenuItem::new(if pinned {
@@ -408,6 +400,126 @@ fn term_menu(
 }
 
 /// 菜单里选了要运行的程序：在这个仓库里新建终端。
+/// 终端的右键菜单里并排查看的那一项。
+enum SplitEntry {
+    /// 并排着，它在里面：「移出并排」
+    Remove,
+    /// 并排着，它不在里面：「加入并排」
+    Add,
+    /// 没并排，右键的不是显示着的那个：「与「显示着的」并排」
+    With { base: TermSlot, name: SharedString },
+    /// 没并排，右键的就是显示着的那个（或者没有显示着的）：「并排查看 ▸」里挑一个
+    Choose,
+    /// 没有别的终端
+    Nothing,
+}
+
+/// 右键菜单里并排查看的那一项（见 [`SplitEntry`]）。
+fn split_item(
+    menu: PopupMenu,
+    entry: SplitEntry,
+    view: &WeakEntity<TermOverview>,
+    slot: &TermSlot,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let (view, slot) = (view.clone(), slot.clone());
+    match entry {
+        SplitEntry::Remove => menu.item(PopupMenuItem::new(tr("移出并排")).on_click(
+            move |_, window, cx| {
+                view.update(cx, |this, cx| this.toggle_pick(&slot, window, cx))
+                    .ok();
+            },
+        )),
+        SplitEntry::Add => menu.item(PopupMenuItem::new(tr("加入并排")).on_click(
+            move |_, window, cx| {
+                view.update(cx, |this, cx| this.split_pair(None, &slot, window, cx))
+                    .ok();
+            },
+        )),
+        SplitEntry::With { base, name } => menu.item(
+            PopupMenuItem::new(tf!("与「{name}」并排", name = name)).on_click(
+                move |_, window, cx| {
+                    view.update(cx, |this, cx| {
+                        this.split_pair(Some(&base), &slot, window, cx)
+                    })
+                    .ok();
+                },
+            ),
+        ),
+        SplitEntry::Choose => {
+            menu.submenu(tr("并排查看"), window, cx, split_menu(view, Some(slot)))
+        }
+        SplitEntry::Nothing => menu,
+    }
+}
+
+/// 挑一个终端来并排的菜单（工具栏的「并排」、并排时的「添加」、右键的「并排查看 ▸」）：按仓库分组，
+/// 行尾写状态。`base`：要和它并排的那个；没有时是显示着的那个。
+fn split_menu(
+    view: WeakEntity<TermOverview>,
+    base: Option<TermSlot>,
+) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+    type Choice = (TermSlot, SharedString, SharedString, Hsla);
+    move |mut menu, _, cx| {
+        let Some(this) = view.upgrade() else {
+            return menu;
+        };
+        // 要写的先都算出来：菜单项里拿不到这一页
+        let groups: Vec<(SharedString, Vec<Choice>)> = {
+            let this = this.read(cx);
+            let hub = this.hub(cx);
+            let app = this.app.read(cx);
+            this.split_choices(&hub, base.as_ref())
+                .iter()
+                .map(|(_, rows)| {
+                    let place = rows
+                        .first()
+                        .map(|row| TermOverview::cell_place(app, row))
+                        .unwrap_or_default();
+                    let rows = rows
+                        .iter()
+                        .map(|row| {
+                            (
+                                row.slot(),
+                                TermOverview::term_name(row, cx),
+                                TermOverview::state_text(row),
+                                TermOverview::state_color(row, cx),
+                            )
+                        })
+                        .collect();
+                    (place, rows)
+                })
+                .collect()
+        };
+        if groups.is_empty() {
+            return menu.item(PopupMenuItem::new(tr("没有其他终端")).disabled(true));
+        }
+        menu = menu.min_w(px(240.)).max_w(px(400.));
+        if groups.iter().map(|(_, rows)| rows.len() + 1).sum::<usize>() > 14 {
+            menu = menu.max_h(px(440.)).scrollable(true);
+        }
+        for (at, (place, rows)) in groups.into_iter().enumerate() {
+            if at > 0 {
+                menu = menu.separator();
+            }
+            menu = menu.label(place);
+            for (slot, name, state, color) in rows {
+                let (view, base) = (view.clone(), base.clone());
+                menu = menu.item(term_split::choice(name, state, color).on_click(
+                    move |_, window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.split_pair(base.as_ref(), &slot, window, cx)
+                        })
+                        .ok();
+                    },
+                ));
+            }
+        }
+        menu
+    }
+}
+
 fn on_start_in(view: &WeakEntity<TermOverview>, entry: RepoEntry) -> presets::OnStart {
     let view = view.clone();
     Rc::new(move |start, window, cx| {
@@ -2112,22 +2224,141 @@ impl TermOverview {
         window.push_notification(Notification::info(text), cx);
     }
 
+    /// 右键菜单里并排查看的那一项怎么写（见 [`split_item`]）。
+    fn split_entry(&self, slot: &TermSlot, cx: &App) -> SplitEntry {
+        if self.split.is_some() {
+            return match self.picked(slot) {
+                true => SplitEntry::Remove,
+                false => SplitEntry::Add,
+            };
+        }
+        let hub = self.hub(cx);
+        let base = self
+            .shown
+            .as_ref()
+            .filter(|shown| *shown != slot)
+            .and_then(|shown| row_in(&hub, shown));
+        match base {
+            Some(row) => SplitEntry::With {
+                base: row.slot(),
+                name: term_split::menu_name(&Self::term_name(row, cx)),
+            },
+            None if self.split_choices(&hub, Some(slot)).is_empty() => SplitEntry::Nothing,
+            None => SplitEntry::Choose,
+        }
+    }
+
+    /// 能拿来并排的终端，按仓库分组，现在看着的那个仓库排在前面。`base`：要和它并排的那个（不列它），
+    /// 没有时是显示着的那个。并排着时列的是还没在并排里的。
+    fn split_choices(&self, hub: &[RepoGroup], base: Option<&TermSlot>) -> Vec<Repo> {
+        let taken: Vec<&TermSlot> = match &self.split {
+            Some(split) => split.cells.iter().map(|cell| &cell.slot).collect(),
+            None => base.or(self.shown.as_ref()).into_iter().collect(),
+        };
+        // 一个仓库在几个工作区里时列了几遍：只要第一遍
+        let mut seen: Vec<TermSlot> = Vec::new();
+        let mut groups: Vec<Repo> = Vec::new();
+        for (entry, rows) in hub.iter().flat_map(|group| &group.repos) {
+            let rows: Vec<Row> = rows
+                .iter()
+                .filter(|row| {
+                    let slot = row.slot();
+                    !taken.contains(&&slot) && !seen.contains(&slot)
+                })
+                .cloned()
+                .collect();
+            seen.extend(rows.iter().map(Row::slot));
+            if !rows.is_empty() {
+                groups.push((entry.clone(), rows));
+            }
+        }
+        if let Some(here) = &self.repo {
+            groups.sort_by_key(|(entry, _)| entry != here);
+        }
+        groups
+    }
+
+    /// 还有没有能拿来并排的终端：没在并排里的（没并排时是显示着的那个以外的）。工具栏的「并排」、
+    /// 并排时的「添加」点不点得了看它。
+    fn has_split_choice(&self, hub: &[RepoGroup]) -> bool {
+        let is = |row: &Row, slot: &TermSlot| row.number == slot.number && row.entry == slot.entry;
+        rows_in(hub).any(|row| match &self.split {
+            Some(split) => !split.cells.iter().any(|cell| is(row, &cell.slot)),
+            None => !self.shown.as_ref().is_some_and(|shown| is(row, shown)),
+        })
+    }
+
+    /// 把 `slot` 和 `base` 并排查看（`base` 没有时是显示着的那个）：右键「与「…」并排」、工具栏的
+    /// 「并排」里挑的。并排着时是加一格（用不到 `base`）。新加的那一格拿到输入焦点。
+    fn split_pair(
+        &mut self,
+        base: Option<&TermSlot>,
+        slot: &TermSlot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(split) = &mut self.split {
+            let at = match split.cells.iter().position(|cell| cell.slot == *slot) {
+                Some(at) => at,
+                None if split.cells.len() >= term_split::MAX_CELLS => {
+                    Self::too_many(window, cx);
+                    return;
+                }
+                None => {
+                    split.cells.push(Cell {
+                        slot: slot.clone(),
+                        peek: None,
+                    });
+                    split.cells.len() - 1
+                }
+            };
+            split.zoom = None;
+            split.focus = at;
+            self.repo = Some(slot.entry.clone());
+            self.sync(window, cx);
+            self.type_in(window, cx);
+            cx.notify();
+            return;
+        }
+        let base = base
+            .or(self.shown.as_ref())
+            .filter(|base| *base != slot)
+            .cloned();
+        match base {
+            Some(base) => {
+                self.picks = vec![base, slot.clone()];
+                self.start_split_at(1, window, cx);
+            }
+            // 没有能和它并排的：照常显示它
+            None => {
+                self.select_term(slot.clone(), window, cx);
+                self.type_in(window, cx);
+            }
+        }
+    }
+
     /// 并排查看勾上的那几个（2～4 个），焦点进第一格。
     fn start_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_split_at(0, window, cx);
+    }
+
+    /// 并排查看勾上的那几个，焦点进第 `focus` 格。
+    fn start_split_at(&mut self, focus: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.picks.len() < term_split::MIN_CELLS {
             return;
         }
         let picks = std::mem::take(&mut self.picks);
+        let focus = focus.min(picks.len() - 1);
         self.cancel_rename(cx);
         // 单个看着的画面放掉（忙着的停着，见 `set_peek`）
         self.set_peek(None, cx);
-        self.repo = picks.first().map(|slot| slot.entry.clone());
+        self.repo = picks.get(focus).map(|slot| slot.entry.clone());
         self.split = Some(Split {
             cells: picks
                 .into_iter()
                 .map(|slot| Cell { slot, peek: None })
                 .collect(),
-            focus: 0,
+            focus,
             zoom: None,
         });
         self.sync(window, cx);
@@ -2320,6 +2551,10 @@ impl TermOverview {
             theme.primary,
         );
         let typing = self.typing(window, cx);
+        let (full, more) = (
+            split.cells.len() >= term_split::MAX_CELLS,
+            self.has_split_choice(hub),
+        );
         let this = cx.entity().downgrade();
         let handler =
             |run: fn(&mut TermOverview, usize, &mut Window, &mut Context<TermOverview>),
@@ -2443,6 +2678,10 @@ impl TermOverview {
                     .mr(px(6.))
                     .text_xs()
                     .text_color(if typing { primary } else { muted }),
+            )
+            .child(
+                term_split::add_button("hub-split-add", full, more)
+                    .dropdown_menu(split_menu(this.clone(), None)),
             )
             .child(
                 Button::new("hub-split-exit")
@@ -3734,42 +3973,47 @@ impl TermOverview {
                 )
         });
         // 勾了要并排查看的：底下一条「已选 n 个」「并排查看」「取消」
-        let picking = (!self.picks.is_empty() && self.split.is_none()).then(|| {
-            let n = self.picks.len();
-            h_flex()
-                .flex_none()
-                .px(px(10.))
-                .py(px(7.))
-                .gap(px(6.))
-                .border_t_1()
-                .border_color(border)
-                .text_size(px(12.))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .child(tf!("已选 {n} 个", n = n.to_string())),
-                )
-                .child(
-                    Button::new("hub-split-go")
-                        .small()
-                        .primary()
-                        .label(tr("并排查看"))
-                        .tooltip(tr("勾选 2～4 个终端并排查看"))
-                        .disabled(n < term_split::MIN_CELLS)
-                        .on_click(cx.listener(|this, _, window, cx| this.start_split(window, cx))),
-                )
-                .child(
-                    Button::new("hub-split-cancel")
-                        .small()
-                        .label(tr("取消"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.picks.clear();
-                            cx.notify();
-                        })),
-                )
-        });
+        let picking =
+            (!self.picks.is_empty() && self.split.is_none()).then(|| {
+                let n = self.picks.len();
+                h_flex()
+                    .flex_none()
+                    .px(px(10.))
+                    .py(px(7.))
+                    .gap(px(6.))
+                    .border_t_1()
+                    .border_color(border)
+                    .text_size(px(12.))
+                    .child(div().flex_1().min_w_0().truncate().child(
+                        match n < term_split::MIN_CELLS {
+                            true => tf!(
+                                "再选 {more} 个",
+                                more = (term_split::MIN_CELLS - n).to_string()
+                            ),
+                            false => tf!("已选 {n} 个", n = n.to_string()),
+                        },
+                    ))
+                    .child(
+                        Button::new("hub-split-go")
+                            .small()
+                            .primary()
+                            .label(tr("并排查看"))
+                            .tooltip(tr("勾选 2～4 个终端并排查看"))
+                            .disabled(n < term_split::MIN_CELLS)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.start_split(window, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("hub-split-cancel")
+                            .small()
+                            .label(tr("取消"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.picks.clear();
+                                cx.notify();
+                            })),
+                    )
+            });
         let on = self.highlight(side);
         let is_on = |pick: Pick| on.as_ref() == Some(&pick);
         // 「已固定」单独一块，不跟着下面的树滚动，也不受换服务器影响
@@ -4244,6 +4488,7 @@ impl TermOverview {
                     false => tf!("点击画面或按 {key} 输入", key = focus_key).into(),
                 });
         let primary = cx.theme().primary;
+        let can_split = self.has_split_choice(hub);
         let slot = shown.as_ref().map(Row::slot);
         let (for_attach, for_restart) = (slot.clone(), slot);
         // 两个按钮对着哪个仓库（和 `go` 一样）、它在侧栏里列在哪个工作区下面
@@ -4285,6 +4530,16 @@ impl TermOverview {
             }))
             .when(shown.is_some(), |bar| {
                 bar.child(
+                    tool_menu_button(
+                        "hub-split",
+                        IconName::Columns2,
+                        tr("并排"),
+                        (!can_split).then(|| tr("没有其他终端可并排查看")),
+                        cx,
+                    )
+                    .dropdown_menu(split_menu(view.clone(), None)),
+                )
+                .child(
                     tool_button(
                         "hub-attach",
                         IconName::Paperclip,

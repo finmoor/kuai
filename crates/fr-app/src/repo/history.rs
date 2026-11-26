@@ -2196,8 +2196,11 @@ impl RepoView {
             remote: theme.magenta,
         };
         let details = self.render_commit_details(colors, cx);
-        // 并排还是上下排跟着设置走：别的标签页里改了，这里重画时跟上
-        let split = self.app.read(cx).settings.diff_split;
+        // 并排还是上下排跟着设置走：别的标签页里改了，这里重画时跟上。改动区不够宽时暂以上下排显示
+        let split_wanted = self.app.read(cx).settings.diff_split;
+        let split = split_wanted && self.split_fits(self.details_diff_width(cx));
+        let narrow_strip =
+            (split_wanted && !split).then(|| self.narrow_split_strip("details-narrow-split", cx));
         let mode = if split {
             DiffMode::Split
         } else {
@@ -2642,16 +2645,19 @@ impl RepoView {
                                                     .xsmall()
                                                     .ghost()
                                                     .icon(ui::icon(IconName::Columns2))
-                                                    .selected(split)
+                                                    .selected(split_wanted)
                                                     .tooltip(tr(
                                                         "并排显示：左侧为旧版本，右侧为新版本",
                                                     ))
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.toggle_split(cx)
-                                                    })),
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.toggle_split(window, cx)
+                                                        },
+                                                    )),
                                             ),
                                     )
                                     .children(search_bar)
+                                    .children(narrow_strip)
                                     .children(ws_strip)
                                     .child(match image_pane {
                                         Some(pane) => pane,
@@ -2663,12 +2669,19 @@ impl RepoView {
                                                 Diff::new(&self.history.diff)
                                                     .line_number(true)
                                                     .syntax_highlight(true)
+                                                    // 并排时两侧各占一半、长行折行
+                                                    .soft_wrap(split)
                                                     .decorations(search_marks)
                                                     .render_header(move |file, _, _| {
                                                         diff_file_header(file, header_width, muted)
                                                     })
                                                     .size_full(),
                                             )
+                                            .children(split.then(|| {
+                                                self.rewrap_guard(
+                                                    super::diff_tools::SplitAt::History,
+                                                )
+                                            }))
                                             // 按住 Ctrl 滚滚轮调代码字号
                                             .child(crate::zoom::wheel_zoom(self.app.clone()))
                                             .into_any_element(),
