@@ -19,10 +19,10 @@
 <p>
 <a href="https://github.com/finmoor/kuai/releases/latest"><img src="https://img.shields.io/github/v/release/finmoor/kuai?style=flat-square&label=release&color=3b82f6" alt="最新版本"></a>
 <a href="https://github.com/finmoor/kuai/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/finmoor/kuai/ci.yml?branch=main&style=flat-square&label=CI" alt="CI"></a>
-<img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square" alt="Windows 10 | 11">
-<img src="https://img.shields.io/badge/Linux-x86__64-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux x86_64">
-<img src="https://img.shields.io/badge/Rust-GPUI-DEA584?style=flat-square&logo=rust&logoColor=white" alt="Rust + GPUI">
-<a href="#许可证"><img src="https://img.shields.io/badge/license-GPL--3.0-22c55e?style=flat-square" alt="GPL-3.0"></a>
+<img src="assets/badges/windows.svg" alt="Windows 10 | 11">
+<img src="assets/badges/linux.svg" alt="Linux x86_64">
+<img src="assets/badges/rust-gpui.svg" alt="Rust + GPUI">
+<a href="#许可证"><img src="assets/badges/license.svg" alt="GPL-3.0"></a>
 </p>
 
 <p>
