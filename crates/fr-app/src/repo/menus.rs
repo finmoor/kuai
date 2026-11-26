@@ -2116,7 +2116,7 @@ impl RepoView {
 
     // ---------- 远程、子模块 ----------
 
-    fn add_remote_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn add_remote_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ask = Ask {
             title: tr("添加远程").into(),
             placeholder: tr("名称，例如 upstream").into(),

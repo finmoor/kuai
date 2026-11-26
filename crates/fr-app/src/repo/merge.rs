@@ -617,18 +617,20 @@ impl RepoView {
             if range.is_empty() {
                 continue;
             }
-            if view.unresolved(ix, cx) {
-                marks.push(
-                    RangeDecoration::new(range.clone())
-                        .with_style(RangeDecorationStyle::Fill)
-                        .with_color(warning.opacity(0.13)),
-                );
-            }
-            if ix == view.focus {
+            // 只用底色：没解决的是警告色，当前这一处深一些。原来当前这一处还描一圈框，框沿着每一行
+            // 文字的宽度走，右边参差不齐，看着粗糙
+            let focused = ix == view.focus;
+            let color = match (view.unresolved(ix, cx), focused) {
+                (true, true) => Some(warning.opacity(0.24)),
+                (true, false) => Some(warning.opacity(0.13)),
+                (false, true) => Some(primary.opacity(0.12)),
+                (false, false) => None,
+            };
+            if let Some(color) = color {
                 marks.push(
                     RangeDecoration::new(range)
-                        .with_style(RangeDecorationStyle::Frame)
-                        .with_color(primary.opacity(0.7)),
+                        .with_style(RangeDecorationStyle::Fill)
+                        .with_color(color),
                 );
             }
         }

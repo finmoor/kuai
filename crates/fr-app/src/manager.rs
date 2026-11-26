@@ -242,7 +242,8 @@ impl ManagerView {
             files: false,
             directories: true,
             multiple: true,
-            prompt: Some(tr("添加仓库").into()),
+            // 系统选文件夹对话框的确定按钮：和入口的「打开仓库…」「打开本机仓库」说法一致
+            prompt: Some(tr("打开").into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = picked.await else {
@@ -334,7 +335,9 @@ impl ManagerView {
         );
         let passphrase = input("", secret_hint(Auth::Key).into(), true);
         let password = input("", secret_hint(Auth::Password).into(), true);
-        let name = input(&old.name, tr("默认使用主机名").into(), false);
+        // 提示起个名字（几台 VPS 都显示成 IP 时分不清）。框只有 190 宽，写短；留空用的是主机地址，
+        // 原来写「默认使用主机名」不对
+        let name = input(&old.name, tr("例如 生产服务器").into(), false);
         let start_dir = input(
             old.start_dir.as_deref().unwrap_or_default(),
             tr("留空则为主目录").into(),
@@ -528,7 +531,7 @@ impl ManagerView {
                             cx.update(|window, cx| {
                                 match done {
                                     Err(text) => {
-                                        window.push_notification(Notification::error(text), cx)
+                                        window.push_notification(Notification::error(text).autohide(false), cx)
                                     }
                                     Ok(()) if unbound && !forgot => {
                                         let text = match auth {
@@ -844,7 +847,15 @@ impl ManagerView {
                     }
                 })
                 .w(px(560.))
+                // 矮的屏幕（150% 缩放的 13 寸笔记本只有 700 来高）上表单放不下：内容区按窗口高度
+                // 限高、可以滚动，按钮一直在下面。原来最后一行被按钮切掉一半
                 .child(
+                    div()
+                        .id("host-form-scroll")
+                        .max_h((window.viewport_size().height - px(230.)).max(px(240.)))
+                        .overflow_y_scroll()
+                        .pr(px(4.))
+                        .child(
                     v_flex()
                         .gap_3()
                         // 主机要满足的条件先说：ARM 的主机、git 太旧的主机连上了也用不了
@@ -998,6 +1009,7 @@ impl ManagerView {
                             },
                         ))
                         .children(mapping_section),
+                        ),
                 )
                 .footer(
                     DialogFooter::new()
@@ -2741,12 +2753,12 @@ impl ManagerView {
             .small()
             .ghost()
             .icon(ui::icon(IconName::Ellipsis))
-            .tooltip(tr("映射或移除此主机"))
-            .dropdown_menu(move |menu, _, _| {
+            .tooltip(tr("映射、端口转发或移除此主机"))
+            .dropdown_menu(move |menu, _, cx| {
                 let (app, remove) = (menu_app.clone(), server.clone());
                 let removal_note = removal_note.clone();
                 let (map_app, map_server) = (menu_app.clone(), server.clone());
-                menu.item(PopupMenuItem::new(tr("映射目录到本机…")).on_click(
+                let mut menu = menu.item(PopupMenuItem::new(tr("映射目录到本机…")).on_click(
                     move |_, window, cx| {
                         crate::mapping::map_dialog(
                             map_app.clone(),
@@ -2757,35 +2769,51 @@ impl ManagerView {
                             cx,
                         )
                     },
-                ))
-                .separator()
-                .item(
-                    PopupMenuItem::new(tr("移除…")).on_click(move |_, window, cx| {
-                        let (app, id) = (app.clone(), remove.id.clone());
-                        // 仓库列表保存在服务器上，不跟着没；这里只是不再连它
-                        let repos = match repo_count {
-                            Some(n) if n > 0 => tf!(
-                                "该主机上的 {n} 个仓库将不再列出，已打开的标签页将关闭。",
-                                n = n
-                            ),
-                            _ => String::new(),
-                        };
-                        confirm(
-                            tf!("移除主机 {name}？", name = remove.name),
-                            tf!(
-                                "{destination}\n{jump}{repos}主机上的内容不受影响。",
-                                destination = remove.destination,
-                                jump = &removal_note,
-                                repos = repos
-                            ),
-                            tr("移除主机"),
-                            true,
-                            window,
-                            cx,
-                            move |cx| app.update(cx, |app, cx| app.remove_server(&id, cx)),
+                ));
+                // 正在转发的端口（终端里点了主机上的 localhost 网址转过来的）：列出来，可以停掉
+                let forwards = crate::port_forward::active(&server.id, cx);
+                if !forwards.is_empty() {
+                    menu = menu.separator();
+                    for (port, local) in forwards {
+                        let id = server.id.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(tf!(
+                                "停止转发端口 {port}（本机 localhost:{local}）",
+                                port,
+                                local
+                            ))
+                            .on_click(move |_, _, cx| crate::port_forward::stop(&id, port, cx)),
                         );
-                    }),
-                )
+                    }
+                }
+                menu.separator()
+                    .item(
+                        PopupMenuItem::new(tr("移除…")).on_click(move |_, window, cx| {
+                            let (app, id) = (app.clone(), remove.id.clone());
+                            // 仓库列表保存在服务器上，不跟着没；这里只是不再连它
+                            let repos = match repo_count {
+                                Some(n) if n > 0 => tf!(
+                                    "该主机上的 {n} 个仓库将不再列出，已打开的标签页将关闭。",
+                                    n = n
+                                ),
+                                _ => String::new(),
+                            };
+                            confirm(
+                                tf!("移除主机 {name}？", name = remove.name),
+                                tf!(
+                                    "{destination}\n{jump}{repos}主机上的内容不受影响。",
+                                    destination = remove.destination,
+                                    jump = &removal_note,
+                                    repos = repos
+                                ),
+                                tr("移除主机"),
+                                true,
+                                window,
+                                cx,
+                                move |cx| app.update(cx, |app, cx| app.remove_server(&id, cx)),
+                            );
+                        }),
+                    )
             })
             .into_any_element()
     }

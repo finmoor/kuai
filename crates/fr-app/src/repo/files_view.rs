@@ -130,12 +130,25 @@ impl RepoView {
                 false => tr("正在连接…"),
             };
             note(text.into(), muted).into_any_element()
+        } else if count == 0 && filtering {
+            note(tr("没有匹配的文件").into(), muted).into_any_element()
         } else if count == 0 {
-            let text = match filtering {
-                true => tr("没有匹配的文件"),
-                false => tr("此目录为空"),
-            };
-            note(text.into(), muted).into_any_element()
+            // 空仓库：看得见的地方给「新建文件…」，原来只有在空白处右键才有
+            v_flex()
+                .child(note(tr("此目录为空").into(), muted))
+                .child(
+                    div().px(px(16.)).pt(px(8.)).child(
+                        Button::new("files-empty-new")
+                            .small()
+                            .icon(ui::icon(IconName::FilePlus))
+                            .label(tr("新建文件…"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let dir = this.target_dir();
+                                this.new_file_dialog(dir, window, cx);
+                            })),
+                    ),
+                )
+                .into_any_element()
         } else {
             uniform_list(
                 "files-tree",
@@ -1448,11 +1461,42 @@ impl RepoView {
             .into_any_element()
     }
 
-    /// 没有打开文件时右边的样子。
+    /// 没有打开文件时右边的样子。仓库还是空的（目录树读完了、一个文件都没有）时说「此目录为空」、
+    /// 给「新建文件…」：原来这里写「在左侧选择文件」，左边却什么都没有。
     fn render_files_empty(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let (muted, fg) = (theme.muted_foreground, theme.foreground);
         let remote = self.entry.server.is_some();
+        if self.files.loaded && !self.files.filtering() && self.files.rows().is_empty() {
+            return v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap(px(14.))
+                .child(
+                    Icon::new(IconName::Files)
+                        .size_8()
+                        .text_color(muted.opacity(0.5)),
+                )
+                .child(
+                    div()
+                        .text_size(px(15.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(fg)
+                        .child(tr("此目录为空")),
+                )
+                .child(
+                    Button::new("files-empty-new-main")
+                        .primary()
+                        .icon(ui::icon(IconName::FilePlus))
+                        .label(tr("新建文件…"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let dir = this.target_dir();
+                            this.new_file_dialog(dir, window, cx);
+                        })),
+                )
+                .into_any_element();
+        }
         // 写现在的键（设置 → 快捷键里改过的跟着变）；去掉了的不写
         let hint = |id: &str, text: &'static str| {
             let keys = crate::keymap::label(id, cx)?;

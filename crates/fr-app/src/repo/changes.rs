@@ -111,7 +111,7 @@ pub(super) struct Changes {
     amend_pushed_task: Option<Task<()>>,
     /// 提交时用的作者（`git var GIT_AUTHOR_IDENT` 读到的名称和邮箱）。外层 None 是还没读，
     /// 里层 None 是没设置（提交会失败）
-    author: Option<Option<(String, String)>>,
+    pub(super) author: Option<Option<(String, String)>>,
     author_task: Option<Task<()>>,
     /// 窗口窄、提交框收成一行时点了展开
     pub(super) commit_expanded: bool,
@@ -1892,14 +1892,61 @@ impl RepoView {
         }));
     }
 
+    /// 合并停下来（有冲突）时，把 git 准备好的合并说明（`MERGE_MSG`，去掉 `#` 开头的注释行）填进
+    /// 提交说明框，框里已经有字就不动。「提交合并」用的是框里的说明（见 `continue_in_progress`），
+    /// 这样看得见、能改；原来框是空的，一点就用默认说明提交了。
+    pub(super) fn prefill_merge_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.changes.message_text(cx).is_empty() {
+            return;
+        }
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        let repo = self.entry.path.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let where_ = ["rev-parse", "--git-path", "MERGE_MSG"].map(String::from);
+            let path = channel.git(&repo, where_.to_vec()).await.ok()?;
+            let path = String::from_utf8_lossy(&path.stdout).trim().to_string();
+            if path.is_empty() {
+                return None;
+            }
+            let out = channel
+                .git(&repo, fr_core::workfile::read_args(&path))
+                .await
+                .ok()
+                .filter(|out| out.success())?;
+            let (_, body) = fr_core::workfile::split_read(&out.stdout)?;
+            let message = String::from_utf8_lossy(body)
+                .lines()
+                .filter(|line| !line.starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
+            this.update_in(cx, |this, window, cx| {
+                if !message.is_empty() && this.changes.message_text(cx).is_empty() {
+                    let message = message.clone();
+                    this.changes
+                        .message
+                        .update(cx, |input, cx| input.set_value(message, window, cx));
+                }
+            })
+            .ok()
+        })
+        .detach();
+    }
+
     /// 设置提交作者：默认只写这个仓库的配置，勾选后写主机上的全局配置。`note` 是对话框下面那行说明。
-    fn author_dialog(
+    pub(super) fn author_dialog(
         &mut self,
         note: Option<&'static str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let (name, email) = self.changes.author.clone().flatten().unwrap_or_default();
+        // 这台主机上还没设过作者（全局的也没有，`git var` 认不出来）：默认写全局配置，换个仓库不用
+        // 再设一次；已经有作者、来改的，默认还是只改这个仓库
+        let unset = matches!(self.changes.author, Some(None));
         let ask = super::dialogs::Ask {
             title: tr("设置提交作者").into(),
             placeholder: tr("名称").into(),
@@ -1908,11 +1955,11 @@ impl RepoView {
             second_value: email,
             hint: note
                 .unwrap_or(tr(
-                    "默认只用于此仓库。勾选后写入该主机的全局配置，用于主机上的所有仓库。",
+                    "勾选时写入该主机的全局配置，用于主机上的所有仓库；不勾选则只用于此仓库。",
                 ))
                 .into(),
             ok: tr("保存"),
-            checks: vec![(tr("用于该主机上的所有仓库").into(), false)],
+            checks: vec![(tr("用于该主机上的所有仓库").into(), unset)],
             validate: Some(Box::new(|_, answer| {
                 answer
                     .second
@@ -2818,8 +2865,13 @@ impl RepoView {
             diff.highlight(&cx.theme().highlight_theme, dark);
         }
         if self.changes.diff.is_none() {
+            let unborn = self.status.as_ref().is_some_and(|s| s.head.is_none());
             let text = if self.changes.unstaged.is_empty() && self.changes.staged.is_empty() {
-                tr("工作区和暂存区均无改动")
+                // 新仓库落在这里（还没有提交）：说下一步
+                match unborn {
+                    true => tr("尚无提交。新建或修改文件后，在此暂存并提交。"),
+                    false => tr("工作区和暂存区均无改动"),
+                }
             } else if self.changes.selected.is_some() {
                 tr("正在读取改动…")
             } else {

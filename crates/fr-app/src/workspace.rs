@@ -27,6 +27,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use fr_core::i18n::{self, tr, trc};
 use fr_core::tf;
@@ -352,7 +353,7 @@ impl Workspace {
                 this.apply_settings(window, cx);
             }),
             // 最小化到托盘：窗口失去焦点时看一眼是不是最小化了。
-            // 窗口不在前台时，显示着的终端不算「正看着」：重画一遍，把这个告诉 `board`
+            // 窗口不在前台时，显示着的终端不算「正看着」：当场告诉 `board`，不等重画（见 `sync_shown`）
             cx.observe_window_activation(window, |this, window, cx| {
                 if !window.is_window_active() {
                     this.hide_if_minimized(cx);
@@ -362,6 +363,12 @@ impl Workspace {
                     // 断网、睡眠后在等着重连的主机马上试一次，不用等到下一次（最多 30 秒）
                     this.app.update(cx, |app, cx| app.retry_now(cx));
                 }
+                this.sync_shown(window, cx);
+                cx.notify();
+            }),
+            // 窗口藏起来、最小化了（没失去焦点也算，比如桌面上只剩它一个窗口）：同上
+            cx.observe_window_visibility(window, |this, _, window, cx| {
+                this.sync_shown(window, cx);
                 cx.notify();
             }),
             // 标题栏上「会话」那一项的个数跟着变；会话页里换了选中的，也要重新告诉 `board`
@@ -410,6 +417,48 @@ impl Workspace {
                 this.board.update(cx, |board, _| board.save_memory());
                 async {}
             }),
+            // 连上时用的是在弹窗里输入的密码、口令：问要不要存下来，以后连接不再问
+            cx.subscribe_in(
+                &app,
+                window,
+                |_, app, typed: &crate::app_state::SecretTyped, window, cx| {
+                    let name = app.read(cx).machine_name(&typed.id).to_string();
+                    let text = match typed.passphrase {
+                        true => tf!("已连接 {name}。保存私钥口令后，以后连接不再询问。", name),
+                        false => tf!("已连接 {name}。保存登录密码后，以后连接不再询问。", name),
+                    };
+                    let (app, id) = (app.clone(), typed.id.clone());
+                    let note = Notification::info(text).action(move |_, _, cx| {
+                        let (app, id, note) = (app.clone(), id.clone(), cx.entity().downgrade());
+                        Button::new("save-typed-secret")
+                            .small()
+                            .primary()
+                            .label(tr("保存"))
+                            .on_click(move |_, window, cx| {
+                                note.update(cx, |note, cx| note.dismiss(window, cx)).ok();
+                                let saving = app.update(cx, |app, cx| app.save_typed_secret(&id, cx));
+                                window
+                                    .spawn(cx, async move |cx| {
+                                        let result = saving.await;
+                                        cx.update(|window, cx| {
+                                            let note = match result {
+                                                Ok(()) => Notification::success(tr("已保存")),
+                                                Err(err) => Notification::error(tf!(
+                                                    "保存失败：{err}",
+                                                    err
+                                                ))
+                                                .autohide(false),
+                                            };
+                                            window.push_notification(note, cx);
+                                        })
+                                        .ok();
+                                    })
+                                    .detach();
+                            })
+                    });
+                    window.push_notification(note, cx);
+                },
+            ),
             // 映射那边要说的话（映射上了、没成、写入落不到服务器）
             cx.subscribe_in(
                 &app,
@@ -442,8 +491,14 @@ impl Workspace {
                                     })
                             })
                         }
-                        crate::mapping::Notice::InstallFailed => {
-                            let text = tr("WinFsp 安装未完成。");
+                        crate::mapping::Notice::InstallFailed
+                        | crate::mapping::Notice::NoWinget => {
+                            let text = match notice {
+                                crate::mapping::Notice::NoWinget => tr(
+                                    "未找到 winget，无法自动安装 WinFsp。请从 WinFsp 官网下载安装，然后重新映射。",
+                                ),
+                                _ => tr("WinFsp 安装未完成。"),
+                            };
                             Notification::error(text).action(move |_, _, cx| {
                                 let note = cx.entity().downgrade();
                                 Button::new("winfsp-download")
@@ -762,9 +817,30 @@ impl Workspace {
             Some(hwnd) => {
                 self.tucked.set(true);
                 cx.spawn(async move |_, _| win::hide(hwnd)).detach();
+                self.tray_tip_once(cx);
             }
             None => window.minimize_window(),
         }
+    }
+
+    /// 第一次收进托盘：发一条系统通知，说 Kuai 还在运行、怎么叫回来（只发一次，记在设置里）。
+    /// Windows 默认把托盘图标收在任务栏右下角的「^」里，第一次用的人以为程序没了。
+    fn tray_tip_once(&self, cx: &mut Context<Self>) {
+        if self.app.read(cx).settings.tray_tip_shown {
+            return;
+        }
+        self.app.update(cx, |app, cx| {
+            app.update_settings(cx, |s| s.tray_tip_shown = true)
+        });
+        let body = match cfg!(windows) {
+            true => tr("点击任务栏右下角的 Kuai 图标即可恢复窗口，图标可能收在「^」中。"),
+            false => tr("点击系统托盘中的 Kuai 图标即可恢复窗口。"),
+        };
+        self.toast_job(ToastJob::Show {
+            key: TRAY_TOAST.to_string(),
+            title: tr("Kuai 已收进托盘，仍在运行").to_string(),
+            body: body.to_string(),
+        });
     }
 
     /// 点了关闭：返回要不要真的关（关了主窗口就退出）。设了关闭到托盘、托盘也在的，把窗口藏起来
@@ -1061,6 +1137,7 @@ impl Workspace {
         {
             self.tucked.set(true);
             win::hide(hwnd);
+            self.tray_tip_once(cx);
         }
     }
 
@@ -2019,14 +2096,14 @@ impl Workspace {
         log::info!(
             "提醒终端待查看：{}，窗口{}",
             path,
-            if window.is_window_active() {
+            if in_front(window) {
                 "在前台"
             } else {
                 "不在前台"
             }
         );
         window.push_notification(note, cx);
-        if window.is_window_active() {
+        if in_front(window) {
             return;
         }
         // 闪任务栏上的按钮也会让系统当场给窗口发消息，同样放到这一轮更新之外（道理见 `toasts`）
@@ -2073,7 +2150,7 @@ impl Workspace {
             })
             .autohide(true);
         window.push_notification(note, cx);
-        if !window.is_window_active() && system {
+        if !in_front(window) && system {
             self.toast_job(ToastJob::Show {
                 key: AWAY_TOAST.to_string(),
                 title: text,
@@ -2094,10 +2171,24 @@ impl Workspace {
         self.toast_jobs.unbounded_send(job).ok();
     }
 
-    /// 现在正显示着哪个终端：窗口在前台时，会话页里选中的（正往里输入的另算），或者当前标签页的
-    /// 终端页上那个。
+    /// 正显示着哪个终端变了：告诉 `board`（显示着的算看过，停下了不提醒）。
+    ///
+    /// 平时在 `render` 里做；窗口失去焦点、藏起来、最小化时由窗口的回调当场做一次：最小化和藏进
+    /// 托盘以后窗口不再重画（GPUI 在最小化时收起重画的回调，藏起来的窗口收不到 `WM_PAINT`），
+    /// 只靠 `render` 的话会一直当作有人在看，停下了也不提醒。
+    fn sync_shown(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let shown = self.shown_terminal(window, cx);
+        if shown != self.told_shown {
+            self.told_shown = shown.clone();
+            let board = self.board.clone();
+            cx.defer(move |cx| board.update(cx, |board, cx| board.set_shown(shown, cx)));
+        }
+    }
+
+    /// 现在正显示着哪个终端：窗口在前台、看得见时，会话页里选中的（正往里输入的另算），或者当前
+    /// 标签页的终端页上那个。
     fn shown_terminal(&self, window: &Window, cx: &App) -> Option<Shown> {
-        if !window.is_window_active() || self.showing_settings {
+        if !in_front(window) || self.showing_settings {
             return None;
         }
         if self.page == Page::Terms {
@@ -2697,18 +2788,8 @@ impl Workspace {
             .pt(px(56.))
             .px(px(16.))
             .overflow_y_scroll()
-            .child(
-                div()
-                    .size(px(68.))
-                    .mb(px(14.))
-                    .rounded(px(18.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(primary.opacity(0.13))
-                    .text_color(primary)
-                    .child(Icon::new(IconName::Server).size(px(30.))),
-            )
+            // Kuai 的标志（和程序图标同一张图）；原来是「主机」图标，和下面第一张卡片的重复
+            .child(img(kuai_logo()).size(px(68.)).mb(px(14.)))
             .child(
                 div()
                     .text_size(px(24.))
@@ -2723,7 +2804,7 @@ impl Workspace {
                     .mb(px(26.))
                     .text_center()
                     .child(tr(
-                        "在远程主机上用 Git、终端和文件，运行 Claude Code 等 agent。",
+                        "在远程主机上用 Git、终端和文件，运行 Claude Code 等 AI 助手。",
                     )),
             )
             .child(
@@ -3631,6 +3712,8 @@ struct AwayNote;
 
 /// 「离开期间有新输出」那条系统通知的键（点了到会话页只看待查看的）。
 const AWAY_TOAST: &str = "away";
+/// 第一次收进托盘时那条说明的标记（点了只把窗口叫回来）。
+const TRAY_TOAST: &str = "tray";
 
 /// 交给发系统通知的那个任务做的事（见 `Workspace::toasts`）。
 enum ToastJob {
@@ -3644,6 +3727,24 @@ enum ToastJob {
     Clear,
 }
 
+/// Kuai 的标志：和程序图标同一张图，只解一次。
+fn kuai_logo() -> Arc<Image> {
+    static LOGO: std::sync::OnceLock<Arc<Image>> = std::sync::OnceLock::new();
+    LOGO.get_or_init(|| {
+        Arc::new(Image::from_bytes(
+            ImageFormat::Png,
+            include_bytes!("../assets/icon.png").to_vec(),
+        ))
+    })
+    .clone()
+}
+
+/// 窗口在用户眼前：激活着，而且看得见。最小化、藏进托盘的不算，哪怕还激活着（桌面上只剩它一个
+/// 窗口时最小化不一定失去激活）。
+fn in_front(window: &Window) -> bool {
+    window.is_window_active() && window.visibility() != WindowVisibility::Hidden
+}
+
 fn stopped_note_key(id: &TermId) -> SharedString {
     format!("{}/{}", id.machine, id.term).into()
 }
@@ -3651,13 +3752,7 @@ fn stopped_note_key(id: &TermId) -> SharedString {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title_bar = self.render_title_bar(window, cx).into_any_element();
-        // 正显示着哪个终端变了：告诉 `board`（显示着的算看过，停下了不提醒）
-        let shown = self.shown_terminal(window, cx);
-        if shown != self.told_shown {
-            self.told_shown = shown.clone();
-            let board = self.board.clone();
-            cx.defer(move |cx| board.update(cx, |board, cx| board.set_shown(shown, cx)));
-        }
+        self.sync_shown(window, cx);
         let theme = cx.theme();
         let (bg, fg) = (theme.background, theme.foreground);
         let content = if self.welcome(cx) {

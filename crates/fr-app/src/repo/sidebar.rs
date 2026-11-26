@@ -528,12 +528,13 @@ impl RepoView {
                             .text_color(muted),
                     )
                 }),
-            // 没加入工作区：描边的小按钮「+ 添加到工作区」，看得出能点
+            // 没加入工作区：描边的小按钮「+ 工作区」，看得出能点；说明在悬停提示里。原来写「添加到
+            // 工作区」，后面的主机、路径就只剩「本机 · C…」
             None => h_flex()
                 .gap(px(3.))
                 .text_color(fg.opacity(0.85))
                 .child(gpui_kit::component::Icon::new(IconName::Plus).size(px(10.)))
-                .child(tr("添加到工作区")),
+                .child(trc("加入", "工作区")),
         };
         let joined = !homes.is_empty();
         let button = Button::new("side-home")

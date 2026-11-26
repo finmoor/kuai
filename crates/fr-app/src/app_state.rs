@@ -62,6 +62,15 @@ pub struct HostConnected(pub String);
 
 impl EventEmitter<HostConnected> for AppState {}
 
+/// 连上了一台主机，用的是这次在弹窗里输入的密码（`passphrase` 时是私钥口令）：问一下要不要存下来，
+/// 以后连接不再问（见 [`AppState::save_typed_secret`]）。键是主机的 id。
+pub struct SecretTyped {
+    pub id: String,
+    pub passphrase: bool,
+}
+
+impl EventEmitter<SecretTyped> for AppState {}
+
 pub struct AppState {
     pub settings: Settings,
     conns: HashMap<String, Connecting>,
@@ -102,6 +111,9 @@ pub struct AppState {
     pub(crate) machine_ids: HashMap<String, String>,
     /// 启动时读设置文件出的问题（见 [`settings::LoadIssue`]）
     pub(crate) load_issue: Option<settings::LoadIssue>,
+    /// 连上时用的、在弹窗里输入的密码或口令，等用户点「保存」（见 [`SecretTyped`]）。只在内存里，
+    /// 下次连接这台时换掉
+    typed_secrets: HashMap<String, String>,
 }
 
 impl AppState {
@@ -130,6 +142,7 @@ impl AppState {
             menu_machine: None,
             local_machine: None,
             machine_ids: HashMap::new(),
+            typed_secrets: HashMap::new(),
         };
         this.start_machines(cx);
         this
@@ -137,6 +150,49 @@ impl AppState {
 
     pub fn server(&self, id: &str) -> Option<&Server> {
         self.settings.server(id)
+    }
+
+    /// 连上了：用的是弹窗里输入的密码、口令（存着的答得上就不会弹窗，所以输入过就是没存或存的不对），
+    /// 而且和这台主机现在的登录方式对得上，就留在内存里，发 [`SecretTyped`] 问要不要存。原来重装、
+    /// 凭据被删以后每次启动都要输，弹窗里也没有「记住」。
+    fn offer_typed_secret(
+        &mut self,
+        id: &str,
+        typed: &fr_channel::TypedSecret,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((kind, secret)) = typed.lock().unwrap().clone() else {
+            return;
+        };
+        let Some(server) = self.server(id) else {
+            return;
+        };
+        let passphrase = match (server.auth, kind) {
+            (Auth::Password, fr_core::askpass::PromptKind::Password) => false,
+            (Auth::Key, fr_core::askpass::PromptKind::Passphrase) => true,
+            _ => return,
+        };
+        self.typed_secrets.insert(id.to_string(), secret);
+        cx.emit(SecretTyped {
+            id: id.to_string(),
+            passphrase,
+        });
+    }
+
+    /// 把连上时输入的密码、口令存进凭据管理器（系统钥匙圈）。存在后台做：Linux 上钥匙圈锁着时会
+    /// 弹系统的框等用户。
+    pub fn save_typed_secret(
+        &mut self,
+        id: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), String>> {
+        let (Some(server), Some(secret)) =
+            (self.server(id).cloned(), self.typed_secrets.remove(id))
+        else {
+            return Task::ready(Err(tr("未找到要保存的密码").to_string()));
+        };
+        cx.background_executor()
+            .spawn(async move { crate::secrets::set(&server, &secret) })
     }
 
     /// 正在连接时显示的那句话：经跳板机的写明走到哪一台了。
@@ -322,6 +378,9 @@ impl AppState {
             }
         })
         .detach();
+        // 这次连接里用户在弹窗里输入的目标服务器的密码、口令（经别的电脑转接的不记）：连上以后问要不要存
+        let typed = fr_channel::TypedSecret::default();
+        self.typed_secrets.remove(id);
         let connecting = match split_relay(id) {
             Some((via, server)) => {
                 // 自己在重连的（不许问人）：转接的那台也照这样连，那边的 ssh 也不许问（见
@@ -364,6 +423,7 @@ impl AppState {
                 let route: Vec<Server> = self.settings.route(id).into_iter().cloned().collect();
                 let slot = failure_slot.clone();
                 let executor = cx.background_executor().clone();
+                let typed = typed.clone();
                 cx.background_executor()
                     .spawn(async move {
                         let server =
@@ -372,6 +432,7 @@ impl AppState {
                         options.jumps = route.iter().map(jump_options).collect();
                         options.on_stage = (!route.is_empty()).then_some(on_stage);
                         options.no_prompt = no_prompt;
+                        options.typed = typed;
                         let mut retry = 0;
                         loop {
                             // 等的时候主机被改了、删了：不再按旧的设置连
@@ -443,6 +504,7 @@ impl AppState {
                 if let Some(Ok(conn)) = this.conns.get(&id).and_then(|c| c.peek()) {
                     let conn = conn.clone();
                     this.last_failures.remove(&id);
+                    this.offer_typed_secret(&id, &typed, cx);
                     this.learn_machine(&id, &conn.hello.machine, cx);
                     // 浏览器里开着的这台主机上的网页：之后的请求经新连接读
                     crate::web_serve::connected(&id, &Channel::Remote(conn.clone()));

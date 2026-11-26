@@ -50,6 +50,11 @@ use crate::terminal;
 pub const QUIET: Duration = Duration::from_secs(10);
 /// 重新算一遍状态的间隔
 const TICK: Duration = Duration::from_secs(1);
+/// 每隔几秒问一次各台主机的 kuaid 还在不在（心跳，见 [`TermBoard::heartbeat`]）
+const BEAT_EVERY: u32 = 5;
+/// 心跳多久没回算连接不稳。ssh 自己要 30 秒才认定断了（`ServerAliveInterval=10`、`CountMax=3`），
+/// 这半分钟里画面停着、状态写「静默」，看不出是断网
+const BEAT_TIMEOUT: Duration = Duration::from_secs(8);
 /// 状态没变也隔这么多次重画一遍：界面上「静默了多久」的字要跟着走
 const REDRAW_EVERY: u32 = 30;
 /// 「看过」有变化时隔这么多次存一次盘
@@ -403,6 +408,10 @@ pub struct TermBoard {
     watches: HashMap<String, (Arc<Connection>, Task<()>)>,
     /// 断开了、列表还留着的主机（上面的终端状态未知）
     offline: HashSet<String>,
+    /// 心跳发出去还没回的：哪台、什么时候发的、经哪个连接发的
+    beats: HashMap<String, (Instant, Arc<Connection>)>,
+    /// 心跳超过 [`BEAT_TIMEOUT`] 没回的主机：还没断开，但多半不通了（上面的终端状态未知，不提醒）
+    unstable: HashSet<String>,
     /// 这次运行中断开的主机：断开的时刻（Unix 毫秒）；重连以后比它晚的输出算离开期间的
     until: HashMap<String, u64>,
     seen: HashMap<TermId, Instant>,
@@ -449,7 +458,9 @@ impl TermBoard {
                 count += 1;
                 let redraw = count % REDRAW_EVERY == 0;
                 let save = count % SAVE_EVERY == 0;
+                let beat = count % BEAT_EVERY == 0;
                 let done = this.update(cx, |this, cx| {
+                    this.heartbeat(beat, cx);
                     this.recompute(cx);
                     if redraw && !this.lists.is_empty() {
                         cx.notify();
@@ -468,6 +479,8 @@ impl TermBoard {
             lists: HashMap::new(),
             watches: HashMap::new(),
             offline: HashSet::new(),
+            beats: HashMap::new(),
+            unstable: HashSet::new(),
             until: HashMap::new(),
             seen: HashMap::new(),
             away: HashSet::new(),
@@ -540,6 +553,9 @@ impl TermBoard {
                         .ok();
                 }
             });
+            // 新接上的连接：旧连接上的心跳、「连接不稳」不算了
+            self.beats.remove(&key);
+            self.unstable.remove(&key);
             self.watches.insert(key, (conn, task));
             changed = true;
         }
@@ -582,6 +598,8 @@ impl TermBoard {
     fn forget(&mut self, machine: &str) {
         self.lists.remove(machine);
         self.offline.remove(machine);
+        self.unstable.remove(machine);
+        self.beats.remove(machine);
         self.until.remove(machine);
         self.seen.retain(|id, _| id.machine != machine);
         self.away.retain(|id| id.machine != machine);
@@ -843,7 +861,8 @@ impl TermBoard {
         let mut changed = false;
         let mut waiting = Vec::new();
         for (machine, list) in &self.lists {
-            let online = !self.offline.contains(machine);
+            // 心跳超时的也当状态未知：画面停着不是终端停了，不能算「待查看」去提醒
+            let online = !self.offline.contains(machine) && !self.unstable.contains(machine);
             for item in list {
                 let id = TermId {
                     machine: machine.clone(),
@@ -998,6 +1017,72 @@ impl TermBoard {
     /// 这台主机断开了、列表还留着（上面的终端状态未知）。
     pub fn is_offline(&self, machine: &str) -> bool {
         self.offline.contains(machine)
+    }
+
+    /// 这台主机的心跳超时了：还连着，但多半不通（见 [`Self::heartbeat`]）。
+    pub fn is_unstable(&self, machine: &str) -> bool {
+        self.unstable.contains(machine) && !self.offline.contains(machine)
+    }
+
+    /// 心跳：每秒看一眼发出去的有没有超时（超时的标成连接不稳），`send` 时给没在等的主机各发一个。
+    /// 回了就去掉标记。只问订阅着终端列表的主机（本机的 kuaid 也问：它卡住了一样看不出来）。
+    fn heartbeat(&mut self, send: bool, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        // 换了连接、不订阅了的：那次心跳不算了
+        let watches = &self.watches;
+        self.beats.retain(|key, (_, conn)| {
+            watches
+                .get(key)
+                .is_some_and(|(current, _)| Arc::ptr_eq(current, conn))
+        });
+        let late: HashSet<String> = (self.beats.iter())
+            .filter(|(_, (sent, _))| now.duration_since(*sent) >= BEAT_TIMEOUT)
+            .map(|(key, _)| key.clone())
+            .collect();
+        let before = self.unstable.len();
+        self.unstable.retain(|key| self.watches.contains_key(key));
+        for key in &late {
+            if self.unstable.insert(key.clone()) {
+                log::info!(
+                    "{key} 的心跳 {} 秒没有回应，标为连接不稳",
+                    BEAT_TIMEOUT.as_secs()
+                );
+            }
+        }
+        if self.unstable.len() != before || !late.is_empty() {
+            cx.notify();
+        }
+        if !send {
+            return;
+        }
+        let idle: Vec<(String, Arc<Connection>)> = (self.watches.iter())
+            .filter(|(key, _)| !self.beats.contains_key(*key))
+            .map(|(key, (conn, _))| (key.clone(), conn.clone()))
+            .collect();
+        for (key, conn) in idle {
+            self.beats.insert(key.clone(), (now, conn.clone()));
+            let ping = conn.ping();
+            cx.spawn(async move |this, cx| {
+                let answered = ping.await.is_ok();
+                this.update(cx, |this, cx| {
+                    // 还是这一次的心跳（没换连接）才算
+                    let current = (this.beats.get(&key))
+                        .is_some_and(|(_, sent_on)| Arc::ptr_eq(sent_on, &conn));
+                    if !current {
+                        return;
+                    }
+                    this.beats.remove(&key);
+                    // 回了错（连接断了）：交给订阅断开那边去标「未连接」
+                    if answered && this.unstable.remove(&key) {
+                        log::info!("{key} 的心跳恢复了");
+                        this.recompute(cx);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
     }
 
     /// 订阅那台电脑用的连接（预览经它接上终端）。

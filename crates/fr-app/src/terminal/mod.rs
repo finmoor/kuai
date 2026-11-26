@@ -855,7 +855,21 @@ impl TerminalView {
     fn build(launcher: Option<Launcher>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         let subscriptions = vec![
-            cx.on_focus(&focus, window, |this, _, cx| this.focus_changed(true, cx)),
+            cx.on_focus(&focus, window, |this, window, cx| {
+                // 设置里开着：中文输入法切到英文模式，敲命令不会先变成拼音候选（「给i他log」）。
+                // 等一下再切：GPUI 画下一帧时才把输入法上下文关联到窗口上（有地方接收文字时才关联），
+                // 焦点刚进来就切的话还没有上下文，切了不算数（实测）
+                if prefs::get(cx).ime_english
+                    && let Some(hwnd) = crate::win::hwnd(window)
+                {
+                    cx.spawn(async move |_, cx| {
+                        cx.background_executor().timer(IME_SWITCH_DELAY).await;
+                        crate::win::ime_english(hwnd);
+                    })
+                    .detach();
+                }
+                this.focus_changed(true, cx)
+            }),
             cx.on_blur(&focus, window, |this, _, cx| this.focus_changed(false, cx)),
             // 终端的设置变了：往回翻的行数、光标的样子交给仿真器，字体、字号重画时就用上了
             cx.observe_global::<prefs::Prefs>(|this, cx| this.prefs_changed(cx)),
@@ -1266,7 +1280,14 @@ impl TerminalView {
             | TermEvent::TextAreaSizeRequest(_)
                 if self.watch.is_some() => {}
             TermEvent::PtyWrite(text) => self.write(text.into_bytes()),
-            TermEvent::Title(title) => self.title = Some(title.into()),
+            TermEvent::Title(title) => {
+                // 提示过「程序没装」，后来程序起来了（自己装好后再运行的，它改了终端的标题，不再是
+                // shell 的）：提示条用不着了，收起
+                if self.missing.is_some() && !crate::presets::shell_title(&title) {
+                    self.missing = None;
+                }
+                self.title = Some(title.into());
+            }
             TermEvent::ResetTitle => self.title = None,
             TermEvent::ClipboardStore(_, text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -1403,8 +1424,15 @@ impl TerminalView {
         };
         if lines.iter().any(|line| not_found_line(line, &word)) {
             self.run_check = None;
+            let (remote, windows) = (session.is_remote(), session.on_windows());
             log::info!("预设「{name}」的程序在主机上找不到");
-            self.missing = Some(missing_tool(&word, &name));
+            self.missing = Some(missing_tool(&word, &name, remote, windows));
+            // 程序没起来，这个终端只是个 shell：不再算这个预设的，不叫它的名字（原来标签页、会话页
+            // 一直写着「Claude Code」），重启时也不再输入那条命令
+            if let Some(slot) = &self.run_slot {
+                crate::presets::remember(slot.clone(), None, cx);
+            }
+            self.run = None;
             cx.notify();
         }
     }
@@ -2301,29 +2329,79 @@ fn not_found_line(line: &str, word: &str) -> bool {
             || lower.contains("不是内部或外部命令"))
 }
 
-/// 找不到的是哪个程序：常用的几个给出安装命令（要主机上有 Node.js 的 npm），装好后再运行一次登录。
-fn missing_tool(word: &str, name: &str) -> MissingTool {
-    let install = match word {
-        "claude" => Some("npm install -g @anthropic-ai/claude-code"),
-        "codex" => Some("npm install -g @openai/codex"),
-        "opencode" => Some("npm install -g opencode-ai"),
+/// 常用的几个程序的安装命令，和装的时候要不要 npm。Claude Code 用官方安装脚本：不要 Node.js，普通
+/// 用户就能装。原来给的是 `npm install -g`，新开的 VPS 上没有 npm，系统源的 Node.js 版本又不够新，
+/// 普通用户全局安装还没有权限（在全新的 Ubuntu 24.04 上实测）。`windows` 是终端里的
+/// shell 在 Windows 上：可能是 PowerShell、命令提示符或 Git Bash，所以交给 `powershell` 去跑，
+/// 哪种 shell 里都能直接运行。
+fn install_command(word: &str, windows: bool) -> Option<(&'static str, bool)> {
+    match (word, windows) {
+        ("claude", false) => Some(("curl -fsSL https://claude.ai/install.sh | bash", false)),
+        ("claude", true) => Some((
+            r#"powershell -NoProfile -Command "irm https://claude.ai/install.ps1 | iex""#,
+            false,
+        )),
+        ("codex", _) => Some(("npm install -g @openai/codex", true)),
+        ("opencode", _) => Some(("npm install -g opencode-ai", true)),
         _ => None,
+    }
+}
+
+/// 把 `%USERPROFILE%\.local\bin` 加进用户的 PATH。Windows 上 Claude Code 的官方安装脚本装在那里，
+/// 却不把它加进 PATH（只提示去系统设置里加），装完新开终端还是找不到 claude。同样交给 `powershell`；
+/// 不写 `$env:`，Git Bash 会把双引号里的 `$` 当成变量展开。
+const ADD_LOCAL_BIN: &str = r#"powershell -NoProfile -Command "[Environment]::SetEnvironmentVariable('Path', ([string][Environment]::GetEnvironmentVariable('Path', 'User')).TrimEnd(';') + ';' + [Environment]::GetFolderPath('UserProfile') + '\.local\bin', 'User')""#;
+
+/// 本机（Windows）装过 Claude Code，只是 `%USERPROFILE%\.local\bin` 不在 PATH 中。
+fn claude_off_path() -> bool {
+    cfg!(windows)
+        && std::env::var_os("USERPROFILE").is_some_and(|home| {
+            std::path::Path::new(&home)
+                .join(".local")
+                .join("bin")
+                .join("claude.exe")
+                .is_file()
+        })
+}
+
+/// 找不到的是哪个程序：常用的几个给出安装命令，装好后再运行一次登录。`remote` 是终端开在主机上
+/// （不是本机），`windows` 见 [`install_command`]。
+fn missing_tool(word: &str, name: &str, remote: bool, windows: bool) -> MissingTool {
+    // 本机的终端里找不到、其实已经装了：给加进 PATH 的命令（kuaid 新开终端时从注册表现读环境变量，
+    // 加完新开的终端就找得到）
+    if word == "claude" && !remote && windows && claude_off_path() {
+        return MissingTool {
+            text: tr(
+                "Claude Code 已安装在 %USERPROFILE%\\.local\\bin，但该目录不在 PATH 中。可运行以下命令将它加入 PATH，然后新开终端：",
+            )
+            .into(),
+            install: Some(ADD_LOCAL_BIN),
+        };
+    }
+    let install = install_command(word, windows);
+    let missing = match remote {
+        true => tf!("主机上未找到 {word}，{name} 可能尚未安装。", word, name),
+        false => tf!("本机未找到 {word}，{name} 可能尚未安装。", word, name),
     };
-    let text = match install {
-        Some(_) => tf!(
-            "主机上未找到 {word}，{name} 可能尚未安装。可运行以下命令安装（需要 Node.js），安装后再运行 {word} 按提示登录：",
-            word,
-            name
+    let then = match install {
+        Some((_, false)) => tf!(
+            "可运行以下命令安装，安装后再运行 {word} 并按提示登录：",
+            word
         ),
-        None => tf!(
-            "主机上未找到 {word}，{name} 可能尚未安装。请先在主机上安装。",
-            word,
-            name
+        Some((_, true)) => tf!(
+            "可运行以下命令安装（需要 Node.js 和 npm），安装后再运行 {word} 并按提示登录：",
+            word
         ),
+        None => tr("请先安装。").to_string(),
+    };
+    // 英文两句之间要空格，中文不要
+    let gap = match fr_core::i18n::lang() {
+        fr_core::i18n::Lang::En => " ",
+        fr_core::i18n::Lang::Zh => "",
     };
     MissingTool {
-        text: text.into(),
-        install,
+        text: format!("{missing}{gap}{then}").into(),
+        install: install.map(|(command, _)| command),
     }
 }
 
@@ -2360,13 +2438,31 @@ impl TerminalView {
                             .gap_1()
                             .child(div().whitespace_normal().child(missing.text.clone()))
                             .children(missing.install.map(|command| {
+                                // 终端窄时按钮折到命令下面
                                 h_flex()
+                                    .flex_wrap()
                                     .gap_2()
+                                    // 长的命令（加进 PATH 那条）在框里折行
                                     .child(
                                         div()
+                                            .min_w_0()
+                                            .whitespace_normal()
                                             .font_family(crate::fonts::mono())
                                             .text_color(muted)
                                             .child(command),
+                                    )
+                                    // 点击即在此终端中运行，提示条随之收起
+                                    .child(
+                                        gpui_kit::component::button::Button::new("run-install")
+                                            .xsmall()
+                                            .label(tr("运行"))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                log::info!("在终端里运行提示的安装命令");
+                                                this.write(format!("{command}\r").into_bytes());
+                                                this.missing = None;
+                                                this.focus.focus(window, cx);
+                                                cx.notify();
+                                            })),
                                     )
                                     .child(
                                         gpui_kit::component::button::Button::new("copy-install")
@@ -2512,6 +2608,38 @@ impl EntityInputHandler for TerminalView {
     }
 }
 
+/// 终端获得焦点后过多久再把输入法切到英文（见 `TerminalView::build` 里的 `on_focus`）
+const IME_SWITCH_DELAY: Duration = Duration::from_millis(150);
+
+/// 这次运行里已经说明过消息刻度了（几个终端同时画出刻度时只说一次；存进设置要过一会儿才生效）。
+static MARKS_TIP: AtomicBool = AtomicBool::new(false);
+
+impl TerminalView {
+    /// 第一次画出消息刻度时说明一次：左边的短线第一次看像显示瑕疵。说过就
+    /// 记在终端设置里（`marks_tip_shown`），以后不再说。放到这一轮画完以后再弹。
+    fn marks_tip(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.scroll.drew_marks
+            || prefs::get(cx).marks_tip_shown
+            || MARKS_TIP.swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        cx.defer_in(window, |_, window, cx| {
+            let text = tr(
+                "终端左边的短线是消息刻度：你发出的每条消息一道，鼠标停上去可以查看，点击跳回那条消息。",
+            );
+            gpui_kit::component::WindowExt::push_notification(
+                window,
+                gpui_kit::component::notification::Notification::info(text).autohide(false),
+                cx,
+            );
+            let mut settings = prefs::get(cx);
+            settings.marks_tip_shown = true;
+            prefs::write(settings, cx);
+        });
+    }
+}
+
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
@@ -2519,6 +2647,7 @@ impl Render for TerminalView {
         let (for_prepaint, for_paint) = (cx.entity(), cx.entity());
         let view = cx.entity().downgrade();
         let overlays = self.scroll_overlays(cx);
+        self.marks_tip(window, cx);
         // 鼠标在网址、路径上停着：下面一个提示
         let tip = self.link_tip(window, cx);
         let panel = div()
@@ -3554,7 +3683,7 @@ mod tests {
 
 #[cfg(test)]
 mod missing_tests {
-    use super::not_found_line;
+    use super::{install_command, missing_tool, not_found_line};
 
     #[test]
     fn 认出_shell_说找不到命令() {
@@ -3569,5 +3698,44 @@ mod missing_tests {
         // 程序自己的输出：没提到这个命令，或者没有 shell 的说法
         assert!(!not_found_line("bash: vim: command not found", "claude"));
         assert!(!not_found_line("claude is thinking…", "claude"));
+    }
+
+    #[test]
+    fn 安装命令按系统给_有官方脚本的不要_npm() {
+        // Claude Code：Linux 主机用 install.sh，Windows 上交给 powershell 跑 install.ps1（终端里可能是
+        // 命令提示符、Git Bash），都不要 Node.js
+        assert_eq!(
+            install_command("claude", false),
+            Some(("curl -fsSL https://claude.ai/install.sh | bash", false))
+        );
+        assert_eq!(
+            install_command("claude", true),
+            Some((
+                r#"powershell -NoProfile -Command "irm https://claude.ai/install.ps1 | iex""#,
+                false
+            ))
+        );
+        assert_eq!(
+            install_command("opencode", false).map(|(_, npm)| npm),
+            Some(true)
+        );
+        assert_eq!(
+            install_command("codex", false).map(|(_, npm)| npm),
+            Some(true)
+        );
+        assert_eq!(install_command("agy", false), None);
+    }
+
+    #[test]
+    fn 本机和主机上找不到的说法分开() {
+        let remote = missing_tool("claude", "Claude Code", true, false);
+        assert!(remote.text.starts_with("主机上未找到 claude"));
+        assert!(!remote.text.contains("Node.js"));
+        let local = missing_tool("codex", "Codex", false, true);
+        assert!(local.text.starts_with("本机未找到 codex"));
+        assert!(local.text.contains("Node.js"));
+        let unknown = missing_tool("agy", "Antigravity CLI", true, false);
+        assert!(unknown.text.ends_with("请先安装。"));
+        assert_eq!(unknown.install, None);
     }
 }

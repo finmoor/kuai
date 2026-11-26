@@ -58,14 +58,24 @@ fn escape(text: &str) -> String {
     out
 }
 
-/// 通知的内容：标题一行、正文一行（空着就只有标题），不出声。
+/// 正文按行拆开，每行照 [`clean`] 处理，空行不要，最多两行。整段过 `clean` 的话换行算控制字符被
+/// 去掉，「可能在等你确认」和终端的最后一行就连成了一句。
+fn body_lines(body: &str) -> Vec<String> {
+    body.lines()
+        .map(clean)
+        .filter(|line| !line.is_empty())
+        .take(2)
+        .collect()
+}
+
+/// 通知的内容：标题一行，正文每行一段（`<text>` 里的换行不算数；标题以外最多显示两段），正文空着
+/// 就只有标题，不出声。
 #[cfg_attr(not(windows), allow(dead_code))]
 fn document(title: &str, body: &str) -> String {
-    let (title, body) = (clean(title), clean(body));
     let mut xml = String::from(r#"<toast><visual><binding template="ToastGeneric">"#);
-    xml.push_str(&format!("<text>{}</text>", escape(&title)));
-    if !body.is_empty() {
-        xml.push_str(&format!("<text>{}</text>", escape(&body)));
+    xml.push_str(&format!("<text>{}</text>", escape(&clean(title))));
+    for line in body_lines(body) {
+        xml.push_str(&format!("<text>{}</text>", escape(&line)));
     }
     xml.push_str(r#"</binding></visual><audio silent="true"/></toast>"#);
     xml
@@ -376,7 +386,7 @@ mod imp {
                             "kuai",
                             super::clean(&title),
                             // 正文可能按标记语言解析：尖括号、& 换掉
-                            super::escape(&super::clean(&body)),
+                            super::escape(&super::body_lines(&body).join("\n")),
                             vec!["default", "Kuai"],
                             hints,
                             -1i32,
@@ -479,6 +489,14 @@ mod tests {
         );
         // 正文空着就只有标题
         assert!(!document("标题", "  ").contains("<text></text>"));
+        // 正文的两行各占一段，不连成一句
+        assert!(
+            document(
+                "Codex 待查看",
+                "demo · 可能在等你确认\nAllow this command? (y/n)\n"
+            )
+            .contains("<text>demo · 可能在等你确认</text><text>Allow this command? (y/n)</text>")
+        );
         // 尖括号、引号换掉，控制字符去掉
         let xml = document("a<b> & \"c\"", "x\u{1b}[0m\ty");
         assert!(xml.contains("<text>a&lt;b&gt; &amp; &quot;c&quot;</text>"));

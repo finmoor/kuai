@@ -50,6 +50,8 @@ pub enum Notice {
     NeedWinFsp,
     /// winget 没装成：提示里带「打开下载页面」按钮（网址写在文字里点不了）
     InstallFailed,
+    /// 没有 winget（LTSC、一些公司的电脑）：说明装不了，带「打开下载页面」，点了才开浏览器
+    NoWinget,
 }
 
 /// 打开 WinFsp 的下载页面（没装成、没有 winget 时手动装）。
@@ -226,7 +228,8 @@ impl AppState {
         }
     }
 
-    /// 安装 WinFsp：交给 winget（它核对安装包、弹一次管理员确认）；没有 winget 就打开下载页面。
+    /// 安装 WinFsp：交给 winget（它核对安装包、弹一次管理员确认）；没有 winget 就说明一声，用户点
+    /// 「打开下载页面」再开浏览器（原来直接弹出浏览器，事先什么都没说）。
     pub fn install_winfsp(&mut self, cx: &mut Context<Self>) {
         if self.mounts.installing {
             return;
@@ -261,12 +264,7 @@ impl AppState {
                         this.mount_all_ready(cx);
                         Notice::Info(tr("WinFsp 已安装。").into())
                     }
-                    (false, Err(Winget::Missing)) => {
-                        let _ = open_winfsp_download();
-                        Notice::Info(
-                            tr("未找到 winget，已打开 WinFsp 下载页。安装后即可映射。").into(),
-                        )
-                    }
+                    (false, Err(Winget::Missing)) => Notice::NoWinget,
                     (false, _) => Notice::InstallFailed,
                 };
                 cx.emit(notice);

@@ -241,7 +241,7 @@ impl RepoView {
                     },
                     (Err(err), _) | (_, Err(err)) => {
                         let text = tf!("无法取出要比较的文件：{err}", err = format!("{err:#}"));
-                        window.push_notification(Notification::error(text), cx);
+                        window.push_notification(Notification::error(text).autohide(false), cx);
                         return;
                     }
                 };
@@ -345,7 +345,7 @@ impl RepoView {
                 (Err(err), ..) | (_, Err(err), ..) | (_, _, Err(err), _) | (.., Err(err)) => {
                     cx.update(|window, cx| {
                         let text = tf!("无法取出要合并的文件：{err}", err = format!("{err:#}"));
-                        window.push_notification(Notification::error(text), cx);
+                        window.push_notification(Notification::error(text).autohide(false), cx);
                     })
                     .ok();
                     return;

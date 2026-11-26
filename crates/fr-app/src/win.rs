@@ -61,6 +61,19 @@ mod imp {
     const SW_SHOW: i32 = 5;
     const SW_RESTORE: i32 = 9;
     const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+    #[link(name = "imm32")]
+    unsafe extern "system" {
+        fn ImmGetDefaultIMEWnd(hwnd: isize) -> isize;
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+    }
+    const WM_IME_CONTROL: u32 = 0x0283;
+    const IMC_GETCONVERSIONMODE: usize = 0x0001;
+    const IMC_SETCONVERSIONMODE: usize = 0x0002;
+    /// 输入法的「中文」位：清掉它就是英文（字母、数字）模式
+    const IME_CMODE_NATIVE: isize = 1;
 
     pub fn hwnd(window: &Window) -> Option<Hwnd> {
         let handle = HasWindowHandle::window_handle(window).ok()?;
@@ -134,6 +147,25 @@ mod imp {
         match (ok != 0, lines) {
             (true, 1..=100) => lines as f32,
             _ => 3.,
+        }
+    }
+
+    /// 输入法切到英文模式（中文输入法打开着也只出字母）：问窗口的输入法默认窗口要转换模式，是中文
+    /// 就设成 0（英文、半角标点，敲命令正合适）。在 Windows 11 上对微软拼音实测：
+    /// 直接改输入法上下文（`ImmSetConversionStatus`）不认，要发 `WM_IME_CONTROL` 给默认窗口；
+    /// 只清掉「中文」位、留着中文标点位（0x401 → 0x400）也不认，仍是中文，设成 0 才切过去。
+    /// 没有输入法的什么都不做。
+    pub fn ime_english(hwnd: Hwnd) {
+        // SAFETY：句柄是还开着的主窗口；输入法默认窗口属于同一个线程，消息同步处理完就返回
+        unsafe {
+            let ime = ImmGetDefaultIMEWnd(hwnd.0);
+            if ime == 0 {
+                return;
+            }
+            let mode = SendMessageW(ime, WM_IME_CONTROL, IMC_GETCONVERSIONMODE, 0);
+            if mode & IME_CMODE_NATIVE != 0 {
+                SendMessageW(ime, WM_IME_CONTROL, IMC_SETCONVERSIONMODE, 0);
+            }
         }
     }
 
@@ -316,6 +348,8 @@ mod imp {
     }
     /// 标题栏是自己画的（客户端装饰），没有系统画的边框要跟着变。
     pub fn set_dark_frame(_: Hwnd, _: bool) {}
+    /// 输入法由各家的框架管（IBus、Fcitx），没有统一的切法，不做。
+    pub fn ime_english(_: Hwnd) {}
 }
 
 /// Wayland 上拿别人给的 xdg-activation 令牌激活窗口。GPUI 自己的 `activate_window` 用的是它最近
@@ -438,6 +472,7 @@ mod imp {
         3.
     }
     pub fn set_dark_frame(_: Hwnd, _: bool) {}
+    pub fn ime_english(_: Hwnd) {}
 }
 
 pub fn hwnd(window: &Window) -> Option<Hwnd> {
@@ -502,6 +537,12 @@ pub fn cursor_on_taskbar() -> bool {
 /// 滚轮滚一格走几行（系统设置里的，默认 3）。GPUI 报的滚动量已经乘过它。
 pub fn wheel_lines() -> f32 {
     imp::wheel_lines()
+}
+
+/// 输入法切到英文模式（终端获得焦点时，设置里开着的话）。Windows 以外不做。要放到这一轮更新之后
+/// 调：发给输入法窗口的消息会同步回到主窗口的窗口过程（同 `show`）。
+pub fn ime_english(hwnd: Hwnd) {
+    imp::ime_english(hwnd);
 }
 
 /// 系统画的窗口边框、系统菜单跟着主题变深、变浅。

@@ -1327,6 +1327,16 @@ impl TermOverview {
     /// 显示一个终端（点标签、点侧栏里仓库下面它那一行）。并排着时：它在并排里就把焦点换过去，不在就
     /// 换掉焦点格里的那个。
     fn select_term(&mut self, slot: TermSlot, window: &mut Window, cx: &mut Context<Self>) {
+        log::info!(
+            "会话页选中终端：{} 的第 {} 个{}",
+            slot.entry.path,
+            slot.number,
+            if self.split.is_some() {
+                "（并排中）"
+            } else {
+                ""
+            }
+        );
         if let Some(split) = &mut self.split {
             match split.cells.iter().position(|cell| cell.slot == slot) {
                 Some(at) => split.focus = at,
@@ -1565,7 +1575,7 @@ impl TermOverview {
         });
         let Some(connecting) = connecting else {
             let text = tf!("终端启动失败：{err}", err = tr("未找到该主机的设置"));
-            window.push_notification(Notification::error(text), cx);
+            window.push_notification(Notification::error(text).autohide(false), cx);
             return;
         };
         cx.spawn_in(window, async move |this, cx| {
@@ -1595,7 +1605,7 @@ impl TermOverview {
                 }
                 Err(err) => {
                     let text = tf!("终端启动失败：{err}", err);
-                    window.push_notification(Notification::error(text), cx);
+                    window.push_notification(Notification::error(text).autohide(false), cx);
                 }
             })
             .ok();
@@ -1768,7 +1778,7 @@ impl TermOverview {
             true => tf!("终端重启失败：{err}", err),
             false => tf!("结束终端失败：{err}", err),
         };
-        window.push_notification(Notification::error(text), cx);
+        window.push_notification(Notification::error(text).autohide(false), cx);
     }
 
     fn end_now(
@@ -2339,6 +2349,7 @@ impl TermOverview {
 
     /// 并排查看勾上的那几个（2～4 个），焦点进第一格。
     fn start_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        log::info!("点了并排查看：已选 {} 个", self.picks.len());
         self.start_split_at(0, window, cx);
     }
 
@@ -3481,11 +3492,18 @@ impl TermOverview {
         // 「未加入工作区」，分不出是哪台）。断开了的总标，写「未连接」，后面跟「重新连接」
         let at = group.key.machine().to_string();
         let offline = self.board.read(cx).is_offline(&at);
+        // 心跳超时（还没断开，多半不通了）：先标出来，不用等 ssh 半分钟后才认定断开
+        let unstable = self.board.read(cx).is_unstable(&at);
         let named = at != LOCAL && scope != Some(at.as_str());
-        let machine: Option<SharedString> = match (offline, named) {
-            (true, false) => Some(tr("未连接").into()),
-            (_, true) => Some(app.machine_name(&at)),
-            (false, false) => None,
+        let machine: Option<SharedString> = match (offline, unstable, named) {
+            (true, _, false) => Some(tr("未连接").into()),
+            (false, true, false) => Some(tr("连接不稳").into()),
+            // 状态写在前面：侧栏窄，截掉的是主机名
+            (false, true, true) => {
+                Some(tf!("连接不稳 · {name}", name = app.machine_name(&at)).into())
+            }
+            (_, _, true) => Some(app.machine_name(&at)),
+            (false, false, false) => None,
         };
         let chip = |text: SharedString| {
             h_flex()
@@ -3501,7 +3519,7 @@ impl TermOverview {
                 .line_height(px(16.))
                 .font_weight(FontWeight::NORMAL)
                 .text_color(muted)
-                .when(offline, |el| {
+                .when(offline || unstable, |el| {
                     el.child(Icon::new(IconName::Unplug).size(px(10.)))
                 })
                 .child(div().min_w_0().truncate().child(text))
@@ -3534,17 +3552,22 @@ impl TermOverview {
             false => ("hub-group", "hub-group-name", "hub-reconnect"),
         };
         let primary = cx.theme().primary;
+        // 「重新连接」做成图标（悬停写字）：写成字时侧栏窄的话工作区名、主机名都挤成一个字加省略号
         let reconnect = offline.then(|| {
             let machine = at.clone();
             div()
                 .id((reconnect_id, index))
                 .flex_none()
-                .mr(px(8.))
-                .text_size(px(11.))
-                .font_weight(FontWeight::NORMAL)
+                .mr(px(4.))
+                .size(px(20.))
+                .rounded(px(4.))
+                .flex()
+                .items_center()
+                .justify_center()
                 .text_color(primary)
-                .hover(|s| s.underline())
-                .child(tr("重新连接"))
+                .hover(|s| s.bg(hover))
+                .child(Icon::new(IconName::Plug).size(px(13.)))
+                .tooltip(|window, cx| ui::tip(tr("重新连接"), window, cx))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
@@ -4315,10 +4338,18 @@ impl TermOverview {
             .items_center()
             .justify_center()
             .text_color(muted)
-            .hover(|s| s.bg(close_hover).text_color(fg))
+            // 没选中的标签：关闭按钮不占位置，悬停时浮在右端（垫上标签悬停的底色，盖住名字的末尾）。
+            // 原来看不见时也占着二十几宽，终端一多名字就只剩图标
             .when(!on, |close| {
-                close.invisible().group_hover("hub-tab", |s| s.visible())
+                close
+                    .absolute()
+                    .right(px(6.))
+                    .top(px(6.))
+                    .bg(hover)
+                    .invisible()
+                    .group_hover("hub-tab", |s| s.visible())
             })
+            .hover(|s| s.bg(close_hover).text_color(fg))
             .child(ui::icon_small(IconName::X))
             .tooltip(|window, cx| ui::tip(tr("结束此终端"), window, cx))
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -4328,6 +4359,7 @@ impl TermOverview {
         h_flex()
             .id(("hub-tab", index))
             .group("hub-tab")
+            .relative()
             .h(px(30.))
             .min_w(px(60.))
             .max_w(px(220.))
@@ -4339,7 +4371,11 @@ impl TermOverview {
             .text_size(px(13.))
             .text_color(if on { fg } else { muted })
             .cursor_pointer()
-            .when(on, |el| el.bg(on_bg).font_weight(FontWeight::MEDIUM))
+            // 正在看的那个不跟着缩，名字写全（最宽 220）；挤的是别的标签。原来一起缩，终端一多，
+            // 正看着的那个也只剩图标和「..」
+            .when(on, |el| {
+                el.bg(on_bg).font_weight(FontWeight::MEDIUM).flex_shrink_0()
+            })
             .when(!on, |el| el.hover(|s| s.bg(hover)))
             .when(pinned, |el| {
                 el.child(

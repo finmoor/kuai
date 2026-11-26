@@ -385,7 +385,7 @@ impl RemoteBrowser {
                 } else {
                     this.status = None;
                     for err in errors {
-                        window.push_notification(Notification::error(err), cx);
+                        window.push_notification(Notification::error(err).autohide(false), cx);
                     }
                     if let Some(last) = entries.last() {
                         this.remember(&last.path, cx);

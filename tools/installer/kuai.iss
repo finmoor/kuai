@@ -86,6 +86,9 @@ zh.RemoveKuaid=是否同时停止后台服务 kuaid 并删除 %1？这台电脑�
 ; 不显示「准备安装」页，任务页上的按钮是「安装」（见 CurPageChanged），说明跟着改
 en.SelectTasksLabel2=Select the additional tasks you would like Setup to perform while installing [name], then click Install.
 zh.SelectTasksLabel2=选择安装 [name] 时要执行的附加任务，然后点击“安装”。
+; 卸载完了说一句主机那一头：主机上的 kuaid 和终端照常运行（这是卖点），不说的话不知道还要去主机上删
+en.UninstalledAll=%1 was successfully removed from your computer.%n%nkuaid and its terminals keep running on your remote hosts. To remove them, delete ~/.kuai on each host.
+zh.UninstalledAll=已顺利从您的电脑中移除 %1。%n%n远程主机上的 kuaid 和终端不受影响，仍在运行；如需清理，请在各主机上删除 ~/.kuai 目录。
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked

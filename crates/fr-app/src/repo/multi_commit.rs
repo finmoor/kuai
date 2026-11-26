@@ -290,6 +290,7 @@ impl RepoView {
                     }
                     Err(err) => {
                         Notification::error(tf!("导出补丁失败：{err}", err = format!("{err:#}")))
+                            .autohide(false)
                     }
                 };
                 window.push_notification(note, cx);

@@ -363,7 +363,7 @@ pub(super) fn tree_menu(
 impl RepoView {
     /// 报错：右下角弹一条。
     fn files_error(&self, text: String, window: &mut Window, cx: &mut Context<Self>) {
-        window.push_notification(Notification::error(text), cx);
+        window.push_notification(Notification::error(text).autohide(false), cx);
     }
 
     pub(super) fn copy_path(&self, path: &str, relative: bool, cx: &mut Context<Self>) {

@@ -713,6 +713,18 @@ impl SettingsPage {
         .description(tr(
             "打开后 Ctrl+V 发给终端中的程序，粘贴改用 Ctrl+Shift+V 或 Shift+Insert。",
         ));
+        // 中文输入法挡住敲命令（「git log」打成「给i他log」）：点进终端时切到英文。只 Windows 有
+        let ime_english = SettingItem::new(
+            tr("点进终端时切换到英文输入"),
+            SettingField::switch(
+                get(&app, |t| t.ime_english),
+                set(&app, |t, on: bool| t.ime_english = on),
+            )
+            .default_value(defaults.ime_english),
+        )
+        .description(tr(
+            "终端获得焦点时把中文输入法切到英文模式，敲命令不必先按 Shift。在终端中用中文和 AI 对话时需再切回中文。",
+        ));
         let right_click = {
             let key = |choice: RightClick| -> SharedString {
                 match choice {
@@ -926,14 +938,18 @@ impl SettingsPage {
                     .item(cursor)
                     .item(blink),
             )
-            .group(
-                SettingGroup::new()
+            .group({
+                let group = SettingGroup::new()
                     .title(tr("滚动和复制"))
                     .item(scrollback)
                     .item(copy_on_select)
                     .item(right_click)
-                    .item(ctrl_v),
-            )
+                    .item(ctrl_v);
+                match cfg!(windows) {
+                    true => group.item(ime_english),
+                    false => group,
+                }
+            })
             .group(SettingGroup::new().title(tr("本机仓库")).item(shell))
             .group(
                 SettingGroup::new()

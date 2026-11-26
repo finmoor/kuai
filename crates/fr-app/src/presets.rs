@@ -603,7 +603,7 @@ fn prompt_dir(title: &str) -> Option<&str> {
 
 /// 这是 shell 自己设的标题：Windows 上刚启动时是它的程序路径（`C:\...\pwsh.exe`）；Linux 上常见的
 /// 是「用户@主机: 目录」，或者就是 shell 的名字。npm 装的 Codex 这类程序不设标题，标题一直是 shell 的。
-fn shell_title(title: &str) -> bool {
+pub(crate) fn shell_title(title: &str) -> bool {
     const SHELLS: [&str; 9] = [
         "pwsh",
         "powershell",

@@ -207,7 +207,7 @@ Linux 版以下三种任选其一：
 2. 在「主机」页点击「添加主机…」，填写 VPS 的地址和用户名（也可以从 `~/.ssh/config` 中选择主机别名），选择用密钥或密码登录。不确定能否连上时先点「测试连接」。
 3. 首次连接时，Kuai 显示主机的密钥指纹请你核对（核对方法见对话框），确认后自动将 kuaid 安装到主机的 `~/.kuai` 下并启动。
 4. 连上后点击「打开仓库…」，在主机上选择仓库所在的目录；还没有仓库时可以「克隆…」，或选择一个目录后按提示初始化新仓库。
-5. 在主机上安装并登录 Claude Code（需要 Node.js 18 或更新的版本）：在仓库的终端页运行 `npm install -g @anthropic-ai/claude-code`，然后运行 `claude`，按提示登录。Codex 是 `npm install -g @openai/codex`，OpenCode 是 `npm install -g opencode-ai`。Kuai 不代为安装；预设的程序没装时，终端顶上会给出安装命令。
+5. 在主机上安装并登录 Claude Code：在仓库的终端页运行官方安装脚本 `curl -fsSL https://claude.ai/install.sh | bash`（不需要 Node.js，普通用户即可安装；Windows 主机在 PowerShell 中运行 `irm https://claude.ai/install.ps1 | iex`），安装后新开一个终端运行 `claude`，按提示登录；提示找不到 `claude` 时，按安装脚本的说明将 `~/.local/bin` 加入 PATH。Codex 是 `npm install -g @openai/codex`，OpenCode 是 `npm install -g opencode-ai`（这两个需要 Node.js）。Kuai 不代为安装；预设的程序没装时，终端顶上会给出安装命令，点击「运行」即在该终端中安装。
 6. 每个仓库分为 Git、终端、文件三页：在终端页运行 `claude`，完成后按 <kbd>Ctrl</kbd>+<kbd>&#96;</kbd> 回到 Git 页查看改动、按行暂存、提交。
 
 打开本机的仓库：在「主机」页选中「本机」，点击「添加本机仓库…」；或在命令行中运行 `kuai.exe <仓库路径>`。

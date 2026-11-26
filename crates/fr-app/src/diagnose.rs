@@ -758,6 +758,9 @@ pub struct Diagnose {
     task: Option<Task<()>>,
     /// 连上了告诉打开它的页面（仓库页借这个连接重新读取，不用再点「重试」）
     on_connected: Option<Connected>,
+    /// 列不列映射（WinFsp、fuse3）那一步：只有映射用得到，本机没装、哪台主机都没设过映射时不列，
+    /// 免得第一次用的人以为缺了东西。检查照常做，见 [`Self::shown_steps`]
+    show_mapping: bool,
 }
 
 /// 诊断连上了主机时调用的，见 [`Diagnose::open`]。
@@ -825,6 +828,7 @@ impl Diagnose {
                 preview: false,
                 task: None,
                 on_connected,
+                show_mapping: false,
             };
             this.run(cx);
             this
@@ -832,6 +836,15 @@ impl Diagnose {
         window.open_dialog(cx, move |dialog, _, _| {
             dialog.title(title.clone()).w(px(680.)).child(view.clone())
         });
+    }
+
+    /// 列出来的几步（[`Self::show_mapping`] 为假时去掉映射那一步）。
+    fn shown_steps(&self) -> Vec<Step> {
+        let mapping = self.layout().winfsp();
+        (self.steps.iter().enumerate())
+            .filter(|(ix, _)| self.show_mapping || *ix != mapping)
+            .map(|(_, step)| step.clone())
+            .collect()
     }
 
     fn layout(&self) -> Layout {
@@ -844,6 +857,9 @@ impl Diagnose {
         self.steps = initial_steps(&self.target);
         let winfsp = self.layout().winfsp();
         fill_winfsp(&mut self.steps[winfsp]);
+        self.show_mapping = fr_mount::installed()
+            || (self.app.read(cx).settings.servers.iter())
+                .any(|server| !server.mappings.is_empty());
         self.running = true;
         self.at = Local::now();
         let id = self.target.id.clone();
@@ -940,7 +956,7 @@ impl Diagnose {
         let text = format!(
             "{}\n{}\n{}",
             header(self.at),
-            steps_text(&self.target, &self.steps),
+            steps_text(&self.target, &self.shown_steps()),
             errors_section()
         );
         match self.hide {
@@ -992,7 +1008,7 @@ impl Render for Diagnose {
                 .id("diagnose-steps")
                 .max_h(px(440.))
                 .overflow_y_scroll()
-                .child(steps_box(&self.steps, cx))
+                .child(steps_box(&self.shown_steps(), cx))
                 .into_any_element(),
         };
         v_flex()

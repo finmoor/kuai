@@ -1830,7 +1830,7 @@ impl RepoView {
                             doc.saving = false;
                         }
                         let text = tf!("保存失败：{err}", err = format!("{:#}", err));
-                        window.push_notification(Notification::error(text), cx);
+                        window.push_notification(Notification::error(text).autohide(false), cx);
                         return;
                     }
                 };

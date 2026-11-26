@@ -892,7 +892,7 @@ impl RepoView {
                     Err(_) if server.is_none() => this.open_new_terminal(dir, start, window, cx),
                     Err(err) => {
                         let text = tf!("终端启动失败：{err}", err);
-                        window.push_notification(Notification::error(text), cx);
+                        window.push_notification(Notification::error(text).autohide(false), cx);
                         cx.notify();
                     }
                 }
@@ -1181,7 +1181,7 @@ impl RepoView {
             this.update_in(cx, |this, window, cx| {
                 this.terminals.ending.retain(|other| *other != number);
                 let text = tf!("结束终端失败：{err}", err = format!("{err:#}"));
-                window.push_notification(Notification::error(text), cx);
+                window.push_notification(Notification::error(text).autohide(false), cx);
                 this.board_changed(cx);
                 cx.notify();
             })

@@ -5,7 +5,8 @@
 //!
 //! - 本机端口尽量和主机上的一样（3000 转到本机 3000），被占了就随便挑一个空的。
 //! - 同一台主机的同一个端口只转一次，之后再点直接打开；ssh 退出了（断线、主机重启）下次点重新转。
-//! - 转发一直开着，退出 Kuai 时结束（[`stop_all`]）。
+//! - 转发一直开着，退出 Kuai 时结束（[`stop_all`]）；转好的那条提示里、主机页右上角的 ⋯ 里可以
+//!   停掉一个（[`stop`]、[`active`]）。原来建好以后看不到有哪些、也停不掉，只能退出 Kuai。
 //! - 经由别的主机连接的主机（它的 kuaid 替这边连）没有这边的 ssh 可用，不转发，说一声、复制地址。
 
 use std::collections::HashMap;
@@ -166,13 +167,25 @@ fn start(
                     let forwards = cx.default_global::<Forwards>();
                     forwards
                         .0
-                        .insert((host, port), (local, Arc::new(Mutex::new(process))));
+                        .insert((host.clone(), port), (local, Arc::new(Mutex::new(process))));
                     let text = tf!(
                         "已将主机上的端口 {port} 转发到本机 localhost:{local}",
                         port,
                         local
                     );
-                    window.push_notification(Notification::success(text), cx);
+                    // 带「停止转发」；还是 5 秒后收起（鼠标停在上面时不收），之后在主机页的 ⋯ 里停
+                    let note = Notification::success(text)
+                        .action(move |_, _, cx| {
+                            let (host, note) = (host.clone(), cx.entity().downgrade());
+                            gpui_kit::component::button::Button::new("forward-stop")
+                                .label(tr("停止转发"))
+                                .on_click(move |_, window, cx| {
+                                    stop(&host, port, cx);
+                                    note.update(cx, |note, cx| note.dismiss(window, cx)).ok();
+                                })
+                        })
+                        .autohide(true);
+                    window.push_notification(note, cx);
                     open_local(local, &tail, window, cx);
                 }
                 Err(err) => {
@@ -203,6 +216,33 @@ fn free_port(wanted: u16) -> u16 {
     bind(0)
         .and_then(|listener| listener.local_addr().ok())
         .map_or(wanted, |address| address.port())
+}
+
+/// 这台主机上正在转发的端口：（主机上的端口，本机端口），按主机上的端口排。ssh 已经退出了的不算。
+pub fn active(host: &str, cx: &App) -> Vec<(u16, u16)> {
+    let Some(forwards) = cx.try_global::<Forwards>() else {
+        return Vec::new();
+    };
+    let mut list: Vec<(u16, u16)> = (forwards.0.iter())
+        .filter(|((at, _), (_, process))| {
+            at == host
+                && process
+                    .lock()
+                    .is_ok_and(|mut process| process.exited().is_none())
+        })
+        .map(|((_, port), (local, _))| (*port, *local))
+        .collect();
+    list.sort_unstable();
+    list
+}
+
+/// 停掉一个转发（丢掉那个 ssh 就结束了，见 `Forwarder` 的 Drop）。
+pub fn stop(host: &str, port: u16, cx: &mut App) {
+    if cx.has_global::<Forwards>() {
+        cx.global_mut::<Forwards>()
+            .0
+            .remove(&(host.to_string(), port));
+    }
 }
 
 /// 退出 Kuai 时结束所有转发。

@@ -70,6 +70,8 @@ pub(super) struct ScrollUi {
     pub bar_hover: bool,
     /// 鼠标停在第几条消息的刻度上
     pub hovered: Option<usize>,
+    /// 上一次画的时候画出了刻度（第一次画出时说明一次，见 `TerminalView::render`）
+    pub drew_marks: bool,
     /// 刚跳到的那一行（网格上的行号）、跳的时刻：亮一下
     pub flash: Option<(i32, Instant)>,
     /// 消息在哪一行（见 [`ScrollUi::mark_lines`]）
@@ -524,6 +526,7 @@ impl TerminalView {
                     lines
                 }
             };
+            self.scroll.drew_marks = lines.iter().any(Option::is_some);
             let reply = match self.scroll.hovered {
                 Some(index) => match lines.get(index).copied().flatten() {
                     Some(line) => {

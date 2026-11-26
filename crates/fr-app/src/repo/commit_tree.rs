@@ -406,6 +406,7 @@ impl RepoView {
                     }
                     Err(err) => {
                         Notification::error(tf!("保存失败：{err}", err = format!("{err:#}")))
+                            .autohide(false)
                     }
                 };
                 window.push_notification(note, cx);

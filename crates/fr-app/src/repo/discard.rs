@@ -164,7 +164,7 @@ impl RepoView {
                             "无法在丢弃前保存文件内容，未丢弃：{err}",
                             err = format!("{err:#}")
                         );
-                        window.push_notification(Notification::error(text), cx);
+                        window.push_notification(Notification::error(text).autohide(false), cx);
                         return;
                     }
                 };

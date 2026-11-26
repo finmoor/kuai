@@ -15,6 +15,7 @@ use std::rc::Rc;
 use fr_channel::Channel;
 use fr_core::i18n::tr;
 use fr_core::tf;
+use gpui_kit::component::Sizable as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
@@ -36,6 +37,30 @@ pub enum Found {
 /// 打开仓库以后做什么（加进列表、打开标签页……），由调用方定。
 type OnOpen<T> = Box<dyn FnOnce(&mut T, RepoEntry, &mut Window, &mut Context<T>)>;
 
+/// 打开、初始化仓库失败的报错，不自动消失（读完自己关）。Windows 上找不到 git（新装的系统上没有）
+/// 时带「打开下载页面」：提示里写的 git-scm.com 点不了，原来这条 5 秒就消失、也找不回来。
+fn open_failed(err: String) -> Notification {
+    let missing_git = cfg!(windows) && err.contains(&fr_core::git::missing());
+    let note = Notification::error(err).autohide(false);
+    if !missing_git {
+        return note;
+    }
+    note.action(|_, _, cx| {
+        let note = cx.entity().downgrade();
+        Button::new("git-download")
+            .small()
+            .label(tr("打开下载页面"))
+            .on_click(move |_, window, cx| {
+                let result = crate::shell::open_url(GIT_DOWNLOAD);
+                crate::shell::report(result, window, cx);
+                note.update(cx, |note, cx| note.dismiss(window, cx)).ok();
+            })
+    })
+}
+
+/// Git for Windows 的下载页。
+const GIT_DOWNLOAD: &str = "https://git-scm.com/download/win";
+
 /// 打开 `server`（空着是本机）上的目录 `dir`：是仓库就交给 `on_open`，不是就问是否初始化，
 /// 初始化成功后同样交给 `on_open`。出错时在右下角报。
 pub fn open_dir<T: 'static>(
@@ -49,7 +74,7 @@ pub fn open_dir<T: 'static>(
     // 本机的目录先看在不在：`git -C` 进不去时报的错和「不是仓库」分不开，会被当成可以初始化
     if server.is_none() && !Path::new(&dir).is_dir() {
         let text = tf!("未找到目录 {dir}", dir);
-        window.push_notification(Notification::error(text), cx);
+        window.push_notification(Notification::error(text).autohide(false), cx);
         return;
     }
     let on_open: OnOpen<T> = Box::new(on_open);
@@ -67,7 +92,7 @@ pub fn open_dir<T: 'static>(
                 window.push_notification(Notification::warning(text), cx);
             }
             Ok((channel, Found::NotRepo)) => ask_init(channel, server, dir, on_open, window, cx),
-            Err(err) => window.push_notification(Notification::error(err), cx),
+            Err(err) => window.push_notification(open_failed(err), cx),
         })
         .ok();
     })
@@ -125,7 +150,7 @@ pub fn open_dirs<T: 'static>(
         }
         this.update_in(cx, |this, window, cx| {
             for err in errors {
-                window.push_notification(Notification::error(err), cx);
+                window.push_notification(open_failed(err), cx);
             }
             if !not_repos.is_empty() {
                 let dirs = not_repos.join(tr("、"));
@@ -259,7 +284,7 @@ fn run_init<T: 'static>(
         let result = init(&channel, &dir).await;
         this.update_in(cx, |this, window, cx| match result {
             Ok(root) => on_open(this, entry(server, &root), window, cx),
-            Err(err) => window.push_notification(Notification::error(err), cx),
+            Err(err) => window.push_notification(open_failed(err), cx),
         })
         .ok();
     })

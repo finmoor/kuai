@@ -422,6 +422,9 @@ pub struct Settings {
     /// 第一次把目录映射到本机时提示过了（映射的目录不适合跑 git、构建）
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mapping_tip_shown: bool,
+    /// 第一次收进托盘时发过说明了（Windows 默认把托盘图标藏在「^」里，第一次用的人以为程序没了）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tray_tip_shown: bool,
     /// 点窗口的关闭按钮时不退出，收到托盘
     #[serde(default)]
     pub close_to_tray: bool,
@@ -651,6 +654,12 @@ pub struct TerminalSettings {
     pub right_click: RightClick,
     /// Ctrl+V 交给终端里的程序（vim 的列选择这类要用到它），粘贴改用 Ctrl+Shift+V、Shift+Insert
     pub ctrl_v_to_program: bool,
+    /// 终端获得焦点时把中文输入法切到英文模式（只 Windows）。默认关：在终端里用中文和 AI 对话的
+    /// 人多，每次点进终端都被切成英文反而碍事
+    pub ime_english: bool,
+    /// 第一次画出消息刻度时说明过了（左边的短线第一次看像显示瑕疵）
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub marks_tip_shown: bool,
 }
 
 /// 光标的样子。
@@ -761,6 +770,8 @@ impl Default for TerminalSettings {
             copy_on_select: false,
             right_click: RightClick::Paste,
             ctrl_v_to_program: false,
+            ime_english: false,
+            marks_tip_shown: false,
         }
     }
 }
@@ -811,6 +822,7 @@ impl Default for Settings {
             dark_theme: default_dark_theme(),
             minimize_to_tray: false,
             mapping_tip_shown: false,
+            tray_tip_shown: false,
             browse_hidden: false,
             welcome_skipped: false,
             close_to_tray: false,

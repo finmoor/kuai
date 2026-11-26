@@ -593,9 +593,11 @@ impl RepoView {
                 });
                 let untouched = this.mode == Mode::History
                     && this.sidebar.selected == sidebar::SideItem::History;
+                // 还没有提交的新仓库：提交列表是空的，停在「本地修改」，下一步就是在那里提交
+                let unborn = parsed.head.is_none();
                 let first = std::mem::take(&mut this.first_status);
                 this.apply_status(parsed, cx);
-                if first && changed && untouched {
+                if first && (changed || unborn) && untouched {
                     this.show_changes(cx);
                 }
                 this.files_status_changed(cx);

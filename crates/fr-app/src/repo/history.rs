@@ -2301,12 +2301,20 @@ impl RepoView {
         } else {
             match self.history.match_pos {
                 Some(pos) => format!("{} / {}", pos + 1, self.history.matches.len()).into(),
+                // 原来的整句（「…个匹配项，按 Enter 跳转到第一个」）窄时被截掉一半：写短句，截掉时
+                // 悬停提示里是整句
                 None => tf!(
-                    "{matches} 个匹配项，按 Enter 跳转到第一个",
+                    "{matches} 个匹配，按 Enter 跳转",
                     matches = self.history.matches.len()
                 )
                 .into(),
             }
+        };
+        let match_tip: SharedString = match (self.history.match_pos, self.history.matches.len()) {
+            (None, matches) if matches > 0 => {
+                tf!("{matches} 个匹配项，按 Enter 跳转到第一个", matches).into()
+            }
+            _ => match_info.clone(),
         };
         let has_matches = !self.history.matches.is_empty();
         let find_info = self.find_info(cx);
@@ -2414,7 +2422,7 @@ impl RepoView {
                             ),
                         )
                         .child(
-                            ui::clipped("match-info", match_info)
+                            ui::clipped_with_tip("match-info", match_info, match_tip)
                                 .flex_shrink(1.)
                                 .text_xs()
                                 .text_color(muted),

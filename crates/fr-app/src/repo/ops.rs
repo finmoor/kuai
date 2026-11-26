@@ -273,7 +273,7 @@ impl RepoView {
                 }
                 (Err(err), _) | (_, Err(err)) => {
                     let text = tf!("无法核对文件内容，未执行：{err}", err);
-                    window.push_notification(Notification::error(text), cx);
+                    window.push_notification(Notification::error(text).autohide(false), cx);
                 }
             })
             .ok();
@@ -329,6 +329,13 @@ impl RepoView {
             cx,
             Box::new(move |this, result, window, cx| match result {
                 Ok(out) => on_success(this, &out, window, cx),
+                // 合并、挑拣、还原、贮藏这些也要提交作者：没设时直接弹设置框（原来贴 git 的英文原话
+                // 「Committer identity unknown」，提交那条路径早就会弹框了）
+                Err(text) if identity_missing(&text) => {
+                    this.changes.author = Some(None);
+                    let note = tr("操作失败：未设置提交作者。请填写名称和邮箱，保存后重新操作。");
+                    this.author_dialog(Some(note), window, cx);
+                }
                 Err(text) => this.failure(&name, text, window, cx),
             }),
         );
@@ -636,6 +643,9 @@ impl RepoView {
                     (Some(state), Err(_)) => {
                         this.in_progress = Some(state);
                         this.show_changes(cx);
+                        if state == fr_core::state::InProgress::Merge {
+                            this.prefill_merge_message(window, cx);
+                        }
                         // 横幅上那个按钮，合并时叫「提交合并」，别的叫「继续」
                         let go = if state == fr_core::state::InProgress::Merge {
                             tr("提交合并")
@@ -993,13 +1003,24 @@ impl RepoView {
             return;
         };
         if self.remote_names.is_empty() {
-            window.push_notification(
-                Notification::warning(tr(
-                    "此仓库尚无远程。请先在侧栏的「远程」上右键选择「添加远程…」。",
-                ))
-                .autohide(false),
-                cx,
-            );
+            // 带上「添加远程…」直达；带按钮的通知默认不自己收起，这条 5 秒后收起（鼠标停在上面时不收），
+            // 原来一直不消失，切到别的页还盖在右下角
+            let view = cx.entity().downgrade();
+            let note = Notification::warning(tr("此仓库尚无远程。请先添加远程。"))
+                .action(move |_, _, cx| {
+                    let (view, note) = (view.clone(), cx.entity().downgrade());
+                    Button::new("no-remote-add")
+                        .small()
+                        .primary()
+                        .label(tr("添加远程…"))
+                        .on_click(move |_, window, cx| {
+                            note.update(cx, |note, cx| note.dismiss(window, cx)).ok();
+                            view.update(cx, |view, cx| view.add_remote_dialog(window, cx))
+                                .ok();
+                        })
+                })
+                .autohide(true);
+            window.push_notification(note, cx);
             return;
         }
         let remotes = self.remote_names.clone();
@@ -1880,6 +1901,14 @@ pub(super) fn with_detail_and(
 }
 
 /// 常见失败的中文说明和下一步。认的是 git 报错里不随语言变的那部分；认不出来就只显示原文。
+/// git 说没有提交作者（名称、邮箱都没设，又猜不出来）。只认英文的说法：认不出来时照常报 git 的原话。
+fn identity_missing(detail: &str) -> bool {
+    let text = detail.to_lowercase();
+    text.contains("please tell me who you are")
+        || text.contains("committer identity unknown")
+        || text.contains("author identity unknown")
+}
+
 pub(crate) fn explain(detail: &str) -> Option<&'static str> {
     let text = detail.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| text.contains(w));
@@ -2182,9 +2211,19 @@ fn summary(out: &GitOutput) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Step, Writing, command_line, explain, find_stash, kept_autostash, last_progress_line,
-        strip_progress, tail, writing_key,
+        Step, Writing, command_line, explain, find_stash, identity_missing, kept_autostash,
+        last_progress_line, strip_progress, tail, writing_key,
     };
+
+    #[test]
+    fn 认出没有提交作者() {
+        let merge = "Committer identity unknown\n\n*** Please tell me who you are.\n\nRun\n";
+        assert!(identity_missing(merge));
+        assert!(identity_missing("Author identity unknown"));
+        assert!(!identity_missing(
+            "CONFLICT (content): Merge conflict in README.md"
+        ));
+    }
 
     #[test]
     fn 路径里有认不出的字符时不交给git() {

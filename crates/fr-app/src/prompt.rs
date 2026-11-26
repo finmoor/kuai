@@ -223,6 +223,15 @@ fn verify_hint(key_type: &str, muted: Hsla, border: Hsla) -> impl IntoElement {
 
 /// 认出提示问的是什么：标题，和一句说明（认不出时没有，只列原文）。看 ssh、git 固定的英文说法；
 /// 主机上的 git 翻译了的提示认不出，照旧按「需要密码」「需要输入」。
+/// 网址的主机是 github.com（`https://github.com`、`https://me@github.com/…`）。
+fn github(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+    let host = host.split(':').next().unwrap_or_default();
+    host.eq_ignore_ascii_case("github.com")
+}
+
 fn classify(prompt: &str, secret: bool) -> (&'static str, Option<SharedString>) {
     let lower = prompt.to_lowercase();
     // 引号里的东西：私钥的路径、仓库的网址
@@ -245,17 +254,23 @@ fn classify(prompt: &str, secret: bool) -> (&'static str, Option<SharedString>) 
             true => fr_core::i18n::trc("句中", "用户名"),
             false => tr("密码或访问令牌"),
         };
-        return (
-            tr("远程仓库要求登录"),
-            Some(
-                fr_core::tf!(
-                    "远程仓库 {url} 要求登录，请输入代码托管平台的{what}。",
-                    url,
-                    what
-                )
-                .into(),
-            ),
+        let mut explain = fr_core::tf!(
+            "远程仓库 {url} 要求登录，请输入代码托管平台的{what}。",
+            url,
+            what
         );
+        // GitHub 不收账号密码：不说的话，新手照常填密码，然后认证失败
+        if github(&url) {
+            let gap = match fr_core::i18n::lang() {
+                fr_core::i18n::Lang::En => " ",
+                fr_core::i18n::Lang::Zh => "",
+            };
+            explain.push_str(gap);
+            explain.push_str(tr(
+                "GitHub 不接受账号密码，密码处请填写个人访问令牌（在 GitHub 的 Settings → Developer settings 中创建）。",
+            ));
+        }
+        return (tr("远程仓库要求登录"), Some(explain.into()));
     }
     // ssh 的登录密码：`user@host's password:`，或 `(user@host) Password:`
     if secret && lower.contains("password") {
@@ -416,7 +431,7 @@ fn open_host_key(
 
 #[cfg(test)]
 mod tests {
-    use super::classify;
+    use super::{classify, github};
 
     #[test]
     fn 认出是哪一种密码() {
@@ -435,5 +450,19 @@ mod tests {
         assert_eq!(title, "主机登录密码");
         let (title, explain) = classify("Verification code: ", false);
         assert_eq!((title, explain), ("需要输入", None));
+    }
+
+    #[test]
+    fn github_的登录框提示用访问令牌() {
+        let (_, explain) = classify("Password for 'https://me@github.com': ", true);
+        assert!(explain.unwrap().contains("个人访问令牌"));
+        let (_, explain) = classify("Username for 'https://github.com': ", false);
+        assert!(explain.unwrap().contains("个人访问令牌"));
+        // 别的托管平台不说
+        let (_, explain) = classify("Username for 'https://gitea.example.com': ", false);
+        assert!(!explain.unwrap().contains("个人访问令牌"));
+        assert!(github("https://GitHub.com:443/me/repo.git"));
+        assert!(!github("https://github.com.evil.example/x"));
+        assert!(!github("https://gitlab.com"));
     }
 }
