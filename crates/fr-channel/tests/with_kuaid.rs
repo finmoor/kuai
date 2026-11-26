@@ -205,10 +205,11 @@ fn 线路断了_在路上的请求报错不卡住_之后的请求马上失败() 
         )
         .is_some()
     );
-    // 一个要 20 秒才回的请求
+    // 一个自己不会回的请求，等断线来结束它。`cut` 要起 PowerShell 查进程，CI 上慢的时候要二十多秒：
+    // 请求睡得比它短就先跑完了，测到的不是断线
     let napping = channel.git(
         &repo,
-        ["-c", "alias.nap=!sleep 20", "nap"]
+        ["-c", "alias.nap=!sleep 600", "nap"]
             .map(String::from)
             .to_vec(),
     );
@@ -217,13 +218,12 @@ fn 线路断了_在路上的请求报错不卡住_之后的请求马上失败() 
         let _ = tx.send(futures::executor::block_on(napping).map(|_| ()));
     });
     std::thread::sleep(Duration::from_millis(500));
-    let cut = Instant::now();
     home.cut();
+    // 从 `cut` 回来算起（它自己用了多久不算）：转接程序已经没了，在路上的请求很快报错
     let result = rx
         .recv_timeout(Duration::from_secs(10))
         .expect("线路断了，请求还卡着");
     assert!(result.is_err(), "线路断了，请求却报成功");
-    assert!(cut.elapsed() < Duration::from_secs(10));
     assert!(!conn.is_alive());
     // 之后的请求发的时候就失败
     let started = Instant::now();
