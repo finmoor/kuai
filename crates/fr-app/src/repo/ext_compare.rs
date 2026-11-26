@@ -18,7 +18,7 @@ use fr_core::status::{Entry, Kind as StatusKind};
 use fr_core::tf;
 use fr_core::workfile;
 use gpui_kit::component::button::Button;
-use gpui_kit::component::notification::Notification;
+use gpui_kit::component::notification::{Notification, NotificationType};
 use gpui_kit::component::{Sizable as _, WindowExt as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -422,46 +422,45 @@ impl RepoView {
                         let view = cx.entity().downgrade();
                         let file = path.clone();
                         // 带着「标记为已解决」：不自动消失，切回来时按钮还在
-                        let note = Notification::success(tf!(
-                            "{path} 已在外部工具中合并",
-                            path = path.as_str()
-                        ))
-                        .autohide(false)
-                        .action(move |_, _, cx| {
-                            let (view, file, me) =
-                                (view.clone(), file.clone(), cx.entity().downgrade());
-                            Button::new("ext-merge-resolved")
-                                .small()
-                                .label(tr("标记为已解决"))
-                                .on_click(move |_, window, cx| {
-                                    let file = file.clone();
-                                    view.update(cx, |this, cx| {
-                                        let add = vec![Step::local(vec![
-                                            "add".into(),
-                                            "--".into(),
-                                            file.clone(),
-                                        ])];
-                                        this.run_seq(
-                                            tr("标记为已解决"),
-                                            add,
-                                            window,
-                                            cx,
-                                            move |_, _, w, cx| {
-                                                let text = tf!(
-                                                    "{path} 已标记为已解决",
-                                                    path = file.as_str()
-                                                );
-                                                w.push_notification(
-                                                    Notification::success(text),
-                                                    cx,
-                                                );
-                                            },
-                                        );
+                        let note = crate::ui::action_note(
+                            NotificationType::Success,
+                            tf!("{path} 已在外部工具中合并", path = path.as_str()),
+                            move |_, _, cx| {
+                                let (view, file, me) =
+                                    (view.clone(), file.clone(), cx.entity().downgrade());
+                                Button::new("ext-merge-resolved")
+                                    .small()
+                                    .label(tr("标记为已解决"))
+                                    .on_click(move |_, window, cx| {
+                                        let file = file.clone();
+                                        view.update(cx, |this, cx| {
+                                            let add = vec![Step::local(vec![
+                                                "add".into(),
+                                                "--".into(),
+                                                file.clone(),
+                                            ])];
+                                            this.run_seq(
+                                                tr("标记为已解决"),
+                                                add,
+                                                window,
+                                                cx,
+                                                move |_, _, w, cx| {
+                                                    let text = tf!(
+                                                        "{path} 已标记为已解决",
+                                                        path = file.as_str()
+                                                    );
+                                                    w.push_notification(
+                                                        Notification::success(text),
+                                                        cx,
+                                                    );
+                                                },
+                                            );
+                                        })
+                                        .ok();
+                                        me.update(cx, |note, cx| note.dismiss(window, cx)).ok();
                                     })
-                                    .ok();
-                                    me.update(cx, |note, cx| note.dismiss(window, cx)).ok();
-                                })
-                        });
+                            },
+                        );
                         window.push_notification(note, cx);
                     }
                 }
@@ -477,7 +476,7 @@ impl RepoView {
             Kind::Diff => tr("尚未设置外部比较工具。请在「设置 → 外部工具」中选择。"),
             Kind::Merge => tr("尚未设置外部合并工具。请在「设置 → 外部工具」中选择。"),
         };
-        let note = Notification::info(text).action(|_, _, cx| {
+        let note = crate::ui::action_note(NotificationType::Info, text, |_, _, cx| {
             let me = cx.entity().downgrade();
             Button::new("ext-open-settings")
                 .small()

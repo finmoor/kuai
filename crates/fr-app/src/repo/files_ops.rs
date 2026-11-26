@@ -12,7 +12,7 @@ use fr_core::tf;
 use futures::StreamExt as _;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
-use gpui_kit::component::notification::Notification;
+use gpui_kit::component::notification::{Notification, NotificationType};
 use gpui_kit::component::{Sizable as _, WindowExt as _};
 use gpui_kit::*;
 
@@ -933,16 +933,20 @@ impl RepoView {
                     Ok(()) => {
                         let shown = dest.to_string_lossy().into_owned();
                         let text = tf!("已下载到 {path}", path = shown.clone());
-                        let notification = Notification::success(text).action(move |_, _, _| {
-                            let shown = shown.clone();
-                            Button::new("download-reveal")
-                                .small()
-                                .label(crate::shell::reveal_label())
-                                .on_click(move |_, window, cx| {
-                                    let result = crate::shell::reveal_in_explorer(&shown);
-                                    crate::shell::report(result, window, cx);
-                                })
-                        });
+                        let notification = crate::ui::action_note(
+                            NotificationType::Success,
+                            text,
+                            move |_, _, _| {
+                                let shown = shown.clone();
+                                Button::new("download-reveal")
+                                    .small()
+                                    .label(crate::shell::reveal_label())
+                                    .on_click(move |_, window, cx| {
+                                        let result = crate::shell::reveal_in_explorer(&shown);
+                                        crate::shell::report(result, window, cx);
+                                    })
+                            },
+                        );
                         window.push_notification(notification, cx);
                     }
                     Err(err) => {

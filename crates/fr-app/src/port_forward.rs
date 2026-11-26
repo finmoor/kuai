@@ -18,7 +18,7 @@ use fr_channel::Forwarder;
 use fr_core::i18n::tr;
 use fr_core::tf;
 use gpui_kit::component::WindowExt as _;
-use gpui_kit::component::notification::Notification;
+use gpui_kit::component::notification::{Notification, NotificationType};
 use gpui_kit::*;
 
 use crate::app_state::{AppState, connect_options, jump_options};
@@ -174,8 +174,8 @@ fn start(
                         local
                     );
                     // 带「停止转发」；还是 5 秒后收起（鼠标停在上面时不收），之后在主机页的 ⋯ 里停
-                    let note = Notification::success(text)
-                        .action(move |_, _, cx| {
+                    let note =
+                        crate::ui::action_note(NotificationType::Success, text, move |_, _, cx| {
                             let (host, note) = (host.clone(), cx.entity().downgrade());
                             gpui_kit::component::button::Button::new("forward-stop")
                                 .label(tr("停止转发"))

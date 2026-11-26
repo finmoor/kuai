@@ -11,7 +11,7 @@ use fr_core::tf;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::PopupMenuItem;
-use gpui_kit::component::notification::Notification;
+use gpui_kit::component::notification::{Notification, NotificationType};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
@@ -272,21 +272,24 @@ impl RepoView {
                 let note = match result {
                     Ok(()) => {
                         let shown = path.to_string_lossy().into_owned();
-                        Notification::success(tf!(
-                            "已将 {count} 个提交导出到 {path}",
-                            count,
-                            path = shown.clone()
-                        ))
-                        .action(move |_, _, _| {
-                            let shown = shown.clone();
-                            Button::new("patch-reveal")
-                                .small()
-                                .label(crate::shell::reveal_label())
-                                .on_click(move |_, window, cx| {
-                                    let result = crate::shell::reveal_in_explorer(&shown);
-                                    crate::shell::report(result, window, cx);
-                                })
-                        })
+                        ui::action_note(
+                            NotificationType::Success,
+                            tf!(
+                                "已将 {count} 个提交导出到 {path}",
+                                count,
+                                path = shown.clone()
+                            ),
+                            move |_, _, _| {
+                                let shown = shown.clone();
+                                Button::new("patch-reveal")
+                                    .small()
+                                    .label(crate::shell::reveal_label())
+                                    .on_click(move |_, window, cx| {
+                                        let result = crate::shell::reveal_in_explorer(&shown);
+                                        crate::shell::report(result, window, cx);
+                                    })
+                            },
+                        )
                     }
                     Err(err) => {
                         Notification::error(tf!("导出补丁失败：{err}", err = format!("{err:#}")))

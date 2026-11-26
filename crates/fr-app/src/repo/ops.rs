@@ -16,7 +16,7 @@ use gpui_kit::component::Sizable as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
-use gpui_kit::component::notification::Notification;
+use gpui_kit::component::notification::{Notification, NotificationType};
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -1006,8 +1006,10 @@ impl RepoView {
             // 带上「添加远程…」直达；带按钮的通知默认不自己收起，这条 5 秒后收起（鼠标停在上面时不收），
             // 原来一直不消失，切到别的页还盖在右下角
             let view = cx.entity().downgrade();
-            let note = Notification::warning(tr("此仓库尚无远程。请先添加远程。"))
-                .action(move |_, _, cx| {
+            let note = crate::ui::action_note(
+                NotificationType::Warning,
+                tr("此仓库尚无远程。请先添加远程。"),
+                move |_, _, cx| {
                     let (view, note) = (view.clone(), cx.entity().downgrade());
                     Button::new("no-remote-add")
                         .small()
@@ -1018,8 +1020,9 @@ impl RepoView {
                             view.update(cx, |view, cx| view.add_remote_dialog(window, cx))
                                 .ok();
                         })
-                })
-                .autohide(true);
+                },
+            )
+            .autohide(true);
             window.push_notification(note, cx);
             return;
         }

@@ -10,7 +10,7 @@ use fr_core::workfile::{self, Snap};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::DialogFooter;
-use gpui_kit::component::notification::Notification;
+use gpui_kit::component::notification::{Notification, NotificationType};
 use gpui_kit::component::{Sizable as _, WindowExt as _, h_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -220,20 +220,19 @@ impl RepoView {
                 };
                 let view = cx.entity().downgrade();
                 let note =
-                    Notification::success(text)
-                        .id::<DiscardNote>()
-                        .action(move |_, _, cx| {
-                            let (view, me) = (view.clone(), cx.entity().downgrade());
-                            Button::new("undo-discard")
-                                .small()
-                                .label(tr("撤销"))
-                                .tooltip(tr("放回丢弃前的内容（Ctrl+Z）"))
-                                .on_click(move |_, window, cx| {
-                                    view.update(cx, |this, cx| this.undo_discard(window, cx))
-                                        .ok();
-                                    me.update(cx, |note, cx| note.dismiss(window, cx)).ok();
-                                })
-                        });
+                    crate::ui::action_note(NotificationType::Success, text, move |_, _, cx| {
+                        let (view, me) = (view.clone(), cx.entity().downgrade());
+                        Button::new("undo-discard")
+                            .small()
+                            .label(tr("撤销"))
+                            .tooltip(tr("放回丢弃前的内容（Ctrl+Z）"))
+                            .on_click(move |_, window, cx| {
+                                view.update(cx, |this, cx| this.undo_discard(window, cx))
+                                    .ok();
+                                me.update(cx, |note, cx| note.dismiss(window, cx)).ok();
+                            })
+                    })
+                    .id::<DiscardNote>();
                 window.push_notification(note, cx);
             })
             .ok();

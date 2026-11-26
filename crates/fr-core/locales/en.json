@@ -2478,7 +2478,7 @@
   "已保存": "Saved",
   "已连接 {name}。保存登录密码后，以后连接不再询问。": "Connected to {name}. Save the sign-in password so you are not asked again.",
   "已连接 {name}。保存私钥口令后，以后连接不再询问。": "Connected to {name}. Save the key passphrase so you are not asked again.",
-  "未找到 winget，无法自动安装 WinFsp。请从 WinFsp 官网下载安装，然后重新映射。": "winget was not found, so WinFsp cannot be installed automatically. Download and install it from the WinFsp website, then map again.",
+  "未找到 winget，无法自动安装 WinFsp。请下载安装后重新映射。": "winget was not found, so WinFsp cannot be installed automatically. Download and install it, then map again.",
   "点击任务栏右下角的 Kuai 图标即可恢复窗口，图标可能收在「^」中。": "Click the Kuai icon at the right end of the taskbar to restore the window. It may be hidden under ^.",
   "点击系统托盘中的 Kuai 图标即可恢复窗口。": "Click the Kuai icon in the system tray to restore the window.",
   "操作失败：未设置提交作者。请填写名称和邮箱，保存后重新操作。": "The operation failed: no commit author is set. Enter a name and email, save, then try again.",

@@ -39,7 +39,7 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_kit::component::notification::Notification;
+use gpui_kit::component::notification::{Notification, NotificationType};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, TitleBar, WindowExt as _, h_flex,
     v_flex,
@@ -428,7 +428,7 @@ impl Workspace {
                         false => tf!("已连接 {name}。保存登录密码后，以后连接不再询问。", name),
                     };
                     let (app, id) = (app.clone(), typed.id.clone());
-                    let note = Notification::info(text).action(move |_, _, cx| {
+                    let note = ui::action_note(NotificationType::Info, text, move |_, _, cx| {
                         let (app, id, note) = (app.clone(), id.clone(), cx.entity().downgrade());
                         Button::new("save-typed-secret")
                             .small()
@@ -478,7 +478,7 @@ impl Workspace {
                         crate::mapping::Notice::NeedWinFsp => {
                             let app = app.clone();
                             let text = tr("映射需要先安装 WinFsp。");
-                            Notification::warning(text).action(move |_, _, cx| {
+                            ui::action_note(NotificationType::Warning, text, move |_, _, cx| {
                                 let (app, note) = (app.clone(), cx.entity().downgrade());
                                 Button::new("install-winfsp")
                                     .small()
@@ -495,11 +495,11 @@ impl Workspace {
                         | crate::mapping::Notice::NoWinget => {
                             let text = match notice {
                                 crate::mapping::Notice::NoWinget => tr(
-                                    "未找到 winget，无法自动安装 WinFsp。请从 WinFsp 官网下载安装，然后重新映射。",
+                                    "未找到 winget，无法自动安装 WinFsp。请下载安装后重新映射。",
                                 ),
                                 _ => tr("WinFsp 安装未完成。"),
                             };
-                            Notification::error(text).action(move |_, _, cx| {
+                            ui::action_note(NotificationType::Error, text, move |_, _, cx| {
                                 let note = cx.entity().downgrade();
                                 Button::new("winfsp-download")
                                     .small()
@@ -545,8 +545,10 @@ impl Workspace {
         if updater.read(cx).updated_from.is_some() {
             cx.defer_in(window, |_, window, cx| {
                 let version = env!("CARGO_PKG_VERSION");
-                let notification = Notification::success(tf!("已更新到 {version}", version))
-                    .action(move |_, _, _| {
+                let notification = ui::action_note(
+                    NotificationType::Success,
+                    tf!("已更新到 {version}", version),
+                    move |_, _, _| {
                         Button::new("update-notes")
                             .small()
                             .label(tr("查看更新内容"))
@@ -555,7 +557,8 @@ impl Workspace {
                                     format!("{}/releases/tag/v{version}", update::repo_url());
                                 crate::shell::report(crate::shell::open_url(&page), window, cx);
                             })
-                    });
+                    },
+                );
                 window.push_notification(notification, cx);
             });
         }
@@ -2079,20 +2082,19 @@ impl Workspace {
             row.clone(),
         );
         // 同一个终端只留一条；带按钮的通知默认不会自己收起，这里要它几秒后收起（标题栏上的个数还在）
-        let note = Notification::info(text)
-            .id1::<TerminalStopped>(key)
-            .action(move |_, _, _| {
-                let (this, row) = (this.clone(), row.clone());
-                Button::new("terminal-go")
-                    .small()
-                    .primary()
-                    .label(tr("前往"))
-                    .on_click(move |_, window, cx| {
-                        this.update(cx, |this, cx| this.go_to_terminal(&row, window, cx))
-                            .ok();
-                    })
-            })
-            .autohide(true);
+        let note = ui::action_note(NotificationType::Info, text, move |_, _, _| {
+            let (this, row) = (this.clone(), row.clone());
+            Button::new("terminal-go")
+                .small()
+                .primary()
+                .label(tr("前往"))
+                .on_click(move |_, window, cx| {
+                    this.update(cx, |this, cx| this.go_to_terminal(&row, window, cx))
+                        .ok();
+                })
+        })
+        .id1::<TerminalStopped>(key)
+        .autohide(true);
         log::info!(
             "提醒终端待查看：{}，窗口{}",
             path,
@@ -2135,20 +2137,19 @@ impl Workspace {
         let system = settings.notify_terminal_system;
         let text = tf!("离开期间 {n} 个终端有新输出", n = n.to_string());
         let this = cx.entity().downgrade();
-        let note = Notification::info(text.clone())
-            .id::<AwayNote>()
-            .action(move |_, _, _| {
-                let this = this.clone();
-                Button::new("away-go")
-                    .small()
-                    .primary()
-                    .label(tr("查看"))
-                    .on_click(move |_, window, cx| {
-                        this.update(cx, |this, cx| this.show_waiting(window, cx))
-                            .ok();
-                    })
-            })
-            .autohide(true);
+        let note = ui::action_note(NotificationType::Info, text.clone(), move |_, _, _| {
+            let this = this.clone();
+            Button::new("away-go")
+                .small()
+                .primary()
+                .label(tr("查看"))
+                .on_click(move |_, window, cx| {
+                    this.update(cx, |this, cx| this.show_waiting(window, cx))
+                        .ok();
+                })
+        })
+        .id::<AwayNote>()
+        .autohide(true);
         window.push_notification(note, cx);
         if !in_front(window) && system {
             self.toast_job(ToastJob::Show {

@@ -11,7 +11,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::menu::ContextMenuExt as _;
-use gpui_kit::component::notification::Notification;
+use gpui_kit::component::notification::{Notification, NotificationType};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -391,7 +391,9 @@ impl RepoView {
                 let note = match result {
                     Ok(()) => {
                         let shown = dest.to_string_lossy().into_owned();
-                        Notification::success(tf!("已保存到 {path}", path = shown.clone())).action(
+                        ui::action_note(
+                            NotificationType::Success,
+                            tf!("已保存到 {path}", path = shown.clone()),
                             move |_, _, _| {
                                 let shown = shown.clone();
                                 Button::new("tree-reveal")

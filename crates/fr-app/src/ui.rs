@@ -7,8 +7,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::button::Button;
+use gpui_kit::component::notification::{Notification, NotificationType};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
@@ -242,6 +244,39 @@ pub fn tip(text: impl Into<SharedString>, window: &mut Window, cx: &mut App) -> 
         return no_tip(cx);
     }
     Tooltip::new(text.into()).build(window, cx)
+}
+
+/// 带一个按钮的通知。文字和按钮一行放得下时并排；放不下时按钮换到下一行、靠右，文字占满整行。
+/// 组件自带的 `Notification::action` 总把按钮放在文字右边，文字那一栏只剩一百来宽，稍长的句子
+/// 会折成四五行。和 `action` 一样默认不自动消失，要自动消失的在后面接 `.autohide(true)`。
+pub fn action_note(
+    kind: NotificationType,
+    text: impl Into<SharedString>,
+    button: impl Fn(&mut Notification, &mut Window, &mut Context<Notification>) -> Button + 'static,
+) -> Notification {
+    let text: SharedString = text.into();
+    Notification::new()
+        .with_type(kind)
+        .content(move |note, window, cx| {
+            h_flex()
+                .flex_wrap()
+                .items_center()
+                .gap_x(px(12.))
+                .gap_y(px(8.))
+                // 按内容的宽度占位（一行排开有多宽就算多宽）：和按钮加起来超过通知的宽度，按钮就换行；
+                // 自己一行时再缩回通知的宽度、在里面折行
+                .child(div().flex_grow(1.).min_w_0().text_sm().child(text.clone()))
+                // 右边留出鼠标移上来时右上角那个关闭按钮的位置（组件给 `action` 留的也是这么多）
+                .child(
+                    div()
+                        .flex_none()
+                        .ml_auto()
+                        .mr(px(14.))
+                        .child(button(note, window, cx).small()),
+                )
+                .into_any_element()
+        })
+        .autohide(false)
 }
 
 /// 计数的小块：侧栏「本地修改」后面的数字、分组里有几项。

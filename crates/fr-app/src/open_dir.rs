@@ -19,7 +19,7 @@ use gpui_kit::component::Sizable as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
-use gpui_kit::component::notification::Notification;
+use gpui_kit::component::notification::{Notification, NotificationType};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
@@ -41,11 +41,10 @@ type OnOpen<T> = Box<dyn FnOnce(&mut T, RepoEntry, &mut Window, &mut Context<T>)
 /// 时带「打开下载页面」：提示里写的 git-scm.com 点不了，原来这条 5 秒就消失、也找不回来。
 fn open_failed(err: String) -> Notification {
     let missing_git = cfg!(windows) && err.contains(&fr_core::git::missing());
-    let note = Notification::error(err).autohide(false);
     if !missing_git {
-        return note;
+        return Notification::error(err).autohide(false);
     }
-    note.action(|_, _, cx| {
+    crate::ui::action_note(NotificationType::Error, err, |_, _, cx| {
         let note = cx.entity().downgrade();
         Button::new("git-download")
             .small()
