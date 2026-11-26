@@ -273,6 +273,19 @@ pub(super) fn tree_menu(
                 ))
                 .separator();
         }
+        // 目录：看改过它里面文件的提交
+        if let Some(row) = row.as_ref().filter(|row| row.dir && !row.path.is_empty()) {
+            let history = format!("{}/", row.path.trim_end_matches('/'));
+            menu = menu
+                .item(item(
+                    tr("目录历史"),
+                    Box::new(move |this, window, cx| {
+                        this.show_page(Page::Git, window, cx);
+                        this.show_file_history(history.clone(), window, cx);
+                    }),
+                ))
+                .separator();
+        }
         let (new_file, new_folder, upload) = (dir.clone(), dir.clone(), dir.clone());
         // 在此新建终端：目录就开在它里面，文件开在它所在的目录，空白处开在仓库根
         let place = this.read(cx).launch_place(&dir, cx);

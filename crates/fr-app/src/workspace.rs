@@ -1831,6 +1831,24 @@ impl Workspace {
         self.app.read(cx).tabs().is_pinned(entry)
     }
 
+    /// 把第 `from` 个标签页拖到第 `to` 个的位置上（往后拖排到它后面，往前拖排到它前面）。固定的只能
+    /// 在固定的之间挪，没固定的也一样：固定的总排在最前面。显示着的还是原来那个仓库。
+    fn move_tab(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return;
+        }
+        let pinned = |ix: usize| self.is_pinned(&self.tabs[ix].entry, cx);
+        if pinned(from) != pinned(to) {
+            return;
+        }
+        let front = self.front_repo();
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.refocus(front, Page::Workspaces);
+        self.persist(cx);
+        cx.notify();
+    }
+
     /// 关掉一批标签页：`which` 挑出要关的（参数是下标和仓库）。固定的不关；正在做操作的、有没保存
     /// 的文件的也留着（原来没保存的照关，修改就丢了），并说一声。显示着的那一页没被关掉就还留在它上面。
     fn close_many(
@@ -2404,16 +2422,220 @@ impl Workspace {
         }
     }
 
-    /// Ctrl+P：快速打开仓库。输入几个字筛选，上下键选，回车打开选中的，也可以点。
+    /// Ctrl+P：命令面板。一个框里搜仓库、命令、当前仓库的分支和标签、文件（见 `command_palette.rs`）。
+    /// 原来只能搜仓库；敲仓库名、回车的用法不变。
     pub fn quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::command_palette::{Chosen, Palette};
+        let repo = self.active_repo().map(|tab| tab.shown(cx));
+        let (rows, runners) = self.palette_commands(repo.as_ref(), cx);
+        let recent = self.app.read(cx).settings.palette_recent.clone();
         let app = self.app.clone();
-        let picker = cx.new(|cx| QuickOpen::new(app, PickFor::Open, window, cx));
-        cx.subscribe_in(&picker, window, |this, _, event: &Picked, window, cx| {
-            window.close_dialog(cx);
-            this.open(event.0.clone(), window, cx);
-        })
+        let palette = cx.new({
+            let repo = repo.clone();
+            |cx| Palette::new(app, repo, rows, recent, window, cx)
+        });
+        let runners = Rc::new(runners);
+        cx.subscribe_in(
+            &palette,
+            window,
+            move |this, _, event: &Chosen, window, cx| {
+                window.close_dialog(cx);
+                this.palette_chosen(event.clone(), &runners, repo.clone(), window, cx);
+            },
+        )
         .detach();
-        show_picker(picker, tr("快速打开仓库").into(), window, cx);
+        crate::command_palette::show(palette, window, cx);
+    }
+
+    /// 命令面板里列的命令，和各自怎么做：快捷键登记表里的、当前仓库页的、主窗口的。
+    fn palette_commands(
+        &self,
+        repo: Option<&Entity<RepoView>>,
+        cx: &App,
+    ) -> (
+        Vec<crate::command_palette::CommandRow>,
+        std::collections::HashMap<String, PaletteRun>,
+    ) {
+        use crate::command_palette::CommandRow;
+        let mut rows = Vec::new();
+        let mut runners = std::collections::HashMap::new();
+        let keymap = &self.app.read(cx).settings.keymap;
+        for entry in crate::keymap::entries(cx) {
+            // 面板自己不列；只列出来看的（终端里的键）没有可做的事
+            let Some(action) = entry.make_action().filter(|_| entry.id != "quick") else {
+                continue;
+            };
+            let keys = crate::keymap::keys_of(&entry, keymap)
+                .first()
+                .map(|keys| crate::keymap::display(keys))
+                .unwrap_or_default();
+            // 新建终端的各个预设只有名字（「Claude Code」），前面说清是做什么
+            let name: SharedString = match entry.preset.is_some() {
+                true => tf!("新建终端：{name}", name = entry.name).into(),
+                false => entry.name.clone(),
+            };
+            // Git、文件这两组只在仓库页里有用：别的页面上灰着并写原因，和下面不带快捷键的那些一样
+            let needs_repo = matches!(
+                entry.group,
+                crate::keymap::Group::Git | crate::keymap::Group::File
+            );
+            rows.push(CommandRow {
+                id: entry.id.clone(),
+                name,
+                group: entry.group.title().into(),
+                keys: keys.into(),
+                why_not: (needs_repo && repo.is_none()).then(|| tr("当前不在仓库页").into()),
+            });
+            runners.insert(entry.id.clone(), PaletteRun::Action(action));
+        }
+        let view = repo.map(|repo| repo.read(cx));
+        for command in crate::repo::palette_commands(view, cx) {
+            rows.push(CommandRow {
+                id: command.id.to_string(),
+                name: command.name,
+                group: "Git".into(),
+                keys: SharedString::default(),
+                why_not: command.why_not,
+            });
+            runners.insert(command.id.to_string(), PaletteRun::Repo(command.run));
+        }
+        let app_commands: [(&str, &'static str, &'static str, PaletteAppRun); 9] = [
+            (
+                "app.open_local",
+                tr("在本机打开仓库…"),
+                tr("仓库"),
+                |this, window, cx| {
+                    this.show_page(Page::Servers, window, cx);
+                    this.manager
+                        .update(cx, |manager, cx| manager.open_local(window, cx));
+                },
+            ),
+            (
+                "app.new_project",
+                tr("新建项目…"),
+                tr("仓库"),
+                |this, window, cx| {
+                    this.show_page(Page::Servers, window, cx);
+                    this.manager
+                        .update(cx, |manager, cx| manager.new_local_project(window, cx));
+                },
+            ),
+            (
+                "app.hosts",
+                tr("主机页"),
+                tr("页面"),
+                |this, window, cx| this.show_page(Page::Servers, window, cx),
+            ),
+            (
+                "app.workspaces",
+                tr("工作区页"),
+                tr("页面"),
+                |this, window, cx| this.show_page(Page::Workspaces, window, cx),
+            ),
+            (
+                "settings.general",
+                tr("设置：常规"),
+                tr("设置"),
+                |this, window, cx| this.open_settings_at(0, window, cx),
+            ),
+            (
+                "settings.appearance",
+                tr("设置：外观"),
+                tr("设置"),
+                |this, window, cx| this.open_settings_at(1, window, cx),
+            ),
+            (
+                "settings.terminal",
+                tr("设置：终端"),
+                tr("设置"),
+                |this, window, cx| this.open_settings_at(2, window, cx),
+            ),
+            (
+                "settings.keys",
+                tr("设置：快捷键"),
+                tr("设置"),
+                |this, window, cx| this.open_settings_at(3, window, cx),
+            ),
+            (
+                "settings.about",
+                tr("设置：关于"),
+                tr("设置"),
+                |this, window, cx| this.open_settings_at(4, window, cx),
+            ),
+        ];
+        for (id, name, group, run) in app_commands {
+            rows.push(CommandRow {
+                id: id.to_string(),
+                name: name.into(),
+                group: group.into(),
+                keys: SharedString::default(),
+                why_not: None,
+            });
+            runners.insert(id.to_string(), PaletteRun::App(run));
+        }
+        (rows, runners)
+    }
+
+    /// 打开设置的第几页（见 `SettingsPage::show_at`）。
+    fn open_settings_at(&mut self, page: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_page
+            .update(cx, |settings, cx| settings.show_at(page, cx));
+        if !self.showing_settings {
+            self.toggle_settings(window, cx);
+        }
+    }
+
+    /// 命令面板里选了一项：做它。面板已经关了。
+    fn palette_chosen(
+        &mut self,
+        chosen: crate::command_palette::Chosen,
+        runners: &std::collections::HashMap<String, PaletteRun>,
+        repo: Option<Entity<RepoView>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::command_palette::Chosen;
+        match chosen {
+            Chosen::Repo(entry) => self.open(entry, window, cx),
+            Chosen::Command(id) => {
+                // 记进「最近用过」，下次排前面
+                self.app.update(cx, |app, cx| {
+                    app.update_settings(cx, |s| {
+                        s.palette_recent.retain(|recent| *recent != id);
+                        s.palette_recent.insert(0, id.clone());
+                        s.palette_recent.truncate(PALETTE_RECENT);
+                    })
+                });
+                match runners.get(&id) {
+                    Some(PaletteRun::Action(action)) => {
+                        // 等对话框关掉、焦点回到原处再发：有的操作看焦点在哪
+                        let action = action.boxed_clone();
+                        window.defer(cx, move |window, cx| window.dispatch_action(action, cx));
+                    }
+                    Some(PaletteRun::Repo(run)) => {
+                        if let Some(repo) = repo {
+                            repo.update(cx, |view, cx| run(view, window, cx));
+                        }
+                    }
+                    Some(PaletteRun::App(run)) => run(self, window, cx),
+                    None => {}
+                }
+            }
+            Chosen::Ref(target, action) => {
+                if let Some(repo) = repo {
+                    repo.update(cx, |view, cx| {
+                        view.palette_ref_action(&target, action, window, cx)
+                    });
+                }
+            }
+            Chosen::File(path, action) => {
+                if let Some(repo) = repo {
+                    repo.update(cx, |view, cx| {
+                        view.palette_file_action(path, action, window, cx)
+                    });
+                }
+            }
+        }
     }
 
     /// Ctrl+Shift+N：选一个仓库，在里面新建终端，到会话页显示它。
@@ -2531,9 +2753,19 @@ impl Workspace {
             (cx.entity().downgrade(), self.app.clone(), tab.entry.clone());
         let tip_title = look.tip_title.clone();
         let tip_path = SharedString::from(tab.entry.path.clone());
+        let drag = DragTab {
+            index: ix,
+            title: look.title.clone(),
+        };
         tab_shell(("tab", ix), look.selected, cx)
             .flex_none()
             .w(px(width))
+            // 拖动改顺序：拖到另一个标签页上放下
+            .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
+            .drag_over::<DragTab>(move |style, _, _, _| style.border_color(accent))
+            .on_drop(
+                cx.listener(move |this, drag: &DragTab, _, cx| this.move_tab(drag.index, ix, cx)),
+            )
             .tooltip(move |window, cx| {
                 ui::two_line_tip(tip_title.clone(), tip_path.clone(), window, cx)
             })
@@ -3801,15 +4033,55 @@ pub(crate) fn go_to_hosts(window: &mut Window, cx: &mut App) {
     });
 }
 
+/// 拖着标签页排序时跟着鼠标的那一块。
+#[derive(Clone)]
+struct DragTab {
+    index: usize,
+    title: SharedString,
+}
+
+impl Render for DragTab {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .px(px(10.))
+            .h(px(28.))
+            .flex()
+            .items_center()
+            .max_w(px(240.))
+            .rounded(px(ui::RADIUS))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .text_size(px(13.))
+            .truncate()
+            .child(self.title.clone())
+    }
+}
+
+/// 命令面板里记几条最近用过的命令
+const PALETTE_RECENT: usize = 8;
+
+type PaletteAppRun = fn(&mut Workspace, &mut Window, &mut Context<Workspace>);
+
+/// 命令面板里一条命令怎么做。
+enum PaletteRun {
+    /// 快捷键登记表里的：发这个动作，和按快捷键一样
+    Action(Box<dyn Action>),
+    /// 当前仓库页的
+    Repo(fn(&mut RepoView, &mut Window, &mut Context<RepoView>)),
+    /// 主窗口的
+    App(PaletteAppRun),
+}
+
 /// 选仓库的框里选中了一个仓库。
 pub(crate) struct Picked(pub RepoEntry);
 
 /// 选仓库干什么。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PickFor {
-    /// 快速打开（Ctrl+P）：刚关掉的、开着的在前，行尾写着
-    Open,
-    /// 在里面新建终端（会话页的 +、Ctrl+Shift+N）：行尾写它在哪个工作区
+    /// 在里面新建终端（会话页的 +、Ctrl+Shift+N）：行尾写它在哪个工作区。快速打开（Ctrl+P）原来
+    /// 也用这个框，现在是命令面板（`command_palette.rs`）
     Terminal,
 }
 
@@ -3917,10 +4189,8 @@ impl QuickOpen {
             .map(|(_, start)| start)
     }
 
-    /// 匹配输入内容的仓库：名字、路径、服务器名里有这几个字（不分大小写）。
-    /// 快速打开：先是刚关掉的（最近关的在最上），再是开着的，最后是各台电脑列表里的其余仓库（本机
-    /// 的在前）；第三项是行尾标的小字：刚关掉、开着。新建终端：各台电脑列表里的仓库，行尾写它在
-    /// 哪个工作区（不在的写「未加入工作区」）。
+    /// 匹配输入内容的仓库：名字、路径、服务器名里有这几个字（不分大小写）。各台电脑列表里的仓库，
+    /// 行尾写它在哪个工作区（不在的写「未加入工作区」）。
     fn matches(&self, cx: &App) -> Vec<(RepoEntry, SharedString, Option<SharedString>)> {
         let needle = self.input.read(cx).value().trim().to_lowercase();
         let app = self.app.read(cx);
@@ -3929,45 +4199,15 @@ impl QuickOpen {
                 || title.to_lowercase().contains(&needle)
                 || entry.path.to_lowercase().contains(&needle)
         };
-        if self.purpose == PickFor::Terminal {
-            return app
-                .all_repos()
-                .into_iter()
-                .map(|entry| {
-                    let place = match app.workspace_of(&entry) {
-                        Some(key) => app.workspace_name(&key),
-                        None => tr("未加入工作区").into(),
-                    };
-                    let title = app.repo_title(&entry);
-                    (entry, title, Some(place))
-                })
-                .filter(wanted)
-                .collect();
-        }
-        let open = app.tabs().repos.clone();
-        let closed: Vec<RepoEntry> = app
-            .closed_tabs()
+        app.all_repos()
             .into_iter()
-            .filter(|entry| !open.contains(entry))
-            .collect();
-        let rest: Vec<RepoEntry> = app
-            .all_repos()
-            .into_iter()
-            .filter(|entry| !open.contains(entry) && !closed.contains(entry))
-            .collect();
-        let closed_mark: SharedString = tr("最近关闭").into();
-        let open_mark: SharedString = tr("已打开").into();
-        closed
-            .iter()
-            .map(|entry| (entry.clone(), Some(closed_mark.clone())))
-            .chain(
-                open.iter()
-                    .map(|entry| (entry.clone(), Some(open_mark.clone()))),
-            )
-            .chain(rest.into_iter().map(|entry| (entry, None)))
-            .map(|(entry, mark)| {
+            .map(|entry| {
+                let place = match app.workspace_of(&entry) {
+                    Some(key) => app.workspace_name(&key),
+                    None => tr("未加入工作区").into(),
+                };
                 let title = app.repo_title(&entry);
-                (entry, title, mark)
+                (entry, title, Some(place))
             })
             .filter(wanted)
             .collect()

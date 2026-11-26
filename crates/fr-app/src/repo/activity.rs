@@ -152,8 +152,9 @@ impl Log {
         }
     }
 
-    /// 联网的命令还在执行：git 到现在为止的标准错误（进度、`remote:` 开头的远程输出），给底部的
-    /// 「输出」实时显示（见 `output.rs`）。结束时 [`Self::end`] 换成完整的输出。
+    /// 联网的命令还在执行：git 到现在为止说的话（进度、`remote:` 开头的远程输出、钩子的输出，两路
+    /// 按到达的先后合在一起），给底部的「输出」实时显示（见 `output.rs`）。结束时 [`Self::end`] 换成
+    /// 完整的输出。
     pub(super) fn live(&mut self, id: u64, stderr: &str) {
         if let Some(entry) = self
             .entries
@@ -161,6 +162,21 @@ impl Log {
             .find(|entry| entry.id == id && entry.outcome == Outcome::Running)
         {
             entry.output = fr_core::git::redact_urls(&clean_stderr(stderr))
+                .into_owned()
+                .into();
+        }
+    }
+
+    /// 执行完的命令两路都有输出时，换成按到达先后合在一起的样子（[`Self::end`] 记的是标准错误在前、
+    /// 标准输出在后）。pre-push 钩子写到标准输出的话 git 不并进标准错误，照 `end` 的排法会跑到
+    /// 钩子后来报的错后面去。
+    pub(super) fn arrival(&mut self, id: u64, said: &str) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == id && entry.outcome != Outcome::Running)
+        {
+            entry.output = fr_core::git::redact_urls(&clean_stderr(said))
                 .into_owned()
                 .into();
         }

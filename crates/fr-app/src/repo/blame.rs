@@ -1,5 +1,8 @@
 //! 逐行追溯（blame）：左边是每一行最后改它的提交，右边是文件内容。点一行跳到那个提交。
 //! 键盘：上下键、PageUp、PageDown、Home、End 换行，回车跳到改这一行的提交，Esc 关闭。
+//!
+//! 一路往前追：页头的「更早的版本」、行的右键菜单「追溯此行更早的修改」换成改这一行的那个提交
+//! 之前的版本（文件那时叫别的名字也跟得上），「较新的版本」退回来。
 
 use fr_core::i18n::tr;
 use fr_core::tf;
@@ -7,7 +10,10 @@ use std::ops::Range;
 
 use fr_core::blame::{self, Blame};
 use gpui_kit::component::button::Button;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
@@ -33,6 +39,10 @@ pub(super) struct BlameView {
     grab_focus: bool,
     /// 关掉以后回到哪个视图
     back: Mode,
+    /// 往更早的版本追过来的路：（路径，版本），最后一个是上一步看的
+    trail: Vec<(String, Option<String>)>,
+    /// 读完以后选中、滚到第几行（往前追时落在差不多的位置）
+    land: Option<usize>,
     _task: Task<()>,
 }
 
@@ -47,6 +57,18 @@ impl RepoView {
         &mut self,
         path: String,
         rev: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_blame(path, rev, Vec::new(), None, cx);
+    }
+
+    /// 打开逐行追溯。`trail` 是往前追过来的路（新打开的是空的），`land` 是读完落在第几行。
+    fn open_blame(
+        &mut self,
+        path: String,
+        rev: Option<String>,
+        trail: Vec<(String, Option<String>)>,
+        land: Option<usize>,
         cx: &mut Context<Self>,
     ) {
         let Some(channel) = self.channel.clone() else {
@@ -75,6 +97,12 @@ impl RepoView {
                                 shown.into()
                             })
                             .collect();
+                        // 往前追过来的：落在原来那一行附近
+                        if let Some(line) = view.land.take().filter(|_| !data.lines.is_empty()) {
+                            let line = line.min(data.lines.len() - 1);
+                            view.selected = Some(line);
+                            view.scroll.scroll_to_item(line, ScrollStrategy::Center);
+                        }
                         view.data = Some(data);
                     }
                     Err(err) => {
@@ -101,10 +129,85 @@ impl RepoView {
             focus: cx.focus_handle(),
             grab_focus: true,
             back,
+            trail,
+            land,
             _task: task,
         });
         self.mode = Mode::Blame;
         cx.notify();
+    }
+
+    /// 往更早的版本追：`line` 给了就追那一行（改它的那个提交之前的版本），没给按选中的行，再没有
+    /// 就按这个版本里最近改过文件的那个提交。追不动（文件就是那个提交加进来的）时说明原因。
+    fn blame_older(&mut self, line: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = &self.blame else {
+            return;
+        };
+        let Some(data) = &view.data else {
+            return;
+        };
+        let line = line.or(view.selected);
+        let picked = match line {
+            Some(line) => data
+                .lines
+                .get(line)
+                .and_then(|l| data.commits.get(l.commit).map(|c| (c, l.orig_line))),
+            None => data
+                .commits
+                .iter()
+                .filter(|commit| !commit.uncommitted())
+                .max_by_key(|commit| commit.time)
+                .map(|commit| (commit, 0)),
+        };
+        let Some((commit, orig_line)) = picked else {
+            return;
+        };
+        // 还没提交的行：更早的版本就是 HEAD 里的
+        let target = match commit.uncommitted() {
+            true => Some(("HEAD".to_string(), view.path.clone())),
+            false => commit.previous.clone(),
+        };
+        let Some((rev, path)) = target else {
+            let text = tf!(
+                "没有更早的版本：此文件由 {id}「{summary}」添加。",
+                id = &commit.id[..commit.id.len().min(8)],
+                summary = commit.summary.as_str()
+            );
+            window.push_notification(
+                gpui_kit::component::notification::Notification::info(text),
+                cx,
+            );
+            return;
+        };
+        let mut trail = view.trail.clone();
+        trail.push((view.path.clone(), view.rev.clone()));
+        // 那一行在更早的版本里大约还在原来的位置
+        let land = match (line, orig_line) {
+            (Some(_), n) if n > 0 => Some(n as usize - 1),
+            (Some(line), _) => Some(line),
+            (None, _) => None,
+        };
+        let back = view.back;
+        self.open_blame(path, Some(rev), trail, land, cx);
+        if let Some(view) = &mut self.blame {
+            view.back = back;
+        }
+    }
+
+    /// 退回上一步看的版本（较新的那个）。
+    fn blame_newer(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = &self.blame else {
+            return;
+        };
+        let mut trail = view.trail.clone();
+        let Some((path, rev)) = trail.pop() else {
+            return;
+        };
+        let (land, back) = (view.selected, view.back);
+        self.open_blame(path, rev, trail, land, cx);
+        if let Some(view) = &mut self.blame {
+            view.back = back;
+        }
     }
 
     pub(super) fn close_blame(&mut self, cx: &mut Context<Self>) {
@@ -188,6 +291,8 @@ impl RepoView {
         let Some(view) = &self.blame else {
             return div().into_any_element();
         };
+        let steps = view.trail.len();
+        let loaded = view.data.is_some();
         let body: AnyElement = match (&view.data, &view.error) {
             (_, Some(err)) => div()
                 .p_3()
@@ -237,9 +342,35 @@ impl RepoView {
                                 None => tr("当前版本").into(),
                             }),
                     )
-                    .child(div().text_xs().text_color(muted).child(tr(
-                        "点击一行跳转到修改该行的提交；使用上下方向键选择，按 Enter 跳转",
-                    )))
+                    .when(steps > 0, |bar| {
+                        bar.child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(tf!("已往前追 {steps} 步", steps)),
+                        )
+                    })
+                    .child(
+                        Button::new("blame-older")
+                            .xsmall()
+                            .label(tr("更早的版本"))
+                            .tooltip(tr(
+                                "追溯选中行更早的修改；未选中行时，回到最近一次修改此文件之前的版本",
+                            ))
+                            .disabled(!loaded)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.blame_older(None, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("blame-newer")
+                            .xsmall()
+                            .label(tr("较新的版本"))
+                            .tooltip(tr("回到上一步查看的版本"))
+                            .disabled(steps == 0)
+                            .on_click(cx.listener(|this, _, _, cx| this.blame_newer(cx))),
+                    )
                     .child(
                         Button::new("close-blame")
                             .xsmall()
@@ -307,6 +438,46 @@ impl RepoView {
                         .on_click(
                             cx.listener(move |this, _, window, cx| this.blame_jump(ix, window, cx)),
                         )
+                        .context_menu({
+                            let view = cx.entity().downgrade();
+                            let (id, uncommitted) = (commit.id.clone(), commit.uncommitted());
+                            move |menu, _, _| {
+                                let (older, jump) = (view.clone(), view.clone());
+                                let menu = menu.item(
+                                    PopupMenuItem::new(tr("追溯此行更早的修改")).on_click(
+                                        move |_, window, cx| {
+                                            older
+                                                .update(cx, |this, cx| {
+                                                    this.blame_older(Some(ix), window, cx)
+                                                })
+                                                .ok();
+                                        },
+                                    ),
+                                );
+                                if uncommitted {
+                                    return menu;
+                                }
+                                let id = id.clone();
+                                menu.item(
+                                    PopupMenuItem::new(tr("在提交历史中查看此提交")).on_click(
+                                        move |_, window, cx| {
+                                            jump.update(cx, |this, cx| {
+                                                this.blame_jump(ix, window, cx)
+                                            })
+                                            .ok();
+                                        },
+                                    ),
+                                )
+                                .separator()
+                                .item(
+                                    PopupMenuItem::new(tr("复制哈希")).on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            id.clone(),
+                                        ));
+                                    }),
+                                )
+                            }
+                        })
                         .child(
                             div()
                                 .w(px(150.))

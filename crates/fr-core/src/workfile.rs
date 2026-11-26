@@ -47,6 +47,14 @@ const SNAP: &str = r#"alias.fr-snap=!f(){ w=; [ "$1" = w ] && w=-w; t=$(mktemp) 
 /// 内容，或 `-` 表示原来没有这个文件，删掉）。
 const UNSNAP: &str = r#"alias.fr-unsnap=!f(){ c=-; if [ -L "$1" ] || [ -d "$1" ]; then c='?'; elif [ -f "$1" ]; then c=$(git hash-object --no-filters -- "$1") || c='?'; elif [ -e "$1" ]; then c='?'; fi; if [ "$c" != "$3" ]; then printf '%s\n' "$4" >&2; return 1; fi; if [ "$2" = - ]; then rm -f -- "$1"; else d=$(dirname -- "$1"); mkdir -p -- "$d" && git cat-file blob "$2" > "$1"; fi; }; f"#;
 
+/// 从工作区删掉一个文件（不碰暂存区）：把文件恢复成某个版本、那个版本里又没有它时用。
+const REMOVE: &str = r#"alias.fr-rm=!f(){ rm -f -- "$1"; }; f"#;
+
+/// 从工作区删掉 `path`（见 [`REMOVE`]）。
+pub fn remove_args(path: &str) -> Vec<String> {
+    vec!["-c".into(), REMOVE.into(), "fr-rm".into(), path.into()]
+}
+
 /// 一个文件在某一刻的样子（见 [`snap_args`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Snap {

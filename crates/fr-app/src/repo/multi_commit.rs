@@ -11,7 +11,7 @@ use fr_core::tf;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::PopupMenuItem;
-use gpui_kit::component::notification::{Notification, NotificationType};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
@@ -239,68 +239,19 @@ impl RepoView {
         window.push_notification(Notification::success(note), cx);
     }
 
+    /// 选中的提交当补丁的来源（新的在前，`format-patch` 出来就是旧的在前）。
+    pub(super) fn picked_patch_source(&self) -> super::patch_io::Source {
+        let ids = self.picked_commits().into_iter().map(|p| p.id).collect();
+        super::patch_io::Source::Commits(ids)
+    }
+
     /// 把选中的提交导出成一个补丁文件（`git format-patch`，从旧到新），存到本机选的位置。
     fn export_picked_patches(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let picked = self.picked_commits();
-        let Some(channel) = self.channel.clone() else {
-            return;
-        };
-        if picked.is_empty() {
+        if self.picked_commits().is_empty() {
             return;
         }
-        let repo = self.entry.path.clone();
-        // format-patch 按走的顺序倒过来输出：给新的在前，出来的补丁就是旧的在前
-        let mut format = args(&["format-patch", "--stdout", "--no-walk=unsorted"]);
-        format.extend(picked.iter().map(|p| p.id.clone()));
-        let name = match picked.as_slice() {
-            [one] => format!("{}.patch", &one.id[..one.id.len().min(8)]),
-            _ => format!("{}-commits.patch", picked.len()),
-        };
-        let downloads = super::files_ops::downloads_dir().unwrap_or_else(std::env::temp_dir);
-        let chosen = cx.prompt_for_new_path(&downloads, Some(&name));
-        let count = picked.len();
-        cx.spawn_in(window, async move |_, cx| {
-            let Ok(Ok(Some(path))) = chosen.await else {
-                return;
-            };
-            let result = channel
-                .git(&repo, format)
-                .await
-                .and_then(|out| out.ok())
-                .and_then(|bytes| std::fs::write(&path, bytes).map_err(anyhow::Error::from));
-            cx.update(|window, cx| {
-                let note = match result {
-                    Ok(()) => {
-                        let shown = path.to_string_lossy().into_owned();
-                        ui::action_note(
-                            NotificationType::Success,
-                            tf!(
-                                "已将 {count} 个提交导出到 {path}",
-                                count,
-                                path = shown.clone()
-                            ),
-                            move |_, _, _| {
-                                let shown = shown.clone();
-                                Button::new("patch-reveal")
-                                    .small()
-                                    .label(crate::shell::reveal_label())
-                                    .on_click(move |_, window, cx| {
-                                        let result = crate::shell::reveal_in_explorer(&shown);
-                                        crate::shell::report(result, window, cx);
-                                    })
-                            },
-                        )
-                    }
-                    Err(err) => {
-                        Notification::error(tf!("导出补丁失败：{err}", err = format!("{err:#}")))
-                            .autohide(false)
-                    }
-                };
-                window.push_notification(note, cx);
-            })
-            .ok();
-        })
-        .detach();
+        let source = self.picked_patch_source();
+        self.export_patch(source, window, cx);
     }
 
     /// 多选着提交时的右键菜单。
@@ -354,10 +305,13 @@ impl RepoView {
             .item(item(tr("复制哈希").into(), |this, w, cx| {
                 this.copy_picked_hashes(w, cx)
             }))
-            .item(item(
-                tr("导出为补丁文件…").into(),
-                |this, w, cx| this.export_picked_patches(w, cx),
-            ))
+            .item(item(tr("导出为补丁…").into(), |this, w, cx| {
+                this.export_picked_patches(w, cx)
+            }))
+            .item(item(tr("复制为补丁").into(), |this, w, cx| {
+                let source = this.picked_patch_source();
+                this.copy_patch(source, w, cx)
+            }))
         })
     }
 
@@ -396,7 +350,7 @@ impl RepoView {
             .collect();
         let more = count.saturating_sub(12);
         let squash_tip: SharedString = match &squash {
-            Ok(_) => tr("打开交互式变基：最早的提交保留，其余并入它，确认前还可以调整").into(),
+            Ok(_) => tr("进入「整理提交」：最早的提交保留，其余并入它，开始前还可以调整").into(),
             Err(reason) => (*reason).into(),
         };
         Some(

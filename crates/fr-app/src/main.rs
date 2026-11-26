@@ -6,6 +6,7 @@ mod appearance;
 mod autostart;
 mod browser;
 mod clone;
+mod command_palette;
 mod desktop;
 mod diagnose;
 mod ext_tools;

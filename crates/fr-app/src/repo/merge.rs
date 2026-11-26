@@ -837,8 +837,29 @@ impl RepoView {
                 Ok(_) => {
                     this.finish_merge_editor(cx);
                     this.show_changes(cx);
-                    let text = tf!("{path} 已保存，并标记为已解决", path);
-                    w.push_notification(Notification::success(text), cx);
+                    // 解决错了能重来：通知里给「重新解决冲突…」
+                    let text = tf!("{path} 已保存，并标记为已解决", path = path.as_str());
+                    let view = cx.entity().downgrade();
+                    let note = crate::ui::action_note(
+                        gpui_kit::component::notification::NotificationType::Success,
+                        text,
+                        move |_, _, cx| {
+                            let (view, path, me) =
+                                (view.clone(), path.clone(), cx.entity().downgrade());
+                            gpui_kit::component::button::Button::new("redo-conflict")
+                                .label(tr("重新解决冲突…"))
+                                .on_click(move |_, window, cx| {
+                                    me.update(cx, |note, cx| note.dismiss(window, cx)).ok();
+                                    let path = path.clone();
+                                    view.update(cx, |this, cx| {
+                                        this.redo_conflict(path, window, cx)
+                                    })
+                                    .ok();
+                                })
+                        },
+                    )
+                    .autohide(true);
+                    w.push_notification(note, cx);
                 }
                 Err(text) if text.contains(changed) => {
                     w.push_notification(Notification::warning(changed).autohide(false), cx);

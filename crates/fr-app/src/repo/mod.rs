@@ -24,6 +24,8 @@ mod blame;
 mod changes;
 mod commit_tree;
 mod compare;
+mod curate;
+mod custom;
 mod detached;
 mod dialogs;
 mod diff_search;
@@ -37,6 +39,7 @@ mod files;
 mod files_ops;
 mod files_view;
 mod history;
+mod hooks;
 mod image_diff;
 mod impact;
 mod inline_diff;
@@ -47,20 +50,27 @@ mod merge;
 mod multi_commit;
 mod ops;
 mod output;
+mod palette;
+mod patch_io;
 mod rail;
-mod rebase;
 mod recover;
+mod restore;
 mod sidebar;
 mod stage_diff;
 mod subs;
 mod sweep;
 mod terminals;
+mod undo;
+mod web;
 mod worktrees;
 
 pub(crate) use files::{local_file_name, same_version};
 pub(crate) use files_ops::new_copy_dir;
 pub(crate) use layout::sidebar_open;
 pub(crate) use ops::explain;
+pub(crate) use palette::{
+    FileAction, PaletteRef, RefAction, RefKind, commands as palette_commands,
+};
 pub(crate) use subs::{PARALLEL, Summary, summarize};
 pub(crate) use terminals::{end_parked_terminals, parked_terminals_of, parked_terminals_running};
 
@@ -112,6 +122,8 @@ enum Mode {
     Compare,
     /// 找回提交，见 [`recover`]；下半部分的详情和改动和提交历史共用
     Recover,
+    /// 整理提交（交互式变基），见 [`curate`]；右边选中提交的改动和提交历史共用
+    Curate,
 }
 
 /// 显示哪一页（侧栏里的切换，Ctrl+` 来回切）。
@@ -163,9 +175,25 @@ pub struct RepoView {
     status: Option<Status>,
     /// 停在一半的合并、变基、挑拣或还原
     in_progress: Option<InProgress>,
+    /// 变基停在哪（第几步、是不是停下修改、要不要拆分），见 [`curate`]
+    rebase: Option<fr_core::rebase::Paused>,
+    rebase_task: Option<Task<()>>,
+    /// 正在读变基停在哪（读到之前横幅先不下结论）
+    rebase_reading: bool,
+    /// 拆分停下时，要拆的那个提交改了哪些文件
+    split: Option<curate::Split>,
+    /// 已经替哪个要拆分的提交把改动放回工作区了：同一个提交只做一次
+    split_started: Option<String>,
+    /// 整理提交的视图（开着时 `mode` 是 [`Mode::Curate`]）
+    curate: Option<curate::Curate>,
+    /// 停在一半时，解决过冲突、还能恢复成冲突状态的文件（见 [`undo`]）
+    resolved: std::collections::HashSet<String>,
+    resolved_task: Option<Task<()>>,
     refs: Refs,
     /// 配置里的远程（`git remote`）。刚添加、还没获取到分支的远程，远程分支里看不到，这里有
     remote_names: Vec<String>,
+    /// 各远程的地址（`remote.<名>.url`）：推出托管平台的网页，见 [`web`]
+    remote_urls: Vec<(String, String)>,
     /// 子模块的路径（相对仓库根）
     submodules: Vec<String>,
     /// 还没读到过状态：第一次读到时有未提交的改动就停在「本地修改」（见 `refresh`）
@@ -197,6 +225,8 @@ pub struct RepoView {
     op_task: Option<Task<()>>,
     /// 获取、拉取、推送的进度（git 标准错误的最后一行）；有它说明正在做的这一步可以取消
     op_progress: Option<SharedString>,
+    /// 提交时钩子说的最后一行：只是显示，这一步不能取消
+    op_live: Option<SharedString>,
     /// 往这里发一下，正在做的联网操作就停下
     op_cancel: Option<futures::channel::oneshot::Sender<()>>,
     /// 执行过的 git 命令和它们的结果
@@ -290,8 +320,17 @@ impl RepoView {
             visible: false,
             status: None,
             in_progress: None,
+            rebase: None,
+            rebase_task: None,
+            rebase_reading: false,
+            split: None,
+            split_started: None,
+            curate: None,
+            resolved: Default::default(),
+            resolved_task: None,
             refs: Refs::default(),
             remote_names: Vec::new(),
+            remote_urls: Vec::new(),
             submodules: Vec::new(),
             first_status: true,
             blame: None,
@@ -311,6 +350,7 @@ impl RepoView {
             op_writing: None,
             op_task: None,
             op_progress: None,
+            op_live: None,
             op_cancel: None,
             activity: activity::Log::default(),
             auto_fetch: auto_fetch::AutoFetch::new(cx),
@@ -525,19 +565,21 @@ impl RepoView {
         let read_state = channel.git_with_input(&repo, state::args(), Some(state::stdin()));
         let read_submodules = channel.git(&repo, menus::submodule_args());
         let read_remotes = channel.git(&repo, vec!["remote".into()]);
+        let read_urls = channel.git(&repo, web::remote_urls_args());
         let nul = fr_core::worktree::has_nul(channel.git_version());
         let read_worktrees = channel.git(&repo, fr_core::worktree::list_args(nul));
         self.refreshing = true;
         self.refresh_again = false;
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
-            let (st, rf, sh, state, sm, rm, wt) = futures::join!(
+            let (st, rf, sh, state, sm, rm, wt, urls) = futures::join!(
                 read_status,
                 read_refs,
                 read_stashes,
                 read_state,
                 read_submodules,
                 read_remotes,
-                read_worktrees
+                read_worktrees,
+                read_urls
             );
             this.update(cx, |this, cx| {
                 this.refreshing = false;
@@ -575,6 +617,10 @@ impl RepoView {
                             .collect()
                     })
                     .unwrap_or_default();
+                // 一个远程都没配时这条命令以 1 退出：按空的算
+                this.remote_urls = urls
+                    .map(|out| web::parse_remote_urls(&out.stdout))
+                    .unwrap_or_default();
                 // 很旧的 git 没有这条命令：当成没有工作树，侧栏上不出现那一项
                 let trees = wt
                     .ok()
@@ -600,6 +646,8 @@ impl RepoView {
                 if first && (changed || unborn) && untouched {
                     this.show_changes(cx);
                 }
+                this.read_rebase_state(cx);
+                this.read_resolved(cx);
                 this.files_status_changed(cx);
                 let refs_out = rf.and_then(|out| out.ok()).unwrap_or_default();
                 let stash_out = sh.map(|out| out.stdout).unwrap_or_default();
@@ -607,9 +655,13 @@ impl RepoView {
                     std::mem::replace(&mut this.refs, refs::parse(&refs_out, &stash_out));
                 this.remap_sidebar_selection(&old_refs, cx);
                 this.compare_refreshed(cx);
-                // 提交历史只含分支、远程分支、标签和 HEAD，这些都没变就不用重读
+                // 提交历史只含分支、远程分支、标签和 HEAD，这些都没变就不用重读；提交图里画着贮藏
+                // 时贮藏变了也要重读
                 let mut key = refs_out;
                 key.extend_from_slice(head.as_bytes());
+                if this.graph_options(cx).0 {
+                    key.extend_from_slice(&stash_out);
+                }
                 if this.history_key.as_ref() != Some(&key) {
                     this.history_key = Some(key);
                     this.reload_history(cx);
@@ -682,7 +734,7 @@ impl RepoView {
             Page::Terminal => {}
             Page::Git => match self.mode {
                 Mode::Merge => self.find_in_merge(window, cx),
-                Mode::Blame => {}
+                Mode::Blame | Mode::Curate => {}
                 Mode::Subs => self.focus_subs_filter(window, cx),
                 _ => {
                     if !self.find_in_diff(window, cx) {
@@ -833,11 +885,17 @@ impl RepoView {
             )
             .child(div().flex_1().min_w(px(4.)))
             .when_some(self.op.clone(), |bar, op| {
-                let text = match &self.op_progress {
-                    Some(progress) if !progress.is_empty() => {
+                // 写在进度里的那句：联网的是 git 报的进度，提交时是钩子说的最后一行
+                let said = self
+                    .op_progress
+                    .clone()
+                    .filter(|progress| !progress.is_empty())
+                    .or(self.op_live.clone().filter(|live| !live.is_empty()));
+                let text = match &said {
+                    Some(progress) => {
                         tf!("正在{op}：{progress}", op = op, progress = progress)
                     }
-                    _ => tf!("正在{op}…", op = op),
+                    None => tf!("正在{op}…", op = op),
                 };
                 // 进度：点开底部的「输出」看完整的输出；联网的那一步里面带「取消」。不让它缩：窗口窄
                 // 的时候缩的是左边的分支名，不然这里只剩「正在…」两个字
@@ -875,11 +933,9 @@ impl RepoView {
                                 .truncate()
                                 .text_xs()
                                 .text_color(muted)
-                                .child(match &self.op_progress {
-                                    Some(progress) if !progress.is_empty() => {
-                                        SharedString::from(progress.to_string())
-                                    }
-                                    _ => tf!("正在{op}…", op = op).into(),
+                                .child(match &said {
+                                    Some(progress) => SharedString::from(progress.to_string()),
+                                    None => tf!("正在{op}…", op = op).into(),
                                 }),
                         )
                         // 只有联网的操作能取消：中途杀掉改暂存区的 git 会留下锁文件
@@ -970,7 +1026,9 @@ impl RepoView {
                 muted,
             ))
             .child(separator())
-            .child(
+            // 主操作是「贮藏…」，⌄ 里是只贮藏已暂存的、保留已暂存的、弹出最近的
+            .child(split_tool(
+                "stash-menu",
                 tool_button(
                     "stash",
                     IconName::Archive,
@@ -990,7 +1048,12 @@ impl RepoView {
                     cx,
                 )
                 .on_click(cx.listener(|this, _, window, cx| this.stash_dialog(window, cx))),
-            )
+                tr("贮藏的更多选项"),
+                idle,
+                self.stash_menu(cx),
+                self.stash_menu(cx),
+                muted,
+            ))
             .child(
                 tool_button(
                     "pop",
@@ -1102,6 +1165,8 @@ impl RepoView {
             .and_then(crate::machines::split_relay)
             .map(|(via, _)| self.app.read(cx).machine_name(via));
         let app = self.app.clone();
+        // 托管平台的网页：各远程一行，另有创建合并请求
+        let web = self.web_menu(cx);
         // 不加悬停提示：提示也出现在按钮下面，会把弹出的菜单第一项盖住
         tool_button_with(
             "open-in",
@@ -1112,7 +1177,28 @@ impl RepoView {
             true,
             cx,
         )
-        .dropdown_menu(move |menu, _, cx| {
+        .dropdown_menu(move |menu, window, cx| {
+            let menu = open_in_items(menu, &dir, &via, &server, &app, cx);
+            match &web {
+                Some(web) => web(menu, window, cx),
+                None => menu,
+            }
+        })
+    }
+}
+
+/// 「打开」菜单的前一半：把仓库交给外面的终端、VS Code、资源管理器（后一半是托管平台的网页）。
+fn open_in_items(
+    menu: gpui_kit::component::menu::PopupMenu,
+    dir: &str,
+    via: &Option<SharedString>,
+    server: &Option<crate::settings::Server>,
+    app: &Entity<AppState>,
+    cx: &mut Context<gpui_kit::component::menu::PopupMenu>,
+) -> gpui_kit::component::menu::PopupMenu {
+    let dir = dir.to_string();
+    {
+        {
             let (a, b, c) = (dir.clone(), dir.clone(), dir.clone());
             if let Some(via) = &via {
                 return menu
@@ -1162,9 +1248,7 @@ impl RepoView {
                                 ),
                             )
                         }
-                        None => {
-                            crate::mapping::menu_items(menu, &app, &server_id, &c, true, &c, cx)
-                        }
+                        None => crate::mapping::menu_items(menu, app, &server_id, &c, true, &c, cx),
                     }
                 }
                 None => menu
@@ -1186,52 +1270,157 @@ impl RepoView {
                         ),
                     ),
             }
-        })
+        }
     }
+}
 
+impl RepoView {
     /// 合并、变基、挑拣、还原停在一半时的横幅：说明状态，给出继续、跳过、中止。
+    ///
+    /// 变基不只因为冲突停下：整理提交里的「停下修改」「拆分」、清单里的 `break` 也停，这时没有冲突、
+    /// 也没有暂存的改动，原来一律说成「此提交没有改动，请跳过」并且点不了「继续」。按变基目录里记的
+    /// 分开说（见 [`curate`]）。
     fn render_in_progress(&self, state: InProgress, cx: &mut Context<Self>) -> impl IntoElement {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Stop {
+            Conflict,
+            /// 还在读变基停在哪
+            Reading,
+            /// 要拆分的提交，改动还没放回工作区
+            SplitPending,
+            Split,
+            Edit,
+            /// 清单里的 `break`，或者清单里的命令没通过
+            Listed,
+            Empty,
+            Resolved,
+        }
         let theme = cx.theme();
-        let (border, warning) = (theme.border, theme.warning);
-        let conflicts = self.status.as_ref().map_or(0, |s| {
-            s.entries
-                .iter()
-                .filter(|e| e.unstaged == Some(status::Kind::Conflicted))
-                .count()
-        });
-        let idle = self.op.is_none();
-        let staged = self
+        let (border, warning, muted, chip) = (
+            theme.border,
+            theme.warning,
+            theme.muted_foreground,
+            theme.secondary,
+        );
+        let entries = self
             .status
             .as_ref()
-            .is_some_and(|s| s.entries.iter().any(|e| e.staged.is_some()));
-        // 没有冲突、也没有暂存的改动：这个提交在当前分支上不带来任何改动（内容已经有了）。
-        // 变基、挑拣、还原这时「继续」会失败，只能跳过；合并可以照常提交
-        let empty = conflicts == 0 && !staged && state != InProgress::Merge;
+            .map(|s| s.entries.as_slice())
+            .unwrap_or(&[]);
+        let conflicts = entries
+            .iter()
+            .filter(|e| e.unstaged == Some(status::Kind::Conflicted))
+            .count();
+        let idle = self.op.is_none();
+        let staged = entries.iter().any(|e| e.staged.is_some());
+        // 已跟踪文件里没暂存的改动：停下修改、拆分时有它，`rebase --continue` 不肯往下走
+        let unstaged = entries
+            .iter()
+            .filter(|e| {
+                e.unstaged.is_some_and(|kind| {
+                    kind != status::Kind::Untracked && kind != status::Kind::Conflicted
+                })
+            })
+            .count();
+        let paused = self.rebase.as_ref().filter(|_| state == InProgress::Rebase);
+        let stop = if conflicts > 0 {
+            Stop::Conflict
+        } else if state == InProgress::Rebase && paused.is_none() && self.rebase_reading {
+            Stop::Reading
+        } else if paused.is_some_and(|p| p.split_pending()) {
+            Stop::SplitPending
+        } else if paused.is_some_and(|p| p.splitting()) {
+            Stop::Split
+        } else if paused.is_some_and(|p| p.amend.is_some()) {
+            Stop::Edit
+        } else if paused.is_some_and(|p| p.stopped.is_none()) {
+            Stop::Listed
+        } else if !staged && state != InProgress::Merge {
+            // 没有冲突、也没有暂存的改动：这个提交在当前分支上不带来任何改动（内容已经有了）
+            Stop::Empty
+        } else {
+            Stop::Resolved
+        };
         let go = if state == InProgress::Merge {
             tr("提交合并")
         } else {
             tr("继续")
         };
-        let text = if conflicts > 0 {
-            tf!(
+        let stopped: String = paused
+            .and_then(|p| p.stopped.as_deref())
+            .map(|id| id.chars().take(8).collect())
+            .unwrap_or_default();
+        let left = self.split_left();
+        // 第二句（灰字）：还差什么才能继续
+        let mut more: Option<String> = None;
+        let text: String = match stop {
+            Stop::Conflict => tf!(
                 "{name}已暂停：{conflicts} 个文件有冲突。请在「本地修改」中解决后点击「{go}」。",
                 name = state.name(),
                 conflicts,
                 go
-            )
-        } else if empty {
-            tf!(
+            ),
+            Stop::Reading => tr("变基已暂停，正在读取状态…").into(),
+            Stop::SplitPending => tf!(
+                "整理已暂停：正在将 {id} 的改动放回「本地修改」…",
+                id = stopped
+            ),
+            Stop::Split => {
+                more = Some(match (left, unstaged > 0 || staged) {
+                    (0, false) => tr("改动已全部提交，可以继续。").into(),
+                    (0, true) => tr("还有改动未提交。").into(),
+                    (left, _) => tf!("还有 {left} 个文件的改动未提交。", left),
+                });
+                tf!(
+                    "整理已暂停：{id} 的改动已放回「本地修改」。分几次提交后点击「继续」。",
+                    id = stopped
+                )
+            }
+            Stop::Edit => {
+                if unstaged > 0 {
+                    more = Some(tf!(
+                        "还有 {unstaged} 个文件的改动未暂存，请先暂存或丢弃。",
+                        unstaged
+                    ));
+                }
+                tf!(
+                    "整理已暂停：停在 {id}。修改并暂存后点击「继续」，已暂存的改动将并入该提交。",
+                    id = stopped
+                )
+            }
+            Stop::Listed => {
+                if unstaged > 0 {
+                    more = Some(tf!(
+                        "还有 {unstaged} 个文件的改动未暂存，请先暂存或丢弃。",
+                        unstaged
+                    ));
+                }
+                tr("变基已按清单暂停。处理完成后点击「继续」。").into()
+            }
+            Stop::Empty => tf!(
                 "{name}已暂停：此提交没有改动（内容已存在）。请点击「跳过此提交」。",
                 name = state.name()
-            )
-        } else if state == InProgress::Merge {
-            tr("合并尚未完成：冲突已全部解决，请点击「提交合并」。说明留空则使用默认说明。").into()
-        } else {
-            tf!(
+            ),
+            Stop::Resolved if state == InProgress::Merge => {
+                tr("合并尚未完成：冲突已全部解决，请点击「提交合并」。说明留空则使用默认说明。")
+                    .into()
+            }
+            Stop::Resolved => tf!(
                 "{name}已暂停：冲突已全部解决，请点击「继续」。",
                 name = state.name()
-            )
+            ),
         };
+        let can_go = idle
+            && match stop {
+                Stop::Conflict | Stop::Reading | Stop::SplitPending | Stop::Empty => false,
+                Stop::Split => left == 0 && unstaged == 0 && !staged,
+                Stop::Edit | Stop::Listed => unstaged == 0,
+                Stop::Resolved => true,
+            };
+        // 停下修改、拆分、清单里的暂停没有「正在重放的提交」可跳：跳过会把已经放上去的提交丢掉
+        let can_skip = state != InProgress::Merge
+            && matches!(stop, Stop::Conflict | Stop::Empty | Stop::Resolved);
+        let step = paused.and_then(|p| p.step).filter(|(_, total)| *total > 1);
         h_flex()
             .min_h(px(34.))
             .py_1()
@@ -1242,19 +1431,42 @@ impl RepoView {
             .border_color(border)
             .bg(warning.opacity(0.15))
             .text_sm()
+            .when_some(step, |bar, (done, total)| {
+                bar.child(
+                    div()
+                        .flex_none()
+                        .px(px(8.))
+                        .h(px(20.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(10.))
+                        .bg(chip)
+                        .text_xs()
+                        .child(tf!("第 {done} 步，共 {total} 步", done, total)),
+                )
+            })
             // 窗口窄的时候折成几行：这里写的是下一步该做什么，不能用省略号截掉
-            .child(div().flex_1().min_w_0().whitespace_normal().child(text))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .child(text)
+                    .when_some(more, |d, more| {
+                        d.child(div().text_xs().text_color(muted).child(more))
+                    }),
+            )
             .child(
                 Button::new("op-continue")
                     .small()
                     .primary()
                     .label(go)
-                    .disabled(!idle || conflicts > 0 || empty)
+                    .disabled(!can_go)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.continue_in_progress(state, window, cx)
                     })),
             )
-            .when(state != InProgress::Merge, |bar| {
+            .when(can_skip, |bar| {
                 bar.child(
                     Button::new("op-skip")
                         .small()
@@ -1383,6 +1595,7 @@ impl RepoView {
                 Mode::Worktrees => self.render_worktrees(cx),
                 Mode::Compare => self.render_compare(cx),
                 Mode::Recover => self.render_history(cx),
+                Mode::Curate => self.render_curate(cx),
             }
         };
         let banner = self
@@ -1573,6 +1786,8 @@ impl Render for RepoView {
         self.viewport = window.viewport_size();
         note_window_width(f32::from(self.viewport.width));
         self.forget_narrow_open(cx);
+        self.drop_stale_curate();
+        self.sync_split(window, cx);
         let sizes = self.sizes(cx);
         self.history.set_layout(self.content_viewport(), sizes);
         self.focus_blame_if_new(window, cx);

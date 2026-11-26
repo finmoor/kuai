@@ -109,7 +109,8 @@ impl Entry {
         self.scope != InTerminal::Fixed
     }
 
-    fn make_action(&self) -> Option<Box<dyn Action>> {
+    /// 按下以后做的事（命令面板里选中这一条时也是做它）；只列出来看的没有。
+    pub fn make_action(&self) -> Option<Box<dyn Action>> {
         if let Some(preset) = &self.preset {
             return Some(Box::new(RunPreset {
                 preset: preset.clone(),
@@ -142,7 +143,7 @@ fn rows() -> Vec<Row> {
         ("tab.next", Window, tr_key("下一个标签页"), "", &["ctrl-tab"], Keep, Some(|| Box::new(crate::NextTab))),
         ("tab.prev", Window, tr_key("上一个标签页"), "", &["ctrl-shift-tab"], Keep, Some(|| Box::new(crate::PrevTab))),
         ("tab.reopen", Window, tr_key("重新打开关闭的标签页"), "", &["ctrl-shift-t"], Keep, Some(|| Box::new(crate::ReopenTab))),
-        ("quick", Window, tr_key("快速打开仓库"), "", &["ctrl-p"], Pass, Some(|| Box::new(crate::QuickOpen))),
+        ("quick", Window, tr_key("快速打开"), tr_key("搜索仓库、命令、分支和文件"), &["ctrl-p"], Pass, Some(|| Box::new(crate::QuickOpen))),
         ("settings", Window, tr_key("打开设置"), "", &["ctrl-,"], Keep, Some(|| Box::new(crate::OpenSettings))),
         // 不用 Ctrl+B：焦点在终端里时它归里面的程序（Claude Code 把命令转到后台、tmux 的前缀键）
         ("sidebar", Window, tr_key("收起或展开侧栏"), "", &["ctrl-shift-b"], Keep, Some(|| Box::new(crate::ToggleSidebar))),

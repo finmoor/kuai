@@ -43,6 +43,9 @@ pub(super) struct Step {
     /// 给人看的写法（活动记录、失败的详情）：借 shell 别名的命令写成等价的命令，不露出别名那段
     /// 脚本。空着就照 `args` 写
     pub shown: Option<String>,
+    /// 不联网、但输出要边做边看的命令（提交：钩子可能跑很久）。和联网的一样实时显示在底部的
+    /// 「输出」里，但不给取消：中途杀掉会留下锁文件
+    pub live: bool,
 }
 
 impl Step {
@@ -52,6 +55,7 @@ impl Step {
             stdin: None,
             net: false,
             shown: None,
+            live: false,
         }
     }
 
@@ -75,6 +79,11 @@ impl Step {
             shown: Some(text),
             ..self
         }
+    }
+
+    /// 输出边做边显示（见 [`Self::live`] 字段）。
+    pub fn live(self) -> Self {
+        Self { live: true, ..self }
     }
 
     /// 活动记录里写的命令：给了 [`Self::shown`] 用它，没给照参数写全（`-c` 也写上）。
@@ -459,10 +468,16 @@ impl RepoView {
                     || label.as_ref() == tr("跳过")
             });
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-        let net_op = steps.iter().any(|step| step.net);
+        // 有实时输出的（联网的、提交）：底部的「输出」里看得到，失败的通知带「查看输出」
+        let net_op = steps.iter().any(|step| step.net || step.live);
         let push_op = steps
             .iter()
             .any(|step| step.net && step.args.iter().any(|arg| arg == "push"));
+        // 变基按清单停下（整理提交里的停下修改、拆分，清单里的 break）时 git 的退出码是 0：做完看一眼
+        // 变基目录还在不在
+        let rebase_op = steps
+            .iter()
+            .any(|step| step.args.iter().any(|arg| arg == "rebase"));
         self.output_start(label.clone(), net_op, push_op);
         self.op = Some(label.clone());
         self.op_writing = Some(writing);
@@ -487,6 +502,9 @@ impl RepoView {
             let mut cancelled = false;
             // 推送途中连接断了：推送可能已经完成，结果不能当成失败报
             let mut push_unknown = false;
+            // 刚执行的这一步两路都有输出时，按到达先后合在一起的样子（见 `activity.rs` 的 `arrival`）；
+            // 没成时通知里的原文也用它，钩子先说的话才不会排到它后来报的错后面
+            let mut arrival: Option<String> = None;
             for step in steps {
                 let is_push = step.net && step.args.iter().any(|arg| arg == "push");
                 let is_fetch = step.net && step.args.iter().any(|arg| arg == "fetch");
@@ -498,6 +516,7 @@ impl RepoView {
                 let net = step.net;
                 let marked = this.update(cx, |this, cx| {
                     this.op_progress = net.then(SharedString::default);
+                    this.op_live = None;
                     cx.notify();
                     let id = this.activity.begin(label.clone(), step.logged());
                     this.output.step(id);
@@ -506,9 +525,14 @@ impl RepoView {
                 let Ok(activity) = marked else {
                     return;
                 };
-                result = if step.net {
-                    let mut stream = channel.git_progress(&repo, step.args);
+                arrival = None;
+                result = if step.net || step.live {
+                    let mut stream =
+                        channel.git_progress_with_input(&repo, step.args, step.stdin);
                     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+                    // 底部的输出显示的：标准错误和标准输出按到达的先后合在一起。提交的钩子 git 都并进
+                    // 标准错误，pre-push 的不并，只显示标准错误就看不到它写到标准输出的话
+                    let mut said: Vec<u8> = Vec::new();
                     // 底部的输出隔一会儿更新一次：大仓库的进度一秒刷几十次，每次都整理全部输出太费
                     let mut shown_at: Option<std::time::Instant> = None;
                     loop {
@@ -526,9 +550,24 @@ impl RepoView {
                             Err(false) => continue,
                         };
                         match item {
-                            Some(Ok(StreamItem::Chunk(chunk))) => stdout.extend_from_slice(&chunk),
+                            Some(Ok(StreamItem::Chunk(chunk))) => {
+                                stdout.extend_from_slice(&chunk);
+                                said.extend_from_slice(&chunk);
+                                // 说完一句（换了行）就显示，和下面标准错误的一样
+                                if chunk.contains(&b'\n') {
+                                    let text = String::from_utf8_lossy(&said).into_owned();
+                                    let shown = this.update(cx, |this, cx| {
+                                        this.activity.live(activity, &text);
+                                        cx.notify();
+                                    });
+                                    if shown.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
                             Some(Ok(StreamItem::Progress(chunk))) => {
                                 stderr.extend_from_slice(&chunk);
+                                said.extend_from_slice(&chunk);
                                 let line = last_progress_line(&stderr);
                                 // 进度（回车刷新的）隔一会儿更新一次；换了行的（远程说的话）马上更新，
                                 // 不然 hook 说完一句停下来等的时候，底部的输出里还看不到这一句
@@ -539,9 +578,12 @@ impl RepoView {
                                 if live {
                                     shown_at = Some(std::time::Instant::now());
                                 }
-                                let text = live.then(|| String::from_utf8_lossy(&stderr).into_owned());
+                                let text = live.then(|| String::from_utf8_lossy(&said).into_owned());
                                 let shown = this.update(cx, |this, cx| {
-                                    this.op_progress = Some(line.into());
+                                    match net {
+                                        true => this.op_progress = Some(line.into()),
+                                        false => this.op_live = Some(line.into()),
+                                    }
                                     if let Some(text) = &text {
                                         this.activity.live(activity, text);
                                     }
@@ -552,6 +594,9 @@ impl RepoView {
                                 }
                             }
                             Some(Ok(StreamItem::Done(mut out))) => {
+                                if !stdout.is_empty() && !stderr.is_empty() {
+                                    arrival = Some(String::from_utf8_lossy(&said).into_owned());
+                                }
                                 out.stdout = stdout;
                                 break Ok(out);
                             }
@@ -571,6 +616,9 @@ impl RepoView {
                 let ok = matches!(&result, Ok(out) if out.success());
                 let logged = this.update(cx, |this, _| {
                     this.activity.end(activity, &result, cancelled);
+                    if let Some(said) = &arrival {
+                        this.activity.arrival(activity, said);
+                    }
                     // 刚联过网：自动获取从现在重新计时
                     if net && ok {
                         this.auto_fetch.last = std::time::Instant::now();
@@ -603,6 +651,15 @@ impl RepoView {
             } else {
                 None
             };
+            let mut paused = match !failed && rebase_op {
+                true => channel
+                    .git(&repo, fr_core::rebase::state_args())
+                    .await
+                    .ok()
+                    .filter(|out| out.success())
+                    .and_then(|out| fr_core::rebase::parse_state(&out.stdout)),
+                false => None,
+            };
             let kept = match autostash && !cancelled {
                 true => channel
                     .git(&repo, fr_core::refs::stash_args())
@@ -615,13 +672,18 @@ impl RepoView {
                 this.op = None;
                 this.op_writing = None;
                 this.op_progress = None;
+                this.op_live = None;
                 this.op_cancel = None;
                 // 先收进「最近的操作」：下面的通知要带「查看输出」时认的是它
                 this.output.finish();
                 this.changes.mark_stale();
                 let result = match result {
                     Ok(out) if out.success() => Ok(out),
-                    Ok(out) => Err(output_text(&out)),
+                    Ok(out) => Err(arrival
+                        .as_deref()
+                        .map(|said| strip_progress(said.trim()))
+                        .filter(|text| !text.trim().is_empty())
+                        .unwrap_or_else(|| output_text(&out))),
                     Err(err) => Err(format!("{err:#}")),
                 };
                 match (stopped, result) {
@@ -672,6 +734,13 @@ impl RepoView {
                         let note =
                             with_detail_and(note, tr("推送结果未知"), &text, this.output_opener(cx));
                         window.push_notification(note, cx);
+                    }
+                    // 没出错，变基却还没完：按清单停下了（停下修改、拆分）。不算完成，不调 `on_done`
+                    (_, Ok(_)) if paused.is_some() => {
+                        window.remove_notification::<StoppedNote>(cx);
+                        if let Some(paused) = paused.take() {
+                            this.rebase_paused(paused, window, cx);
+                        }
                     }
                     (_, result) => {
                         // 停在一半时做的事（继续、跳过、中止、解决一个文件）有了结果：
@@ -955,11 +1024,35 @@ impl RepoView {
             );
             return;
         };
-        if status.upstream.is_some() {
+        if let Some(upstream) = status.upstream.clone() {
             let push = args(&["push", "--progress"]);
-            self.run_net_op(tr("推送"), push, window, cx, |this, _, window, cx| {
-                this.notify_net(Notification::success(tr("推送完成")), window, cx);
-            });
+            // 推到了哪个远程的哪个分支：通知里的「创建合并请求」按它拼地址
+            let (remote, remote_branch) = self
+                .split_remote_ref(&upstream)
+                .unwrap_or_else(|| (self.default_remote(), branch.clone()));
+            // 没成时看是不是 pre-push 钩子拦下的（见 `hooks.rs`）
+            let retry = push.clone();
+            self.run_steps(
+                tr("推送"),
+                vec![Step::net(push)],
+                window,
+                cx,
+                Box::new(move |this, result, window, cx| {
+                    let text = tf!(
+                        "已推送 {branch} 到 {remote}",
+                        branch = branch.as_str(),
+                        remote = remote.as_str()
+                    );
+                    match result {
+                        Ok(_) => this.notify_pushed(text, remote_branch, remote, window, cx),
+                        // 跳过钩子再推成功时，通知和这里一样（带「创建合并请求」）
+                        Err(detail) => {
+                            let pushed = (text, remote_branch, remote);
+                            this.push_failed(detail, retry, pushed, window, cx)
+                        }
+                    }
+                }),
+            );
             return;
         }
         // 还没有上游：先确认推到哪个远程
@@ -1101,13 +1194,14 @@ impl RepoView {
                             to = format!("{remote}/{branch}")
                         ),
                     };
+                    let pushed = branch.clone();
                     this.run_net_op(
                         tr("推送"),
                         push,
                         window,
                         cx,
                         move |this, _, window, cx| {
-                            this.notify_net(Notification::success(text), window, cx);
+                            this.notify_pushed(text, pushed, remote, window, cx);
                         },
                     );
                 });

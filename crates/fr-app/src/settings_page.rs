@@ -8,7 +8,7 @@
 use fr_core::i18n::{Language, tr};
 use fr_core::tf;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonGroup};
+use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_kit::component::group_box::GroupBoxVariant;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
@@ -41,6 +41,83 @@ pub struct SettingsPage {
     _observe: [Subscription; 2],
 }
 
+/// 各主机用的是哪种托管平台（打开提交、分支、合并请求的网页时按它拼地址）：一行一个主机，
+/// 可以换一种、可以删掉。
+fn hosting_table(app: &Entity<AppState>, cx: &mut App) -> AnyElement {
+    use fr_core::hosting::Flavor;
+    let (muted, border) = (cx.theme().muted_foreground, cx.theme().border);
+    let hosts: Vec<(String, Flavor)> = app
+        .read(cx)
+        .settings
+        .hosting
+        .iter()
+        .map(|(host, flavor)| (host.clone(), *flavor))
+        .collect();
+    let rows = hosts.into_iter().enumerate().map(|(ix, (host, flavor))| {
+        let (pick_app, pick_host) = (app.clone(), host.clone());
+        let (drop_app, drop_host) = (app.clone(), host.clone());
+        h_flex()
+            .gap_2()
+            .py_1()
+            .when(ix > 0, |row| row.border_t_1().border_color(border))
+            .child(
+                crate::ui::clipped(("hosting-host", ix), host.clone())
+                    .flex_1()
+                    .text_sm(),
+            )
+            // 不加悬停提示：提示出现在按钮下面，会盖住弹出的菜单
+            .child(
+                Button::new(("hosting-flavor", ix))
+                    .small()
+                    .outline()
+                    .label(flavor.label())
+                    .dropdown_caret(true)
+                    .dropdown_menu(move |mut menu, _, _| {
+                        for choice in Flavor::ALL {
+                            let (app, host) = (pick_app.clone(), pick_host.clone());
+                            menu = menu.item(
+                                PopupMenuItem::new(choice.label())
+                                    .checked(choice == flavor)
+                                    .on_click(move |_, _, cx| {
+                                        let host = host.clone();
+                                        app.update(cx, |app, cx| {
+                                            app.update_settings(cx, |s| {
+                                                s.hosting.insert(host, choice);
+                                            })
+                                        });
+                                    }),
+                            );
+                        }
+                        menu
+                    }),
+            )
+            .child(
+                Button::new(("hosting-forget", ix))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Trash)
+                    .tooltip(tr("删除：下次用到这台主机时再询问"))
+                    .on_click(move |_, _, cx| {
+                        let host = drop_host.clone();
+                        drop_app.update(cx, |app, cx| {
+                            app.update_settings(cx, |s| {
+                                s.hosting.remove(&host);
+                            })
+                        });
+                    }),
+            )
+    });
+    v_flex()
+        .w_full()
+        .gap_1()
+        .child(div().text_sm().child(tr("托管平台")))
+        .child(div().text_xs().text_color(muted).child(tr(
+            "在网页上查看提交、分支，创建合并请求时，按主机使用的平台拼出网址。",
+        )))
+        .children(rows)
+        .into_any_element()
+}
+
 impl SettingsPage {
     pub fn new(app: Entity<AppState>, updater: Entity<Updater>, cx: &mut Context<Self>) -> Self {
         let observe = [
@@ -60,8 +137,13 @@ impl SettingsPage {
 
     /// 打开时显示终端那一页（新建终端的预设在最上面）。
     pub fn show_terminal(&mut self, cx: &mut Context<Self>) {
+        self.show_at(2, cx);
+    }
+
+    /// 打开时显示第几页（顺序见 [`Self::render`]：常规、外观、终端、快捷键、关于）。
+    pub fn show_at(&mut self, page: usize, cx: &mut Context<Self>) {
         self.generation += 1;
-        self.start_page = 2;
+        self.start_page = page;
         cx.notify();
     }
 
@@ -433,14 +515,22 @@ impl SettingsPage {
                     .item(code_size)
                     .item(tab_width),
             )
-            .group(
-                SettingGroup::new()
+            .group({
+                let group = SettingGroup::new()
                     .title("Git")
                     .item(auto_fetch)
                     .item(changes_view)
                     .item(confirm_discard)
-                    .item(stash),
-            )
+                    .item(stash);
+                // 记过是哪种托管平台的主机：可以改、可以忘掉（下次用到再问）
+                match self.app.read(cx).settings.hosting.is_empty() {
+                    true => group,
+                    false => {
+                        let app = self.app.clone();
+                        group.item(SettingItem::render(move |_, _, cx| hosting_table(&app, cx)))
+                    }
+                }
+            })
             .group(
                 SettingGroup::new()
                     .title(tr("外部工具"))

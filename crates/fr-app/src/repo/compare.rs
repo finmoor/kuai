@@ -1221,6 +1221,27 @@ impl RepoView {
             })
             .child(summary)
             .child(div().flex_1())
+            // 两端的差异导出、复制成补丁。不加悬停提示：提示出现在按钮下面，会盖住弹出的菜单
+            .children(
+                fr_core::compare::export_args(&base.rev(), &other.rev(), self.compare.from_base)
+                    .map(|list| {
+                        let view = cx.entity().downgrade();
+                        Button::new("compare-patch")
+                            .ghost()
+                            .xsmall()
+                            .flex_none()
+                            .icon(ui::icon(IconName::FileDiff))
+                            .label(tr("补丁"))
+                            .dropdown_caret(true)
+                            .dropdown_menu(move |menu, _, _| {
+                                super::patch_io::patch_items(
+                                    menu,
+                                    &view,
+                                    super::patch_io::Source::Range(list.clone()),
+                                )
+                            })
+                    }),
+            )
             .child(
                 Button::new("compare-close")
                     .ghost()

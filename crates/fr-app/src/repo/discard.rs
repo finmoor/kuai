@@ -18,12 +18,18 @@ use gpui_kit::*;
 use super::RepoView;
 use super::ops::Step;
 
-/// 上一次丢弃：撤销用。
+/// 上一次丢弃（或者别的覆盖了工作区文件的操作：恢复文件、应用补丁）：撤销用。
 #[derive(Clone)]
 pub(super) struct Discarded {
+    /// 做的是什么（「丢弃」「恢复文件」「应用补丁」），撤销的提示里用
+    label: &'static str,
     files: Vec<String>,
     before: Vec<Snap>,
     after: Vec<Snap>,
+    /// 带着冲突应用上的补丁：撤销时先清掉这些文件在暂存区里的冲突状态
+    unmerge: bool,
+    /// 这个操作连暂存区一起改了：撤销时把这些文件在暂存区里的样子也放回去
+    staged: bool,
 }
 
 /// 「已丢弃」那条通知的标识：同一时间只留一条（撤销的总是最近一次）。
@@ -125,10 +131,55 @@ impl RepoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.run_with_undo(tr("丢弃"), files, steps, done, None, window, cx);
+    }
+
+    /// 同 [`Self::discard_with_undo`]，给别的会覆盖工作区文件的操作用（恢复文件、应用补丁）：
+    /// `label` 是这个操作的名字；`look` 给了一个路径时，通知里多一个「查看改动」，到「本地修改」里
+    /// 选中它。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_with_undo(
+        &mut self,
+        label: &'static str,
+        files: Vec<String>,
+        steps: Vec<Step>,
+        done: String,
+        look: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let job = Overwrite {
+            label,
+            files,
+            steps,
+            done,
+            look,
+            conflicts_ok: false,
+            staged: false,
+        };
+        self.overwrite_with_undo(job, window, cx);
+    }
+
+    /// 存一份再做 `job`（见 [`Overwrite`]），做完弹带「撤销」的通知。存不了就不做。
+    pub(super) fn overwrite_with_undo(
+        &mut self,
+        job: Overwrite,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(channel) = self.channel.clone() else {
             return;
         };
         let repo = self.entry.path.clone();
+        let Overwrite {
+            label,
+            files,
+            steps,
+            done,
+            look,
+            conflicts_ok,
+            staged,
+        } = job;
         cx.spawn_in(window, async move |this, cx| {
             // 未跟踪的目录（状态里一项、以 / 结尾）：`git clean -d` 会删掉里面的全部文件
             let mut expanded = Vec::new();
@@ -161,21 +212,36 @@ impl RepoView {
                     Ok(before) => before,
                     Err(err) => {
                         let text = tf!(
-                            "无法在丢弃前保存文件内容，未丢弃：{err}",
+                            "无法在{label}前保存文件内容，未执行：{err}",
+                            label,
                             err = format!("{err:#}")
                         );
                         window.push_notification(Notification::error(text).autohide(false), cx);
                         return;
                     }
                 };
-                this.run_seq(
-                    tr("丢弃"),
+                this.run_steps(
+                    label,
                     steps,
                     window,
                     cx,
-                    move |this, _, window, cx| {
-                        this.after_discard(expanded, before, done, window, cx);
-                    },
+                    Box::new(move |this, result, window, cx| {
+                        let failed = match result {
+                            Ok(_) => None,
+                            Err(text) if conflicts_ok => Some(text),
+                            Err(text) => return this.failure(label, text, window, cx),
+                        };
+                        let done = Done {
+                            label,
+                            files: expanded,
+                            before,
+                            text: done,
+                            look,
+                            failed,
+                            staged,
+                        };
+                        this.after_discard(done, window, cx);
+                    }),
                 );
             })
             .ok();
@@ -184,55 +250,96 @@ impl RepoView {
     }
 
     /// 丢弃做完了：记下丢弃后的样子（撤销前核对），弹「已丢弃 … 撤销」。
-    fn after_discard(
-        &mut self,
-        files: Vec<String>,
-        before: Vec<Snap>,
-        done: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn after_discard(&mut self, done: Done, window: &mut Window, cx: &mut Context<Self>) {
         let Some(channel) = self.channel.clone() else {
             return;
         };
         let repo = self.entry.path.clone();
+        let Done {
+            label,
+            files,
+            before,
+            text: done,
+            look,
+            failed,
+            staged,
+        } = done;
         cx.spawn_in(window, async move |this, cx| {
             let after = snap(&channel, &repo, &files, false).await;
             this.update_in(cx, |this, window, cx| {
                 let after = after.unwrap_or_else(|_| vec![Snap::Unknown; files.len()]);
+                // 最后一步说失败：文件一个都没变就是真的没做成；变了是带着冲突做上了
+                let unmerge = failed.is_some();
+                if let Some(text) = failed
+                    && before.iter().zip(&after).all(|(b, a)| b == a)
+                {
+                    return this.failure(label, text, window, cx);
+                }
                 let lost = before
                     .iter()
                     .zip(&after)
                     .filter(|(b, a)| b != a && (**b == Snap::Unknown || **a == Snap::Unknown))
                     .count();
                 this.discarded = Some(Discarded {
+                    label,
                     files,
                     before,
                     after,
+                    unmerge,
+                    staged,
                 });
-                let text = match lost {
-                    0 => done.clone(),
-                    lost => tf!(
+                let text = match (unmerge, lost) {
+                    (true, _) => tf!(
+                        "{done}，部分文件有冲突。请在「本地修改」中解决。",
+                        done = done.as_str()
+                    ),
+                    (false, 0) => done.clone(),
+                    (false, lost) => tf!(
                         "{done}（其中 {lost} 个是链接或目录，无法撤销）",
                         done = done.as_str(),
                         lost
                     ),
                 };
+                if unmerge {
+                    this.show_changes(cx);
+                }
                 let view = cx.entity().downgrade();
-                let note =
-                    crate::ui::action_note(NotificationType::Success, text, move |_, _, cx| {
-                        let (view, me) = (view.clone(), cx.entity().downgrade());
-                        Button::new("undo-discard")
-                            .small()
-                            .label(tr("撤销"))
-                            .tooltip(tr("放回丢弃前的内容（Ctrl+Z）"))
-                            .on_click(move |_, window, cx| {
-                                view.update(cx, |this, cx| this.undo_discard(window, cx))
-                                    .ok();
-                                me.update(cx, |note, cx| note.dismiss(window, cx)).ok();
-                            })
-                    })
-                    .id::<DiscardNote>();
+                let kind = match unmerge {
+                    true => NotificationType::Warning,
+                    false => NotificationType::Success,
+                };
+                let note = crate::ui::actions_note(kind, None, text, move |_, _, cx| {
+                    let (undo_view, me) = (view.clone(), cx.entity().downgrade());
+                    let undo = Button::new("undo-discard")
+                        .small()
+                        .label(tr("撤销"))
+                        .tooltip(tf!("放回{label}前的内容（Ctrl+Z）", label))
+                        .on_click(move |_, window, cx| {
+                            undo_view
+                                .update(cx, |this, cx| this.undo_discard(window, cx))
+                                .ok();
+                            me.update(cx, |note, cx| note.dismiss(window, cx)).ok();
+                        });
+                    let Some(path) = look.clone() else {
+                        return vec![undo];
+                    };
+                    // 看完还可以回来撤销：这条通知不收
+                    let look_view = view.clone();
+                    let look = Button::new("look-change")
+                        .small()
+                        .label(tr("查看改动"))
+                        .on_click(move |_, _, cx| {
+                            look_view
+                                .update(cx, |this, cx| {
+                                    this.show_changes(cx);
+                                    this.select_change(&path, cx);
+                                    cx.notify();
+                                })
+                                .ok();
+                        });
+                    vec![undo, look]
+                })
+                .id::<DiscardNote>();
                 window.push_notification(note, cx);
             })
             .ok();
@@ -246,34 +353,85 @@ impl RepoView {
             window.push_notification(Notification::info(tr("没有可撤销的丢弃")), cx);
             return;
         };
+        let label = discarded.label;
         window.remove_notification::<DiscardNote>(cx);
-        let steps: Vec<Step> = discarded
+        let changed: Vec<(&String, (&Snap, &Snap))> = discarded
             .files
             .iter()
             .zip(discarded.before.iter().zip(&discarded.after))
             .filter(|(_, (before, after))| {
                 before != after && **before != Snap::Unknown && **after != Snap::Unknown
             })
-            .map(|(file, (before, after))| {
-                let changed = tf!("{file} 在丢弃后又被修改，未撤销。", file = file.as_str());
-                Step::local(workfile::unsnap_args(file, before, after, &changed))
-                    .shown(format!("restore {}", fr_core::git::sh_quote(file)))
-            })
             .collect();
+        let mut steps: Vec<Step> = Vec::new();
+        // 带着冲突应用上的：先把这些文件在暂存区里的冲突状态清掉，再放回内容
+        if discarded.unmerge && !changed.is_empty() {
+            let mut reset: Vec<String> = ["reset", "-q", "--"].map(String::from).to_vec();
+            reset.extend(changed.iter().map(|(file, _)| (*file).clone()));
+            steps.push(Step::local(reset));
+        }
+        steps.extend(changed.iter().map(|(file, (before, after))| {
+            let changed = tf!(
+                "{file} 在{label}后又被修改，未撤销。",
+                file = file.as_str(),
+                label
+            );
+            Step::local(workfile::unsnap_args(file, before, after, &changed))
+                .shown(format!("restore {}", fr_core::git::sh_quote(file)))
+        }));
+        // 连暂存区一起改了的（补丁应用到暂存区、三方合并）：git 要求这些文件应用前工作区和暂存区
+        // 一样，所以内容放回以后照着工作区更新暂存区，就是应用前的样子
+        if discarded.staged && !changed.is_empty() {
+            let mut index: Vec<String> = ["update-index", "--add", "--remove", "--"]
+                .map(String::from)
+                .to_vec();
+            index.extend(changed.iter().map(|(file, _)| (*file).clone()));
+            steps.push(Step::local(index));
+        }
         if steps.is_empty() {
-            window.push_notification(Notification::info(tr("丢弃的内容已经放回")), cx);
+            window.push_notification(Notification::info(tr("原来的内容已经放回")), cx);
             return;
         }
-        let count = steps.len();
+        let count = changed.len();
         self.run_seq(
-            tr("撤销丢弃"),
+            tf!("撤销{label}", label),
             steps,
             window,
             cx,
             move |_, _, window, cx| {
-                let text = tf!("已撤销丢弃，放回了 {count} 个文件", count);
+                let text = tf!("已撤销{label}，放回了 {count} 个文件", label, count);
                 window.push_notification(Notification::success(text), cx);
             },
         );
     }
+}
+
+/// 一个会覆盖工作区文件的操作（见 [`RepoView::overwrite_with_undo`]）。
+pub(super) struct Overwrite {
+    /// 操作的名字（「丢弃」「恢复文件」「应用补丁」）
+    pub label: &'static str,
+    /// 会被动到的文件
+    pub files: Vec<String>,
+    pub steps: Vec<Step>,
+    /// 做完说的那句话
+    pub done: String,
+    /// 通知里多一个「查看改动」，到「本地修改」里选中这个文件
+    pub look: Option<String>,
+    /// 最后一步说失败、文件却变了也算做上了：三方合并应用补丁时，有冲突的文件带着冲突标记写进了
+    /// 工作区，git 的退出码是 1。撤销时先清掉这些文件在暂存区里的冲突状态
+    pub conflicts_ok: bool,
+    /// 连暂存区一起改（`git apply --index`、`--3way`）：撤销时暂存区也放回去
+    pub staged: bool,
+}
+
+/// 做完以后要记的（见 [`RepoView::after_discard`]）。
+struct Done {
+    label: &'static str,
+    files: Vec<String>,
+    before: Vec<Snap>,
+    text: String,
+    look: Option<String>,
+    /// 最后一步的报错（[`Overwrite::conflicts_ok`] 时才留着）
+    failed: Option<String>,
+    staged: bool,
 }

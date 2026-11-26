@@ -20,6 +20,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use super::RepoView;
+use super::ops::Step;
 
 /// 一个上游已删除的分支，和它的提交在不在远程分支里。
 struct Gone {
@@ -139,13 +140,29 @@ impl RepoView {
                 .into_iter()
                 .map(|name| inspect(&channel, &repo, name, upstream.as_deref()));
             let list = futures::future::join_all(checks).await;
-            this.update_in(cx, |this, window, cx| this.sweep_dialog(list, window, cx))
-                .ok();
+            this.update_in(cx, |this, window, cx| {
+                let dialog = Sweep {
+                    title: tr("清理上游已删除的分支").into(),
+                    note: tr("仅删除本地分支。未并入远程分支的提交，删除后难以找回。").into(),
+                    label: tr("清理分支"),
+                };
+                this.sweep_dialog_with(list, dialog, window, cx)
+            })
+            .ok();
         })
         .detach();
     }
 
-    fn sweep_dialog(&mut self, list: Vec<Gone>, window: &mut Window, cx: &mut Context<Self>) {
+    /// 列出要删的分支，逐个标出提交在不在远程分支里，勾选后一起删（清理上游已删除的分支、侧栏里
+    /// 多选后删除都用它）。
+    fn sweep_dialog_with(
+        &mut self,
+        list: Vec<Gone>,
+        dialog_text: Sweep,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Sweep { title, note, label } = dialog_text;
         let list = Rc::new(list);
         let states: Rc<Vec<Cell<bool>>> =
             Rc::new(list.iter().map(|gone| Cell::new(gone.merged)).collect());
@@ -188,7 +205,7 @@ impl RepoView {
             let picked = states.iter().filter(|state| state.get()).count();
             let (view, list, states) = (view.clone(), list.clone(), states.clone());
             dialog
-                .title(tr("清理上游已删除的分支"))
+                .title(title.clone())
                 .w(px(520.))
                 // 回车不执行，要明确点按钮
                 .on_ok(|_, _, _| false)
@@ -198,7 +215,7 @@ impl RepoView {
                             .text_xs()
                             .text_color(muted)
                             .whitespace_normal()
-                            .child(tr("仅删除本地分支。未并入远程分支的提交，删除后难以找回。")),
+                            .child(note.clone()),
                     ),
                 )
                 .footer(
@@ -221,8 +238,10 @@ impl RepoView {
                                         .map(|(gone, _)| (gone.name.clone(), gone.tip.clone()))
                                         .collect();
                                     window.close_dialog(cx);
-                                    view.update(cx, |this, cx| this.run_sweep(names, window, cx))
-                                        .ok();
+                                    view.update(cx, |this, cx| {
+                                        this.run_sweep(names, label, window, cx)
+                                    })
+                                    .ok();
                                 }),
                         ),
                 )
@@ -234,6 +253,7 @@ impl RepoView {
     fn run_sweep(
         &mut self,
         names: Vec<(String, String)>,
+        label: &'static str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -252,21 +272,276 @@ impl RepoView {
         let mut args: Vec<String> = vec!["branch".into(), "-D".into(), "--".into()];
         args.extend(names.iter().map(|(name, _)| name.clone()));
         self.verify_then(checks, window, cx, move |this, window, cx| {
-            this.run_op(
-                tr("清理分支"),
-                args,
-                None,
-                window,
-                cx,
-                move |this, _, window, cx| {
-                    // 记进「找回提交」，按原名能恢复
-                    this.remember_deleted(names.clone(), cx);
-                    let text = tf!("已删除 {n} 个分支", n = count);
-                    window.push_notification(Notification::success(text), cx);
-                },
-            );
+            this.run_op(label, args, None, window, cx, move |this, _, window, cx| {
+                // 记进「找回提交」，按原名能恢复
+                this.remember_deleted(names.clone(), cx);
+                this.sidebar.multi.clear();
+                let text = tf!("已删除 {n} 个分支", n = count);
+                window.push_notification(Notification::success(text), cx);
+            });
         });
     }
+
+    // ---------- 侧栏多选：批量删除、推送 ----------
+
+    /// 多选着分支或标签时的右键菜单：对选中的全部操作。`picked` 是完整的引用名，都是同一类。
+    pub(super) fn side_multi_menu(
+        &self,
+        picked: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> super::menus::MenuFn {
+        let view = cx.entity().downgrade();
+        let tags = picked
+            .first()
+            .is_some_and(|full| full.starts_with("refs/tags/"));
+        let names: Vec<String> = picked
+            .iter()
+            .filter_map(|full| full.splitn(3, '/').nth(2))
+            .map(str::to_string)
+            .collect();
+        let count = names.len();
+        let remote = self.default_remote();
+        Box::new(move |menu, _, _| {
+            let item = |label: String,
+                        run: fn(
+                &mut RepoView,
+                Vec<String>,
+                &mut Window,
+                &mut Context<RepoView>,
+            )| {
+                let (view, names) = (view.clone(), names.clone());
+                gpui_kit::component::menu::PopupMenuItem::new(label).on_click(
+                    move |_, window, cx| {
+                        let names = names.clone();
+                        view.update(cx, |this, cx| run(this, names, window, cx))
+                            .ok();
+                    },
+                )
+            };
+            let copy = names.join("\n");
+            let menu = match tags {
+                true => menu
+                    .item(item(
+                        tf!("推送选中的 {count} 个标签到 {remote}", count, remote),
+                        |this, names, w, cx| this.push_tags(names, w, cx),
+                    ))
+                    .item(item(
+                        tf!("删除选中的 {count} 个本地标签…", count),
+                        |this, names, w, cx| this.delete_tags(names, w, cx),
+                    )),
+                false => menu
+                    .item(item(
+                        tf!("推送选中的 {count} 个分支…", count),
+                        |this, names, w, cx| this.push_branches(names, w, cx),
+                    ))
+                    .item(item(
+                        tf!("删除选中的 {count} 个分支…", count),
+                        |this, names, w, cx| this.delete_branches(names, w, cx),
+                    )),
+            };
+            menu.separator().item(
+                gpui_kit::component::menu::PopupMenuItem::new(tr("复制名称")).on_click(
+                    move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                    },
+                ),
+            )
+        })
+    }
+
+    /// 删除选中的几个本地分支：和清理上游已删除的分支用同一个对话框，逐个标出提交在不在远程分支
+    /// 里，不在的默认不勾。当前分支删不了，不列。
+    pub(super) fn delete_branches(
+        &mut self,
+        names: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let picked: Vec<(String, String)> = self
+            .refs
+            .branches
+            .iter()
+            .filter(|branch| !branch.current && names.contains(&branch.name))
+            .map(|branch| (branch.name.clone(), branch.target.clone()))
+            .collect();
+        if picked.is_empty() {
+            let text = tr("选中的是当前分支，无法删除。请先切换到其他分支。");
+            window.push_notification(Notification::info(text), cx);
+            return;
+        }
+        let skipped = names.len() - picked.len();
+        let Some(channel) = self.channel.clone() else {
+            return;
+        };
+        let repo = self.entry.path.clone();
+        let upstream = self.status.as_ref().and_then(|s| s.upstream.clone());
+        cx.spawn_in(window, async move |this, cx| {
+            let checks = picked
+                .into_iter()
+                .map(|name| inspect(&channel, &repo, name, upstream.as_deref()));
+            let list = futures::future::join_all(checks).await;
+            this.update_in(cx, |this, window, cx| {
+                let note = match skipped {
+                    0 => tr("仅删除本地分支。未并入远程分支的提交，删除后难以找回。").to_string(),
+                    _ => tr("仅删除本地分支；当前分支不能删除，未列出。未并入远程分支的提交，删除后难以找回。")
+                        .to_string(),
+                };
+                let dialog = Sweep {
+                    title: tr("删除分支").into(),
+                    note: note.into(),
+                    label: tr("删除分支"),
+                };
+                this.sweep_dialog_with(list, dialog, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 推送选中的几个分支：有上游的推到上游，没有的推到默认远程的同名分支并设为上游。先说清各推到
+    /// 哪里，确认了再推。
+    fn push_branches(&mut self, names: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        use std::collections::BTreeMap;
+        if self.remote_names.is_empty() {
+            let text = tr("此仓库尚无远程。请先添加远程。");
+            window.push_notification(Notification::warning(text), cx);
+            return;
+        }
+        // 远程 → （已有上游的引用规格，新分支的引用规格）
+        let mut plan: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
+        let mut lines: Vec<String> = Vec::new();
+        for branch in self
+            .refs
+            .branches
+            .iter()
+            .filter(|b| names.contains(&b.name))
+        {
+            let known = branch
+                .upstream
+                .as_deref()
+                .filter(|_| !branch.gone)
+                .and_then(|upstream| self.split_remote_ref(upstream));
+            match known {
+                Some((remote, on_remote)) => {
+                    lines.push(format!("{} → {remote}/{on_remote}", branch.name));
+                    let spec = format!("refs/heads/{}:refs/heads/{on_remote}", branch.name);
+                    plan.entry(remote).or_default().0.push(spec);
+                }
+                None => {
+                    let remote = self.default_remote();
+                    lines.push(tf!(
+                        "{name} → {remote}/{name}（新分支，设为上游）",
+                        name = branch.name.as_str(),
+                        remote = remote.as_str()
+                    ));
+                    let spec = format!("refs/heads/{0}:refs/heads/{0}", branch.name);
+                    plan.entry(remote).or_default().1.push(spec);
+                }
+            }
+        }
+        let count = lines.len();
+        if count == 0 {
+            return;
+        }
+        let mut steps: Vec<Step> = Vec::new();
+        for (remote, (known, fresh)) in plan {
+            if !known.is_empty() {
+                let mut push = vec!["push".to_string(), "--progress".into(), remote.clone()];
+                push.extend(known);
+                steps.push(Step::net(push));
+            }
+            if !fresh.is_empty() {
+                let mut push = vec!["push".to_string(), "--progress".into(), "-u".into(), remote];
+                push.extend(fresh);
+                steps.push(Step::net(push));
+            }
+        }
+        let description = lines.join("\n");
+        self.confirm_plain(
+            tf!("推送 {count} 个分支？", count),
+            description,
+            tr("推送"),
+            window,
+            cx,
+            move |this, window, cx| {
+                this.run_seq(
+                    tr("推送"),
+                    steps.clone(),
+                    window,
+                    cx,
+                    move |this, _, window, cx| {
+                        let text = tf!("已推送 {count} 个分支", count);
+                        this.notify_net(Notification::success(text), window, cx);
+                    },
+                );
+            },
+        );
+    }
+
+    /// 删除选中的几个本地标签。
+    fn delete_tags(&mut self, names: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let count = names.len();
+        let shown = names.join(tr("、"));
+        let description = tf!(
+            "删除 {count} 个本地标签：{shown}。远程上的同名标签不受影响。",
+            count,
+            shown
+        );
+        self.confirm(
+            tf!("删除 {count} 个标签？", count),
+            description,
+            tr("删除"),
+            window,
+            cx,
+            move |this, window, cx| {
+                let mut delete: Vec<String> = vec!["tag".into(), "-d".into(), "--".into()];
+                delete.extend(names.iter().cloned());
+                this.run_op(
+                    tr("删除标签"),
+                    delete,
+                    None,
+                    window,
+                    cx,
+                    move |this, _, window, cx| {
+                        this.sidebar.multi.clear();
+                        let text = tf!("已删除 {count} 个本地标签", count);
+                        window.push_notification(Notification::success(text), cx);
+                    },
+                );
+            },
+        );
+    }
+
+    /// 把选中的几个标签推送到默认远程。
+    fn push_tags(&mut self, names: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.remote_names.is_empty() {
+            let text = tr("此仓库尚无远程。请先添加远程。");
+            window.push_notification(Notification::warning(text), cx);
+            return;
+        }
+        let (count, remote) = (names.len(), self.default_remote());
+        let mut push = vec!["push".to_string(), "--progress".into(), remote.clone()];
+        push.extend(names.iter().map(|name| format!("refs/tags/{name}")));
+        self.run_net_op(
+            tr("推送"),
+            push,
+            window,
+            cx,
+            move |this, _, window, cx| {
+                let text = tf!("已推送 {count} 个标签到 {remote}", count, remote);
+                this.notify_net(Notification::success(text), window, cx);
+            },
+        );
+    }
+}
+
+/// 批量删除分支的对话框上写什么。
+struct Sweep {
+    title: SharedString,
+    /// 列表下面那句说明
+    note: SharedString,
+    /// 操作的名字（「清理分支」「删除分支」）
+    label: &'static str,
 }
 
 #[cfg(test)]

@@ -279,6 +279,46 @@ pub fn action_note(
         .autohide(false)
 }
 
+/// 同 [`action_note`]，按钮有几个（「撤销」加「查看改动」这类）：文字放不下时几个按钮一起换到下一行；
+/// 几个按钮自己一行也放不下时（英文的「Skip hooks and commit…」）再各占一行，靠右。
+/// `title` 给了就在文字上面多一行粗一点的标题。
+pub fn actions_note(
+    kind: NotificationType,
+    title: Option<SharedString>,
+    text: impl Into<SharedString>,
+    buttons: impl Fn(&mut Notification, &mut Window, &mut Context<Notification>) -> Vec<Button>
+    + 'static,
+) -> Notification {
+    let text: SharedString = text.into();
+    let note = Notification::new().with_type(kind);
+    let note = match title {
+        Some(title) => note.title(title),
+        None => note,
+    };
+    note.content(move |note, window, cx| {
+        let buttons = buttons(note, window, cx);
+        h_flex()
+            .flex_wrap()
+            .items_center()
+            .gap_x(px(12.))
+            .gap_y(px(8.))
+            .child(div().flex_grow(1.).min_w_0().text_sm().child(text.clone()))
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .justify_end()
+                    .min_w_0()
+                    .max_w_full()
+                    .ml_auto()
+                    .mr(px(14.))
+                    .gap_2()
+                    .children(buttons.into_iter().map(|button| button.small())),
+            )
+            .into_any_element()
+    })
+    .autohide(false)
+}
+
 /// 计数的小块：侧栏「本地修改」后面的数字、分组里有几项。
 pub fn count_pill(count: usize, strong: bool, cx: &App) -> Div {
     let theme = cx.theme();

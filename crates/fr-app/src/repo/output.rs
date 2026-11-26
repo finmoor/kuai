@@ -197,6 +197,22 @@ impl RepoView {
         window.push_notification(note, cx);
     }
 
+    /// 刚做完的那个操作的全部输出。
+    pub(super) fn last_output_text(&self) -> Option<String> {
+        self.output.recent.front().and_then(|op| self.op_text(op))
+    }
+
+    /// 刚做完的操作里远程说了话（钩子的说明、合并请求的链接）时，打开底部输出的回调。
+    pub(super) fn output_opener_if_said(
+        &self,
+        cx: &Context<Self>,
+    ) -> Option<super::ops::OpenOutput> {
+        let said = self
+            .last_output_text()
+            .is_some_and(|text| remote_said(&text));
+        said.then(|| self.output_opener(cx)).flatten()
+    }
+
     /// 操作的全部输出（几步连在一起）；记录都被挤掉了是 None。
     fn op_text(&self, op: &Op) -> Option<String> {
         let entries: Vec<&Entry> = op

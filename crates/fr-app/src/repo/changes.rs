@@ -146,6 +146,19 @@ impl Changes {
                     secondary: true, ..
                 } = event
                 {
+                    // 组件对 Ctrl+Enter 也照 Enter 办：先在光标处插一个换行，再发这个事件。把这个换行
+                    // 拿掉再提交，不然光标在一行中间时这一行被拆成两行；钩子拦下、说明留着时末尾还多
+                    // 一个空行，框收成一行时看着像是空的
+                    this.changes.message.update(cx, |m, cx| {
+                        let (at, text) = (m.cursor(), m.value().to_string());
+                        let newline = at > 0
+                            && text.is_char_boundary(at)
+                            && text.as_bytes().get(at - 1) == Some(&b'\n');
+                        if newline {
+                            let fixed = format!("{}{}", &text[..at - 1], &text[at..]);
+                            m.set_value(fixed, window, cx);
+                        }
+                    });
                     this.commit(window, cx);
                 }
             },
@@ -1690,11 +1703,18 @@ impl RepoView {
     }
 
     pub(super) fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.commit_then(false, window, cx);
+        self.commit_then(false, false, window, cx);
     }
 
-    /// 提交；`push` 为真时提交成功后接着推送。
-    fn commit_then(&mut self, push: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// 提交；`push` 为真时提交成功后接着推送，`no_verify` 为真时这一次不运行 pre-commit、
+    /// commit-msg 钩子。
+    pub(super) fn commit_then(
+        &mut self,
+        push: bool,
+        no_verify: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.op.is_some() {
             return;
         }
@@ -1774,29 +1794,53 @@ impl RepoView {
                         window,
                         cx,
                         move |this, window, cx| {
-                            this.commit_now(push, amend, sent.clone(), message.clone(), window, cx)
+                            let commit = super::hooks::Commit {
+                                push,
+                                amend,
+                                no_verify,
+                                sent: sent.clone(),
+                                message: message.clone(),
+                            };
+                            this.commit_now(commit, window, cx)
                         },
                     );
                 }
-                _ => this.commit_now(push, amend, sent, message, window, cx),
+                _ => {
+                    let commit = super::hooks::Commit {
+                        push,
+                        amend,
+                        no_verify,
+                        sent,
+                        message,
+                    };
+                    this.commit_now(commit, window, cx)
+                }
             })
             .ok();
         })
         .detach();
     }
 
-    fn commit_now(
+    /// 真的提交。钩子可能跑很久，输出边做边显示在底部的「输出」里（工具栏的进度点开看）。
+    pub(super) fn commit_now(
         &mut self,
-        push: bool,
-        amend: bool,
-        sent: String,
-        message: String,
+        commit: super::hooks::Commit,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let super::hooks::Commit {
+            push,
+            amend,
+            no_verify,
+            sent,
+            message,
+        } = commit.clone();
         let mut args: Vec<String> = vec!["commit".into(), "-F".into(), "-".into()];
         if amend {
             args.push("--amend".into());
+        }
+        if no_verify {
+            args.push("--no-verify".into());
         }
         let label = if amend {
             tr("修改提交")
@@ -1804,7 +1848,12 @@ impl RepoView {
             tr("提交")
         };
         let used = message.clone();
-        let step = Step::input(args, message.into_bytes());
+        let step = Step::input(args, message.into_bytes()).live();
+        // 修改上次提交做完能撤销：回到修改前的那个提交，补进去的改动留在暂存区
+        let point = amend
+            .then(|| self.undo_point())
+            .flatten()
+            .map(|point| point.soft());
         self.run_steps(
             label,
             vec![step],
@@ -1813,8 +1862,11 @@ impl RepoView {
             Box::new(move |this, result, window, cx| {
                 if let Err(detail) = result {
                     // 没设置作者（名称、邮箱）时直接弹出设置框；git 的报错会随主机的语言翻译，
-                    // 不按文字认，再问一次 git 当前的作者
-                    return this.after_commit_failure(label, detail, window, cx);
+                    // 不按文字认，再问一次 git 当前的作者。再看是不是钩子没通过
+                    return this.after_commit_failure(label, detail, commit, window, cx);
+                }
+                if point.is_some() {
+                    this.notify_undoable(tr("已修改上次提交"), point, window, cx);
                 }
                 // 记下这条说明，下次可以从「最近用过的」里再拿
                 let entry = this.entry.clone();
@@ -1840,11 +1892,13 @@ impl RepoView {
         );
     }
 
-    /// 提交失败：先看是不是没设置作者，是就弹出设置框（提交说明还在，设好再提交）；不是照常报错。
+    /// 提交失败：先看是不是没设置作者，是就弹出设置框（提交说明还在，设好再提交）；再看是不是钩子
+    /// 没通过（见 [`super::hooks`]）；都不是照常报错，带「查看输出」。
     fn after_commit_failure(
         &mut self,
         label: &'static str,
         detail: String,
+        commit: super::hooks::Commit,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1852,15 +1906,23 @@ impl RepoView {
             return super::ops::failure(window, cx, label, detail);
         };
         let request = channel.git(&self.entry.path, ident_args());
+        // 已经跳过钩子了还失败，就不是钩子的事
+        let hooks = match commit.no_verify {
+            true => Task::ready(Vec::new()),
+            false => self.commit_hooks(cx),
+        };
         cx.spawn_in(window, async move |this, cx| {
             let missing = matches!(request.await, Ok(out) if !out.success());
+            let hooks = hooks.await;
             this.update_in(cx, |this, window, cx| {
                 if missing {
                     this.changes.author = Some(None);
                     let note = tr("提交失败：未设置提交作者。请填写名称和邮箱，提交说明已保留。");
                     this.author_dialog(Some(note), window, cx);
+                } else if !hooks.is_empty() {
+                    this.hook_failed(hooks, commit, window, cx);
                 } else {
-                    super::ops::failure(window, cx, label, detail);
+                    this.failure(label, detail, window, cx);
                 }
                 cx.notify();
             })
@@ -2070,6 +2132,10 @@ impl RepoView {
                 .size_full()
                 .track_focus(&self.changes.focus)
                 .on_key_down(cx.listener(Self::changes_key))
+                .drag_over::<ExternalPaths>(|style, _, _, _| style)
+                .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                    this.drop_patch(paths, window, cx)
+                }))
                 .child(
                     v_flex()
                         .h(relative(0.46))
@@ -2101,6 +2167,11 @@ impl RepoView {
             .size_full()
             .track_focus(&self.changes.focus)
             .on_key_down(cx.listener(Self::changes_key))
+            // 把补丁文件拖到这里：打开应用补丁的对话框
+            .drag_over::<ExternalPaths>(|style, _, _, _| style)
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.drop_patch(paths, window, cx)
+            }))
             .child(
                 v_flex()
                     .w(px(list_width))
@@ -2187,6 +2258,14 @@ impl RepoView {
                                 }),
                         )
                     }),
+            )
+            // 更多：应用补丁、把改动导出成补丁
+            .child(
+                Button::new("changes-list-more")
+                    .xsmall()
+                    .ghost()
+                    .icon(ui::icon(IconName::Ellipsis))
+                    .dropdown_menu_with_anchor(Anchor::TopRight, self.patch_menu(cx)),
             )
             .into_any_element()
     }
@@ -2833,7 +2912,8 @@ impl RepoView {
                             // 按钮在窗口最底下，菜单往上开，不盖住按钮自己
                             .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
                                 let view = push_view.clone();
-                                menu.item(
+                                let (fixup_view, skip_view) = (view.clone(), view.clone());
+                                let menu = menu.item(
                                     PopupMenuItem::new(if amend {
                                         tr("修改上次提交并推送")
                                     } else {
@@ -2842,9 +2922,40 @@ impl RepoView {
                                     .on_click(
                                         move |_, window, cx| {
                                             view.update(cx, |this, cx| {
-                                                this.commit_then(true, window, cx)
+                                                this.commit_then(true, false, window, cx)
                                             })
                                             .ok();
+                                        },
+                                    ),
+                                );
+                                // 把已暂存的改动补进更早的提交，不新增提交
+                                let menu = match amend {
+                                    true => menu,
+                                    false => menu.item(
+                                        PopupMenuItem::new(tr("并入之前的提交…")).on_click(
+                                            move |_, window, cx| {
+                                                fixup_view
+                                                    .update(cx, |this, cx| {
+                                                        this.fixup_dialog(None, window, cx)
+                                                    })
+                                                    .ok();
+                                            },
+                                        ),
+                                    ),
+                                };
+                                menu.separator().item(
+                                    PopupMenuItem::new(if amend {
+                                        tr("修改上次提交，跳过钩子（--no-verify）")
+                                    } else {
+                                        tr("提交，跳过钩子（--no-verify）")
+                                    })
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            skip_view
+                                                .update(cx, |this, cx| {
+                                                    this.commit_then(false, true, window, cx)
+                                                })
+                                                .ok();
                                         },
                                     ),
                                 )

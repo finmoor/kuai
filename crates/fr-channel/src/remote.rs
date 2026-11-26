@@ -1050,7 +1050,14 @@ impl Connection {
         }
     }
 
-    pub(crate) fn git_stream(&self, repo: &str, args: Vec<String>, progress: bool) -> GitStream {
+    /// `stdin` 作为请求带的字节发过去，kuaid 写进 git 的标准输入（和不流式的 `git` 请求一样）。
+    pub(crate) fn git_stream(
+        &self,
+        repo: &str,
+        args: Vec<String>,
+        progress: bool,
+        stdin: Option<Vec<u8>>,
+    ) -> GitStream {
         let (tx, rx) = mpsc::unbounded();
         let id = self.inner.next_id();
         self.inner
@@ -1058,13 +1065,14 @@ impl Connection {
             .lock()
             .unwrap()
             .insert(id, Pending::Stream(tx.clone()));
+        let payload = stdin.unwrap_or_default();
         let request = Request {
             id,
             method: "git".into(),
             params: json!({ "repo": repo, "args": args, "stream": true, "progress": progress }),
-            bytes: 0,
+            bytes: payload.len() as u64,
         };
-        if let Err(err) = self.inner.send(request, Vec::new()) {
+        if let Err(err) = self.inner.send(request, payload) {
             self.inner.pending.lock().unwrap().remove(&id);
             let _ = tx.unbounded_send(Err(err));
         }

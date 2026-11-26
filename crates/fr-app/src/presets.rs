@@ -61,6 +61,152 @@ pub struct Preset {
     /// 在新建终端的菜单里列出来
     #[serde(default = "yes", skip_serializing_if = "is_yes")]
     pub shown: bool,
+    /// 还出现在哪些右键菜单里（提交、分支、文件）：命令里可以用 `$sha`、`$branch`、`$file`、`$repo`、
+    /// `$remote`，点的时候换成点的那个对象（见 [`expand`]）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub places: Vec<Place>,
+    /// 从右键菜单运行时不开终端，在后台运行、输出显示在底部的「输出」里
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
+}
+
+/// 一条命令还出现在哪种对象的右键菜单里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Place {
+    #[serde(rename = "commit")]
+    Commit,
+    #[serde(rename = "branch")]
+    Branch,
+    #[serde(rename = "file")]
+    File,
+}
+
+impl Place {
+    pub const ALL: [Place; 3] = [Place::Commit, Place::Branch, Place::File];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Place::Commit => tr("提交"),
+            Place::Branch => tr("分支"),
+            Place::File => tr("文件"),
+        }
+    }
+}
+
+/// 命令里的变量换成什么。没有的（比如在提交上点的没有 `$file`）换成空的。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Vars {
+    pub sha: String,
+    pub branch: String,
+    pub file: String,
+    pub repo: String,
+    pub remote: String,
+}
+
+/// 把命令里的 `$sha`、`$branch`、`$file`、`$repo`、`$remote` 换成值。值里有空格、引号这些字符时
+/// 用双引号括起来（里面的 `"`、`\`、`$`、反引号加反斜杠）；已经写在引号里的不再加引号。认不得的
+/// `$名字`（shell 自己的变量）原样留着。
+pub fn expand(command: &str, vars: &Vars) -> String {
+    let safe = |value: &str| {
+        !value.is_empty()
+            && value
+                .chars()
+                .all(|c| c.is_alphanumeric() || "_./@:+-=,%~".contains(c))
+    };
+    let escaped = |value: &str| {
+        let mut out = String::with_capacity(value.len() + 2);
+        for c in value.chars() {
+            if matches!(c, '"' | '\\' | '$' | '`') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out
+    };
+    let mut out = String::with_capacity(command.len() + 32);
+    // 现在在哪种引号里：值要不要自己加引号看它
+    let mut quote: Option<char> = None;
+    let mut rest = command;
+    while let Some(c) = rest.chars().next() {
+        if c != '$' {
+            match (quote, c) {
+                (None, '"' | '\'') => quote = Some(c),
+                (Some(open), c) if c == open => quote = None,
+                _ => {}
+            }
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+            continue;
+        }
+        let name: String = rest[1..]
+            .chars()
+            .take_while(|c| c.is_ascii_lowercase())
+            .collect();
+        let value = match name.as_str() {
+            "sha" => Some(&vars.sha),
+            "branch" => Some(&vars.branch),
+            "file" => Some(&vars.file),
+            "repo" => Some(&vars.repo),
+            "remote" => Some(&vars.remote),
+            _ => None,
+        };
+        match value {
+            Some(value) => {
+                match quote {
+                    // 单引号里什么都不转义
+                    Some('\'') => out.push_str(value),
+                    Some(_) => out.push_str(&escaped(value)),
+                    None if safe(value) => out.push_str(value),
+                    None => {
+                        out.push('"');
+                        out.push_str(&escaped(value));
+                        out.push('"');
+                    }
+                }
+                rest = &rest[1 + name.len()..];
+            }
+            None => {
+                out.push('$');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out
+}
+
+/// 出现在 `place` 这种对象的右键菜单里的命令。
+pub fn for_place(place: Place, cx: &App) -> Vec<Preset> {
+    all(cx)
+        .into_iter()
+        .filter(|preset| preset.places.contains(&place))
+        .collect()
+}
+
+/// 现成的例子（设置里「添加示例」）：把右键点的对象交给终端里的 AI。
+fn examples() -> Vec<Preset> {
+    let example = |name: &str, command: &str, place: Place| Preset {
+        id: String::new(),
+        name: name.to_string(),
+        command: command.to_string(),
+        resume: String::new(),
+        icon: "claude-code".to_string(),
+        hue: None,
+        shown: false,
+        places: vec![place],
+        background: false,
+    };
+    vec![
+        example(
+            tr("让 Claude Code 评审此提交"),
+            "claude \"评审提交 $sha，指出有风险的改动\"",
+            Place::Commit,
+        ),
+        example(
+            tr("让 Claude Code 讲解此文件"),
+            "claude \"讲解 $file 的结构和关键逻辑\"",
+            Place::File,
+        ),
+    ]
 }
 
 fn yes() -> bool {
@@ -81,6 +227,8 @@ pub fn builtins() -> Vec<Preset> {
         icon: icon.to_string(),
         hue: None,
         shown: true,
+        places: Vec::new(),
+        background: false,
     };
     vec![
         preset(
@@ -1021,6 +1169,8 @@ pub fn run_dialog(place: SharedString, on_start: OnStart, window: &mut Window, c
                         icon: start.icon.clone(),
                         hue: None,
                         shown: true,
+                        places: Vec::new(),
+                        background: false,
                     },
                     cx,
                 );
@@ -1202,24 +1352,44 @@ fn table(cx: &mut App) -> AnyElement {
                     .text_color(muted.opacity(0.6)),
             )
             .child(
-                name_col(h_flex().gap_2())
-                    .child(icon(&preset.icon).flex_none().size_4().text_color(color(
-                        &preset.icon,
-                        preset.hue,
-                        cx,
-                    )))
-                    .child(ui::clipped(("preset-name", index), preset.name.clone()).text_sm())
-                    .when(builtin, |name| {
+                name_col(v_flex())
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(icon(&preset.icon).flex_none().size_4().text_color(color(
+                                &preset.icon,
+                                preset.hue,
+                                cx,
+                            )))
+                            .child(
+                                ui::clipped(("preset-name", index), preset.name.clone()).text_sm(),
+                            )
+                            .when(builtin, |name| {
+                                name.child(
+                                    div()
+                                        .flex_none()
+                                        .px_1()
+                                        .rounded(px(3.))
+                                        .border_1()
+                                        .border_color(border)
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(tr("内置")),
+                                )
+                            }),
+                    )
+                    // 还出现在哪些右键菜单里：「显示」只管新建终端的菜单，关着也照样在右键菜单里
+                    .when(!preset.places.is_empty(), |name| {
+                        let places: Vec<&str> =
+                            preset.places.iter().map(|place| place.label()).collect();
                         name.child(
-                            div()
-                                .flex_none()
-                                .px_1()
-                                .rounded(px(3.))
-                                .border_1()
-                                .border_color(border)
-                                .text_xs()
-                                .text_color(muted)
-                                .child(tr("内置")),
+                            ui::clipped(
+                                ("preset-places", index),
+                                tf!("右键菜单：{places}", places = places.join(tr("、"))),
+                            )
+                            .pl(px(24.))
+                            .text_xs()
+                            .text_color(muted),
                         )
                     }),
             )
@@ -1308,6 +1478,25 @@ fn table(cx: &mut App) -> AnyElement {
                 .label(tr("添加预设…"))
                 .on_click(|_, window, cx| edit_dialog(None, window, cx)),
         )
+        // 不加悬停提示：提示出现在按钮下面，会盖住弹出的菜单
+        .child(
+            Button::new("preset-example")
+                .small()
+                .label(tr("添加示例"))
+                .dropdown_caret(true)
+                .dropdown_menu(|mut menu, _, _| {
+                    for example in examples() {
+                        let name = example.name.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(name)
+                                .on_click(move |_, _, cx| add(example.clone(), cx)),
+                        );
+                    }
+                    menu.separator().label(tr(
+                        "示例出现在提交、文件的右键菜单里，命令中的 $sha、$file 换成所点的对象。",
+                    ))
+                }),
+        )
         .child(
             Button::new("preset-restore")
                 .small()
@@ -1371,17 +1560,28 @@ fn edit_dialog(existing: Option<Preset>, window: &mut Window, cx: &mut App) {
         icon: "play".to_string(),
         hue: None,
         shown: true,
+        places: Vec::new(),
+        background: false,
     });
     let name = field(&base.name, tr("例如 开发服务器"), window, cx);
     let command = field(&base.command, tr("例如 npm run dev"), window, cx);
     let resume = field(&base.resume, tr("例如 claude -c"), window, cx);
     let icon_choice = Rc::new(RefCell::new(base.icon.clone()));
     let hue_choice = Rc::new(Cell::new(base.hue));
+    // 出现在哪：新建终端的菜单，提交、分支、文件的右键菜单
+    let shown_choice = Rc::new(Cell::new(base.shown));
+    let places_choice = Rc::new(RefCell::new(base.places.clone()));
+    let background_choice = Rc::new(Cell::new(base.background));
     let problem: Rc<RefCell<Option<SharedString>>> = Rc::default();
     let submit: Submit = {
         let (name, command, resume) = (name.clone(), command.clone(), resume.clone());
         let (icon_choice, hue_choice, problem) =
             (icon_choice.clone(), hue_choice.clone(), problem.clone());
+        let (shown_choice, places_choice, background_choice) = (
+            shown_choice.clone(),
+            places_choice.clone(),
+            background_choice.clone(),
+        );
         Rc::new(move |window, cx| {
             let text =
                 |input: &Entity<InputState>, cx: &App| input.read(cx).value().trim().to_string();
@@ -1392,7 +1592,9 @@ fn edit_dialog(existing: Option<Preset>, window: &mut Window, cx: &mut App) {
                 resume: text(&resume, cx),
                 icon: icon_choice.borrow().clone(),
                 hue: hue_choice.get(),
-                shown: base.shown,
+                shown: shown_choice.get(),
+                places: places_choice.borrow().clone(),
+                background: background_choice.get(),
             };
             let found = if preset.name.is_empty() {
                 Some(tr("请填写名称"))
@@ -1515,7 +1717,58 @@ fn edit_dialog(existing: Option<Preset>, window: &mut Window, cx: &mut App) {
                     .child(label(tr("图标和颜色")))
                     .child(h_flex().gap_1().flex_wrap().children(icons))
                     .child(h_flex().gap_1().children(colors)),
-            );
+            )
+            .child({
+                let shown = shown_choice.clone();
+                let chosen = places_choice.borrow().clone();
+                let places = Place::ALL.into_iter().enumerate().map(|(ix, place)| {
+                    let pick = places_choice.clone();
+                    Checkbox::new(("preset-place", ix))
+                        .label(place.label())
+                        .checked(chosen.contains(&place))
+                        .on_click(move |on, window, _| {
+                            let mut list = pick.borrow_mut();
+                            list.retain(|have| *have != place);
+                            if *on {
+                                list.push(place);
+                            }
+                            window.refresh();
+                        })
+                });
+                let background = background_choice.clone();
+                v_flex()
+                    .gap_2()
+                    .child(label(tr("出现在")))
+                    .child(
+                        h_flex()
+                            .gap_4()
+                            .flex_wrap()
+                            .child(
+                                Checkbox::new("preset-place-new")
+                                    .label(tr("新建终端"))
+                                    .checked(shown.get())
+                                    .on_click(move |on, window, _| {
+                                        shown.set(*on);
+                                        window.refresh();
+                                    }),
+                            )
+                            .children(places),
+                    )
+                    .child(div().text_xs().text_color(muted).child(tr(
+                        "勾选提交、分支或文件后，命令出现在它们的右键菜单里，可用 $sha、$branch、$file、$repo、$remote 代表所点的对象。",
+                    )))
+                    .when(!chosen.is_empty(), |d| {
+                        d.child(
+                            Checkbox::new("preset-background")
+                                .label(tr("从右键菜单运行时不开终端，在后台运行并显示输出"))
+                                .checked(background.get())
+                                .on_click(move |on, window, _| {
+                                    background.set(*on);
+                                    window.refresh();
+                                }),
+                        )
+                    })
+            });
         if let Some(found) = problem.borrow().clone() {
             body = body.child(div().text_sm().text_color(danger).child(found));
         }
@@ -1819,6 +2072,8 @@ mod tests {
                 icon: self.icon,
                 hue: self.hue,
                 shown: true,
+                places: Vec::new(),
+                background: false,
             }
         }
     }

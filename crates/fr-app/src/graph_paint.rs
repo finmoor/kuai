@@ -28,16 +28,20 @@ pub fn column_width(max_lanes: u16) -> Pixels {
 
 /// 一行提交图。`segments` 是这一行的线段，`lane`、`color` 是节点的位置和颜色，`clipped` 是这一行
 /// 有画不下的。
+/// `square` 为真时节点画成方的（贮藏）。
 pub fn graph_cell(
     segments: Vec<Segment>,
     lane: u16,
     color: u8,
     clipped: bool,
+    square: bool,
     width: Pixels,
 ) -> impl IntoElement {
     canvas(
         |_, _, _| {},
-        move |bounds, _, window, _| paint_row(bounds, &segments, lane, color, clipped, window),
+        move |bounds, _, window, _| {
+            paint_row(bounds, &segments, lane, color, clipped, square, window)
+        },
     )
     .w(width)
     .h_full()
@@ -49,6 +53,7 @@ fn paint_row(
     lane: u16,
     color: u8,
     clipped: bool,
+    square: bool,
     window: &mut Window,
 ) {
     let x = |l: u16| bounds.origin.x + px(LANE_WIDTH * (l as f32 + 0.5) + 3.);
@@ -95,7 +100,7 @@ fn paint_row(
                 origin: point(center.x - r, center.y - r),
                 size: size(r * 2., r * 2.),
             },
-            r,
+            if square { px(1.5) } else { r },
             lane_color(color),
             px(1.5),
             gpui_kit::white(),

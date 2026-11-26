@@ -551,17 +551,28 @@ impl Channel {
     /// 执行 git，输出边产生边送回来。
     pub fn git_stream(&self, repo: &str, args: Vec<String>) -> GitStream {
         match self {
-            Channel::Local => local::git_stream(repo, args, false),
-            Channel::Remote(conn) => conn.git_stream(repo, args, false),
+            Channel::Local => local::git_stream(repo, args, false, None),
+            Channel::Remote(conn) => conn.git_stream(repo, args, false, None),
         }
     }
 
     /// 同 [`Self::git_stream`]，标准错误也边产生边送回来（[`StreamItem::Progress`]），
     /// 用来显示获取、推送的进度。
     pub fn git_progress(&self, repo: &str, args: Vec<String>) -> GitStream {
+        self.git_progress_with_input(repo, args, None)
+    }
+
+    /// 同 [`Self::git_progress`]，`stdin` 写进 git 的标准输入。提交时用：说明从标准输入给，钩子的
+    /// 输出边产生边送回来。
+    pub fn git_progress_with_input(
+        &self,
+        repo: &str,
+        args: Vec<String>,
+        stdin: Option<Vec<u8>>,
+    ) -> GitStream {
         match self {
-            Channel::Local => local::git_stream(repo, args, true),
-            Channel::Remote(conn) => conn.git_stream(repo, args, true),
+            Channel::Local => local::git_stream(repo, args, true, stdin),
+            Channel::Remote(conn) => conn.git_stream(repo, args, true, stdin),
         }
     }
 

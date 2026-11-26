@@ -156,7 +156,12 @@ pub(crate) fn git_cancellable(
     (output.boxed(), cancel)
 }
 
-pub(crate) fn git_stream(repo: &str, args: Vec<String>, progress: bool) -> GitStream {
+pub(crate) fn git_stream(
+    repo: &str,
+    args: Vec<String>,
+    progress: bool,
+    stdin: Option<Vec<u8>>,
+) -> GitStream {
     let (tx, rx) = mpsc::unbounded();
     let on_stderr: Option<OnStderr> = progress.then(|| {
         let tx = tx.clone();
@@ -171,7 +176,7 @@ pub(crate) fn git_stream(repo: &str, args: Vec<String>, progress: bool) -> GitSt
         if worker.cancelled() {
             return;
         }
-        let (running, killer) = match exec::spawn_with(Path::new(&repo), &args, None, on_stderr) {
+        let (running, killer) = match exec::spawn_with(Path::new(&repo), &args, stdin, on_stderr) {
             Ok(started) => started,
             Err(err) => {
                 let _ = tx.unbounded_send(Err(err));

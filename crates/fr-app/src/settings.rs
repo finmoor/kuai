@@ -93,6 +93,15 @@ pub struct RepoMemo {
     /// 指向哪；「找回提交」里列出来，可以按原名恢复。只留 [`RepoMemo::KEEP_DELETED`] 秒
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deleted_branches: Vec<DeletedBranch>,
+    /// 置顶的本地分支（名字），按置顶的先后：排在侧栏「分支」的最上面
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_branches: Vec<String>,
+    /// 提交图里把贮藏也画出来
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub graph_stashes: bool,
+    /// 提交图只走第一父提交：只看主线，不看合并进来的分支上的提交
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub first_parent: bool,
 }
 
 /// 删掉的一个分支：名字、删除时指向的提交、什么时候删的（Unix 秒）。
@@ -116,6 +125,9 @@ impl RepoMemo {
             && self.hidden_refs.is_empty()
             && self.recent_messages.is_empty()
             && self.deleted_branches.is_empty()
+            && self.pinned_branches.is_empty()
+            && !self.graph_stashes
+            && !self.first_parent
     }
 
     /// 记下刚删掉的分支，顺便去掉过期的（`now` 是 Unix 秒）。
@@ -449,6 +461,13 @@ pub struct Settings {
     /// 拉取时工作区有改动：不问，直接贮藏、拉完放回（拉取菜单里的开关）
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pull_autostash: bool,
+    /// 命令面板里最近用过的命令（id），新的在前
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub palette_recent: Vec<String>,
+    /// 各主机用的是哪种托管平台（github.com 这几个公开的站点不用记）：打开提交、分支、合并请求的
+    /// 网页时按它拼地址。键是主机名（带端口的连端口）
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub hosting: std::collections::BTreeMap<String, fr_core::hosting::Flavor>,
     /// 代码的字号：改动、合并编辑器、文件页的编辑器（在改动上按住 Ctrl 滚滚轮也能调）
     #[serde(default = "default_code_size")]
     pub code_font_size: u8,
@@ -833,6 +852,8 @@ impl Default for Settings {
             hide_untracked: false,
             stash_before_switch: false,
             pull_autostash: false,
+            palette_recent: Vec::new(),
+            hosting: Default::default(),
             code_font_size: default_code_size(),
             tab_width: default_tab_width(),
             diff_tool: String::new(),
@@ -1113,6 +1134,9 @@ impl Settings {
                     hidden_refs: Vec::new(),
                     recent_messages: Vec::new(),
                     deleted_branches: Vec::new(),
+                    pinned_branches: Vec::new(),
+                    graph_stashes: false,
+                    first_parent: false,
                 });
                 self.repo_memos.len() - 1
             }

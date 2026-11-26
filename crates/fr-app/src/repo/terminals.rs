@@ -853,6 +853,8 @@ impl RepoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 预设的命令里用了 `$branch` 这类变量：按当前的分支、HEAD 换（右键菜单里点的已经换过了）
+        let start = start.map(|start| self.expand_start(start, cx));
         if self.terminals.listed || self.board_rows(cx).is_some() {
             return self.open_new_terminal(dir, start, window, cx);
         }

@@ -277,8 +277,16 @@ impl RepoView {
     ) -> super::menus::MenuFn {
         let base = self.tracked_file_menu(path.clone(), at, cx);
         let view = cx.entity().downgrade();
+        let commit = self.history.tree.as_ref().map(|tree| tree.commit.clone());
         Box::new(move |menu, window, cx| {
             let menu = base(menu, window, cx);
+            // 全部文件里的都在这个提交里有：只给「恢复到此提交中的版本」那一组
+            let menu = match &commit {
+                Some(commit) => {
+                    super::restore::restore_items(menu.separator(), &view, &path, commit)
+                }
+                None => menu,
+            };
             let (view, path) = (view.clone(), path.clone());
             menu.separator().item(
                 gpui_kit::component::menu::PopupMenuItem::new(tr("将此版本另存为…")).on_click(

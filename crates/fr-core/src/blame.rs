@@ -24,6 +24,9 @@ pub struct BlameCommit {
     /// 作者时间，Unix 秒
     pub time: i64,
     pub summary: String,
+    /// 这个提交改之前，这些行在哪个提交、哪个文件里（文件改过名时路径不一样）。这个文件就是它
+    /// 加进来的，或者行还没提交时没有
+    pub previous: Option<(String, String)>,
 }
 
 impl BlameCommit {
@@ -40,6 +43,8 @@ pub struct BlameLine {
     pub commit: usize,
     /// 这一行是不是一段连续同提交的行里的第一行（界面上只在第一行显示提交信息）
     pub first: bool,
+    /// 这一行在改它的那个提交里是第几行（从 1 数）：往更早的版本追时落在差不多的位置
+    pub orig_line: u32,
     /// 行的内容，原始字节（文件不一定是 UTF-8）
     pub content: Vec<u8>,
 }
@@ -59,6 +64,7 @@ pub fn parse(out: &[u8]) -> Blame {
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut current: Option<usize> = None;
     let mut previous: Option<usize> = None;
+    let mut orig_line = 0;
     for line in out.split(|&b| b == b'\n') {
         if let Some(content) = line.strip_prefix(b"\t") {
             let Some(commit) = current else {
@@ -67,6 +73,7 @@ pub fn parse(out: &[u8]) -> Blame {
             blame.lines.push(BlameLine {
                 commit,
                 first: previous != Some(commit),
+                orig_line,
                 content: content.strip_suffix(b"\r").unwrap_or(content).to_vec(),
             });
             previous = Some(commit);
@@ -85,6 +92,11 @@ pub fn parse(out: &[u8]) -> Blame {
                 });
             }
             current = Some(ix);
+            orig_line = value
+                .split_ascii_whitespace()
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
             continue;
         }
         let Some(commit) = current.and_then(|ix| blame.commits.get_mut(ix)) else {
@@ -94,6 +106,11 @@ pub fn parse(out: &[u8]) -> Blame {
             "author" => commit.author = value.to_string(),
             "author-time" => commit.time = value.parse().unwrap_or(0),
             "summary" => commit.summary = value.to_string(),
+            "previous" => {
+                commit.previous = value
+                    .split_once(' ')
+                    .map(|(id, path)| (id.to_string(), crate::patchfile::unquote(path)))
+            }
             _ => {}
         }
     }

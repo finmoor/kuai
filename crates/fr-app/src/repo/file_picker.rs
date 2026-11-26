@@ -116,10 +116,25 @@ fn parse_files(bytes: &[u8]) -> Vec<SharedString> {
         .collect();
     // 有冲突的文件在暂存区里有两三个版本，git ls-files 每个版本各列一行（相邻）
     files.dedup();
+    // 目录也能选（看目录历史）：各级目录排在文件后面，以 `/` 结尾。没输入字时先看到的还是文件
+    let mut dirs: Vec<SharedString> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for file in &files {
+        let mut end = 0;
+        while let Some(at) = file[end..].find('/') {
+            end += at + 1;
+            if seen.insert(&file[..end]) {
+                dirs.push(SharedString::from(file[..end].to_string()));
+            }
+        }
+    }
+    dirs.sort();
+    drop(seen);
+    files.extend(dirs);
     files
 }
 
-/// 按输入的字筛选（不分大小写）：文件名里有的排在前面，其次是路径里有的。
+/// 按输入的字筛选（不分大小写）：文件名（目录是它自己的名字）里有的排在前面，其次是路径里有的。
 fn filter_files(files: &[SharedString], needle: &str) -> (Vec<SharedString>, usize) {
     if needle.is_empty() {
         return (files.iter().take(MAX_ROWS).cloned().collect(), files.len());
@@ -132,7 +147,11 @@ fn filter_files(files: &[SharedString], needle: &str) -> (Vec<SharedString>, usi
             continue;
         }
         total += 1;
-        let name = lower.rsplit('/').next().unwrap_or(&lower);
+        let name = lower
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(&lower);
         if name.contains(needle) {
             if by_name.len() < MAX_ROWS {
                 by_name.push(file.clone());
@@ -164,6 +183,7 @@ impl Render for FilePicker {
             .enumerate()
             .map(|(ix, path)| {
                 let (for_history, for_blame) = (path.to_string(), path.to_string());
+                let is_dir = path.ends_with('/');
                 h_flex()
                     .id(ix)
                     .px_2()
@@ -179,20 +199,30 @@ impl Render for FilePicker {
                             blame: false,
                         })
                     }))
+                    .when(is_dir, |row| {
+                        row.child(
+                            crate::ui::icon_small(gpui_kit::assets::IconName::Folder)
+                                .flex_none()
+                                .text_color(muted),
+                        )
+                    })
                     .child(crate::ui::clipped("path", path).flex_1().text_sm())
-                    .child(
-                        Button::new(("blame", ix))
-                            .xsmall()
-                            .ghost()
-                            .label(tr("逐行追溯"))
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.stop_propagation();
-                                cx.emit(Picked {
-                                    path: for_blame.clone(),
-                                    blame: true,
-                                })
-                            })),
-                    )
+                    // 目录没有逐行追溯
+                    .when(!is_dir, |row| {
+                        row.child(
+                            Button::new(("blame", ix))
+                                .xsmall()
+                                .ghost()
+                                .label(tr("逐行追溯"))
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.emit(Picked {
+                                        path: for_blame.clone(),
+                                        blame: true,
+                                    })
+                                })),
+                        )
+                    })
                     .into_any_element()
             })
             .collect();
@@ -226,7 +256,7 @@ impl Render for FilePicker {
                 note.map(|(text, color)| div().px_2().text_xs().text_color(color).child(text)),
             )
             .child(div().px_2().text_xs().text_color(muted).child(tr(
-                "按 Enter 或点击查看文件历史；右侧的「逐行追溯」显示每行的修改者。",
+                "按 Enter 或点击查看文件或目录的历史；右侧的「逐行追溯」显示每行的修改者。",
             )))
     }
 }
@@ -267,7 +297,41 @@ mod tests {
     #[test]
     fn 拆出文件列表() {
         let got = parse_files(b"a.txt\0src/b.rs\0");
-        assert_eq!(got, files(&["a.txt", "src/b.rs"]));
+        assert_eq!(got, files(&["a.txt", "src/b.rs", "src/"]));
+    }
+
+    #[test]
+    fn 各级目录各列一次_排在文件后面() {
+        let got = parse_files(b"src/login/a.ts\0src/login/b.ts\0src/c.ts\0docs/d.md\0");
+        assert_eq!(
+            got,
+            files(&[
+                "src/login/a.ts",
+                "src/login/b.ts",
+                "src/c.ts",
+                "docs/d.md",
+                "docs/",
+                "src/",
+                "src/login/",
+            ])
+        );
+    }
+
+    #[test]
+    fn 目录按自己的名字算() {
+        let all = parse_files(b"src/login/api.ts\0src/login/form.ts\0src/relogin.ts\0");
+        let (got, total) = filter_files(&all, "login");
+        assert_eq!(total, 4);
+        // 名字里有的在前（文件、目录），只是路径里有的在后
+        assert_eq!(
+            got,
+            files(&[
+                "src/relogin.ts",
+                "src/login/",
+                "src/login/api.ts",
+                "src/login/form.ts",
+            ])
+        );
     }
 
     #[test]

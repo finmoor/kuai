@@ -103,9 +103,12 @@ A full graphical Git client, modelled on Fork. When Claude Code is done, switch 
 
 - **Stage and discard by file, hunk or line**, and undo a discard; split or single list (check a box to stage); side-by-side view, inline word diff, ignore whitespace, image diff
 - **Commit graph**, with branches, remotes, tags and stashes grouped into folders by name; search commits by message, author, hash, file path or changed content
-- **Merge, rebase and interactive rebase** (reorder, reword, squash, drop), cherry-pick, revert, reset; select several commits to act on them at once, or drag a branch onto the current one to merge it
+- **Merge, rebase and commit clean-up** (reorder, reword, fold, split or drop commits before pushing), cherry-pick, revert, reset; select several commits to act on them at once, or drag a branch onto the current one to merge it; rebase, reset, merge and pull can be undone afterwards
 - **Conflict resolution**: current and incoming side by side on top (with the common ancestor if you like), take a side for each conflict, and edit the result below; or hand the file to an external tool such as Beyond Compare, WinMerge or Meld
-- **Compare** any two branches, tags, commits or the local changes; file history and blame
+- **Compare** any two branches, tags, commits or the local changes; file and directory history, blame; restore a file to the version in any commit
+- **Patches**: export or copy local changes, commits, stashes or a comparison as a patch; apply a patch from a file, the clipboard or by dropping it in, checked before it is applied
+- **Hooks**: hook output is shown live while committing; when a hook fails your message is kept, and you can view the output or skip the hook
+- **Hosting sites**: open the repository, a commit or a branch in the browser and create a pull request (GitHub, GitLab, Gitee, Gitea, Bitbucket), no sign-in needed
 - **Worktrees, sub-repository overview, submodules**; background auto-fetch, with the time of the last fetch under the branch name; the full output of pushes and pulls, including what server hooks say, in the Output panel at the bottom
 - **Recover commits**: every move of HEAD and your branches, including resets and rebases Claude Code ran in the terminal; pick a step and create a branch there. Resets, rebases and force pushes spell out which commits they affect before they run
 
@@ -150,14 +153,14 @@ Terminal, Git and Files are three pages of the same repository, and you can go s
   </tr>
 </table>
 
-Also: Chinese and English UI, system tray and start at sign-in, pinned and reopenable tabs, quick open (Ctrl+P), and one-click updates verified by SHA-256.
+Also: Chinese and English UI, system tray and start at sign-in, tabs you can pin, reorder and reopen, quick open (Ctrl+P: repositories, commands, branches and files), custom commands in context menus, and one-click updates verified by SHA-256.
 
 ## How it compares
 
 **With [Fork](https://fork.dev/).** Kuai's Git UI follows Fork closely, and aims to replace it for everyday use.
 
 - **What Kuai adds**: repositories on remote hosts; built-in terminals that outlive the app; the Files page and directory mapping; a Chinese UI; open source.
-- **What is still missing**: bisect, a dedicated Git LFS UI, git-flow, custom commands, batch operations on several selected commits, and account integration and pull requests for GitHub, GitLab and the like.
+- **What is still missing**: bisect, a dedicated Git LFS UI, git-flow, and account integration for GitHub, GitLab and the like (creating a pull request only opens the web page; you cannot view or review one inside Kuai).
 
 **With an IDE.** Kuai is not an IDE. The Files page is for reading and small edits: there is no code completion, go-to-definition or debugger. For heavier editing, map the directory on the host to this computer and open it in VS Code or another editor. The editor then reads and writes files carried over SSH, which suits editing; git, running and building are still best done on the host (in Kuai's Git page and terminal). If you need VS Code extensions or a debugger running on the host, use VS Code's Remote - SSH.
 
@@ -261,7 +264,7 @@ Found a bug or have a suggestion? Please open an [issue](https://github.com/finm
 
 ## Keyboard shortcuts
 
-The ones you will use most: <kbd>Ctrl</kbd>+<kbd>P</kbd> quick open repository, <kbd>Ctrl</kbd>+<kbd>&#96;</kbd> switch between the Terminal page and the previous page, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> the Sessions page, <kbd>Ctrl</kbd>+<kbd>Enter</kbd> commit, and Space on a changed line to stage it.
+The ones you will use most: <kbd>Ctrl</kbd>+<kbd>P</kbd> quick open (repositories, commands, branches and files), <kbd>Ctrl</kbd>+<kbd>&#96;</kbd> switch between the Terminal page and the previous page, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> the Sessions page, <kbd>Ctrl</kbd>+<kbd>Enter</kbd> commit, and Space on a changed line to stage it.
 
 You can change shortcuts in Settings → Shortcuts, and give each new-terminal preset its own shortcut; the table below lists the defaults.
 
@@ -277,7 +280,7 @@ You can change shortcuts in Settings → Shortcuts, and give each new-terminal p
 | Ctrl+Shift+F, Ctrl+Shift+L, Ctrl+Shift+P | Fetch, pull, push (same as the toolbar buttons) |
 | Ctrl+Shift+S | Stash changes |
 | Ctrl+F | Find in the current page: search commits on the Git page (or within the diff you are viewing), find in the open file on the Files page, find text in the merge editor |
-| Ctrl+P | Quick open repository (Up/Down to select, Enter to open) |
+| Ctrl+P | Quick open: find repositories, commands, branches and tags, files (Up/Down to select, Enter to open or run; start with `>`, `@` or `/` to see only commands, branches or files; Tab on a branch or file lists more actions) |
 | Ctrl+, | Open or close Settings |
 | Ctrl+W | Close the current tab (asks first if an operation is running); on the Files page, closes the open file first |
 | Ctrl+Tab, Ctrl+Shift+Tab | Next / previous tab |

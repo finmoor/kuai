@@ -105,6 +105,17 @@ struct SideRow {
     open: bool,
     /// 文件夹、分组里有几项
     count: usize,
+    /// 置顶的分支（排在「分支」最上面的那几行）
+    pin: Pin,
+}
+
+/// 一行是不是置顶的分支。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pin {
+    None,
+    Pinned,
+    /// 置顶的最后一个：下面画一条细线，和目录树分开
+    Last,
 }
 
 /// 目录树里的一行（还没对应到侧栏的具体项）。
@@ -213,6 +224,10 @@ pub(super) struct Sidebar {
     /// 这一帧的行：画侧栏时算一遍，列表画行时接着用（原来行数、画行各算一遍整棵树，
     /// 标签有几千个时每次重画都要建两遍）
     rows: Rc<Vec<SideRow>>,
+    /// 多选的分支或标签（Ctrl、Shift 加点击），完整的引用名；只算同一类的，两个以上才算多选
+    pub(super) multi: Vec<String>,
+    /// Shift 连选从哪一个算起
+    multi_anchor: Option<String>,
 }
 
 impl Sidebar {
@@ -232,6 +247,8 @@ impl Sidebar {
             selected: SideItem::History,
             focus: cx.focus_handle(),
             rows: Rc::default(),
+            multi: Vec::new(),
+            multi_anchor: None,
         };
         (sidebar, subscription)
     }
@@ -272,6 +289,7 @@ impl RepoView {
                 key: None,
                 open: false,
                 count: self.change_count(),
+                pin: Pin::None,
             },
             SideRow {
                 item: SideItem::History,
@@ -280,6 +298,7 @@ impl RepoView {
                 key: None,
                 open: false,
                 count: 0,
+                pin: Pin::None,
             },
             SideRow {
                 item: SideItem::Compare,
@@ -288,6 +307,7 @@ impl RepoView {
                 key: None,
                 open: false,
                 count: 0,
+                pin: Pin::None,
             },
         ];
         if self.has_subs() {
@@ -298,6 +318,7 @@ impl RepoView {
                 key: None,
                 open: false,
                 count: self.sub_count(),
+                pin: Pin::None,
             });
         }
         if self.has_worktrees_item() {
@@ -308,6 +329,7 @@ impl RepoView {
                 key: None,
                 open: false,
                 count: self.live_worktrees(),
+                pin: Pin::None,
             });
         }
         rows.push(SideRow {
@@ -317,6 +339,7 @@ impl RepoView {
             key: None,
             open: false,
             count: 0,
+            pin: Pin::None,
         });
         // 一棵目录树 → 侧栏的行。`prefix` 是收起键的前缀，`base` 是这棵树整体缩进几层
         let push_tree = |rows: &mut Vec<SideRow>,
@@ -342,6 +365,7 @@ impl RepoView {
                             key: Some(key),
                             open,
                             count: leaves,
+                            pin: Pin::None,
                         }
                     }
                     TreeRow::Leaf { index, name, depth } => SideRow {
@@ -351,6 +375,7 @@ impl RepoView {
                         key: None,
                         open: false,
                         count: 0,
+                        pin: Pin::None,
                     },
                 });
             }
@@ -364,6 +389,7 @@ impl RepoView {
                 key: None,
                 open,
                 count,
+                pin: Pin::None,
             });
             open
         };
@@ -378,7 +404,33 @@ impl RepoView {
             .map(|(i, b)| (b.name.as_ref(), i))
             .collect();
         if header(&mut rows, SideSection::Branches, branches.len()) {
-            push_tree(&mut rows, &branches, "b", 1, &SideItem::Branch);
+            // 置顶的排在最上面，写全名、不进目录树；剩下的照旧排成树
+            let pinned_names = self.pinned_branches(cx);
+            let pinned: Vec<(&str, usize)> = pinned_names
+                .iter()
+                .filter_map(|name| branches.iter().find(|(branch, _)| branch == name).copied())
+                .collect();
+            let rest: Vec<(&str, usize)> = branches
+                .iter()
+                .filter(|(name, _)| !pinned.iter().any(|(pinned, _)| pinned == name))
+                .copied()
+                .collect();
+            let last = pinned.len().saturating_sub(1);
+            for (at, (name, index)) in pinned.iter().enumerate() {
+                rows.push(SideRow {
+                    item: SideItem::Branch(*index),
+                    depth: 1,
+                    label: name.to_string(),
+                    key: None,
+                    open: false,
+                    count: 0,
+                    pin: match at == last && !rest.is_empty() {
+                        true => Pin::Last,
+                        false => Pin::Pinned,
+                    },
+                });
+            }
+            push_tree(&mut rows, &rest, "b", 1, &SideItem::Branch);
         }
 
         // 远程：第一层是各个远程，下面是它的分支
@@ -414,6 +466,7 @@ impl RepoView {
                     key: Some(key.clone()),
                     open,
                     count: under.len(),
+                    pin: Pin::None,
                 });
                 if open {
                     push_tree(&mut rows, &under, &key, 2, &SideItem::Remote);
@@ -447,6 +500,7 @@ impl RepoView {
                     key: None,
                     open: false,
                     count: 0,
+                    pin: Pin::None,
                 }));
             }
         };
@@ -476,6 +530,134 @@ impl RepoView {
             );
         }
         rows
+    }
+
+    /// 置顶的本地分支（按仓库记，和隐藏的分支记在同一处）。
+    pub(super) fn pinned_branches(&self, cx: &App) -> Vec<String> {
+        self.app
+            .read(cx)
+            .settings
+            .memo(&self.entry)
+            .map(|memo| memo.pinned_branches.clone())
+            .unwrap_or_default()
+    }
+
+    /// 置顶一个分支，或者取消置顶。
+    pub(super) fn toggle_pinned(&mut self, name: String, cx: &mut Context<Self>) {
+        let entry = self.entry.clone();
+        // 顺手把已经不存在的分支从置顶里清掉
+        let alive: Vec<String> = self.refs.branches.iter().map(|b| b.name.clone()).collect();
+        self.app.update(cx, |app, cx| {
+            app.edit_memo(&entry, cx, |memo| {
+                let was = memo.pinned_branches.contains(&name);
+                memo.pinned_branches
+                    .retain(|pinned| *pinned != name && alive.contains(pinned));
+                if !was {
+                    memo.pinned_branches.push(name);
+                }
+            })
+        });
+        cx.notify();
+    }
+
+    /// 侧栏里这一行对应的完整引用名（分支、标签才有）：多选按它记。
+    fn side_ref(&self, item: SideItem) -> Option<String> {
+        match item {
+            SideItem::Branch(i) => self
+                .refs
+                .branches
+                .get(i)
+                .map(|b| format!("refs/heads/{}", b.name)),
+            SideItem::Tag(i) => self
+                .refs
+                .tags
+                .get(i)
+                .map(|t| format!("refs/tags/{}", t.name)),
+            _ => None,
+        }
+    }
+
+    /// Ctrl 加点击：把这一行加进多选，或者从多选里去掉。换了类（分支、标签）就重新选。
+    fn toggle_side_multi(&mut self, item: SideItem, cx: &mut Context<Self>) {
+        let Some(full) = self.side_ref(item) else {
+            return;
+        };
+        let kind = |name: &str| name.starts_with("refs/heads/");
+        // 还没多选时，先把现在选中的那一行算进去
+        if self.sidebar.multi.is_empty()
+            && let Some(current) = self.side_ref(self.sidebar.selected)
+            && kind(&current) == kind(&full)
+        {
+            self.sidebar.multi.push(current);
+        }
+        if self
+            .sidebar
+            .multi
+            .first()
+            .is_some_and(|first| kind(first) != kind(&full))
+        {
+            self.sidebar.multi.clear();
+        }
+        match self.sidebar.multi.iter().position(|name| *name == full) {
+            Some(at) if self.sidebar.multi.len() > 1 => {
+                self.sidebar.multi.remove(at);
+            }
+            Some(_) => {}
+            None => self.sidebar.multi.push(full.clone()),
+        }
+        self.sidebar.multi_anchor = Some(full);
+        self.sidebar.selected = item;
+        cx.notify();
+    }
+
+    /// Shift 加点击：从上一次点的那一行到这一行，看得见的同一类的都选上。
+    fn range_side_multi(&mut self, item: SideItem, cx: &mut Context<Self>) {
+        let Some(full) = self.side_ref(item) else {
+            return;
+        };
+        let anchor = self
+            .sidebar
+            .multi_anchor
+            .clone()
+            .or_else(|| self.side_ref(self.sidebar.selected))
+            .unwrap_or_else(|| full.clone());
+        let kind = |name: &str| name.starts_with("refs/heads/");
+        let visible: Vec<String> = self
+            .sidebar
+            .rows
+            .iter()
+            .filter_map(|row| self.side_ref(row.item))
+            .filter(|name| kind(name) == kind(&full))
+            .collect();
+        let at = |name: &str| visible.iter().position(|seen| seen == name);
+        let (Some(from), Some(to)) = (at(&anchor), at(&full)) else {
+            return self.toggle_side_multi(item, cx);
+        };
+        let (from, to) = (from.min(to), from.max(to));
+        self.sidebar.multi = visible[from..=to].to_vec();
+        self.sidebar.selected = item;
+        cx.notify();
+    }
+
+    /// 多选着的引用里还在的那些（刷新以后有的可能没了）；不到两个不算多选。
+    pub(super) fn side_multi(&self) -> Vec<String> {
+        let alive = |full: &String| match full.strip_prefix("refs/heads/") {
+            Some(name) => self.refs.branches.iter().any(|b| b.name == name),
+            None => full
+                .strip_prefix("refs/tags/")
+                .is_some_and(|name| self.refs.tags.iter().any(|t| t.name == name)),
+        };
+        let picked: Vec<String> = self
+            .sidebar
+            .multi
+            .iter()
+            .filter(|f| alive(f))
+            .cloned()
+            .collect();
+        match picked.len() {
+            0 | 1 => Vec::new(),
+            _ => picked,
+        }
     }
 
     /// 记下这个标签页是从哪个工作区打开的（见 `home_hint`）。
@@ -995,6 +1177,8 @@ impl RepoView {
         let rows = self.sidebar.rows.clone();
         let hidden = self.hidden_refs(cx);
         let gone = self.gone_count();
+        let multi = self.side_multi();
+        let border = cx.theme().border;
         let theme = cx.theme();
         let (fg, muted, active, hover, warning, accent) = (
             theme.sidebar_foreground,
@@ -1008,7 +1192,13 @@ impl RepoView {
             .filter_map(|ix| {
                 let row = rows.get(ix)?.clone();
                 let item = row.item;
-                let selected = item == self.sidebar.selected;
+                let picked = self
+                    .side_ref(item)
+                    .is_some_and(|full| multi.contains(&full));
+                let selected = match multi.is_empty() {
+                    true => item == self.sidebar.selected,
+                    false => picked,
+                };
                 let is_header = matches!(item, SideItem::Header(_));
                 // 行本身占满宽度（好点），里面一块圆角的底显示选中、悬停
                 let inner = h_flex()
@@ -1246,6 +1436,13 @@ impl RepoView {
                                         .child(detail),
                                 )
                             })
+                            .when(row.pin != Pin::None, |r| {
+                                r.child(
+                                    ui::icon_small(IconName::Pin)
+                                        .flex_none()
+                                        .text_color(muted.opacity(0.8)),
+                                )
+                            })
                             .map(mark)
                     }
                     SideItem::Remote(_) => inner
@@ -1282,11 +1479,14 @@ impl RepoView {
                 };
                 let drop_here = matches!(item, SideItem::Branch(i)
                     if self.refs.branches.get(i).is_some_and(|b| b.current));
+                let last_pinned = row.pin == Pin::Last;
                 let outer = h_flex()
                     .id(ix)
                     .h(px(ROW_HEIGHT))
                     .w_full()
                     .cursor_pointer()
+                    // 置顶的最后一行下面一条细线，和下面的目录树分开
+                    .when(last_pinned, |row| row.border_b_1().border_color(border))
                     .when_some(dragged, |row, dragged| {
                         row.on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
                     })
@@ -1302,12 +1502,30 @@ impl RepoView {
                     })
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         this.sidebar.focus.focus(window, cx);
+                        // 分支、标签：Ctrl 加点击多选，Shift 加点击连选
+                        let modifiers = event.modifiers();
+                        let multi = matches!(item, SideItem::Branch(_) | SideItem::Tag(_));
+                        if multi && (modifiers.control || modifiers.platform) {
+                            return this.toggle_side_multi(item, cx);
+                        }
+                        if multi && modifiers.shift {
+                            return this.range_side_multi(item, cx);
+                        }
+                        this.sidebar.multi.clear();
+                        this.sidebar.multi_anchor = this.side_ref(item);
                         this.click_sidebar(item, event.click_count(), window, cx)
                     }))
                     // 点右键先选中这一项，菜单里的操作都是对它做的
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, _, _, cx| {
+                            // 在多选的行上点右键：菜单是对选中的全部做的，多选留着
+                            let in_multi = this
+                                .side_ref(item)
+                                .is_some_and(|full| this.side_multi().contains(&full));
+                            if in_multi {
+                                return;
+                            }
                             if matches!(
                                 item,
                                 SideItem::Branch(_)
@@ -1317,13 +1535,18 @@ impl RepoView {
                                     | SideItem::Stash(_)
                                     | SideItem::Submodule(_)
                             ) {
+                                this.sidebar.multi.clear();
                                 this.sidebar.selected = item;
                                 cx.notify();
                             }
                         }),
                     )
                     .child(inner);
-                let menu = self.sidebar_menu(item, cx);
+                // 多选着、点的又是其中一行：菜单换成对选中的全部操作
+                let menu = match picked && multi.len() > 1 {
+                    true => Some(self.side_multi_menu(multi.clone(), cx)),
+                    false => self.sidebar_menu(item, cx),
+                };
                 Some(match menu {
                     Some(menu) => outer.context_menu(menu).into_any_element(),
                     None => outer.into_any_element(),
@@ -1409,7 +1632,7 @@ impl RepoView {
         }
         self.sidebar.selected = found.unwrap_or(match self.mode {
             Mode::Changes | Mode::Merge => SideItem::Changes,
-            Mode::History | Mode::Blame => SideItem::History,
+            Mode::History | Mode::Blame | Mode::Curate => SideItem::History,
             Mode::Subs => SideItem::SubRepos,
             Mode::Worktrees => SideItem::Worktrees,
             Mode::Compare => SideItem::Compare,

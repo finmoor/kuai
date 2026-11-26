@@ -11,11 +11,16 @@ pub fn args() -> Vec<String> {
     ]
 }
 
-/// 列出贮藏。
+/// 列出贮藏。说明放最后（里面什么字符都可能有）；前一栏是贮藏提交的父提交，第一个是贮藏时的 HEAD。
 pub fn stash_args() -> Vec<String> {
-    ["stash", "list", "-z", "--format=%gd%x1f%H%x1f%ct%x1f%gs"]
-        .map(String::from)
-        .to_vec()
+    [
+        "stash",
+        "list",
+        "-z",
+        "--format=%gd%x1f%H%x1f%ct%x1f%P%x1f%gs",
+    ]
+    .map(String::from)
+    .to_vec()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -57,6 +62,8 @@ pub struct Stash {
     pub time: i64,
     /// 比如 `WIP on main: 1234abc 说明` 或 `On main: 自己写的说明`
     pub message: String,
+    /// 贮藏时 HEAD 指向的提交（贮藏提交的第一个父提交）：提交图里把贮藏画在它上面
+    pub base: Option<String>,
 }
 
 /// 解析 [`args`] 和 [`stash_args`] 的输出。
@@ -102,15 +109,19 @@ pub fn parse(refs_out: &[u8], stash_out: &[u8]) -> Refs {
     }
     for record in String::from_utf8_lossy(stash_out).split('\0') {
         let record = record.trim_start_matches('\n');
-        let f: Vec<&str> = record.splitn(4, '\x1f').collect();
-        if f.len() < 4 {
-            continue;
-        }
+        let f: Vec<&str> = record.splitn(5, '\x1f').collect();
+        // 五栏：第四栏是父提交。四栏的是没有父提交那一栏的旧写法
+        let (parents, message) = match f.as_slice() {
+            [_, _, _, parents, message] => (*parents, *message),
+            [_, _, _, message] => ("", *message),
+            _ => continue,
+        };
         refs.stashes.push(Stash {
             selector: f[0].to_string(),
             target: f[1].to_string(),
             time: f[2].parse().unwrap_or(0),
-            message: f[3].to_string(),
+            message: message.to_string(),
+            base: parents.split_ascii_whitespace().next().map(str::to_string),
         });
     }
     refs

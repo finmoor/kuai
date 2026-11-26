@@ -42,6 +42,23 @@ fn ends(base: &End, other: &End, from_base: bool) -> Option<Vec<String>> {
     })
 }
 
+/// 两端之间的全部改动，写成能拿去别处应用的补丁（二进制文件带内容）。两端都是工作区时没有。
+pub fn export_args(base: &End, other: &End, from_base: bool) -> Option<Vec<String>> {
+    let mut args: Vec<String> = [
+        "diff",
+        "--binary",
+        "--full-index",
+        "--no-ext-diff",
+        "--no-color",
+        "-M",
+    ]
+    .map(String::from)
+    .to_vec();
+    args.extend(ends(base, other, from_base)?);
+    args.push("--".into());
+    Some(args)
+}
+
 /// 两端之间改了哪些文件：状态和增删行数一次取回来（[`parse_files`]）。
 pub fn files_args(base: &End, other: &End, from_base: bool) -> Option<Vec<String>> {
     let mut args: Vec<String> = [

@@ -321,3 +321,60 @@ fn 保存时主机上的文件被别人改过_不写_按新的样子再存才写
     assert!(!written.conflict);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "我的修改\n");
 }
+
+/// 提交走的是「边执行边回输出、说明从标准输入给」这一路（`git_progress_with_input`）：经 kuaid 时
+/// 说明作为请求带的字节发过去。提交成了、说明没丢，钩子的输出当进度回来。
+#[test]
+fn 流式执行时标准输入照样送到_提交的说明和钩子的输出都对() {
+    use fr_channel::StreamItem;
+
+    let home = Home::new();
+    let channel = Channel::Remote(home.connect());
+    let repo = home.files();
+    let git = |args: &[&str]| {
+        let out = wait(
+            channel.git(&repo, args.iter().map(|arg| arg.to_string()).collect()),
+            TIMEOUT,
+        )
+        .expect("git 卡住了")
+        .unwrap();
+        assert!(out.success(), "git {args:?}：{}", out.stderr);
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "t"]);
+    git(&["config", "user.email", "t@example.com"]);
+    std::fs::write(Path::new(&repo).join("a.txt"), "1\n").unwrap();
+    git(&["add", "a.txt"]);
+    // 钩子说一句话（git 把提交钩子的标准输出并进标准错误）
+    let hook = Path::new(&repo)
+        .join(".git")
+        .join("hooks")
+        .join("pre-commit");
+    std::fs::write(&hook, "#!/bin/sh\necho hook-says-hello\n").unwrap();
+
+    let message = "第一行\n\n正文，带中文";
+    let stream = channel.git_progress_with_input(
+        &repo,
+        ["commit", "-F", "-"].map(String::from).to_vec(),
+        Some(message.as_bytes().to_vec()),
+    );
+    let items = wait(Box::pin(stream.collect::<Vec<_>>()), TIMEOUT).expect("提交卡住了");
+    let mut said = Vec::new();
+    let mut done = None;
+    for item in items {
+        match item.expect("流里出了错") {
+            StreamItem::Progress(chunk) => said.extend(chunk),
+            StreamItem::Chunk(_) => {}
+            StreamItem::Done(out) => done = Some(out),
+        }
+    }
+    let done = done.expect("流结束了没有结果");
+    assert!(done.success(), "提交没成：{}", done.stderr);
+    assert!(
+        String::from_utf8_lossy(&said).contains("hook-says-hello"),
+        "钩子的输出没当进度回来：{}",
+        String::from_utf8_lossy(&said)
+    );
+    assert_eq!(git(&["log", "-1", "--format=%B"]).trim(), message);
+}

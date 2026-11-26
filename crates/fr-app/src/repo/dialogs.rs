@@ -461,6 +461,219 @@ impl RepoView {
         self.stash_entries_dialog(picked, window, cx);
     }
 
+    /// 工具栏「贮藏」的 ⌄（和右键是同一份菜单）。
+    pub(super) fn stash_menu(&self, cx: &mut Context<Self>) -> super::menus::MenuFn {
+        use gpui_kit::component::menu::PopupMenuItem;
+        let view = cx.entity().downgrade();
+        let entries = self
+            .status
+            .as_ref()
+            .map(|s| s.entries.as_slice())
+            .unwrap_or(&[]);
+        let has_changes = !entries.is_empty();
+        let has_staged = entries.iter().any(|e| e.staged.is_some());
+        let has_stash = !self.refs.stashes.is_empty();
+        let staged_ok = self
+            .channel
+            .as_ref()
+            .and_then(|channel| channel.git_version())
+            .is_some_and(|version| version >= fr_core::stash::STAGED_GIT);
+        Box::new(move |menu, _, _| {
+            let item =
+                |label: SharedString,
+                 enabled: bool,
+                 run: fn(&mut RepoView, &mut Window, &mut Context<RepoView>)| {
+                    let view = view.clone();
+                    PopupMenuItem::new(label)
+                        .disabled(!enabled)
+                        .on_click(move |_, window, cx| {
+                            view.update(cx, |this, cx| run(this, window, cx)).ok();
+                        })
+                };
+            menu.item(item(tr("贮藏…").into(), has_changes, |this, w, cx| {
+                this.stash_dialog(w, cx)
+            }))
+            .item(item(
+                match staged_ok {
+                    true => tr("仅贮藏已暂存的改动…").into(),
+                    false => tr("仅贮藏已暂存的改动（需要 git 2.35）").into(),
+                },
+                has_staged && staged_ok,
+                |this, w, cx| this.stash_mode_dialog(fr_core::stash::Mode::Staged, w, cx),
+            ))
+            .item(item(
+                tr("贮藏，并保留已暂存的改动…").into(),
+                has_staged,
+                |this, w, cx| this.stash_mode_dialog(fr_core::stash::Mode::KeepIndex, w, cx),
+            ))
+            .separator()
+            .item(item(
+                tr("弹出最近的贮藏…").into(),
+                has_stash,
+                |this, w, cx| this.stash_pop_latest(w, cx),
+            ))
+        })
+    }
+
+    /// 「仅贮藏已暂存的改动」「贮藏，并保留已暂存的改动」。
+    pub(super) fn stash_mode_dialog(
+        &mut self,
+        mode: fr_core::stash::Mode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use fr_core::stash::Mode;
+        let (title, hint, checks) = match mode {
+            Mode::Staged => (
+                tr("仅贮藏已暂存的改动"),
+                tr("只收起已暂存的改动，未暂存的改动留在工作区。"),
+                Vec::new(),
+            ),
+            Mode::KeepIndex => (
+                tr("贮藏，并保留已暂存的改动"),
+                tr(
+                    "全部改动存进贮藏；已暂存的改动同时留在工作区和暂存区，便于只对它们测试、提交。",
+                ),
+                vec![(tr("包含未跟踪的文件").into(), false)],
+            ),
+        };
+        let ask = Ask {
+            title: title.into(),
+            placeholder: tr("说明（可选）").into(),
+            hint: hint.into(),
+            ok: tr("贮藏"),
+            checks,
+            allow_empty: true,
+            ..Default::default()
+        };
+        self.ask(ask, window, cx, move |this, answer, window, cx| {
+            let untracked = answer.checks.first().copied().unwrap_or(false);
+            let args = fr_core::stash::push_mode_args(Some(&answer.text), untracked, mode);
+            this.run_op(
+                tr("贮藏"),
+                args,
+                None,
+                window,
+                cx,
+                move |_, out, window, cx| {
+                    let said = String::from_utf8_lossy(&out.stdout);
+                    let note = match (said.contains("No local changes"), mode) {
+                        (true, _) => Notification::warning(tr("没有可贮藏的改动")),
+                        (false, Mode::Staged) => Notification::success(tr("已贮藏已暂存的改动")),
+                        (false, Mode::KeepIndex) => {
+                            Notification::success(tr("改动已贮藏，已暂存的改动仍保留"))
+                        }
+                    };
+                    window.push_notification(note, cx);
+                },
+            );
+        });
+    }
+
+    /// 给贮藏改名：git 没有这个命令，先从列表里拿掉、再按新的说明存回去（同一个提交）。存回去的
+    /// 排在最前面。
+    pub(super) fn rename_stash_dialog(
+        &mut self,
+        target: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(stash) = self.stash_now(&target) else {
+            return;
+        };
+        let ask = Ask {
+            title: tr("重命名贮藏").into(),
+            placeholder: tr("说明").into(),
+            value: super::sidebar::stash_label(&stash.message),
+            ok: tr("重命名"),
+            ..Default::default()
+        };
+        self.ask(ask, window, cx, move |this, answer, window, cx| {
+            // 对话框开着时编号可能已经指向别的贮藏：按提交再找一遍
+            let Some(stash) = this.stash_now(&target) else {
+                return;
+            };
+            let message = fr_core::stash::renamed_message(&stash.message, &answer.text);
+            let checks = vec![(
+                super::ops::args(&["rev-parse", "-q", "--verify", &stash.selector]),
+                Some(stash.target.clone()),
+            )];
+            let steps = vec![
+                Step::local(super::ops::args(&["stash", "drop", "-q", &stash.selector])),
+                Step::local(super::ops::args(&[
+                    "stash",
+                    "store",
+                    "-m",
+                    &message,
+                    &stash.target,
+                ])),
+            ];
+            this.verify_then(checks, window, cx, move |this, window, cx| {
+                this.run_seq(
+                    tr("重命名贮藏"),
+                    steps,
+                    window,
+                    cx,
+                    |_, _, window, cx| {
+                        window.push_notification(Notification::success(tr("贮藏已重命名")), cx);
+                    },
+                );
+            });
+        });
+    }
+
+    /// 把贮藏转成分支：从贮藏时的那个提交新建分支并切过去，放回贮藏里的改动，成功后贮藏删掉
+    /// （`git stash branch`）。
+    pub(super) fn stash_branch_dialog(
+        &mut self,
+        target: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.stash_now(&target).is_none() {
+            return;
+        }
+        let ask = Ask {
+            title: tr("将贮藏转为分支").into(),
+            placeholder: tr("分支名称，例如 feature/login").into(),
+            hint: tr(
+                "从贮藏时所在的提交新建分支并切换过去，再放回贮藏中的改动；成功后该贮藏删除。",
+            )
+            .into(),
+            ok: tr("创建"),
+            validate: Some(Box::new(|this, answer| {
+                ref_name_error(&answer.text).or_else(|| this.branch_exists_error(&answer.text))
+            })),
+            ..Default::default()
+        };
+        self.ask(ask, window, cx, move |this, answer, window, cx| {
+            let Some(stash) = this.stash_now(&target) else {
+                return;
+            };
+            let branch = answer.text;
+            let args = super::ops::args(&["stash", "branch", &branch, &stash.selector]);
+            let checks = vec![(
+                super::ops::args(&["rev-parse", "-q", "--verify", &stash.selector]),
+                Some(stash.target.clone()),
+            )];
+            this.verify_then(checks, window, cx, move |this, window, cx| {
+                let branch = branch.clone();
+                this.run_op(
+                    tr("将贮藏转为分支"),
+                    args,
+                    None,
+                    window,
+                    cx,
+                    move |this, _, window, cx| {
+                        this.show_changes(cx);
+                        let text = tf!("已创建分支 {branch}，贮藏中的改动已放回工作区", branch);
+                        window.push_notification(Notification::success(text), cx);
+                    },
+                );
+            });
+        });
+    }
+
     /// 贮藏的对话框；`picked` 不空时多一个勾选项「仅贮藏选中的 N 个文件」，默认勾上。
     pub(super) fn stash_entries_dialog(
         &mut self,

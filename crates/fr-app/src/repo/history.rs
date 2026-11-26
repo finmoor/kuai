@@ -127,6 +127,19 @@ pub(super) struct Loaded {
     commits: Arc<Vec<Commit>>,
     graph: Arc<Graph>,
     stats: SharedString,
+    /// 列表里哪几行是贮藏（提交图的「显示 → 贮藏」开着时插进来的）
+    stashes: Arc<HashSet<Box<str>>>,
+}
+
+/// 读提交历史时怎么排（[`build_loaded`]）。
+#[derive(Clone, Default)]
+struct Build {
+    /// 文件历史、找出来的提交：互相不一定是父子，连成一条线
+    linear: bool,
+    /// 只走第一父提交：每个提交只留第一个父提交
+    first_parent: bool,
+    /// 画进提交图的贮藏：（贮藏的提交，贮藏时的 HEAD，时间，说明）
+    stashes: Vec<(String, String, i64, String)>,
 }
 
 pub(super) enum Load {
@@ -359,6 +372,16 @@ impl History {
         }
     }
 
+    /// 当前分支有几个提交待推送。
+    pub(super) fn unpushed_count(&self) -> usize {
+        self.unpushed.len()
+    }
+
+    /// 这个提交待推送（当前分支有、上游还没有）。
+    pub(super) fn is_unpushed(&self, id: &str) -> bool {
+        self.unpushed.contains(id)
+    }
+
     /// 每帧记下窗口的宽度和各块的大小（怎么算的见 `layout::sizes`）。
     pub(super) fn set_layout(&mut self, viewport: Size<Pixels>, sizes: super::layout::Sizes) {
         self.details_height = px(sizes.details_height);
@@ -460,12 +483,36 @@ impl RepoView {
         // 文件历史：只要改过这个文件的提交，跟着改名往回找
         // 交给 git 找出来的提交也一样：互相不一定是父子，连成一条线来画
         let file_mode = self.history.file.is_some() || self.history.found.is_some();
-        let log_args = match (&self.history.file, &self.history.found) {
+        // 提交图的显示选项只管全部提交那一份列表
+        let (show_stashes, first_parent) = match file_mode {
+            true => (false, false),
+            false => self.graph_options(cx),
+        };
+        let mut log_args = match (&self.history.file, &self.history.found) {
             (Some(path), _) => gitlog::file_log_args(path),
             (None, Some((find, needle))) => {
                 gitlog::find_log_args(&self.log_scope(), &self.hidden_refs(cx), *find, needle)
             }
             (None, None) => gitlog::scoped_log_args(&self.log_scope(), &self.hidden_refs(cx)),
+        };
+        if first_parent {
+            log_args.insert(1, "--first-parent".into());
+        }
+        let build = Build {
+            linear: file_mode,
+            first_parent,
+            stashes: match show_stashes {
+                true => self
+                    .refs
+                    .stashes
+                    .iter()
+                    .filter_map(|stash| {
+                        let label = super::sidebar::stash_label(&stash.message);
+                        Some((stash.target.clone(), stash.base.clone()?, stash.time, label))
+                    })
+                    .collect(),
+                false => Vec::new(),
+            },
         };
         let mut stream = channel.git_stream(&self.entry.path, log_args);
         let (tx, mut rx) = mpsc::unbounded();
@@ -480,8 +527,7 @@ impl RepoView {
                         buf.extend_from_slice(&chunk);
                         if !page_sent && let Some(end) = gitlog::nth_record_end(&buf, FIRST_PAGE) {
                             page_sent = true;
-                            let page =
-                                build_loaded(&buf[..end], started.elapsed(), None, file_mode);
+                            let page = build_loaded(&buf[..end], started.elapsed(), None, &build);
                             let _ = tx.unbounded_send(Progress::Page(page));
                         }
                     }
@@ -492,7 +538,7 @@ impl RepoView {
                                 &buf,
                                 started.elapsed(),
                                 Some(out.elapsed),
-                                file_mode,
+                                &build,
                             ))
                         } else {
                             Err(out.stderr)
@@ -892,7 +938,7 @@ impl RepoView {
     }
 
     /// 选一个已跟踪的文件，看它的历史或逐行追溯：没改动的文件只能从这里进。
-    fn pick_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn pick_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(channel) = self.channel.clone() else {
             return;
         };
@@ -965,6 +1011,61 @@ impl RepoView {
             self.history.scope = scope;
             self.restart_history(cx);
         }
+        cx.notify();
+    }
+
+    /// 提交图的显示选项（按仓库记）：（把贮藏画进去，只走第一父提交）。
+    pub(super) fn graph_options(&self, cx: &App) -> (bool, bool) {
+        self.app
+            .read(cx)
+            .settings
+            .memo(&self.entry)
+            .map(|memo| (memo.graph_stashes, memo.first_parent))
+            .unwrap_or_default()
+    }
+
+    /// 搜索行右边的「显示」：提交图里画不画贮藏、是不是只走第一父提交。
+    fn render_graph_options(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        let (stashes, first_parent) = self.graph_options(cx);
+        let accent = cx.theme().primary;
+        let on = stashes || first_parent;
+        // 不加悬停提示：提示出现在按钮下面，会盖住弹出的菜单
+        Button::new("history-graph-options")
+            .small()
+            .ghost()
+            .icon(match on {
+                true => ui::icon(IconName::Eye).text_color(accent),
+                false => ui::icon(IconName::Eye),
+            })
+            .label(tr("显示"))
+            .dropdown_menu(move |menu, _, _| {
+                let toggle = |label: &'static str, checked: bool, stash: bool| {
+                    let view = view.clone();
+                    PopupMenuItem::new(label)
+                        .checked(checked)
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |this, cx| this.toggle_graph_option(stash, cx))
+                                .ok();
+                        })
+                };
+                menu.item(toggle(tr("贮藏"), stashes, true)).item(toggle(
+                    tr("只走第一父提交（只看主线）"),
+                    first_parent,
+                    false,
+                ))
+            })
+    }
+
+    pub(super) fn toggle_graph_option(&mut self, stash: bool, cx: &mut Context<Self>) {
+        let entry = self.entry.clone();
+        self.app.update(cx, |app, cx| {
+            app.edit_memo(&entry, cx, |memo| match stash {
+                true => memo.graph_stashes = !memo.graph_stashes,
+                false => memo.first_parent = !memo.first_parent,
+            })
+        });
+        self.restart_history(cx);
         cx.notify();
     }
 
@@ -1586,6 +1687,11 @@ impl RepoView {
         let view = cx.entity().downgrade();
         Box::new(move |menu, window, cx| {
             let menu = base(menu, window, cx);
+            // 把这个文件改回这个提交里的样子，或者只退掉这个提交对它的改动
+            let menu = match commit.is_empty() {
+                true => menu,
+                false => super::restore::restore_items(menu.separator(), &view, &path, &commit),
+            };
             let (view, commit, parent, path, orig) = (
                 view.clone(),
                 commit.clone(),
@@ -1724,9 +1830,21 @@ impl RepoView {
                 // 待推送的标 ↑；待拉取的标 ↓，整行淡一些（还不在当前分支上）
                 let unpushed = marks && self.history.unpushed.contains(&commit.id);
                 let unpulled = marks && self.history.unpulled.contains(&commit.id);
-                let menu = match in_multi {
-                    true => Some(self.multi_commit_menu(cx)),
-                    false => self.commit_menu(ix, cx),
+                // 画进提交图的贮藏：菜单是贮藏的那一份（应用、弹出、删除……）
+                let is_stash = data.stashes.contains(&commit.id);
+                let stash_at = match is_stash {
+                    true => self
+                        .refs
+                        .stashes
+                        .iter()
+                        .position(|stash| *stash.target == *commit.id),
+                    false => None,
+                };
+                let menu = match (in_multi, is_stash) {
+                    (_, true) => stash_at
+                        .and_then(|at| self.sidebar_menu(super::sidebar::SideItem::Stash(at), cx)),
+                    (true, false) => Some(self.multi_commit_menu(cx)),
+                    (false, false) => self.commit_menu(ix, cx),
                 };
                 let line = h_flex()
                     .id(ix)
@@ -1796,6 +1914,7 @@ impl RepoView {
                         row.lane,
                         row.color,
                         row.clipped,
+                        is_stash,
                         graph_width,
                     ))
                     .child(
@@ -1813,17 +1932,38 @@ impl RepoView {
                                 colors,
                                 &mut |label, badge| self.wire_badge(label, badge, cx),
                             ))
-                            .child(ui::clipped(
-                                ("subject", ix),
-                                SharedString::from(commit.subject.to_string()),
-                            )),
+                            .when(is_stash, |cell| {
+                                cell.child(
+                                    h_flex()
+                                        .flex_none()
+                                        .h(px(18.))
+                                        .px(px(6.))
+                                        .gap(px(4.))
+                                        .rounded(px(4.))
+                                        .border_1()
+                                        .border_color(colors.border)
+                                        .text_xs()
+                                        .text_color(colors.muted)
+                                        .child(ui::icon_small(IconName::Archive))
+                                        .child(tr("贮藏")),
+                                )
+                            })
+                            .child(
+                                ui::clipped(
+                                    ("subject", ix),
+                                    SharedString::from(commit.subject.to_string()),
+                                )
+                                .when(is_stash, |d| d.text_color(colors.muted)),
+                            ),
                     )
                     .child(
                         h_flex()
                             .w(px(AUTHOR_WIDTH))
                             .flex_none()
                             .gap(px(6.))
-                            .child(ui::avatar(&commit.author, 18., cx))
+                            .when(!is_stash, |cell| {
+                                cell.child(ui::avatar(&commit.author, 18., cx))
+                            })
                             .child(
                                 ui::clipped(
                                     ("author", ix),
@@ -2386,16 +2526,22 @@ impl RepoView {
                             .border_b_1()
                             .border_color(border)
                             .text_sm()
-                            .child(div().text_color(muted).child(tr("文件历史")))
+                            .child(div().text_color(muted).child(match path.ends_with('/') {
+                                true => tr("目录历史"),
+                                false => tr("文件历史"),
+                            }))
                             .child(ui::clipped("file-history-path", path.clone()).flex_1())
-                            .child(
-                                Button::new("file-blame")
-                                    .xsmall()
-                                    .label(tr("逐行追溯"))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.show_blame(path.clone(), cx)
-                                    })),
-                            )
+                            // 目录没有逐行追溯
+                            .when(!path.ends_with('/'), |bar| {
+                                bar.child(
+                                    Button::new("file-blame")
+                                        .xsmall()
+                                        .label(tr("逐行追溯"))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.show_blame(path.clone(), cx)
+                                        })),
+                                )
+                            })
                             .child(
                                 Button::new("close-file-history")
                                     .xsmall()
@@ -2449,8 +2595,16 @@ impl RepoView {
                         })
                         .child(div().flex_1())
                         .children(pending)
+                        .children(
+                            self.history
+                                .file
+                                .is_none()
+                                .then(|| self.render_curate_entry(cx))
+                                .flatten(),
+                        )
                         .when(self.history.file.is_none(), |bar| {
                             bar.child(self.render_scope_button(cx))
+                                .child(self.render_graph_options(cx))
                         })
                         .child(
                             Button::new("pick-file")
@@ -2703,6 +2857,155 @@ impl RepoView {
             .into_any_element()
     }
 
+    /// 整理提交视图的右边：清单里选中的那个提交改了什么。说明、文件、改动和提交详情共用一份数据
+    /// （[`Self::show_object`] 读的），这里只是换一种排法：这一栏窄，文件排成一行行小块，点一下
+    /// 滚到它的改动；改动一律上下排。
+    pub(super) fn render_curate_preview(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (border, muted, hover, chip) = (
+            theme.border,
+            theme.muted_foreground,
+            theme.list_hover,
+            theme.secondary,
+        );
+        let (added, removed, changed) = (theme.green, theme.red, theme.yellow);
+        if self.history.diff.read(cx).mode() != DiffMode::Unified {
+            self.history
+                .diff
+                .update(cx, |state, cx| state.set_mode(DiffMode::Unified, cx));
+        }
+        let head = match &self.history.details {
+            Some(details) => {
+                let subject = details
+                    .message
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let short: String = details.id.chars().take(8).collect();
+                let meta = format!(
+                    "{short} · {} · {} · {}",
+                    details.author,
+                    format_date(details.author_time),
+                    self.history.diff_info
+                );
+                v_flex()
+                    .gap(px(2.))
+                    .child(
+                        ui::clipped("curate-preview-subject", subject)
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD),
+                    )
+                    .child(
+                        ui::clipped("curate-preview-meta", meta)
+                            .text_xs()
+                            .text_color(muted),
+                    )
+            }
+            None => v_flex().child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(self.history.diff_info.clone()),
+            ),
+        };
+        let chips: Vec<AnyElement> = self
+            .history
+            .files
+            .iter()
+            .enumerate()
+            .map(|(ix, file)| {
+                let color = match file.letter {
+                    "A" => added,
+                    "D" => removed,
+                    _ => changed,
+                };
+                let name = file_tree::split_name(&file.path).1.to_string();
+                let path = file.path.clone();
+                h_flex()
+                    .id(("curate-file", ix))
+                    .flex_none()
+                    .h(px(22.))
+                    .px(px(7.))
+                    .gap(px(5.))
+                    .rounded(px(5.))
+                    .bg(chip)
+                    .text_xs()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(hover))
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(color)
+                            .child(file.letter),
+                    )
+                    .child(div().max_w(px(180.)).truncate().child(name))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(muted)
+                            .child(format!("+{} −{}", file.additions, file.deletions)),
+                    )
+                    .tooltip(move |window, cx| ui::tip(path.clone(), window, cx))
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_changed_file(ix, cx)))
+                    .into_any_element()
+            })
+            .collect();
+        let has_files = !chips.is_empty();
+        let header_width = px(360.);
+        let image_pane = self
+            .history
+            .image
+            .clone()
+            .map(|(_, view)| div().flex_1().min_h_0().child(view).into_any_element());
+        v_flex()
+            .size_full()
+            .child(
+                div()
+                    .flex_none()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(head),
+            )
+            .when(has_files, |view| {
+                view.child(
+                    div()
+                        .id("curate-files")
+                        .flex_none()
+                        .max_h(px(82.))
+                        .overflow_y_scroll()
+                        .px_3()
+                        .py(px(6.))
+                        .border_b_1()
+                        .border_color(border)
+                        .child(h_flex().flex_wrap().gap(px(5.)).children(chips)),
+                )
+            })
+            .child(match image_pane {
+                Some(pane) => pane,
+                None => div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        Diff::new(&self.history.diff)
+                            .line_number(true)
+                            .syntax_highlight(true)
+                            .render_header(move |file, _, _| {
+                                diff_file_header(file, header_width, muted)
+                            })
+                            .size_full(),
+                    )
+                    // 按住 Ctrl 滚滚轮调代码字号
+                    .child(crate::zoom::wheel_zoom(self.app.clone()))
+                    .into_any_element(),
+            })
+            .into_any_element()
+    }
+
     /// 每帧推进一次滚动测速，测完打印结果并退出。
     pub(super) fn tick_bench(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.step_bench(window) {
@@ -2806,11 +3109,11 @@ fn build_loaded(
     out: &[u8],
     fetch_time: Duration,
     git_time: Option<Duration>,
-    linear: bool,
+    build: &Build,
 ) -> Loaded {
     let t0 = Instant::now();
     let mut commits = gitlog::parse(out);
-    if linear {
+    if build.linear {
         // 文件历史里的提交互相不一定是父子：连成一条线来画
         let count = commits.len() as u32;
         for (ix, commit) in commits.iter_mut().enumerate() {
@@ -2818,6 +3121,13 @@ fn build_loaded(
             commit.parents = if next < count { vec![next] } else { Vec::new() };
         }
     }
+    if build.first_parent {
+        // 只看主线：合并进来的那一边不画
+        for commit in &mut commits {
+            commit.parents.truncate(1);
+        }
+    }
+    let stashes = insert_stashes(&mut commits, &build.stashes);
     let t1 = Instant::now();
     let graph = Graph::build(&commits);
     let t2 = Instant::now();
@@ -2841,7 +3151,45 @@ fn build_loaded(
         commits: Arc::new(commits),
         graph: Arc::new(graph),
         stats: stats.into(),
+        stashes: Arc::new(stashes),
     }
+}
+
+/// 把贮藏当成一个提交插进列表：紧挨在贮藏时的 HEAD 上面，父提交就是它（贮藏提交自己还有一两个
+/// 只存暂存区、未跟踪文件的父提交，不画）。那个 HEAD 不在列表里的贮藏不插。返回插进去的那几个。
+///
+/// 列表里父提交记的是下标：插一行，它后面的行、和指着后面的下标都往后挪一格。
+fn insert_stashes(
+    commits: &mut Vec<Commit>,
+    stashes: &[(String, String, i64, String)],
+) -> HashSet<Box<str>> {
+    let mut inserted = HashSet::new();
+    // 旧的先插：同一个提交上的几个贮藏，新的排在上面
+    for (id, base, time, label) in stashes.iter().rev() {
+        let Some(at) = commits.iter().position(|commit| *commit.id == **base) else {
+            continue;
+        };
+        for commit in commits.iter_mut() {
+            for parent in &mut commit.parents {
+                if *parent as usize >= at {
+                    *parent += 1;
+                }
+            }
+        }
+        commits.insert(
+            at,
+            Commit {
+                id: id.as_str().into(),
+                parents: vec![at as u32 + 1],
+                author: "".into(),
+                time: *time,
+                refs: "".into(),
+                subject: label.as_str().into(),
+            },
+        );
+        inserted.insert(id.as_str().into());
+    }
+    inserted
 }
 
 /// 只要日期，逐行追溯里用。
