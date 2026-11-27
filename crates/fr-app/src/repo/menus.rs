@@ -2636,8 +2636,10 @@ impl RepoView {
             InProgress::Rebase => self.rebase_undo_point(),
             _ => self.undo_point(),
         };
+        // 做完时变基目录已经没了：叫什么（整理还是变基）趁现在定下
+        let name = self.op_name(state);
         self.run_op(
-            tf!("继续{name}", name = state.name()),
+            tf!("继续{name}", name),
             go,
             stdin,
             window,
@@ -2646,7 +2648,7 @@ impl RepoView {
                 if used_message {
                     this.changes.clear_message(window, cx);
                 }
-                let text = tf!("{name}已完成", name = state.name());
+                let text = tf!("{name}已完成", name);
                 this.notify_undoable(text, point, window, cx);
             },
         );
@@ -2660,10 +2662,11 @@ impl RepoView {
         cx: &mut Context<Self>,
     ) {
         let description = match state {
-            InProgress::Rebase => {
-                tr("跳过正在重放的提交：其改动（含已解决的冲突）将被丢弃，变基继续处理后续提交。")
-            }
-            _ => tr("放弃当前正在处理的提交，已解决的冲突将丢失。"),
+            InProgress::Rebase => tf!(
+                "跳过正在重放的提交：其改动（含已解决的冲突）将被丢弃，{name}继续处理后续提交。",
+                name = self.op_name(state)
+            ),
+            _ => tr("放弃当前正在处理的提交，已解决的冲突将丢失。").to_string(),
         };
         self.confirm(
             tr("跳过此提交？"),
@@ -2686,12 +2689,10 @@ impl RepoView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let description = tf!(
-            "恢复到{name}之前的状态，已解决的冲突将丢失。",
-            name = state.name()
-        );
+        let name = self.op_name(state);
+        let description = tf!("恢复到{name}之前的状态，已解决的冲突将丢失。", name);
         self.confirm(
-            tf!("中止{name}？", name = state.name()),
+            tf!("中止{name}？", name),
             description,
             tr("中止"),
             window,
@@ -2699,13 +2700,13 @@ impl RepoView {
             move |this, window, cx| {
                 let abort = args(&[state.command(), "--abort"]);
                 this.run_op(
-                    tf!("中止{name}", name = state.name()),
+                    tf!("中止{name}", name),
                     abort,
                     None,
                     window,
                     cx,
                     move |_, _, window, cx| {
-                        let text = tf!("已中止{name}，已恢复到开始前的状态", name = state.name());
+                        let text = tf!("已中止{name}，已恢复到开始前的状态", name);
                         window.push_notification(Notification::success(text), cx);
                     },
                 );

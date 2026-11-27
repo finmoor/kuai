@@ -143,6 +143,8 @@ impl RepoView {
             Box::new(move |this, result, window, cx| match result {
                 Ok(_) => {
                     let text = tf!("「{name}」已完成", name = name.as_str());
+                    // 后台运行的命令只有这里看得到输出：通知留着，等人点「查看输出」或关掉
+                    // （和推送成功带「创建合并请求」的那条一样）
                     let note = match this.output_opener(cx) {
                         Some(open) => crate::ui::action_note(
                             gpui_kit::component::notification::NotificationType::Success,
@@ -156,8 +158,7 @@ impl RepoView {
                                         me.update(cx, |note, cx| note.dismiss(window, cx)).ok();
                                     })
                             },
-                        )
-                        .autohide(true),
+                        ),
                         None => Notification::success(text),
                     };
                     window.push_notification(note, cx);

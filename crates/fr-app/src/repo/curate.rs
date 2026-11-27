@@ -285,7 +285,10 @@ impl RepoView {
             return;
         }
         if let Some(state) = self.in_progress {
-            let text = tf!("{name}尚未完成，请先完成或中止。", name = state.name());
+            let text = tf!(
+                "{name}尚未完成，请先完成或中止。",
+                name = self.op_name(state)
+            );
             window.push_notification(Notification::warning(text), cx);
             return;
         }
@@ -681,6 +684,12 @@ impl RepoView {
 
     // ---------- 整理中途停下 ----------
 
+    /// 停在一半的操作在界面上叫什么（横幅、继续、中止、通知）：「整理提交」起的变基叫「整理」，
+    /// 别的照 git 的操作叫。
+    pub(super) fn op_name(&self, state: fr_core::state::InProgress) -> &'static str {
+        op_name_of(state, self.rebase.as_ref())
+    }
+
     /// 变基停下了，而且不是因为冲突（清单里的 `edit`、`break`）：记下停在哪，回到「本地修改」。要拆分
     /// 的提交这时把改动放回工作区。git 这时的退出码是 0，由 `run_steps` 看变基目录还在才知道。
     pub(super) fn rebase_paused(
@@ -695,6 +704,7 @@ impl RepoView {
         let pending = paused.split_pending();
         let stopped = paused.stopped.as_deref().map(short).unwrap_or_default();
         let amend = paused.amend.is_some();
+        let name = op_name_of(fr_core::state::InProgress::Rebase, Some(&paused));
         self.rebase = Some(paused);
         if pending {
             self.begin_split(window, cx);
@@ -705,7 +715,7 @@ impl RepoView {
                 "已停在 {id}。修改并暂存后，点击上方的「继续」，已暂存的改动将并入该提交。",
                 id = stopped
             ),
-            false => tr("变基已按清单暂停。处理完成后，点击上方的「继续」。").to_string(),
+            false => tf!("{name}已按清单暂停。处理完成后，点击上方的「继续」。", name),
         };
         window.push_notification(Notification::info(text), cx);
     }
@@ -1495,9 +1505,39 @@ fn parse_counts(out: &str) -> HashMap<String, usize> {
     counts
 }
 
+/// 见 [`RepoView::op_name`]。`paused` 是读到的变基状态：刚做完一步、`RepoView::rebase` 还没
+/// 刷新时用这一步之后读到的。
+pub(super) fn op_name_of(
+    state: fr_core::state::InProgress,
+    paused: Option<&Paused>,
+) -> &'static str {
+    match state {
+        fr_core::state::InProgress::Rebase if paused.is_some_and(|paused| paused.curating) => {
+            tr("整理")
+        }
+        _ => state.name(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_counts;
+    use super::{op_name_of, parse_counts};
+    use fr_core::rebase::Paused;
+    use fr_core::state::InProgress;
+
+    #[test]
+    fn 整理提交停下时叫整理() {
+        let curating = Paused {
+            curating: true,
+            ..Default::default()
+        };
+        let other = Paused::default();
+        assert_eq!(op_name_of(InProgress::Rebase, Some(&curating)), "整理");
+        assert_eq!(op_name_of(InProgress::Rebase, Some(&other)), "变基");
+        assert_eq!(op_name_of(InProgress::Rebase, None), "变基");
+        // 只有变基分得出来：别的操作照 git 的叫
+        assert_eq!(op_name_of(InProgress::Merge, Some(&curating)), "合并");
+    }
 
     #[test]
     fn 数每个提交改了几个文件() {

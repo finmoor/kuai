@@ -1350,17 +1350,20 @@ impl RepoView {
             .and_then(|p| p.stopped.as_deref())
             .map(|id| id.chars().take(8).collect())
             .unwrap_or_default();
+        // 「整理提交」起的变基叫「整理」
+        let name = self.op_name(state);
         let left = self.split_left();
         // 第二句（灰字）：还差什么才能继续
         let mut more: Option<String> = None;
         let text: String = match stop {
             Stop::Conflict => tf!(
                 "{name}已暂停：{conflicts} 个文件有冲突。请在「本地修改」中解决后点击「{go}」。",
-                name = state.name(),
+                name,
                 conflicts,
                 go
             ),
-            Stop::Reading => tr("变基已暂停，正在读取状态…").into(),
+            // 还没读到变基目录：认不出是不是整理，不写操作名
+            Stop::Reading => tr("已暂停，正在读取状态…").into(),
             Stop::SplitPending => tf!(
                 "整理已暂停：正在将 {id} 的改动放回「本地修改」…",
                 id = stopped
@@ -1384,7 +1387,8 @@ impl RepoView {
                     ));
                 }
                 tf!(
-                    "整理已暂停：停在 {id}。修改并暂存后点击「继续」，已暂存的改动将并入该提交。",
+                    "{name}已暂停：停在 {id}。修改并暂存后点击「继续」，已暂存的改动将并入该提交。",
+                    name,
                     id = stopped
                 )
             }
@@ -1395,20 +1399,17 @@ impl RepoView {
                         unstaged
                     ));
                 }
-                tr("变基已按清单暂停。处理完成后点击「继续」。").into()
+                tf!("{name}已按清单暂停。处理完成后点击「继续」。", name)
             }
             Stop::Empty => tf!(
                 "{name}已暂停：此提交没有改动（内容已存在）。请点击「跳过此提交」。",
-                name = state.name()
+                name
             ),
             Stop::Resolved if state == InProgress::Merge => {
                 tr("合并尚未完成：冲突已全部解决，请点击「提交合并」。说明留空则使用默认说明。")
                     .into()
             }
-            Stop::Resolved => tf!(
-                "{name}已暂停：冲突已全部解决，请点击「继续」。",
-                name = state.name()
-            ),
+            Stop::Resolved => tf!("{name}已暂停：冲突已全部解决，请点击「继续」。", name),
         };
         let can_go = idle
             && match stop {

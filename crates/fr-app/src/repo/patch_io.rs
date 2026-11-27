@@ -848,7 +848,10 @@ impl RepoView {
             return;
         }
         if let Some(state) = self.in_progress {
-            let text = tf!("{name}尚未完成，请先完成或中止。", name = state.name());
+            let text = tf!(
+                "{name}尚未完成，请先完成或中止。",
+                name = self.op_name(state)
+            );
             window.push_notification(Notification::warning(text), cx);
             return;
         }

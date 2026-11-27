@@ -464,7 +464,7 @@ impl RepoView {
         // 按标签认：和 `continue_in_progress`、`skip_in_progress` 里起的标签是同一句话
         let resuming = was_in_progress
             && self.in_progress.is_some_and(|state| {
-                label.as_ref() == tf!("继续{name}", name = state.name())
+                label.as_ref() == tf!("继续{name}", name = self.op_name(state))
                     || label.as_ref() == tr("跳过")
             });
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
@@ -651,7 +651,8 @@ impl RepoView {
             } else {
                 None
             };
-            let mut paused = match !failed && rebase_op {
+            // 没出错时看是不是按清单停下了；遇到冲突停下时也读，通知里才叫得对（整理还是变基）
+            let mut paused = match rebase_op && !cancelled {
                 true => channel
                     .git(&repo, fr_core::rebase::state_args())
                     .await
@@ -693,7 +694,9 @@ impl RepoView {
                     (Some(state), Err(text)) if resuming => {
                         this.in_progress = Some(state);
                         this.show_changes(cx);
-                        let title = tf!("{name}尚未完成，再次暂停", name = state.name());
+                        let paused = paused.as_ref().or(this.rebase.as_ref());
+                        let name = super::curate::op_name_of(state, paused);
+                        let title = tf!("{name}尚未完成，再次暂停", name);
                         let note = Notification::warning(
                             tr("如有新冲突，请在「本地修改」中解决后点击「继续」，或点击「跳过此提交」。"),
                         )
@@ -714,11 +717,15 @@ impl RepoView {
                         } else {
                             tr("继续")
                         };
+                        let name = super::curate::op_name_of(
+                            state,
+                            paused.as_ref().or(this.rebase.as_ref()),
+                        );
                         let note = Notification::warning(tf!(
                             "请在「本地修改」中解决冲突后点击上方的「{go}」，或点击「中止」放弃。",
                             go
                         ))
-                        .title(tf!("{name}遇到冲突，已暂停", name = state.name()))
+                        .title(tf!("{name}遇到冲突，已暂停", name))
                         .id::<StoppedNote>();
                         window.push_notification(note, cx);
                     }

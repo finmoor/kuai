@@ -171,7 +171,8 @@ pub fn todo(items: &[Item], moved: &[(String, String)]) -> Vec<String> {
 /// 这几条说明，然后一行是要拆分的提交（空格分开，可以是空行），最后是清单：按字节数把说明一条条
 /// 写到清单旁边的 `fr-msg-1`、`fr-msg-2`……，要拆分的提交写进 `fr-split`（变基结束、中止时 git
 /// 连同清单一起删掉），剩下的写进清单。`read` 和 `dd bs=1` 一次读一个字节，不会多读走后面的。
-const EDITOR: &str = r#"f(){ d=$(dirname "$1"); read -r lens; i=0; for n in $lens; do i=$((i+1)); dd bs=1 count="$n" of="$d/fr-msg-$i" 2>/dev/null || return 1; done; read -r split; [ -z "$split" ] || printf '%s\n' $split > "$d/fr-split"; cat > "$1"; }; f"#;
+/// 另放一个空的 `fr-curate`：停下时认得出这是「整理提交」起的变基（[`Paused::curating`]）。
+const EDITOR: &str = r#"f(){ d=$(dirname "$1"); : > "$d/fr-curate"; read -r lens; i=0; for n in $lens; do i=$((i+1)); dd bs=1 count="$n" of="$d/fr-msg-$i" 2>/dev/null || return 1; done; read -r split; [ -z "$split" ] || printf '%s\n' $split > "$d/fr-split"; cat > "$1"; }; f"#;
 
 /// `git rebase -i` 的参数：把 `base` 之后的提交重做，清单和新的说明（[`input`]）从标准输入给。
 /// 总是带 `--autostash`：工作区干净时它什么都不做，有改动时先贮藏、做完放回去。
@@ -244,6 +245,9 @@ pub struct Paused {
     pub head: String,
     /// 一并移动的分支（`--update-refs`、清单里的 `update-ref`）：（完整引用名，变基开始前指着的提交）
     pub moved: Vec<(String, String)>,
+    /// 是「整理提交」起的变基（变基目录里有 [`EDITOR`] 放的 `fr-curate`）：界面上叫「整理」。
+    /// 终端里、别处起的变基没有它
+    pub curating: bool,
 }
 
 impl Paused {
@@ -264,7 +268,7 @@ impl Paused {
 
 /// 读变基目录里的几个小文件：不在变基就什么都不输出。借 git 的 shell 别名，一次读完。
 /// `rebase-apply` 也是 `git am` 用的目录，里面有 `rebasing` 才是变基。
-const STATE: &str = r#"alias.fr-rebase-state=!f(){ d=$(git rev-parse --git-path rebase-merge); if [ ! -d "$d" ]; then d=$(git rev-parse --git-path rebase-apply); [ -f "$d/rebasing" ] || return 0; fi; echo "dir=$d"; for n in amend stopped-sha msgnum end head-name orig-head fr-split update-refs; do [ -f "$d/$n" ] && printf '%s=%s\n' "$n" "$(tr '\n' ' ' < "$d/$n" | cut -c1-9000)"; done; printf 'head=%s\n' "$(git rev-parse -q --verify HEAD)"; }; f"#;
+const STATE: &str = r#"alias.fr-rebase-state=!f(){ d=$(git rev-parse --git-path rebase-merge); if [ ! -d "$d" ]; then d=$(git rev-parse --git-path rebase-apply); [ -f "$d/rebasing" ] || return 0; fi; echo "dir=$d"; for n in amend stopped-sha msgnum end head-name orig-head fr-split update-refs fr-curate; do [ -f "$d/$n" ] && printf '%s=%s\n' "$n" "$(tr '\n' ' ' < "$d/$n" | cut -c1-9000)"; done; printf 'head=%s\n' "$(git rev-parse -q --verify HEAD)"; }; f"#;
 
 /// 读变基停在哪（见 [`Paused`]），输出交给 [`parse_state`]。
 pub fn state_args() -> Vec<String> {
@@ -292,6 +296,7 @@ pub fn parse_state(out: &[u8]) -> Option<Paused> {
             "head-name" => paused.branch = filled().filter(|name| name.starts_with("refs/")),
             "orig-head" => paused.orig_head = filled(),
             "fr-split" => paused.split = value.split_ascii_whitespace().map(String::from).collect(),
+            "fr-curate" => paused.curating = true,
             "head" => paused.head = value.to_string(),
             // 每个分支三行：引用名、开始前的位置、移过去以后的位置（还没移时是全 0）
             "update-refs" => {
@@ -388,8 +393,10 @@ mod tests {
     fn 读出变基停在哪() {
         assert_eq!(parse_state(b""), None);
         let out = "dir=.git/rebase-merge\namend=aaa1 \nstopped-sha=bbb2 \nmsgnum=2 \nend=5 \n\
-                   head-name=refs/heads/main \norig-head=ccc3 \nfr-split=bbb2 ddd4 \nhead=aaa1\n";
+                   head-name=refs/heads/main \norig-head=ccc3 \nfr-split=bbb2 ddd4 \nfr-curate=\n\
+                   head=aaa1\n";
         let paused = parse_state(out.as_bytes()).unwrap();
+        assert!(paused.curating);
         assert_eq!(paused.amend.as_deref(), Some("aaa1"));
         assert_eq!(paused.stopped.as_deref(), Some("bbb2"));
         assert_eq!(paused.step, Some((2, 5)));
@@ -409,6 +416,8 @@ mod tests {
         let paused = parse_state(out.as_bytes()).unwrap();
         assert_eq!((paused.amend, paused.stopped), (None, None));
         assert_eq!(paused.branch, None);
+        // 没有 fr-curate：不是「整理提交」起的
+        assert!(!paused.curating);
         assert!(!Paused::default().splitting());
         // update-refs：每个分支三行（引用名、开始前、移过去以后）
         let out = "dir=d\nupdate-refs=refs/heads/x aaa 000 refs/heads/y bbb ccc \nhead=h\n";
@@ -612,6 +621,7 @@ mod tests {
 
         // 停在 a 上：等着修改
         let paused = state().expect("停在 a 上");
+        assert!(paused.curating, "整理提交起的变基认得出来");
         assert_eq!(paused.amend.as_deref(), Some(a.as_str()));
         assert_eq!(paused.stopped.as_deref(), Some(a.as_str()));
         assert_eq!(paused.step, Some((1, 4)));
@@ -653,6 +663,15 @@ mod tests {
         assert_eq!(text(&["show", "main~3:a.txt"]), "a\nmore");
         // mid 原来指着 b，现在落在 b 拆出来的最后一个提交上
         assert_eq!(text(&["rev-parse", "mid"]), text(&["rev-parse", "main~1"]));
+
+        // 终端里起的 `git rebase -i`（编辑器是别的）停下：不算整理
+        let edit_first = "sequence.editor=sed -i 1s/^pick/edit/";
+        let (_, finished) = run(own(&["-c", edit_first, "rebase", "-i", &base]), None);
+        assert_eq!(finished.code, Some(0), "{}", finished.stderr);
+        let paused = state().expect("停在第一个提交上");
+        assert!(paused.amend.is_some() && !paused.curating, "{paused:?}");
+        let (_, finished) = run(own(&["rebase", "--abort"]), None);
+        assert_eq!(finished.code, Some(0), "{}", finished.stderr);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
