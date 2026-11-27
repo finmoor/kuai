@@ -9,12 +9,12 @@
 <p><b>合上电脑，它还在写；打开电脑，逐行验收。</b></p>
 
 <p>
-为在 VPS 上运行 Claude Code、Codex 的人而做的桌面客户端（Windows、Linux）：<br>
-断网不断的终端、逐行审查改动的 Git 界面、直接修改服务器文件的编辑器，合在一个窗口中。<br>
-编译、测试、同时运行的几个 Claude Code，占用的都是服务器的 CPU 和内存，电脑只负责显示。
+把 Claude Code、Codex 放到服务器上运行，用一个桌面窗口掌控全程：<br>
+<b>断网不断的终端</b> · <b>逐行审查的 Git</b> · <b>直接修改服务器文件的编辑器</b><br>
+编译、测试、同时运行的几个 AI 助手，占用的都是服务器的 CPU 和内存，电脑只负责显示。
 </p>
 
-<p><sub>经 SSH 连接 · 没有中转服务器，没有账号 · 服务器无需 root，不对外开放端口 · 开源</sub></p>
+<p><sub>Windows · Linux · 经 SSH 连接 · 没有中转服务器，没有账号 · 服务器无需 root，不对外开放端口 · 开源</sub></p>
 
 <p>
 <a href="https://github.com/finmoor/kuai/releases/latest"><img src="https://img.shields.io/github/v/release/finmoor/kuai?style=flat-square&label=release&color=3b82f6" alt="最新版本"></a>
@@ -27,9 +27,9 @@
 
 <p>
 <a href="#下载"><b>下载</b></a> ·
-<a href="#功能">功能</a> ·
-<a href="#快速上手">快速上手</a> ·
-<a href="#工作原理">工作原理</a> ·
+<a href="#三件事一个窗口">功能</a> ·
+<a href="#五分钟上手">上手</a> ·
+<a href="#工作原理">原理</a> ·
 <a href="#安全">安全</a> ·
 <a href="CHANGELOG.md">更新记录</a> ·
 <a href="README.en.md">English</a>
@@ -39,48 +39,29 @@
 
 <sub>同一个窗口中的三页：会话、Git、文件，仓库位于远程主机 dev-server。截图中的项目与人名均为演示数据。</sub>
 
-<br><br>
-
-<table>
-  <tr>
-    <td width="33%" align="center" valign="top"><b>① 跑</b><br><sub>终端常驻在服务器上<br>断网、关窗口、合上电脑都不中断</sub></td>
-    <td width="33%" align="center" valign="top"><b>② 审</b><br><sub>并排对比、逐行审查、按行暂存<br>Git 界面向 Fork 看齐</sub></td>
-    <td width="33%" align="center" valign="top"><b>③ 改</b><br><sub>目录树和带语法高亮的编辑器<br>也可映射到本机，用 VS Code 打开</sub></td>
-  </tr>
-</table>
-
 </div>
 
-## 重活交给服务器，把电脑还给你
+## 把 Claude Code 放到服务器上，然后呢
 
-在自己的电脑上运行 Claude Code，占用的不只是一个终端窗口：每个 Claude Code 进程占用几百 MB 内存，它启动的安装依赖、编译、测试、开发服务器再各占一份。同时运行几个任务，电脑发烫、风扇不停，其他工作跟着变慢。
-
-放到服务器上，用 Kuai 操作：
-
-- **CPU、内存、电量，用的都是服务器的。** 电脑上只运行 Kuai 一个原生程序（Rust 编写，不是 Electron，占用约 150 MB 内存），轻薄本、旧电脑都够用。
-- **同时运行几个任务，取决于服务器，不取决于电脑。** 不够时升级服务器的配置，电脑不用换。
-- **开发环境不装在电脑上。** Node、依赖、Docker、数据库都在服务器上，弄乱了可以重装；电脑上除了 Kuai，只需要 git 和 ssh。
-- **它能动的只有那台服务器。** Claude Code 在服务器上拥有登录用户的全部权限，范围也止于那台服务器：电脑上的文件、SSH 私钥、浏览器中的登录状态，它读不到，也改不了。想让它跳过权限确认放手去做，放在一台随时可以重装的 VPS 上，比放在自己的电脑上稳妥；界限和例外见[安全](#安全)。
-- **服务器上也不添负担。** `kuaid` 是约 3 MB 的单个程序，常驻内存只有几 MB，不需要 Node 等运行时；小内存的 VPS，资源都留给 Claude Code。
-
-## 在服务器上运行 Claude Code，本来是这样的
-
-所以不少人专门买一台 VPS 运行 Claude Code、Codex，任务可以连续运行几个小时。麻烦在于怎么用它。
+在自己的电脑上运行 Claude Code，电脑发烫、风扇不停；合上盖子，任务就停了。所以不少人专门买一台 VPS 运行它：可以连续工作几个小时，弄乱了可以重装。麻烦在于怎么用这台服务器。
 
 | 只有 SSH 的时候 | 用 Kuai |
 |---|---|
 | SSH 一断，运行到一半的任务随之中断，只能再套一层 tmux | 终端常驻在服务器上：断网、关窗口、合上电脑都不中断，再次打开时画面原样接回 |
+| 同时运行几个任务，不知道哪一个停下来等你确认 | 所有主机、所有仓库的终端汇总在一页，哪个停下来了会提醒 |
 | 想给它看一张截图，要先传到服务器，再把路径贴给它 | 截图直接粘贴，文件直接拖进终端，自动上传 |
 | 它改了几十个文件，只能在终端里翻 `git diff` | 并排对比逐行审查，要的按行暂存，不要的丢弃 |
+| 它把分支变基、重置坏了，要翻 reflog 才能救回来 | 「找回提交」列出分支移动过的每一步，选中即可从那里新建分支；在 Kuai 中做的变基、重置、合并可直接撤销 |
 | 想修改两行，要么用 vim，要么再配一个远程编辑器 | 文件树和编辑器就在旁边；按住 Ctrl 单击终端里的路径，直接跳到那一行 |
-| 同时运行几个任务，不知道哪一个停下来等你确认 | 所有仓库的终端汇总在一页，哪个停下来了会提醒 |
 | 换一台电脑，要重新配置一遍 | 工作区保存在服务器上，换一台电脑连接，仓库和终端都在 |
 
-Kuai 在服务器上安装一个常驻的小程序 `kuaid`（约 3 MB，无需 root，不对外开放端口），经 SSH 与它通信：终端在服务器上运行，git 命令在服务器上执行，文件在服务器上读写，电脑上的 Kuai 只负责显示。本机的仓库用法相同。
+Kuai 在服务器上安装一个常驻的小程序 `kuaid`（约 3 MB，无需 root，不对外开放端口），经 SSH 与它通信：终端在服务器上运行，git 在服务器上执行，文件在服务器上读写，电脑上的 Kuai 只负责显示。本机的仓库用法相同。
 
 > 名字取自筷子：不用叉子（Fork）改用筷子，「筷」也谐音「快」。
 
-## 功能
+## 三件事，一个窗口
+
+每个仓库分为终端、Git、文件三页。让它跑，审它改的，自己动手改两行，都不用离开这个窗口。
 
 ### ① 跑：合上电脑，它还在工作
 
@@ -88,100 +69,128 @@ Kuai 在服务器上安装一个常驻的小程序 `kuaid`（约 3 MB，无需 r
 
 ![「会话」页：左侧按工作区列出各仓库的终端，右侧是 Claude Code 的画面](assets/screenshots/zh-CN/terminals.png)
 
-- **停下来就提醒**：「会话」页汇总所有主机上各仓库的终端（未加入工作区的仓库也在），分出运行中、等你和空闲；AI 助手停下等你时提醒，Kuai 不在前台时发送系统通知，离开期间有新输出的也会标出
-- **截图直接发给它**：复制截图后粘贴，或将图片、文件拖进终端；文件自动上传到主机，终端中得到的是它在主机上的路径
-- **同时运行多个任务**：一个仓库可以打开多个终端，可改名，可勾选 2～4 个并排查看
-- **一键开 Claude Code**：「新终端」旁的 ⌄ 直接运行 Claude Code、Codex、OpenCode、Antigravity CLI 或自己添加的命令，也可在新终端中接着上次的对话；按钮默认开哪一个可在设置中选择
+- **停下来就提醒**：「会话」页汇总所有主机上各仓库的终端，分出运行中、等你和空闲；AI 助手停下等你时提醒，Kuai 不在前台时发送系统通知
+- **同时运行几个任务**：一个仓库可以打开多个终端，可改名，可将 2～4 个并排查看
+- **截图直接发给它**：复制截图后粘贴，或将图片、文件拖进终端，自动上传到主机
+- **一键开 Claude Code**：新建终端时直接运行 Claude Code、Codex、OpenCode、Antigravity CLI 或自己添加的命令，也可接着上次的对话
+- **长对话也好找**：往回翻时输入区固定在底部；左侧的刻度是发出过的消息，鼠标停留预览，单击跳转
 - 本机仓库的终端同样在退出 Kuai 后继续运行
-- 字体、字号、行高、光标、回滚行数均可设置
+
+<table>
+  <tr>
+    <td width="50%" valign="top"><img src="assets/screenshots/zh-CN/split.png" alt="并排查看两个终端"><br><sub><b>并排查看</b> · 几个 Claude Code 同时工作，一眼看全</sub></td>
+    <td width="50%" valign="top"><img src="assets/screenshots/zh-CN/workspaces.png" alt="工作区页"><br><sub><b>工作区</b> · 一组仓库的分支、改动数和终端状态</sub></td>
+  </tr>
+</table>
 
 ### ② 审：它改的每一行，都由你过目
 
-完整的图形化 Git 客户端，界面和操作向 Fork 看齐。Claude Code 完成后切换到 Git 页：并排对比逐行查看，要的按行暂存，不要的丢弃，然后提交、推送。
+Claude Code 完成后切换到 Git 页：并排对比逐行查看，要的按行暂存，不要的丢弃，然后提交、推送。
 
 ![本地修改：选中若干行后暂存，下方填写提交说明](assets/screenshots/zh-CN/changes.png)
 
-- **按文件、按块、按行**暂存和丢弃，丢弃后可撤销；分栏或单列表（勾选方框暂存）；并排对比、行内差异高亮、忽略空白、图片对比
+- **按文件、按块、按行**暂存和丢弃，丢弃后可撤销；并排对比、行内差异高亮、忽略空白、图片对比
+- **它做错了也能退回**：变基、重置、合并、拉取之后，通知中直接撤销；「找回提交」列出 HEAD 和各分支移动过的记录，包括它在终端里执行的重置、变基，选中一步即可从那里新建分支
+- **推送前整理提交**：把它留下的一串零碎提交调整顺序、修改说明、并入、拆分或丢弃，整理好再推送
+- **钩子不再是黑盒**：提交时实时显示钩子的输出；未通过时保留提交说明，可查看输出或跳过
+
+Git 页是一个完整的图形化 Git 客户端，界面和操作向 [Fork](https://fork.dev/) 看齐：
+
+<table>
+  <tr>
+    <td width="50%" valign="top"><img src="assets/screenshots/zh-CN/curate.png" alt="整理提交"><br><sub><b>整理提交</b> · 推送前调整顺序、修改说明、并入、拆分、丢弃</sub></td>
+    <td width="50%" valign="top"><img src="assets/screenshots/zh-CN/palette.png" alt="快速打开"><br><sub><b>快速打开</b> · Ctrl+P 查找仓库、命令、分支和文件</sub></td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top"><img src="assets/screenshots/zh-CN/compare.png" alt="比较两个分支"><br><sub><b>比较</b> · 任意两个分支、标签、提交或本地修改</sub></td>
+    <td width="50%" valign="top"><img src="assets/screenshots/zh-CN/git-light.png" alt="浅色主题下的 Git 页"><br><sub><b>提交图</b> · 13 套配色，深色和浅色各选一套</sub></td>
+  </tr>
+</table>
+
 - **提交图**，以及按名称分组的分支、远程、标签和贮藏；可按说明、作者、哈希、文件路径或改动内容搜索提交
-- **合并、变基、整理提交**（推送前调整顺序、修改说明、并入、拆分、丢弃）、挑拣、还原、重置；提交可多选后批量操作，分支可拖到当前分支上合并；变基、重置、合并、拉取之后可撤销
+- **合并、变基、挑拣、还原、重置**；合并前提示是否会有冲突；提交可多选后批量操作，分支可拖到当前分支上合并
 - **冲突解决**：上方对照当前、传入（可加共同祖先），逐处采纳，下方的结果可直接编辑；也可交给 Beyond Compare、WinMerge、Meld 等外部工具
-- **比较**任意两个分支、标签、提交或本地修改；文件和目录的历史、逐行追溯；文件可恢复到某个提交中的版本
+- **比较与历史**：比较任意两个分支、标签、提交或本地修改；文件和目录的历史、逐行追溯；文件可恢复到某个提交中的版本
 - **补丁**：本地修改、提交、贮藏、比较结果可导出或复制为补丁；补丁可从文件、剪贴板或拖入应用，应用前先检查
-- **钩子**：提交时实时显示钩子的输出；未通过时保留提交说明，可查看输出或跳过钩子
 - **托管平台**：在浏览器中打开仓库、提交、分支，创建合并请求（GitHub、GitLab、Gitee、Gitea、Bitbucket），无需登录
-- **工作树、子仓库总览、子模块**；后台自动获取，分支名下显示上次获取的时间；推送、拉取的完整输出（包括服务器 hook 的说明）在底部「输出」中
-- **找回提交**：列出 HEAD 和各分支移动过的记录，包括 Claude Code 在终端里执行的重置、变基，选中一步即可从那里新建分支；重置、变基、强制推送前写明会影响哪些提交
+- **自定义命令**：把常用的命令加入提交、分支、文件的右键菜单，例如让 Claude Code 评审选中的提交
+- **工作树、子仓库总览、子模块**；后台自动获取；推送、拉取的完整输出（包括服务器 hook 的说明）在底部「输出」中
 
 ### ③ 改：服务器上的文件，像本机的一样修改
 
 ![文件页：左侧为远程仓库的目录树，右侧为编辑器](assets/screenshots/zh-CN/files.png)
 
 - **目录树**：新建、重命名、删除、上传、下载；有改动和未跟踪的文件带标记，可按名称过滤
-- **编辑器**：行号、语法高亮、查找和替换；保存时若文件已被其他程序修改，会先提示；图片直接显示
+- **编辑器**：行号、语法高亮、查找和替换；保存时若文件已被其他程序修改，会先提示；图片直接显示，Markdown 可预览
 - 读写经由已建立的 SSH 连接，**无需另行配置 SFTP**，使用跳板机时同样可用
 - **目录映射**：将主机上的目录映射为本机的盘符或文件夹，用资源管理器、VS Code 等本机程序直接打开（Windows 上需安装 [WinFsp](https://winfsp.dev/)，Kuai 可代为安装；Linux 上需安装 fuse3，只能映射为文件夹）
 
 ### 三页互通
 
-终端、Git、文件是同一个仓库的三页，可以直接从一页跳到另一页：
-
 - **终端 → 文件**：按住 <kbd>Ctrl</kbd> 单击终端中的文件路径，在文件页中打开并跳到对应的行；右键点在路径上，可在浏览器中打开网页、用默认程序打开、复制路径
 - **文件 → Git**：查看正在编辑的文件的改动，以及改过它的提交
 - **Git → 文件**：在改动的文件上点击右键，在文件页中打开
 - **文件 → 终端**：在文件所在的目录中新建终端
-- <kbd>Ctrl</kbd>+<kbd>&#96;</kbd> 在终端页和之前的页面之间切换，<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd> 切换到文件页
+- <kbd>Ctrl</kbd>+<kbd>&#96;</kbd> 在终端页和之前的页面之间切换，<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd> 切换到文件页，<kbd>Ctrl</kbd>+<kbd>P</kbd> 查找仓库、命令、分支和文件
 
-### 主机：一台普通的 VPS 即可
+此外还有：中文和英文界面、13 套配色、托盘和开机自启、可固定、拖动排序和恢复的标签页、可修改的快捷键，以及带 SHA-256 校验的一键更新。
 
-- 主机可以是 **Linux（x86_64）** 的 VPS、云服务器或开发机，也可以是开启了 OpenSSH 服务的 **Windows** 电脑；暂不支持 ARM
-- 首次连接时自动将 `kuaid` 安装到用户目录 `~/.kuai`：**不需要 root 权限，不对外开放端口**，主机也无需联网
-- 使用系统的 OpenSSH 客户端（Windows 自带的，或 Linux 上的 ssh），沿用 `~/.ssh/config`、密钥和 ssh-agent；密码和私钥口令保存在 Windows 凭据管理器或 Linux 的系统钥匙圈中
-- 支持多级**跳板机**，跳板机上不安装任何程序
-- **工作区**将常一起使用的仓库归为一组，保存在仓库所在的主机上：换一台电脑连接，看到的是同一份
-- 新版 Kuai 连接时自动更新主机上的 kuaid，正在运行的终端不受影响
+## 重活交给服务器，把电脑还给你
 
-### 更多画面
+在自己的电脑上运行 Claude Code，占用的不只是一个终端窗口：每个 Claude Code 进程占用几百 MB 内存，它启动的安装依赖、编译、测试、开发服务器再各占一份。放到服务器上，用 Kuai 操作：
 
-<table>
-  <tr>
-    <td width="50%" valign="top"><img src="assets/screenshots/zh-CN/compare.png" alt="比较两个分支"><br><sub><b>比较</b> · 任意两个分支、标签、提交或本地修改</sub></td>
-    <td width="50%" valign="top"><img src="assets/screenshots/zh-CN/workspaces.png" alt="工作区页"><br><sub><b>工作区</b> · 一组仓库的分支、改动数和终端状态</sub></td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top"><img src="assets/screenshots/zh-CN/themes.png" alt="设置中的全部配色"><br><sub><b>配色</b> · 13 套，深色和浅色各选一套</sub></td>
-    <td width="50%" valign="top"><img src="assets/screenshots/zh-CN/git-light.png" alt="浅色主题下的 Git 页"><br><sub><b>深色与浅色</b> · 可跟随系统</sub></td>
-  </tr>
-</table>
+- **CPU、内存、电量，用的都是服务器的。** 电脑上只运行 Kuai 一个原生程序（Rust 编写，不是 Electron，占用约 150 MB 内存），轻薄本、旧电脑都够用。
+- **同时运行几个任务，取决于服务器，不取决于电脑。** 不够时升级服务器的配置，电脑不用换。
+- **开发环境不装在电脑上。** Node、依赖、Docker、数据库都在服务器上，弄乱了可以重装；电脑上除了 Kuai，只需要 git 和 ssh。
+- **它能动的只有那台服务器。** Claude Code 在服务器上拥有登录用户的全部权限，范围也止于那台服务器：电脑上的文件、SSH 私钥、浏览器中的登录状态，它读不到，也改不了。想让它跳过权限确认放手去做，放在一台随时可以重装的 VPS 上，比放在自己的电脑上稳妥；界限和例外见[安全](#安全)。
+- **服务器上也不添负担。** `kuaid` 是约 3 MB 的单个程序，常驻内存只有几 MB，不需要 Node 等运行时；小内存的 VPS，资源都留给 Claude Code。
 
-此外还有：中文和英文界面、托盘和开机自启、可固定、拖动排序和恢复的标签页、快速打开（Ctrl+P：仓库、命令、分支和文件）、可加入右键菜单的自定义命令，以及带 SHA-256 校验的一键更新。
+## 五分钟上手
 
-## 与现有工具相比
+1. [下载](#下载)并打开 Kuai。
+2. 在「主机」页点击「添加主机…」，填写 VPS 的地址和用户名（也可以从 `~/.ssh/config` 中选择主机别名），选择用密钥或密码登录。不确定能否连上时先点「测试连接」。
+3. 首次连接时，Kuai 显示主机的密钥指纹请你核对（核对方法见对话框），确认后自动将 kuaid 安装到主机的 `~/.kuai` 下并启动：**不需要 root 权限，不对外开放端口**，主机也无需联网。
+4. 连上后点击「打开仓库…」，在主机上选择仓库所在的目录；还没有仓库时可以「克隆…」，或「新建项目…」。
+5. 在仓库的终端页点击「新终端」旁的 ⌄，选择 Claude Code。主机上还没有安装时，终端顶上会给出安装命令，点击「运行」即可安装（Claude Code 用官方安装脚本，不需要 Node.js；Codex、OpenCode 经 npm 安装），安装后按提示登录。
+6. 它完成后按 <kbd>Ctrl</kbd>+<kbd>&#96;</kbd> 回到 Git 页，查看改动、按行暂存、提交、推送。
 
-**与 [Fork](https://fork.dev/) 相比。** Kuai 的 Git 界面和操作方式向 Fork 看齐，目标是在日常使用中替代它。
+打开本机的仓库：在「主机」页选中「本机」，点击「添加本机仓库…」；或在命令行中运行 `kuai <仓库路径>`。
 
-- **多出来的**：打开远程主机上的仓库；内置的、退出后继续运行的终端；文件页和目录映射；中文界面；开源。
-- **还没有的**：bisect、Git LFS 的专用界面、git-flow，以及 GitHub、GitLab 等平台的账号集成（创建合并请求只打开网页，不在 Kuai 中查看和评审）。
+<details>
+<summary><b>开始前的准备和常见情况</b></summary>
 
-**与 IDE 相比。** Kuai 不是 IDE。文件页用于查看和少量修改，没有代码补全、跳转到定义和调试；需要大量编写代码时，可将主机上的目录映射到本机，用 VS Code 等编辑器打开。映射后编辑器读写的是经 SSH 传来的文件，适合编辑；git、运行和构建仍建议在主机上进行（Kuai 的 Git 页和终端）。需要在主机上运行 VS Code 扩展、调试程序时，请使用 VS Code 的 Remote - SSH。
+| 位置 | 需要什么 | 怎么检查、怎么装 |
+|---|---|---|
+| 本机（Windows） | git 2.31 或更新的版本；OpenSSH 客户端（Windows 10、11 自带） | `git --version`、`ssh -V`；没有 git 请安装 [Git for Windows](https://git-scm.com/download/win) |
+| 本机（Linux） | git 2.31 或更新的版本、ssh | `sudo apt install git openssh-client` |
+| 远程主机 | Linux x86_64（暂不支持 ARM）或开启了 OpenSSH 服务的 Windows；能用 SSH 登录（密钥或密码，VPS 控制台中给出的 IP、用户名和密码即可） | 先在命令行中 `ssh 用户名@地址` 试一次 |
+| 远程主机 | git 2.31 或更新的版本 | `git --version`。Ubuntu 20.04、Debian 11 自带的版本低于要求：Ubuntu 运行 `sudo add-apt-repository -y ppa:git-core/ppa && sudo apt update && sudo apt install -y git`，Debian 11 运行 `sudo apt install -t bullseye-backports git`（需先启用 backports） |
+| 远程主机 | 要用的 AI 助手，已安装并登录 | Claude Code：`curl -fsSL https://claude.ai/install.sh \| bash`（Windows 主机在 PowerShell 中运行 `irm https://claude.ai/install.ps1 \| iex`），安装后新开一个终端运行 `claude`，按提示登录；提示找不到 `claude` 时，按安装脚本的说明将 `~/.local/bin` 加入 PATH。Codex：`npm install -g @openai/codex`。OpenCode：`npm install -g opencode-ai` |
+
+- **主机**可以是 Linux（x86_64）的 VPS、云服务器或开发机，也可以是开启了 OpenSSH 服务的 Windows 电脑；支持多级**跳板机**，跳板机上不安装任何程序。
+- **连接**使用系统的 OpenSSH 客户端，沿用 `~/.ssh/config`、密钥和 ssh-agent；密码和私钥口令保存在 Windows 凭据管理器或 Linux 的系统钥匙圈中。
+- **工作区**将常一起使用的仓库归为一组，保存在仓库所在的主机上：换一台电脑连接，看到的是同一份。
+- **更新**：新版 Kuai 连接时自动更新主机上的 kuaid，正在运行的终端不受影响。
+- **原来用 tmux 的**：主机上已有的 tmux 会话，在 Kuai 的终端中照常 `tmux attach` 接回即可。新任务建议直接在 Kuai 的终端中运行，不必再套一层 tmux：Kuai 的终端本身就常驻在主机上，而套在 tmux 中的程序在 Kuai 看来只是 tmux，「会话」页的停下提醒和消息刻度对它不准确。
+
+</details>
 
 ## 下载
 
-从 [GitHub Releases](https://github.com/finmoor/kuai/releases/latest) 下载。程序未进行代码签名：首次运行时 Windows 可能提示「Windows 已保护你的电脑」，请点击「更多信息」，再点击「仍要运行」；下载的文件可与 Releases 页面上各文件旁显示的 SHA-256 核对。
+从 [GitHub Releases](https://github.com/finmoor/kuai/releases/latest) 下载：
 
-Windows 版以下两种任选其一：
+| 系统 | 文件 | 说明 |
+|---|---|---|
+| Windows | `kuai-<版本>-windows-x64-setup.exe`（推荐） | 安装版，装在用户目录下，无需管理员权限 |
+| Windows | `kuai-<版本>-windows-x64.zip` | 解压版，解压后双击 `kuai.exe` |
+| Ubuntu、Debian | `kuai_<版本>_amd64.deb` | `sudo apt install ./kuai_<版本>_amd64.deb` |
+| 其他 Linux | `kuai-<版本>-linux-x64.AppImage` | 加上可执行权限后直接运行 |
+| Linux | `kuai-<版本>-linux-x64.tar.gz` | 解压版，运行其中的 `kuai` |
 
-- **安装版** `kuai-<版本>-windows-x64-setup.exe`（推荐）：安装在用户目录下（`%LOCALAPPDATA%\Programs\Kuai`），无需管理员权限；可从开始菜单启动，可在「设置 → 应用」中卸载。
-- **解压版** `kuai-<版本>-windows-x64.zip`：解压得到的 Kuai 文件夹可放在任意位置，双击 `kuai.exe` 运行。
+程序未进行代码签名：首次运行时 Windows 可能提示「Windows 已保护你的电脑」，请点击「更多信息」，再点击「仍要运行」；下载的文件可与 Releases 页面上各文件旁显示的 SHA-256 核对。有新版本时，标题栏会显示更新提示，点击即可一键更新；主机上的 kuaid 无需单独更新。
 
-Linux 版以下三种任选其一：
-
-- **.deb 安装包** `kuai_<版本>_amd64.deb`（Ubuntu、Debian）：`sudo apt install ./kuai_<版本>_amd64.deb`，装在 `/opt/kuai`，可从应用菜单启动或运行 `kuai`。
-- **AppImage** `kuai-<版本>-linux-x64.AppImage`（其他发行版）：加上可执行权限后直接运行，首次运行时添加到应用菜单。
-- **解压版** `kuai-<版本>-linux-x64.tar.gz`：解压得到的 Kuai 文件夹可放在任意位置，运行其中的 `kuai`，首次运行时添加到应用菜单。
-
-托盘图标需要桌面支持 StatusNotifierItem（KDE、Ubuntu 的 GNOME 自带；其他 GNOME 需安装 AppIndicator 扩展）；Wayland 桌面上窗口无法隐藏到托盘，「关闭到托盘」改为最小化。
-
-运行要求：
+<details>
+<summary><b>运行要求和安装细节</b></summary>
 
 | 位置 | 要求 |
 |---|---|
@@ -190,32 +199,12 @@ Linux 版以下三种任选其一：
 | 远程主机 | Linux（x86_64，暂不支持 ARM），或开启了 OpenSSH 服务的 Windows；已安装 git 2.31 或更新的版本；无需 root 权限 |
 | 目录映射 | Windows 上需安装 [WinFsp](https://winfsp.dev/)，未安装时 Kuai 可经 winget 代为安装；Linux 上需安装 fuse3，只能映射为文件夹 |
 
-有新版本时，标题栏齿轮左侧会显示更新提示，点击可查看更新内容并一键更新（安装版在后台运行新的安装程序，解压版直接替换文件；Linux 的 .deb 经系统的管理员认证由 apt 安装，AppImage 替换原文件）；也可在「设置 → 关于」中检查更新。主机上的 kuaid 无需单独更新，新版 Kuai 连接时会自动替换。各版本的更新内容见 [CHANGELOG.md](CHANGELOG.md)。
+- Windows 安装版装在 `%LOCALAPPDATA%\Programs\Kuai`，可从开始菜单启动，可在「设置 → 应用」中卸载；解压版的 Kuai 文件夹可放在任意位置。
+- Linux 的 .deb 装在 `/opt/kuai`，可从应用菜单启动或运行 `kuai`；AppImage 和解压版首次运行时添加到应用菜单。
+- 托盘图标需要桌面支持 StatusNotifierItem（KDE、Ubuntu 的 GNOME 自带；其他 GNOME 需安装 AppIndicator 扩展）；Wayland 桌面上窗口无法隐藏到托盘，「关闭到托盘」改为最小化。
+- 更新：安装版在后台运行新的安装程序，解压版直接替换文件；Linux 的 .deb 经系统的管理员认证由 apt 安装，AppImage 替换原文件；也可在「设置 → 关于」中检查更新。各版本的更新内容见 [CHANGELOG.md](CHANGELOG.md)。
 
-## 快速上手
-
-### 开始前准备
-
-| 位置 | 需要什么 | 怎么检查、怎么装 |
-|---|---|---|
-| 本机（Windows） | git 2.31 或更新的版本；OpenSSH 客户端（Windows 10、11 自带） | `git --version`、`ssh -V`；没有 git 请安装 [Git for Windows](https://git-scm.com/download/win) |
-| 本机（Linux） | git 2.31 或更新的版本、ssh | `sudo apt install git openssh-client` |
-| 远程主机 | Linux x86_64（暂不支持 ARM）或开启了 OpenSSH 服务的 Windows；能用 SSH 登录（密钥或密码，VPS 控制台中给出的 IP、用户名和密码即可） | 先在命令行中 `ssh 用户名@地址` 试一次 |
-| 远程主机 | git 2.31 或更新的版本 | `git --version`。Ubuntu 20.04、Debian 11 自带的版本低于要求：Ubuntu 运行 `sudo add-apt-repository -y ppa:git-core/ppa && sudo apt update && sudo apt install -y git`，Debian 11 运行 `sudo apt install -t bullseye-backports git`（需先启用 backports） |
-| 远程主机 | 要用的 AI 助手，已安装并登录 | 见下面第 5 步 |
-
-### 步骤
-
-1. 安装并打开 Kuai。
-2. 在「主机」页点击「添加主机…」，填写 VPS 的地址和用户名（也可以从 `~/.ssh/config` 中选择主机别名），选择用密钥或密码登录。不确定能否连上时先点「测试连接」。
-3. 首次连接时，Kuai 显示主机的密钥指纹请你核对（核对方法见对话框），确认后自动将 kuaid 安装到主机的 `~/.kuai` 下并启动。
-4. 连上后点击「打开仓库…」，在主机上选择仓库所在的目录；还没有仓库时可以「克隆…」，或选择一个目录后按提示初始化新仓库。
-5. 在主机上安装并登录 Claude Code：在仓库的终端页运行官方安装脚本 `curl -fsSL https://claude.ai/install.sh | bash`（不需要 Node.js，普通用户即可安装；Windows 主机在 PowerShell 中运行 `irm https://claude.ai/install.ps1 | iex`），安装后新开一个终端运行 `claude`，按提示登录；提示找不到 `claude` 时，按安装脚本的说明将 `~/.local/bin` 加入 PATH。Codex 是 `npm install -g @openai/codex`，OpenCode 是 `npm install -g opencode-ai`（这两个需要 Node.js）。Kuai 不代为安装；预设的程序没装时，终端顶上会给出安装命令，点击「运行」即在该终端中安装。
-6. 每个仓库分为 Git、终端、文件三页：在终端页运行 `claude`，完成后按 <kbd>Ctrl</kbd>+<kbd>&#96;</kbd> 回到 Git 页查看改动、按行暂存、提交。
-
-打开本机的仓库：在「主机」页选中「本机」，点击「添加本机仓库…」；或在命令行中运行 `kuai.exe <仓库路径>`。
-
-**原来用 tmux 的：** 主机上已有的 tmux 会话，在 Kuai 的终端中照常 `tmux attach` 接回即可，原来经 SSH 接回的方式也不受影响。新任务建议直接在 Kuai 的终端中运行，不必再套一层 tmux：Kuai 的终端本身就常驻在主机上，而套在 tmux 中的程序在 Kuai 看来只是 tmux，「会话」页的停下提醒和消息刻度对它不准确。
+</details>
 
 ## 工作原理
 
@@ -257,6 +246,11 @@ Kuai 不自建连接和认证，全部交给 SSH。思路与 VS Code 的 Remote 
 需要留意：Kuai 不限制终端中程序在主机上的行为。Claude Code 等程序在主机上拥有登录用户的全部权限，这一点与经 SSH 直接运行它们相同；存放在主机上的密钥和令牌（git 凭据、API 密钥等）它同样可以使用，主机上只放项目需要的。
 
 发现安全问题，请经本仓库 Security 页的 [Report a vulnerability](https://github.com/finmoor/kuai/security/advisories/new) 私下报告，不要公开提 Issue。
+
+## 与现有工具相比
+
+- **与 [Fork](https://fork.dev/) 相比**：Kuai 的 Git 界面和操作方式向 Fork 看齐，目标是在日常使用中替代它；多出远程主机上的仓库、退出后继续运行的终端、文件页和目录映射、中文界面，并且开源。还没有的：bisect、Git LFS 的专用界面、git-flow，以及 GitHub、GitLab 等平台的账号集成（创建合并请求只打开网页，不在 Kuai 中查看和评审）。
+- **与 IDE 相比**：Kuai 不是 IDE。文件页用于查看和少量修改，没有代码补全、跳转到定义和调试；需要大量编写代码时，可将主机上的目录映射到本机，用 VS Code 等编辑器打开。映射后编辑器读写的是经 SSH 传来的文件，适合编辑；git、运行和构建仍建议在主机上进行。需要在主机上运行 VS Code 扩展、调试程序时，请使用 VS Code 的 Remote - SSH。
 
 ## 反馈
 

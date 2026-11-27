@@ -9,12 +9,12 @@
 <p><b>Close the laptop and it keeps coding. Open it and review every line.</b></p>
 
 <p>
-A desktop client for Windows and Linux, for people who run Claude Code or Codex on a VPS.<br>
-Terminals that survive disconnects, line-by-line review, in-place file editing, in one window.<br>
-Builds, tests and several Claude Code sessions at once use the server's CPU and memory; your computer only draws the screen.
+Run Claude Code and Codex on a server and stay in control from one desktop window:<br>
+<b>terminals that survive disconnects</b> · <b>line-by-line Git review</b> · <b>an editor for the server's files</b><br>
+Builds, tests and several AI assistants at once use the server's CPU and memory; your computer only draws the screen.
 </p>
 
-<p><sub>Connects over SSH · no relay server, no account · no root and no open port on the server · open source</sub></p>
+<p><sub>Windows · Linux · connects over SSH · no relay server, no account · no root and no open port on the server · open source</sub></p>
 
 <p>
 <a href="https://github.com/finmoor/kuai/releases/latest"><img src="https://img.shields.io/github/v/release/finmoor/kuai?style=flat-square&label=release&color=3b82f6" alt="Latest release"></a>
@@ -27,8 +27,8 @@ Builds, tests and several Claude Code sessions at once use the server's CPU and 
 
 <p>
 <a href="#download"><b>Download</b></a> ·
-<a href="#features">Features</a> ·
-<a href="#getting-started">Getting started</a> ·
+<a href="#three-jobs-one-window">Features</a> ·
+<a href="#up-and-running-in-five-minutes">Getting started</a> ·
 <a href="#how-it-works">How it works</a> ·
 <a href="#security">Security</a> ·
 <a href="CHANGELOG.md">Changelog</a> ·
@@ -39,48 +39,29 @@ Builds, tests and several Claude Code sessions at once use the server's CPU and 
 
 <sub>Three pages of one window: Sessions, Git and Files, on the remote host dev-server. Projects and people shown are demo data.</sub>
 
-<br><br>
-
-<table>
-  <tr>
-    <td width="33%" align="center" valign="top"><b>① Run</b><br><sub>Terminals live on the server<br>Survive disconnects and a closed laptop</sub></td>
-    <td width="33%" align="center" valign="top"><b>② Review</b><br><sub>Side-by-side diff, staging line by line<br>A Git UI modelled on Fork</sub></td>
-    <td width="33%" align="center" valign="top"><b>③ Edit</b><br><sub>File tree and syntax-highlighted editor<br>Or map it locally and open it in VS Code</sub></td>
-  </tr>
-</table>
-
 </div>
 
-## Leave the heavy lifting to the server
+## Claude Code is on a server. Now what?
 
-Running Claude Code on your own computer takes more than a terminal window: each Claude Code process uses a few hundred MB of memory, and the installs, builds, tests and dev servers it starts each take their share. Run several tasks at once and the laptop runs hot, the fans stay on, and everything else slows down.
-
-Put them on a server and drive them from Kuai:
-
-- **The CPU, memory and battery in use are the server's.** Your computer runs one native program, Kuai (written in Rust, not Electron, about 150 MB of memory); a thin or ageing laptop is enough.
-- **How many tasks run at once depends on the server, not on your computer.** When that is not enough, resize the server and keep the laptop.
-- **The development environment stays off your computer.** Node, dependencies, Docker and databases live on the server and can be rebuilt when they get messy; besides Kuai, your computer only needs git and ssh.
-- **All it can touch is that server.** Claude Code has every right of the signed-in user on the server, and its reach ends there: the files on your computer, your SSH private keys and your browser sessions are out of its sight and out of its hands. If you want it to skip permission prompts and just get on with it, a VPS you can rebuild at any time is a safer place for that than your own computer; the limits and the one exception are under [Security](#security).
-- **Light on the server too.** `kuaid` is a single program of about 3 MB that stays resident in a few MB of memory and needs no runtime such as Node, so a small VPS keeps its resources for Claude Code.
-
-## Claude Code on a server, before and after
-
-That is why plenty of people rent a VPS just to run Claude Code or Codex, where a task can run for hours. The awkward part is working with it.
+Run Claude Code on your own computer and the laptop runs hot with the fans on; close the lid and the task stops. That is why plenty of people rent a VPS just to run it: it can work for hours, and you can rebuild the machine when it gets messy. The awkward part is working with that server.
 
 | With SSH alone | With Kuai |
 |---|---|
 | The SSH session drops and the half-finished task goes with it, so you wrap everything in tmux | Terminals live on the server: lose the network, close the window or the laptop, and they keep running. Open Kuai again and the screen is as you left it |
+| Several tasks are running and you cannot tell which one is waiting for you | One page lists the terminals of every repository on every host and tells you when one stops |
 | To show it a screenshot you upload the file first, then paste the path | Paste the screenshot or drop the file on the terminal; it is uploaded for you |
 | It changed dozens of files and all you have is `git diff` in a terminal | Review side by side, stage the lines you want, discard the rest |
+| It rebased or reset a branch into a mess and you dig through the reflog to get it back | Recover commits lists every move of your branches, and you create a branch at any step; a rebase, reset or merge done in Kuai can simply be undone |
 | To fix two lines you reach for vim or set up a remote editor | The file tree and editor are right there; Ctrl-click a path in the terminal to land on that line |
-| Several tasks are running and you cannot tell which one is waiting for you | One page lists the terminals of every repository and tells you when one stops |
 | On another computer you set everything up again | Workspaces are stored on the server: connect from another computer and the repositories and terminals are there |
 
 Kuai installs a small resident program, `kuaid` (about 3 MB, no root, no open port), on the server and talks to it over SSH: terminals run on the server, git runs on the server, files are read and written on the server, and Kuai on your computer only draws the result. Repositories on this computer work the same way.
 
 > The name is the Chinese word for chopsticks (筷子, *kuàizi*): chopsticks instead of a fork. 筷 also sounds like 快, "fast".
 
-## Features
+## Three jobs, one window
+
+Every repository has three pages: Terminal, Git and Files. Let it run, review what it changed, fix two lines yourself, all without leaving the window.
 
 ### ① Run: close the laptop, it keeps working
 
@@ -88,100 +69,128 @@ Every repository has its own terminals, running on the host the repository lives
 
 ![The Sessions page: terminals of each repository grouped by workspace on the left, a Claude Code session on the right](assets/screenshots/en/terminals.png)
 
-- **Told when it stops**: the Sessions page gathers the terminals of every repository on every host, including repositories not in a workspace, and tells running, waiting and idle ones apart. You are notified when an AI assistant stops and waits for you, with a system notification when Kuai is in the background, and terminals that printed output while you were away are marked
-- **Hand it a screenshot**: copy a screenshot and paste, or drop images and files on the terminal. The file is uploaded to the host, and the terminal receives its path there
-- **Several tasks at once**: a repository can have several terminals; rename them, or check 2 to 4 to view them side by side
-- **Claude Code in one click**: the ⌄ next to New terminal runs Claude Code, Codex, OpenCode, Antigravity CLI or a command of your own, or continues the last conversation in a new terminal; choose in Settings what the button itself opens
+- **Told when it stops**: the Sessions page gathers the terminals of every repository on every host and tells running, waiting and idle ones apart. You are notified when an AI assistant stops and waits for you, with a system notification when Kuai is in the background
+- **Several tasks at once**: a repository can have several terminals; rename them, or view 2 to 4 side by side
+- **Hand it a screenshot**: copy a screenshot and paste, or drop images and files on the terminal; they are uploaded to the host
+- **Claude Code in one click**: a new terminal can start Claude Code, Codex, OpenCode, Antigravity CLI or a command of your own, or continue the last conversation
+- **Find your way in a long conversation**: the input area stays pinned at the bottom while you scroll back; the marks on the left are the messages you sent, with a preview on hover and a jump on click
 - Terminals of local repositories also keep running after Kuai quits
-- Font, size, line height, cursor and scrollback are configurable
+
+<table>
+  <tr>
+    <td width="50%" valign="top"><img src="assets/screenshots/en/split.png" alt="Two terminals side by side"><br><sub><b>Side by side</b> · Claude Code and a shell in the same view; up to four panes</sub></td>
+    <td width="50%" valign="top"><img src="assets/screenshots/en/workspaces.png" alt="The Workspaces page"><br><sub><b>Workspaces</b> · branches, changes and terminals of a group at a glance</sub></td>
+  </tr>
+</table>
 
 ### ② Review: every line it changed, in front of you
 
-A full graphical Git client, modelled on Fork. When Claude Code is done, switch to the Git page: read the changes side by side, stage the lines you want, discard the rest, then commit and push.
+When Claude Code is done, switch to the Git page: read the changes side by side, stage the lines you want, discard the rest, then commit and push.
 
 ![Local changes: a few lines selected for staging, with the commit message below](assets/screenshots/en/changes.png)
 
-- **Stage and discard by file, hunk or line**, and undo a discard; split or single list (check a box to stage); side-by-side view, inline word diff, ignore whitespace, image diff
+- **Stage and discard by file, hunk or line**, and undo a discard; side-by-side view, inline word diff, ignore whitespace, image diff
+- **A way back when it gets it wrong**: undo a rebase, reset, merge or pull right from the notification; Recover commits lists every move of HEAD and your branches, including resets and rebases it ran in the terminal, and creates a branch at any step
+- **Clean up before you push**: reorder, reword, fold, split or drop the string of small commits it left behind, then push
+- **Hooks are no longer a black box**: hook output is shown live while committing; when a hook fails your message is kept, and you can view the output or skip the hook
+
+The Git page is a full graphical Git client, modelled on [Fork](https://fork.dev/):
+
+<table>
+  <tr>
+    <td width="50%" valign="top"><img src="assets/screenshots/en/curate.png" alt="Clean up commits"><br><sub><b>Clean up commits</b> · reorder, reword, fold, split or drop before pushing</sub></td>
+    <td width="50%" valign="top"><img src="assets/screenshots/en/palette.png" alt="Quick open"><br><sub><b>Quick open</b> · Ctrl+P finds repositories, commands, branches and files</sub></td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top"><img src="assets/screenshots/en/compare.png" alt="Comparing two branches"><br><sub><b>Compare</b> · any two branches, tags, commits or the local changes</sub></td>
+    <td width="50%" valign="top"><img src="assets/screenshots/en/git-light.png" alt="The Git page in a light theme"><br><sub><b>Commit graph</b> · 13 color themes, one for dark mode and one for light</sub></td>
+  </tr>
+</table>
+
 - **Commit graph**, with branches, remotes, tags and stashes grouped into folders by name; search commits by message, author, hash, file path or changed content
-- **Merge, rebase and commit clean-up** (reorder, reword, fold, split or drop commits before pushing), cherry-pick, revert, reset; select several commits to act on them at once, or drag a branch onto the current one to merge it; rebase, reset, merge and pull can be undone afterwards
+- **Merge, rebase, cherry-pick, revert, reset**; a merge tells you beforehand whether it will conflict; select several commits to act on them at once, or drag a branch onto the current one to merge it
 - **Conflict resolution**: current and incoming side by side on top (with the common ancestor if you like), take a side for each conflict, and edit the result below; or hand the file to an external tool such as Beyond Compare, WinMerge or Meld
-- **Compare** any two branches, tags, commits or the local changes; file and directory history, blame; restore a file to the version in any commit
+- **Compare and history**: compare any two branches, tags, commits or the local changes; file and directory history, blame; restore a file to the version in any commit
 - **Patches**: export or copy local changes, commits, stashes or a comparison as a patch; apply a patch from a file, the clipboard or by dropping it in, checked before it is applied
-- **Hooks**: hook output is shown live while committing; when a hook fails your message is kept, and you can view the output or skip the hook
 - **Hosting sites**: open the repository, a commit or a branch in the browser and create a pull request (GitHub, GitLab, Gitee, Gitea, Bitbucket), no sign-in needed
-- **Worktrees, sub-repository overview, submodules**; background auto-fetch, with the time of the last fetch under the branch name; the full output of pushes and pulls, including what server hooks say, in the Output panel at the bottom
-- **Recover commits**: every move of HEAD and your branches, including resets and rebases Claude Code ran in the terminal; pick a step and create a branch there. Resets, rebases and force pushes spell out which commits they affect before they run
+- **Custom commands**: add your own commands to the context menus of commits, branches and files, for example to have Claude Code review the selected commit
+- **Worktrees, sub-repository overview, submodules**; background auto-fetch; the full output of pushes and pulls, including what server hooks say, in the Output panel at the bottom
 
 ### ③ Edit: files on the server, as if they were local
 
 ![The Files page: the file tree of a remote repository on the left, the editor on the right](assets/screenshots/en/files.png)
 
 - **File tree**: create, rename, delete, upload and download; modified and untracked files are marked, and you can filter by name
-- **Editor**: line numbers, syntax highlighting, find and replace; if another program has changed the file, you are asked before saving over it; images are shown inline
+- **Editor**: line numbers, syntax highlighting, find and replace; if another program has changed the file, you are asked before saving over it; images are shown inline and Markdown can be previewed
 - Reads and writes go through the SSH connection that is already open: **no SFTP to configure**, and it works through jump hosts too
 - **Directory mapping**: map a directory on the host to a drive letter or folder on this computer and open it with Explorer, VS Code or any local program (on Windows it needs [WinFsp](https://winfsp.dev/), which Kuai can install for you; on Linux it needs fuse3 and maps to folders only)
 
 ### Three pages that work together
 
-Terminal, Git and Files are three pages of the same repository, and you can go straight from one to another:
-
 - **Terminal → Files**: hold <kbd>Ctrl</kbd> and click a file path in the terminal to open it on the Files page at that line; right-click a path to open a web page in the browser, open the file in its default program or copy the path
 - **Files → Git**: see the changes to the file you are editing, and the commits that touched it
 - **Git → Files**: right-click a changed file and open it on the Files page
 - **Files → Terminal**: open a new terminal in the file's directory
-- <kbd>Ctrl</kbd>+<kbd>&#96;</kbd> switches between the Terminal page and the page you were on; <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd> goes to the Files page
+- <kbd>Ctrl</kbd>+<kbd>&#96;</kbd> switches between the Terminal page and the page you were on, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd> goes to the Files page, and <kbd>Ctrl</kbd>+<kbd>P</kbd> finds repositories, commands, branches and files
 
-### Hosts: any ordinary VPS will do
+Also: Chinese and English UI, 13 color themes, system tray and start at sign-in, tabs you can pin, reorder and reopen, customizable shortcuts, and one-click updates verified by SHA-256.
 
-- A host can be a **Linux (x86_64)** VPS, cloud server or dev box, or a **Windows** computer with the OpenSSH server enabled; ARM is not supported yet
-- On first connection `kuaid` is installed into the user's home directory (`~/.kuai`): **no root, no port open to the network**, and the host does not need Internet access
-- Uses the system OpenSSH client (the one that ships with Windows, or ssh on Linux), along with your `~/.ssh/config`, keys and ssh-agent; passwords and key passphrases are kept in Windows Credential Manager or the Linux keyring
-- Multi-level **jump hosts**; nothing is installed on the jump host
-- **Workspaces** group repositories you use together and are stored on the host that holds them: connect from another computer and you see the same list
-- A newer Kuai updates `kuaid` on the host when it connects, without interrupting running terminals
+## Leave the heavy lifting to the server
 
-### More screens
+Running Claude Code on your own computer takes more than a terminal window: each Claude Code process uses a few hundred MB of memory, and the installs, builds, tests and dev servers it starts each take their share. Put them on a server and drive them from Kuai:
 
-<table>
-  <tr>
-    <td width="50%" valign="top"><img src="assets/screenshots/en/compare.png" alt="Comparing two branches"><br><sub><b>Compare</b> · any two branches, tags, commits or the local changes</sub></td>
-    <td width="50%" valign="top"><img src="assets/screenshots/en/workspaces.png" alt="The Workspaces page"><br><sub><b>Workspaces</b> · branches, changes and terminals of a group at a glance</sub></td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top"><img src="assets/screenshots/en/themes.png" alt="All color themes in Settings"><br><sub><b>Color themes</b> · 13 of them, one for dark mode and one for light</sub></td>
-    <td width="50%" valign="top"><img src="assets/screenshots/en/git-light.png" alt="The Git page in a light theme"><br><sub><b>Light and dark</b> · can follow the system</sub></td>
-  </tr>
-</table>
+- **The CPU, memory and battery in use are the server's.** Your computer runs one native program, Kuai (written in Rust, not Electron, about 150 MB of memory); a thin or ageing laptop is enough.
+- **How many tasks run at once depends on the server, not on your computer.** When that is not enough, resize the server and keep the laptop.
+- **The development environment stays off your computer.** Node, dependencies, Docker and databases live on the server and can be rebuilt when they get messy; besides Kuai, your computer only needs git and ssh.
+- **All it can touch is that server.** Claude Code has every right of the signed-in user on the server, and its reach ends there: the files on your computer, your SSH private keys and your browser sessions are out of its sight and out of its hands. If you want it to skip permission prompts and just get on with it, a VPS you can rebuild at any time is a safer place for that than your own computer; the limits and the one exception are under [Security](#security).
+- **Light on the server too.** `kuaid` is a single program of about 3 MB that stays resident in a few MB of memory and needs no runtime such as Node, so a small VPS keeps its resources for Claude Code.
 
-Also: Chinese and English UI, system tray and start at sign-in, tabs you can pin, reorder and reopen, quick open (Ctrl+P: repositories, commands, branches and files), custom commands in context menus, and one-click updates verified by SHA-256.
+## Up and running in five minutes
 
-## How it compares
+1. [Download](#download) and open Kuai.
+2. On the Hosts page click "Add host…" and enter the address and user name of your VPS (or choose a host alias from `~/.ssh/config`), then choose key or password sign-in. Click "Test connection" if you are not sure it will connect.
+3. On first connection Kuai shows the host key fingerprint for you to verify (the dialog explains how); after you confirm, it installs `kuaid` under `~/.kuai` on the host and starts it: **no root, no port open to the network**, and the host does not need Internet access.
+4. Once connected, click "Open repository…" and pick the repository's directory on the host. With no repository yet, use "Clone…" or "New project…".
+5. On the repository's Terminal page, click the ⌄ next to "New terminal" and choose Claude Code. If it is not installed on the host yet, the terminal shows the install command at the top and "Run" installs it (Claude Code uses the official installer and needs no Node.js; Codex and OpenCode install through npm); then sign in as prompted.
+6. When it is done, press <kbd>Ctrl</kbd>+<kbd>&#96;</kbd> to return to the Git page, review the changes, stage by line, commit and push.
 
-**With [Fork](https://fork.dev/).** Kuai's Git UI follows Fork closely, and aims to replace it for everyday use.
+For a repository on this computer: select "This computer" on the Hosts page and click "Add local repository…", or run `kuai <path>` from a command line.
 
-- **What Kuai adds**: repositories on remote hosts; built-in terminals that outlive the app; the Files page and directory mapping; a Chinese UI; open source.
-- **What is still missing**: bisect, a dedicated Git LFS UI, git-flow, and account integration for GitHub, GitLab and the like (creating a pull request only opens the web page; you cannot view or review one inside Kuai).
+<details>
+<summary><b>Before you start, and common situations</b></summary>
 
-**With an IDE.** Kuai is not an IDE. The Files page is for reading and small edits: there is no code completion, go-to-definition or debugger. For heavier editing, map the directory on the host to this computer and open it in VS Code or another editor. The editor then reads and writes files carried over SSH, which suits editing; git, running and building are still best done on the host (in Kuai's Git page and terminal). If you need VS Code extensions or a debugger running on the host, use VS Code's Remote - SSH.
+| Where | What you need | How to check or install |
+|---|---|---|
+| This computer (Windows) | git 2.31 or newer; the OpenSSH client (built into Windows 10 and 11) | `git --version`, `ssh -V`; without git, install [Git for Windows](https://git-scm.com/download/win) |
+| This computer (Linux) | git 2.31 or newer, ssh | `sudo apt install git openssh-client` |
+| Remote host | Linux x86_64 (ARM is not supported yet) or Windows with the OpenSSH server enabled; SSH sign-in works (a key, or the IP, user name and password from your VPS console) | Try `ssh user@address` from a command line first |
+| Remote host | git 2.31 or newer | `git --version`. The git that ships with Ubuntu 20.04 and Debian 11 is too old: on Ubuntu run `sudo add-apt-repository -y ppa:git-core/ppa && sudo apt update && sudo apt install -y git`; on Debian 11 run `sudo apt install -t bullseye-backports git` (enable backports first) |
+| Remote host | The AI assistants you want to use, installed and signed in | Claude Code: `curl -fsSL https://claude.ai/install.sh \| bash` (on a Windows host run `irm https://claude.ai/install.ps1 \| iex` in PowerShell), then open a new terminal, run `claude` and follow the prompts to sign in; if `claude` is not found, add `~/.local/bin` to PATH as the installer describes. Codex: `npm install -g @openai/codex`. OpenCode: `npm install -g opencode-ai` |
+
+- **A host** can be a Linux (x86_64) VPS, cloud server or dev box, or a Windows computer with the OpenSSH server enabled; multi-level **jump hosts** are supported, and nothing is installed on the jump host.
+- **Connections** use the system OpenSSH client, along with your `~/.ssh/config`, keys and ssh-agent; passwords and key passphrases are kept in Windows Credential Manager or the Linux keyring.
+- **Workspaces** group repositories you use together and are stored on the host that holds them: connect from another computer and you see the same list.
+- **Updates**: a newer Kuai updates `kuaid` on the host when it connects, without interrupting running terminals.
+- **Coming from tmux**: reattach existing tmux sessions on the host with `tmux attach` in a Kuai terminal as usual. Start new tasks directly in Kuai's terminal without another tmux layer: Kuai's terminals already live on the host, and a program inside tmux looks like just tmux to Kuai, so stop alerts and message marks on the Sessions page are not accurate for it.
+
+</details>
 
 ## Download
 
-Get it from [GitHub Releases](https://github.com/finmoor/kuai/releases/latest). The binaries are not code-signed: on first run Windows may show "Windows protected your PC"; choose "More info", then "Run anyway". You can check each download against the SHA-256 shown next to it on the Releases page.
+Get it from [GitHub Releases](https://github.com/finmoor/kuai/releases/latest):
 
-For Windows, in either form:
+| System | File | Notes |
+|---|---|---|
+| Windows | `kuai-<version>-windows-x64-setup.exe` (recommended) | Installer; installs into your user profile, no administrator rights needed |
+| Windows | `kuai-<version>-windows-x64.zip` | Portable; unzip and run `kuai.exe` |
+| Ubuntu, Debian | `kuai_<version>_amd64.deb` | `sudo apt install ./kuai_<version>_amd64.deb` |
+| Other Linux | `kuai-<version>-linux-x64.AppImage` | Make it executable and run it |
+| Linux | `kuai-<version>-linux-x64.tar.gz` | Portable; extract and run `kuai` in it |
 
-- **Installer** `kuai-<version>-windows-x64-setup.exe` (recommended): installs into your user profile (`%LOCALAPPDATA%\Programs\Kuai`), no administrator rights needed; starts from the Start menu and uninstalls from Settings → Apps.
-- **Portable** `kuai-<version>-windows-x64.zip`: unzip the Kuai folder anywhere and run `kuai.exe`.
+The binaries are not code-signed: on first run Windows may show "Windows protected your PC"; choose "More info", then "Run anyway". You can check each download against the SHA-256 shown next to it on the Releases page. When a new version is out, a notice appears in the title bar and one click updates Kuai; `kuaid` on your hosts needs no separate update.
 
-For Linux, pick one of three:
-
-- **.deb package** `kuai_<version>_amd64.deb` (Ubuntu, Debian): `sudo apt install ./kuai_<version>_amd64.deb`; it installs into `/opt/kuai` and starts from the application menu or as `kuai`.
-- **AppImage** `kuai-<version>-linux-x64.AppImage` (other distributions): make it executable and run it; the first run adds Kuai to the application menu.
-- **Portable** `kuai-<version>-linux-x64.tar.gz`: extract the Kuai folder anywhere and run `kuai` in it; the first run adds Kuai to the application menu.
-
-The tray icon needs a desktop with StatusNotifierItem support (built into KDE and Ubuntu's GNOME; other GNOME setups need the AppIndicator extension). On Wayland the window cannot be hidden to the tray, so "close to tray" minimizes it instead.
-
-Requirements:
+<details>
+<summary><b>Requirements and installation details</b></summary>
 
 | Where | What |
 |---|---|
@@ -190,32 +199,12 @@ Requirements:
 | Remote host | Linux (x86_64; ARM is not supported yet), or Windows with the OpenSSH server enabled; git 2.31 or newer; no root needed |
 | Directory mapping | On Windows, [WinFsp](https://winfsp.dev/) (Kuai offers to install it through winget if it is missing); on Linux, fuse3, folders only |
 
-When a new version is out, a notice appears left of the gear in the title bar; click it to read the changes and update in one step (the installer build runs the new installer in the background and the portable build replaces its files; on Linux the .deb is installed by apt after the system asks for administrator authentication, and the AppImage replaces its own file). You can also check from Settings → About. `kuaid` on your hosts needs no separate update: a newer Kuai replaces it on connection. Release notes are in [CHANGELOG.md](CHANGELOG.md) (in Chinese).
+- The Windows installer puts Kuai in `%LOCALAPPDATA%\Programs\Kuai`; it starts from the Start menu and uninstalls from Settings → Apps. The portable Kuai folder can live anywhere.
+- On Linux the .deb installs into `/opt/kuai` and starts from the application menu or as `kuai`; the AppImage and the portable build add Kuai to the application menu on first run.
+- The tray icon needs a desktop with StatusNotifierItem support (built into KDE and Ubuntu's GNOME; other GNOME setups need the AppIndicator extension). On Wayland the window cannot be hidden to the tray, so "close to tray" minimizes it instead.
+- Updating: the installer build runs the new installer in the background and the portable build replaces its files; on Linux the .deb is installed by apt after the system asks for administrator authentication, and the AppImage replaces its own file. You can also check from Settings → About. Release notes are in [CHANGELOG.md](CHANGELOG.md) (in Chinese).
 
-## Getting started
-
-### Before you start
-
-| Where | What you need | How to check or install |
-|---|---|---|
-| This computer (Windows) | git 2.31 or newer; the OpenSSH client (built into Windows 10 and 11) | `git --version`, `ssh -V`; without git, install [Git for Windows](https://git-scm.com/download/win) |
-| This computer (Linux) | git 2.31 or newer, ssh | `sudo apt install git openssh-client` |
-| Remote host | Linux x86_64 (ARM is not supported yet) or Windows with the OpenSSH server enabled; SSH sign-in works (a key, or the IP, user name and password from your VPS console) | Try `ssh user@address` from a command line first |
-| Remote host | git 2.31 or newer | `git --version`. The git that ships with Ubuntu 20.04 and Debian 11 is too old: on Ubuntu run `sudo add-apt-repository -y ppa:git-core/ppa && sudo apt update && sudo apt install -y git`; on Debian 11 run `sudo apt install -t bullseye-backports git` (enable backports first) |
-| Remote host | The AI assistants you want to use, installed and signed in | See step 5 below |
-
-### Steps
-
-1. Install and open Kuai.
-2. On the Hosts page click "Add host…" and enter the address and user name of your VPS (or choose a host alias from `~/.ssh/config`), then choose key or password sign-in. Click "Test connection" if you are not sure it will connect.
-3. On first connection Kuai shows the host key fingerprint for you to verify (the dialog explains how); after you confirm, it installs `kuaid` under `~/.kuai` on the host and starts it.
-4. Once connected, click "Open repository…" and pick the repository's directory on the host. With no repository yet, use "Clone…", or pick a directory and initialize a new repository when asked.
-5. Install and sign in to Claude Code on the host: on the repository's Terminal page run the official installer `curl -fsSL https://claude.ai/install.sh | bash` (no Node.js needed, and no root; on a Windows host run `irm https://claude.ai/install.ps1 | iex` in PowerShell), then open a new terminal, run `claude` and follow the prompts to sign in. If `claude` is not found, add `~/.local/bin` to PATH as the installer describes. Codex is `npm install -g @openai/codex` and OpenCode is `npm install -g opencode-ai` (both need Node.js). Kuai does not install them for you; when a preset's program is missing, the terminal shows the install command at the top, and "Run" installs it in that terminal.
-6. Each repository has three pages, Git, Terminal and Files: run `claude` on the Terminal page, then press <kbd>Ctrl</kbd>+<kbd>&#96;</kbd> to return to the Git page, review the changes, stage by line and commit.
-
-For a repository on this computer: select "This computer" on the Hosts page and click "Add local repository…", or run `kuai.exe <path>` from a command line.
-
-**Coming from tmux:** reattach existing tmux sessions on the host with `tmux attach` in a Kuai terminal as usual; attaching over plain SSH keeps working too. Start new tasks directly in Kuai's terminal without another tmux layer: Kuai's terminals already live on the host, and a program inside tmux looks like just tmux to Kuai, so stop alerts and message marks on the Sessions page are not accurate for it.
+</details>
 
 ## How it works
 
@@ -257,6 +246,11 @@ Kuai does not implement its own connection or authentication; it leaves both to 
 Keep in mind: Kuai does not restrict what programs in a terminal do on the host. Claude Code and the like have all the rights of the signed-in user there, exactly as when you run them over plain SSH; keys and tokens stored on the host (git credentials, API keys and so on) are theirs to use as well, so keep only what the project needs on the host.
 
 Found a security issue? Please report it privately through [Report a vulnerability](https://github.com/finmoor/kuai/security/advisories/new) on the Security tab rather than in a public issue.
+
+## How it compares
+
+- **With [Fork](https://fork.dev/)**: Kuai's Git UI follows Fork closely, and aims to replace it for everyday use. It adds repositories on remote hosts, built-in terminals that outlive the app, the Files page and directory mapping, a Chinese UI, and it is open source. Still missing: bisect, a dedicated Git LFS UI, git-flow, and account integration for GitHub, GitLab and the like (creating a pull request only opens the web page; you cannot view or review one inside Kuai).
+- **With an IDE**: Kuai is not an IDE. The Files page is for reading and small edits: there is no code completion, go-to-definition or debugger. For heavier editing, map the directory on the host to this computer and open it in VS Code or another editor. The editor then reads and writes files carried over SSH, which suits editing; git, running and building are still best done on the host. If you need VS Code extensions or a debugger running on the host, use VS Code's Remote - SSH.
 
 ## Feedback
 
