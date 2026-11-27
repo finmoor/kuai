@@ -270,6 +270,24 @@ pub fn terminal_launch(
     })
 }
 
+/// 本机终端用的 shell：设置里选的，没选、找不到了用第一个找得到的；程序和参数。一个都没有是空的。
+/// 本机的定时任务开终端时带上它，和手动开的终端一样。
+pub fn local_shell_command(app: &Entity<AppState>, cx: &App) -> Vec<String> {
+    let preferred = app.read(cx).settings.terminal_shell.clone();
+    let mut shells = local_shells();
+    if shells.is_empty() {
+        return Vec::new();
+    }
+    let at = shells
+        .iter()
+        .position(|shell| shell.id == preferred)
+        .unwrap_or(0);
+    let shell = shells.swap_remove(at);
+    let mut command = vec![shell.program.to_string_lossy().into_owned()];
+    command.extend(shell.args);
+    command
+}
+
 fn no_shell() -> &'static str {
     if cfg!(windows) {
         tr("未找到可用的 shell（PowerShell、cmd）。")

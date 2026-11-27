@@ -241,7 +241,7 @@ fn read_loop(mut reader: TcpStream, session: &Session, paused: &Sender<()>) -> O
 
 /// 终端里开哪个 shell：sshd 配的默认 shell（ssh 登录上来用的就是它），没配就依次找
 /// PowerShell 7、Windows PowerShell、命令提示符。
-fn default_shell() -> Vec<String> {
+pub fn default_shell() -> Vec<String> {
     let program = sshd_default_shell()
         .filter(|path| std::path::Path::new(path).is_file())
         .or_else(|| find_in_path("pwsh.exe"))

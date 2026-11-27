@@ -37,8 +37,8 @@ use serde_json::json;
 pub use fr_core::askpass::PromptKind;
 pub use fr_core::hop::run_helper as run_ssh_hop;
 pub use fr_core::protocol::{
-    DirEntry, DirListing, FsEntry, FsExpect, FsSpace, FsStat, FsWrite, FsWritten, Hello, SubRepos,
-    TermInfo, TermMark,
+    DaemonStatus, DirEntry, DirListing, FsEntry, FsExpect, FsSpace, FsStat, FsWrite, FsWritten,
+    Hello, SubRepos, TermInfo, TermMark,
 };
 #[cfg(unix)]
 pub use remote::local_run_dir;
@@ -217,6 +217,21 @@ pub struct StateStream {
 
 impl Stream for StateStream {
     type Item = Result<fr_core::store::Store>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.rx).poll_next(cx)
+    }
+}
+
+/// 一台主机上的定时任务：先来现在的整份，之后每次有改动来一份新的（见 [`Connection::task_watch`]）。
+/// 连接断了，流以一个错误结束。丢弃就不订阅了。
+pub struct TaskStream {
+    rx: mpsc::UnboundedReceiver<Result<fr_core::tasks::TaskFile>>,
+    _cancel: Box<dyn Send>,
+}
+
+impl Stream for TaskStream {
+    type Item = Result<fr_core::tasks::TaskFile>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.rx).poll_next(cx)

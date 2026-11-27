@@ -73,6 +73,7 @@ Every repository has its own terminals, running on the host the repository lives
 - **Several tasks at once**: a repository can have several terminals; rename them, or view 2 to 4 side by side
 - **Hand it a screenshot**: copy a screenshot and paste, or drop images and files on the terminal; they are uploaded to the host
 - **Claude Code in one click**: a new terminal can start Claude Code, Codex, OpenCode, Antigravity CLI or a command of your own, or continue the last conversation
+- **Work that starts on time**: scheduled tasks open a terminal on the host at the set time and start Claude Code, Codex and others with the model, reasoning effort and prompt you chose, say to review yesterday's commits every morning. The host runs them, so Kuai can stay closed, and each run can get a fresh worktree
 - **Find your way in a long conversation**: the input area stays pinned at the bottom while you scroll back; the marks on the left are the messages you sent, with a preview on hover and a jump on click
 - Terminals of local repositories also keep running after Kuai quits
 
@@ -226,7 +227,7 @@ flowchart LR
 ```
 
 - **git runs on the host.** The client only receives the output and draws it; the code that parses it and lays out the commit graph (`fr-core`) is shared by the client and `kuaid`.
-- **`kuaid` is a single statically linked binary** (about 3 MB on Linux), uploaded over SSH into `~/.kuai`. It exits by itself 10 minutes after the last client has disconnected and the last terminal has ended.
+- **`kuaid` is a single statically linked binary** (about 3 MB on Linux), uploaded over SSH into `~/.kuai`. It exits by itself 10 minutes after the last client has disconnected and the last terminal has ended, unless scheduled tasks are enabled. It can be set to start at boot on the Hosts page (on Linux through the user's crontab, no root needed).
 - **All traffic goes through the stdin and stdout of SSH**, using the keys and configuration you already have: no port to open in a firewall, no extra account.
 - **A native UI.** The client is written in Rust with [GPUI](https://www.gpui.rs/) (via [gpui-kit](https://github.com/longbridge/gpui-kit)) and drawn on the GPU. In the feasibility test, on a repository with 200,000 commits and up to 13 parallel lanes, parsing the history took 79 ms, laying out the lanes 14 ms, and a frame while scrolling 2.7 ms on average.
 

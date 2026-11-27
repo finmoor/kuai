@@ -113,6 +113,31 @@ pub fn connect() -> Result<()> {
     pump(stream)
 }
 
+/// `kuaid --boot`：开机时（Windows 上是登录时）由启动项运行。常驻进程没在跑就拉起来，然后退出。
+pub fn boot() -> Result<()> {
+    // 登录时由 Run 键启动，系统会给我们开一个控制台窗口：马上脱开，窗口跟着关掉
+    #[cfg(windows)]
+    // SAFETY: 没有参数，只是不再连着控制台
+    unsafe {
+        windows_sys::Win32::System::Console::FreeConsole();
+    }
+    // 开机时 cron 给的 SHELL 是 /bin/sh：拉起的常驻进程开的终端就成了 sh，读不到 ~/.bashrc 里加的
+    // PATH（nvm 装的 claude、codex）。按账号登记的登录 shell 来
+    #[cfg(unix)]
+    if let Some(shell) = crate::term::pty::passwd_shell() {
+        // SAFETY: 刚启动，还没有别的线程
+        unsafe { std::env::set_var("SHELL", shell) };
+    }
+    let paths = Paths::new()?;
+    paths.create()?;
+    #[cfg(windows)]
+    let _ = std::env::set_current_dir(crate::dirs::home_dir());
+    let mut started = None;
+    let stream = connect_or_start(&paths, &mut started, Instant::now() + WAIT)?;
+    drop(stream);
+    Ok(())
+}
+
 /// 常驻进程换不换成我们这一版：版本号比我们旧就换；版本号一样、程序不一样（开发时）也换。
 fn should_replace(theirs: &str, mine: &str) -> bool {
     let version = |build: &str| -> Vec<u64> {

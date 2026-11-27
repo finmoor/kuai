@@ -237,6 +237,8 @@ pub struct Row {
     pub kind: Kind,
     /// 离开期间（重开 Kuai、断线重连）有过新输出，还没看过
     pub away: bool,
+    /// 看过最近一次输出以后的样子（看过以后没有新输出）。会话页里选中着的那个要等选到别的才算
+    pub seen: bool,
     /// 所在主机连着
     pub online: bool,
     pub last_output: Option<Instant>,
@@ -244,6 +246,24 @@ pub struct Row {
     pub born: u64,
     /// 除了 shell 还在跑的程序（协议 14 起 kuaid 随列表推）。空着是不知道：旧版 kuaid
     pub programs: Option<Vec<String>>,
+    /// 定时任务开出来的：哪个任务的哪一次
+    pub task: Option<TaskMark>,
+    /// 会话页里同一个任务的几次运行折成一行时，最新那一行后面折起来了几次（会话页自己填）
+    pub folded: usize,
+}
+
+/// 定时任务开出来的终端是哪个任务的哪一次（会话页的时钟角标、横条、折行用）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskMark {
+    pub task: String,
+    pub run: String,
+    pub name: SharedString,
+    /// 本该运行的时间（任务所在主机的时间）
+    pub at: fr_core::schedule::Wall,
+    /// 实际开始的时刻（Unix 秒）：同一分钟里手动运行了几次时，名字里靠它的秒数区分
+    pub started: u64,
+    /// 开在新建的工作树里
+    pub worktree: bool,
 }
 
 /// 终端里跑的是哪一类程序：会话页侧栏按它挑图标。
@@ -422,6 +442,8 @@ pub struct TermBoard {
     /// 各终端提醒上算哪一类、列表里写什么名字（列表到了、每秒重算状态时一起算：要读预设和设置）
     kinds: HashMap<TermId, Kind>,
     labels: HashMap<TermId, (SharedString, bool)>,
+    /// 定时任务开出来的终端（见 [`TaskMark`]）
+    task_marks: HashMap<TermId, TaskMark>,
     shown: Option<Shown>,
     /// 上次运行（和这次断开过的主机）存下的看过的时刻、离开的时刻
     memory: Memory,
@@ -487,6 +509,7 @@ impl TermBoard {
             states: HashMap::new(),
             kinds: HashMap::new(),
             labels: HashMap::new(),
+            task_marks: HashMap::new(),
             shown: None,
             memory: term_memory::load(),
             dirty: false,
@@ -783,9 +806,11 @@ impl TermBoard {
     /// 仓库里重名的，序号最小的那个不加，别的后面加上自己的序号（Claude Code、Claude Code 2，和仓库终端页
     /// 侧栏里那一格序号一样）。起了名字的照样占着默认名字：改一个的名字、结束一个，别的名字都不变。
     fn refresh_meta(&mut self, cx: &App) {
-        let names = &self.app.read(cx).settings.term_names;
+        let app = self.app.read(cx);
+        let names = &app.settings.term_names;
         self.kinds.clear();
         self.labels.clear();
+        self.task_marks.clear();
         for (machine, list) in &self.lists {
             let mut order: Vec<&Listed> = list.iter().collect();
             order.sort_by(|a, b| (&a.owner.0.path, a.owner.1).cmp(&(&b.owner.0.path, b.owner.1)));
@@ -800,7 +825,31 @@ impl TermBoard {
                     entry: listed.owner.0.clone(),
                     number: listed.owner.1,
                 };
-                let start = presets::started(&slot, Some(&listed.info.term), cx);
+                // 定时任务开出来的：叫任务的名字，按它的预设认是哪家程序
+                let run_of = app.task_run_of(machine, &listed.info.term);
+                if let Some((task, run)) = run_of {
+                    self.task_marks.insert(
+                        id.clone(),
+                        TaskMark {
+                            task: task.id.clone(),
+                            run: run.id.clone(),
+                            name: task.name.clone().into(),
+                            at: run.at,
+                            started: run.started,
+                            worktree: run.worktree.is_some(),
+                        },
+                    );
+                }
+                let task = run_of.map(|(task, _)| task);
+                let start = match task {
+                    Some(task) => Some(presets::Start {
+                        name: task.name.clone(),
+                        command: task.preset.command.clone(),
+                        icon: task.preset.icon.clone(),
+                        hue: task.preset.hue,
+                    }),
+                    None => presets::started(&slot, Some(&listed.info.term), cx),
+                };
                 let kind = kind_of(
                     listed.info.programs.as_deref(),
                     listed.info.alive,
@@ -812,13 +861,49 @@ impl TermBoard {
                     .title
                     .as_deref()
                     .filter(|title| !title.is_empty());
-                bases.push((id, listed, presets::display_name(title, start.as_ref())));
+                let base = match task {
+                    Some(task) => Some(task.name.clone().into()),
+                    None => presets::display_name(title, start.as_ref()),
+                };
+                bases.push((id, listed, base));
             }
+            let host_now = app
+                .task_book(machine)
+                .and_then(|book| book.file.clock.as_ref())
+                .map(crate::tasks::host_now);
             for (id, listed, base) in &bases {
                 if let Some(name) = term_names::find(names, machine, &listed.info.term, listed.born)
                 {
                     self.labels
                         .insert(id.clone(), (name.to_string().into(), true));
+                    continue;
+                }
+                // 同一个定时任务开着好几次运行：后面写开始时间（比终端的序号好认），只有一次时就叫任务名
+                if let Some(mark) = self.task_marks.get(id) {
+                    let siblings: Vec<&TaskMark> = self
+                        .task_marks
+                        .iter()
+                        .filter(|(other, other_mark)| {
+                            other.machine == id.machine && other_mark.task == mark.task
+                        })
+                        .map(|(_, other_mark)| other_mark)
+                        .collect();
+                    let label: SharedString = match siblings.len() > 1 {
+                        true => {
+                            let mut when =
+                                crate::tasks::text::short_when(&mark.at, host_now.as_ref());
+                            // 同一分钟里运行了几次（手动连着点）：再带上秒
+                            if siblings
+                                .iter()
+                                .any(|other| other.run != mark.run && other.at == mark.at)
+                            {
+                                when.push_str(&format!(":{:02}", mark.started % 60));
+                            }
+                            format!("{} {when}", mark.name).into()
+                        }
+                        false => mark.name.clone(),
+                    };
+                    self.labels.insert(id.clone(), (label, false));
                     continue;
                 }
                 let label = match base {
@@ -1182,8 +1267,15 @@ impl TermBoard {
             .get(&id)
             .cloned()
             .unwrap_or_else(|| (tf!("终端 {n}", n = number.to_string()).into(), false));
+        let task = self.task_marks.get(&id).cloned();
+        let seen = match (self.seen.get(&id), listed.last_output) {
+            (Some(seen), Some(at)) => *seen >= at,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
         Row {
             away: self.away.contains(&id),
+            seen,
             kind: self.kinds.get(&id).copied().unwrap_or(Kind::Command),
             id,
             entry,
@@ -1199,6 +1291,8 @@ impl TermBoard {
             last_output: listed.last_output,
             born: listed.born,
             programs: listed.info.programs.clone(),
+            task,
+            folded: 0,
         }
     }
 
@@ -1479,10 +1573,13 @@ pub(crate) mod tests {
             state: TermState::Idle,
             kind: Kind::Shell,
             away: false,
+            seen: false,
             online: true,
             last_output: None,
             born: 0,
             programs: None,
+            task: None,
+            folded: 0,
         }
     }
 

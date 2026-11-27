@@ -404,7 +404,8 @@ pub fn path() -> PathBuf {
     dir().join(FILE)
 }
 
-fn dir() -> PathBuf {
+/// 放状态文件的目录（任务文件也在这里，见 [`crate::tasks::path`]）。
+pub fn dir() -> PathBuf {
     let env = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
     if let Some(home) = env("FR_KUAID_HOME") {
         return PathBuf::from(home).join("kuai");

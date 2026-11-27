@@ -57,6 +57,7 @@ use crate::repo_scan::RepoScan;
 use crate::settings::{Front, RepoEntry};
 use crate::settings_page::SettingsPage;
 use crate::tab_fit::{self, Segment};
+use crate::tasks::page::{TaskPage, TaskPageEvent};
 use crate::term_board::{
     AwayUpdates, BoardHandle, Row as TermRow, Shown, TermBoard, TermId, Waiting,
 };
@@ -104,6 +105,8 @@ enum Page {
     Servers,
     Terms,
     Workspaces,
+    /// 定时任务（协议 18，见 `tasks`）
+    Tasks,
     /// `tabs` 里的第几个
     Repo(usize),
 }
@@ -115,6 +118,7 @@ enum Page {
 enum Nav {
     Servers,
     Terms,
+    Tasks,
     Workspaces {
         machine: String,
         key: Option<WorkspaceKey>,
@@ -232,6 +236,8 @@ pub struct Workspace {
     manager: Entity<ManagerView>,
     /// 工作区页（标题栏上的「工作区」）
     workspaces: Entity<WorkspacePage>,
+    /// 任务页（标题栏上的「任务」）
+    tasks_page: Entity<TaskPage>,
     settings_page: Entity<SettingsPage>,
     /// 仓库（和子仓库）的标签页，全局一份
     tabs: Vec<RepoTab>,
@@ -298,6 +304,7 @@ impl Workspace {
             cx.new(|cx| WorkspacePage::new(app.clone(), board.clone(), scan.clone(), window, cx));
         let settings_page = cx.new(|cx| SettingsPage::new(app.clone(), updater.clone(), cx));
         let overview = cx.new(|cx| TermOverview::new(app.clone(), board.clone(), window, cx));
+        let tasks_page = cx.new(|cx| TaskPage::new(app.clone(), board.clone(), cx));
         let quitting = Rc::new(Cell::new(false));
         let subscriptions = vec![
             cx.subscribe_in(&manager, window, |this, _, event, window, cx| match event {
@@ -331,6 +338,25 @@ impl Workspace {
                     PageEvent::RunInTerminal(entry, start) => {
                         this.new_terminal_for(entry.clone(), start.clone(), window, cx)
                     }
+                },
+            ),
+            cx.subscribe_in(
+                &tasks_page,
+                window,
+                |this, _, event: &TaskPageEvent, window, cx| match event {
+                    TaskPageEvent::OpenTerminal(id) => {
+                        let row = this.board.read(cx).row(id);
+                        if let Some(row) = row {
+                            this.go_to_terminal(&row, window, cx);
+                        }
+                    }
+                    TaskPageEvent::ShowHost(machine) => {
+                        let machine = machine.clone();
+                        this.show_page(Page::Servers, window, cx);
+                        this.manager
+                            .update(cx, |manager, cx| manager.select(machine, cx));
+                    }
+                    TaskPageEvent::OpenRepo(entry) => this.open(entry.clone(), window, cx),
                 },
             ),
             // 设置变了：服务器改名要刷新标签上的名字；服务器被移除了，它上面的仓库的标签页跟着关掉；
@@ -385,6 +411,12 @@ impl Workspace {
                         at,
                         dir,
                     } => this.open_repo_path(entry, path.clone(), *at, *dir, window, cx),
+                    Go::Task { machine, id } => {
+                        let (machine, id) = (machine.clone(), id.clone());
+                        this.show_page(Page::Tasks, window, cx);
+                        this.tasks_page
+                            .update(cx, |page, cx| page.select(&machine, &id, cx));
+                    }
                 },
             ),
             cx.subscribe_in(&board, window, |this, _, event: &Waiting, window, cx| {
@@ -611,6 +643,7 @@ impl Workspace {
             updater,
             manager,
             workspaces,
+            tasks_page,
             settings_page,
             tabs: Vec::new(),
             page: Page::Workspaces,
@@ -646,6 +679,7 @@ impl Workspace {
         }
         this.page = match &saved.front {
             Front::Servers => Page::Servers,
+            Front::Tasks => Page::Tasks,
             Front::Workspaces | Front::Terms => Page::Workspaces,
             Front::Repo(entry) => this
                 .tabs
@@ -1478,6 +1512,7 @@ impl Workspace {
         match self.page {
             Page::Servers => Nav::Servers,
             Page::Terms => Nav::Terms,
+            Page::Tasks => Nav::Tasks,
             Page::Workspaces => {
                 let (machine, key) = self.workspaces.read(cx).selection(cx);
                 Nav::Workspaces { machine, key }
@@ -1498,6 +1533,7 @@ impl Workspace {
         match nav {
             Nav::Servers => trc("页面", "主机").into(),
             Nav::Terms => trc("页面", "会话").into(),
+            Nav::Tasks => trc("页面", "任务").into(),
             Nav::Workspaces { key: Some(key), .. } => {
                 tf!("工作区「{name}」", name = app.workspace_name(key)).into()
             }
@@ -1567,6 +1603,7 @@ impl Workspace {
     fn visit(&mut self, nav: Nav, window: &mut Window, cx: &mut Context<Self>) {
         match nav {
             Nav::Servers => self.show_page(Page::Servers, window, cx),
+            Nav::Tasks => self.show_page(Page::Tasks, window, cx),
             Nav::Terms => {
                 self.show_terms(window, cx);
                 if self.terms_typing {
@@ -1631,6 +1668,12 @@ impl Workspace {
         }
         if was == Some(Page::Servers) {
             self.manager.update(cx, |page, _| page.hidden());
+        }
+        if was == Some(Page::Tasks) {
+            self.tasks_page.update(cx, |page, _| page.hidden());
+        }
+        if now == Some(Page::Tasks) {
+            self.tasks_page.update(cx, |page, cx| page.shown(cx));
         }
         if now == Some(Page::Terms) {
             self.overview
@@ -2067,6 +2110,15 @@ impl Workspace {
     /// 按钮闪，再发一条系统通知（设置里可以关）。
     fn terminal_waiting(&mut self, row: &TermRow, window: &mut Window, cx: &mut Context<Self>) {
         if !self.app.read(cx).settings.notify_terminal_stopped {
+            return;
+        }
+        // 定时任务关了「停下时通知」：标题栏上照样计数，不弹通知
+        if self
+            .app
+            .read(cx)
+            .task_run_of(&row.id.machine, &row.id.term)
+            .is_some_and(|(task, _)| !task.notify)
+        {
             return;
         }
         let app = self.app.read(cx);
@@ -2653,6 +2705,7 @@ impl Workspace {
             Page::Servers => Front::Servers,
             Page::Terms => Front::Terms,
             Page::Workspaces => Front::Workspaces,
+            Page::Tasks => Front::Tasks,
             Page::Repo(ix) => repos
                 .get(ix)
                 .cloned()
@@ -3312,6 +3365,34 @@ impl Workspace {
             .when(narrow, |tab| {
                 tab.tooltip(move |window, cx| ui::tip(workspaces_label, window, cx))
             });
+        // 定时任务：有正在运行的、等着查看的标一个点
+        let tasks_label = trc("页面", "任务");
+        let busy = crate::tasks::busy(self.app.read(cx), self.board.read(cx));
+        let tasks = self
+            .render_page_entry(
+                Page::Tasks,
+                "page-tasks",
+                IconName::Clock,
+                tasks_label,
+                narrow,
+                cx,
+            )
+            .when(busy, |tab| {
+                tab.child(
+                    div()
+                        .flex_none()
+                        .size(px(6.))
+                        .rounded_full()
+                        .bg(cx.theme().primary),
+                )
+            })
+            .tooltip(move |window, cx| {
+                let text = match busy {
+                    true => tr("定时任务：有任务正在运行").to_string(),
+                    false => tasks_label.to_string(),
+                };
+                ui::tip(text, window, cx)
+            });
         // 最左边的后退、前进：提示里写会回到哪
         let travel = |back: bool, cx: &mut Context<Self>| {
             let target = self.travel_target(back, cx);
@@ -3474,6 +3555,7 @@ impl Workspace {
                             .child(servers)
                             .child(terms)
                             .child(workspaces)
+                            .child(tasks)
                             .child(div().flex_none().w(px(1.)).h(px(16.)).mx(px(4.)).bg(border))
                     })
                     // 标签页那一块画在这个占位的块里面（绝对定位）。标题栏的宽度按里面内容的
@@ -3997,6 +4079,7 @@ impl Render for Workspace {
                 Page::Servers => self.manager.clone().into_any_element(),
                 Page::Terms => self.overview.clone().into_any_element(),
                 Page::Workspaces => self.workspaces.clone().into_any_element(),
+                Page::Tasks => self.tasks_page.clone().into_any_element(),
                 Page::Repo(ix) => match self.tabs.get(ix) {
                     Some(tab) => tab.view.clone().into_any_element(),
                     None => self.workspaces.clone().into_any_element(),

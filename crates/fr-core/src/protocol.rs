@@ -96,6 +96,23 @@
 //! - `relay_input`：参数 `{relay, eof}`，`relay` 是 `relay_open` 的请求编号，请求带的字节写进 ssh 的
 //!   标准输入；`eof` 为真时写完关掉标准输入。不回响应。
 //!
+//! 定时任务（协议 18 起，格式见 [`crate::tasks`]）。存在主机上，到点由 kuaid 按主机的本地时间运行，
+//! 没有客户端连着也照常运行：
+//! - `task_get`：返回 [`crate::tasks::TaskFile`]（任务、运行记录，`clock` 是主机现在的钟）。
+//! - `task_watch`：订阅。先回一条 `chunk: true`、`result` 是现在的整份，之后每次有改动（改了任务、
+//!   开始或结束一次运行、会话的最后一行变了）再回一条整份，直到被 `cancel`。
+//! - `task_apply`：参数 `{ops: [TaskOp]}`，依次执行，返回改完的整份。有一个做不了就都不算，回 `error`。
+//! - `task_run`：参数 `{id}`，立即运行一次，返回这次的 [`crate::tasks::Run`]（跳过、启动失败时
+//!   `outcome` 写着，不回 `error`）。
+//! - `task_screen`：参数 `{run}`，返回 `{}`，后面跟着这次运行结束时存下的画面（还原屏幕用的输出）。
+//! - `term_close` 结束的是定时任务开出来的终端时，先存下画面，工作树里没有改动的连同分支删除。
+//!
+//! 常驻进程本身（协议 18 起，主机页「常驻进程」一栏用）：
+//! - `daemon_status`：返回 [`DaemonStatus`]：运行了多久、时区、开机时启动开没开、几个定时任务。
+//! - `autostart_set`：参数 `{enabled}`，打开或关掉开机时启动（Linux 写 crontab，Windows 写 Run 键），
+//!   返回 [`DaemonStatus`]。设不了时回 `error`。
+//! - 重启用 `shutdown`：常驻进程退出后客户端重连，转接程序拉起新的。
+//!
 //! 给 ssh 转接程序（`kuaid --connect`）和运维用的：
 //! - `info`：返回 [`DaemonInfo`]。
 //! - `bridge`：参数 `{auth_sock}`，转接程序报告这条 ssh 连接转发过来的 ssh-agent 套接字。不回响应。
@@ -133,10 +150,12 @@ use serde_json::Value;
 /// 映射到本机的盘（Linux 上的 FUSE）要的：文件的权限位（[`FsStat::mode`]）、`fs_chmod`；`fs_pwrite`
 /// 可以带 `append`（在主机上追加到末尾），同一个文件的 `fs_pwrite` 按收到的先后做；`fs_remove` 可以带
 /// `kind`（只删这一种，`file` 或 `dir`）；`fs_rename` 带 `replace` 时目录可以盖空目录。
+/// 18：定时任务（`task_get`、`task_watch`、`task_apply`、`task_run`、`task_screen`）；常驻进程的情况
+/// 和开机时启动（`daemon_status`、`autostart_set`）。
 ///
 /// 客户端握手（`hello`）时带上自己的 `protocol`，kuaid 按它决定发不发新加的东西：kuaid 可以比客户端
 /// 新（另一台电脑上更新的 Kuai 换上的），旧客户端认不得的不能发给它。
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// 客户端的协议从这一版起，kuaid 才在终端流里发消息刻度（[`TermMarks`]）、分段还原屏幕
 /// （[`TermOpened::restore`]）。更旧的客户端把终端流里带结果的消息都当成 [`TermOpened`]，收到刻度
@@ -240,6 +259,30 @@ pub struct DaemonInfo {
     /// 目录联接和符号链接。带着它的 Kuai 拉起来的才会这样，换一个不带的 Kuai 来起就没有了
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub guarded: bool,
+}
+
+/// `daemon_status`、`autostart_set` 的结果（协议 18 起）：主机页「常驻进程」一栏要的。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DaemonStatus {
+    #[serde(flatten)]
+    pub info: DaemonInfo,
+    /// 这个程序已经运行了多少秒（升级换了程序从头算）
+    #[serde(default)]
+    pub uptime: u64,
+    /// 主机的钟和时区
+    #[serde(default)]
+    pub clock: crate::tasks::Clock,
+    /// 开机时启动开没开；这台主机设不了时为空，原因在 `autostart_error`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autostart: Option<bool>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub autostart_error: String,
+    /// 启用的、按时运行的定时任务有几个
+    #[serde(default)]
+    pub tasks: usize,
+    /// 定时任务开出来、还没结束的终端有几个（重启前的确认里说）
+    #[serde(default)]
+    pub task_terms: usize,
 }
 
 /// `term_open` 的参数。

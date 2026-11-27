@@ -31,6 +31,8 @@ fn kuaid_bin() -> PathBuf {
 /// 一个临时的主目录，里面按客户端上传的样子装着 kuaid。丢弃时让常驻进程退出、删掉目录。
 struct Home {
     dir: PathBuf,
+    /// 常驻进程多带的环境变量（假钟这些）
+    env: Vec<(String, String)>,
 }
 
 impl Home {
@@ -49,7 +51,10 @@ impl Home {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        Home { dir }
+        Home {
+            dir,
+            env: Vec::new(),
+        }
     }
 
     /// 装一个版本：`~/.kuai/<build>/kuaid.exe`，旁边是随带的新版 ConPTY（和 Kuai 装的一样）。
@@ -74,6 +79,7 @@ impl Home {
         let mut cmd = Command::new(exe);
         cmd.env("FR_KUAID_HOME", &self.dir)
             .env_remove("SSH_AUTH_SOCK")
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
             .current_dir(&self.dir);
         cmd
     }
@@ -1007,4 +1013,339 @@ fn 传上来的文件_终端里的程序读得到_列目录从盘符往下() {
     let root = client.call("list_dir", json!({ "path": format!("/{drive}") }));
     assert_eq!(root["path"], format!("{drive}/"));
     assert_eq!(root["parent"], "/");
+}
+
+/// 在 `dir` 里建一个有一个提交的仓库。
+fn make_repo(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}：{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(&["add", "a.txt"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "一",
+    ]);
+}
+
+/// 定时任务：`repo` 里每天 9 点，用 PowerShell 的 `Write-Output` 把提示词打出来。
+fn echo_task(repo: &Path, extra: Value) -> Value {
+    let mut task = json!({
+        "id": "t1",
+        "name": "夜间 测试",
+        "prompt": "kuai-task-hello",
+        "repo": repo,
+        "preset": { "name": "echo", "command": "Write-Output" },
+        "launch": { "command": "Write-Output", "prompt": "arg" },
+        "shell": shell(),
+        "schedule": { "kind": "daily", "time": "09:00" },
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        task[key] = value.clone();
+    }
+    json!({ "ops": [{ "op": "set", "task": task }] })
+}
+
+#[test]
+fn 定时任务到点开终端输入命令_结束时存下画面_没改动的工作树删掉() {
+    let mut home = Home::new();
+    // 假钟：差几秒九点
+    home.env = vec![
+        ("FR_KUAID_CLOCK".into(), "2026-11-27 08:59:56".into()),
+        ("FR_KUAID_TASK_TICK".into(), "300".into()),
+    ];
+    let exe = home.install("1.0.0-tasks");
+    let repo = home.dir.join("code").join("app");
+    make_repo(&repo);
+    let mut client = home.connect(&exe);
+    client.hello();
+    let watch = client.send("task_watch", json!({}), &[]);
+    let (first, _) = client.take("第一份任务", |r| r.id == watch && r.chunk);
+    let clock = &first.result.unwrap()["clock"];
+    assert_eq!(clock["zone"], "test");
+    assert_eq!(clock["now"]["hour"], 8);
+
+    let applied = client.call(
+        "task_apply",
+        echo_task(&repo, json!({ "worktree": "head" })),
+    );
+    assert_eq!(applied["tasks"][0]["id"], "t1");
+
+    // 到九点：开了终端、记了一条运行记录
+    let mut run = Value::Null;
+    wait_until("九点的运行", || {
+        run = client.call("task_get", json!({}))["runs"][0].clone();
+        run["term"].is_string()
+    });
+    assert_eq!(run["outcome"], "started");
+    assert_eq!(run["trigger"], "scheduled");
+    assert_eq!(run["at"]["hour"], 9);
+    let term = run["term"].as_str().unwrap().to_string();
+    let worktree = PathBuf::from(run["worktree"].as_str().unwrap());
+    assert!(worktree.is_dir(), "工作树没建：{worktree:?}");
+    assert!(
+        worktree
+            .to_string_lossy()
+            .ends_with(r"app.worktrees\夜间-测试-1127-0900"),
+        "{worktree:?}"
+    );
+    // 终端开在工作树里，叫仓库的第 2 个终端；命令输入了，提示词打出来了（只看着接上，不改大小）
+    let info = client.terms().into_iter().find(|t| t.term == term).unwrap();
+    assert!(info.key.ends_with("\u{1f}2"), "{:?}", info.key);
+    assert_eq!(PathBuf::from(&info.cwd), worktree);
+    let stream = client.send(
+        "term_attach",
+        json!({ "term": term, "cols": 120, "rows": 36, "watch": true }),
+        &[],
+    );
+    let seen = client.output_until(stream, "kuai-task-hello");
+    // PowerShell 边打边上色，命令被转义序列拆开了，只看变量名在
+    assert!(seen.contains("KUAI_TASK_PROMPT"), "{seen:?}");
+    client.send("cancel", json!({ "id": stream }), &[]);
+
+    // 上一次还在运行（刚开的）：立即运行跳过
+    let skipped = client.call("task_run", json!({ "id": "t1" }));
+    assert_eq!(skipped["outcome"], "skipped");
+    assert_eq!(skipped["reason"], "上一次仍在运行");
+
+    // 订阅的收到了推送
+    let (pushed, _) = client.take("运行记录的推送", |r| {
+        r.id == watch
+            && r.chunk
+            && r.result
+                .as_ref()
+                .is_some_and(|f| f["runs"][0]["term"].is_string())
+    });
+    assert_eq!(pushed.result.unwrap()["runs"][0]["task"], "t1");
+
+    // 结束终端：存下画面，工作树里没改动，连同分支删掉
+    client.call("term_close", json!({ "term": term }));
+    let file = client.call("task_get", json!({}));
+    let ended = file["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["term"] == term.as_str())
+        .unwrap()
+        .clone();
+    assert!(ended["ended"].is_u64());
+    assert_eq!(ended["screen"], true);
+    assert_eq!(ended["changes"], 0);
+    wait_until("没改动的工作树删掉", || !worktree.exists());
+    wait_until("空着的 app.worktrees 一起删掉", || {
+        !worktree.parent().unwrap().exists()
+    });
+    wait_until("分支一起删掉", || {
+        let branches = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "--list"])
+            .output()
+            .unwrap();
+        !String::from_utf8_lossy(&branches.stdout).contains("夜间")
+    });
+    let id = client.send("task_screen", json!({ "run": ended["id"] }), &[]);
+    let (response, screen) = client.reply(id, "task_screen 的回答");
+    assert_eq!(response.error, None);
+    assert!(String::from_utf8_lossy(&screen).contains("kuai-task-hello"));
+
+    // 有按时运行的任务：常驻进程不因为空闲退出（这里只看它报的终端数，空闲退出要十分钟）
+    client.call(
+        "task_apply",
+        json!({ "ops": [{ "op": "remove", "id": "t1" }] }),
+    );
+    assert_eq!(client.call("task_get", json!({}))["runs"], json!([]));
+}
+
+#[test]
+fn 定时任务_工作树里有改动就留着() {
+    let mut home = Home::new();
+    home.env = vec![("FR_KUAID_TASK_TICK".into(), "300".into())];
+    let exe = home.install("1.0.0-tasks2");
+    let repo = home.dir.join("code").join("app");
+    make_repo(&repo);
+    let mut client = home.connect(&exe);
+    client.hello();
+    // 手动运行的任务：命令往工作树里写一个文件
+    let task = echo_task(
+        &repo,
+        json!({
+            "worktree": "head",
+            "schedule": { "kind": "manual" },
+            "launch": { "command": "Set-Content new.txt", "prompt": "arg" },
+        }),
+    );
+    client.call("task_apply", task);
+    let run = client.call("task_run", json!({ "id": "t1" }));
+    assert_eq!(run["outcome"], "started", "{run}");
+    assert_eq!(run["trigger"], "manual");
+    let worktree = PathBuf::from(run["worktree"].as_str().unwrap());
+    wait_until("命令写出文件", || worktree.join("new.txt").is_file());
+    let term = run["term"].as_str().unwrap();
+    client.call("term_close", json!({ "term": term }));
+    let ended = client.call("task_get", json!({}))["runs"][0].clone();
+    assert_eq!(ended["changes"], 1);
+    assert!(worktree.is_dir(), "有改动的工作树被删了");
+}
+
+#[test]
+fn 定时任务_叫停常驻进程时先存下还开着的运行的画面() {
+    let mut home = Home::new();
+    home.env = vec![("FR_KUAID_TASK_TICK".into(), "300".into())];
+    let exe = home.install("1.0.0-tasks3");
+    let repo = home.dir.join("code").join("app");
+    make_repo(&repo);
+    let mut client = home.connect(&exe);
+    client.hello();
+    let task = echo_task(
+        &repo,
+        json!({ "worktree": "head", "schedule": { "kind": "manual" } }),
+    );
+    client.call("task_apply", task);
+    let run = client.call("task_run", json!({ "id": "t1" }));
+    assert_eq!(run["outcome"], "started", "{run}");
+    let term = run["term"].as_str().unwrap().to_string();
+    let worktree = PathBuf::from(run["worktree"].as_str().unwrap());
+    let stream = client.send(
+        "term_attach",
+        json!({ "term": term, "cols": 120, "rows": 36, "watch": true }),
+        &[],
+    );
+    client.output_until(stream, "kuai-task-hello");
+    client.send("cancel", json!({ "id": stream }), &[]);
+
+    // 叫停（主机页的「重启…」也是这样）：那次运行还开着
+    let (ok, text) = home.run(&exe, "--stop");
+    assert!(ok, "{text}");
+    client.wait_closed();
+    wait_until("常驻进程退出", || !home.run(&exe, "--status").0);
+
+    // 再连上来：记成结束了、存下了画面，没改动的工作树删掉了
+    let mut client = home.connect(&exe);
+    client.hello();
+    let ended = client.call("task_get", json!({}))["runs"][0].clone();
+    assert!(ended["ended"].is_u64(), "{ended}");
+    assert_eq!(ended["screen"], true, "{ended}");
+    assert_eq!(ended["changes"], 0, "{ended}");
+    assert!(!worktree.exists(), "没改动的工作树没删：{worktree:?}");
+    let id = client.send("task_screen", json!({ "run": ended["id"] }), &[]);
+    let (response, screen) = client.reply(id, "task_screen 的回答");
+    assert_eq!(response.error, None);
+    assert!(String::from_utf8_lossy(&screen).contains("kuai-task-hello"));
+}
+
+#[test]
+fn 定时任务_有人接着看时程序结束_也存下画面() {
+    let mut home = Home::new();
+    home.env = vec![("FR_KUAID_TASK_TICK".into(), "300".into())];
+    let exe = home.install("1.0.0-tasks4");
+    let repo = home.dir.join("code").join("app");
+    make_repo(&repo);
+    let mut client = home.connect(&exe);
+    client.hello();
+    client.call(
+        "task_apply",
+        echo_task(&repo, json!({ "schedule": { "kind": "manual" } })),
+    );
+    let run = client.call("task_run", json!({ "id": "t1" }));
+    assert_eq!(run["outcome"], "started", "{run}");
+    let term = run["term"].as_str().unwrap().to_string();
+    // 正经接上（不是只看），等提示词打出来再退出 shell：有人看到了结束，会话立刻从登记表里拿掉
+    let stream = client.send(
+        "term_attach",
+        json!({ "term": term, "cols": 120, "rows": 36 }),
+        &[],
+    );
+    client.output_until(stream, "kuai-task-hello");
+    client.line(&term, "exit");
+    client.exit_of(stream);
+    wait_until("会话从登记表里拿掉", || {
+        !client.terms().iter().any(|t| t.term == term)
+    });
+
+    let mut ended = Value::Null;
+    wait_until("运行记成结束", || {
+        ended = client.call("task_get", json!({}))["runs"][0].clone();
+        ended["ended"].is_u64()
+    });
+    assert_eq!(ended["screen"], true, "{ended}");
+    let id = client.send("task_screen", json!({ "run": ended["id"] }), &[]);
+    let (response, screen) = client.reply(id, "task_screen 的回答");
+    assert_eq!(response.error, None);
+    assert!(String::from_utf8_lossy(&screen).contains("kuai-task-hello"));
+}
+
+#[test]
+fn 开机时启动_写进启动项_启动项拉起常驻进程() {
+    let mut home = Home::new();
+    // 不往真的启动项里写
+    let key = format!(r"Software\KuaiTest-kuaid-boot-{}", std::process::id());
+    home.env = vec![("FR_KUAID_AUTOSTART_KEY".into(), key.clone())];
+    let exe = home.install("1.0.0-boot");
+    let mut client = home.connect(&exe);
+    client.hello();
+    let status = client.call("daemon_status", json!({}));
+    assert_eq!(status["autostart"], false, "{status}");
+    assert_eq!(status["tasks"], 0);
+    assert!(status["pid"].as_u64().unwrap() > 0);
+    assert!(status["clock"]["now"]["year"].as_u64().unwrap() >= 2026);
+
+    let status = client.call("autostart_set", json!({ "enabled": true }));
+    assert_eq!(status["autostart"], true, "{status}");
+    // 启动项里写的是这一版的程序、--boot，测试实例还带着自己的主目录
+    let out = Command::new("reg")
+        .args(["query", &format!(r"HKCU\{key}")])
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&out.stdout);
+    assert!(listed.contains("1.0.0-boot"), "{listed}");
+    assert!(listed.contains("--boot --home"), "{listed}");
+
+    // 常驻进程停了；照着启动项运行（不带测试的环境变量，主目录在参数里）：拉起来了
+    let (ok, text) = home.run(&exe, "--stop");
+    assert!(ok, "{text}");
+    client.wait_closed();
+    wait_until("常驻进程退出", || !home.run(&exe, "--status").0);
+    let out = home
+        .command(&exe)
+        .env_remove("FR_KUAID_HOME")
+        .args(["--boot", "--home"])
+        .arg(&home.dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (ok, text) = home.run(&exe, "--status");
+    assert!(ok, "{text}");
+
+    let mut client = home.connect(&exe);
+    client.hello();
+    let status = client.call("autostart_set", json!({ "enabled": false }));
+    assert_eq!(status["autostart"], false);
+    for path in [key.clone(), format!("{key}-approved")] {
+        let _ = Command::new("reg")
+            .args(["delete", &format!(r"HKCU\{path}"), "/f"])
+            .output();
+    }
 }

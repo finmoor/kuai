@@ -809,3 +809,225 @@ fn 传上来的文件_终端里的程序读得到_没传完的客户端走了就
     wait_until("没传完的被删掉", || !partial());
     assert_eq!(names(&drop_dir), ["截_图_1.png"]);
 }
+
+/// 这个用户现在的 crontab；还没有是空的。
+fn crontab() -> String {
+    let out = Command::new("crontab").arg("-l").output().unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// 测试改的是这个用户真的 crontab：中途失败时把测试加的那一行（含这个脚本路径的）删掉，别的行
+/// 不动；只剩测试那一行时整份删掉。测试走完时那一行已经由「关掉」删了，这里什么都不做。
+struct CrontabLine(String);
+
+impl Drop for CrontabLine {
+    fn drop(&mut self) {
+        let listed = crontab();
+        if !listed.contains(&self.0) {
+            return;
+        }
+        let kept: String = listed
+            .lines()
+            .filter(|line| !line.contains(&self.0))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        if kept.trim().is_empty() {
+            let _ = Command::new("crontab").arg("-r").status();
+        } else if let Ok(mut child) = Command::new("crontab")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(kept.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
+#[test]
+fn 开机时启动_写进_crontab_脚本拉起常驻进程() {
+    if Command::new("crontab").arg("-l").output().is_err() {
+        eprintln!("这台机器没有 crontab，跳过");
+        return;
+    }
+    let home = Home::new();
+    let exe = home.install("1.0.0-boot");
+    let mut client = home.connect(&exe);
+    client.hello();
+    let status = client.call("daemon_status", json!({}));
+    assert_eq!(status["autostart"], false, "{status}");
+    assert!(status["clock"]["now"]["year"].as_u64().unwrap() >= 2026);
+    let before = crontab();
+
+    let script = home.dir.join(".kuai/boot.sh");
+    let _restore = CrontabLine(script.display().to_string());
+    let status = client.call("autostart_set", json!({ "enabled": true }));
+    assert_eq!(status["autostart"], true, "{status}");
+    let listed = crontab();
+    assert!(
+        listed.contains(&format!("@reboot '{}'", script.display())),
+        "{listed}"
+    );
+    // 原来的那些行原样留着
+    for line in before.lines() {
+        assert!(listed.contains(line), "{listed}");
+    }
+    let text = std::fs::read_to_string(&script).unwrap();
+    assert!(text.contains(&*exe.to_string_lossy()), "{text}");
+
+    // 常驻进程停了；像开机时那样跑脚本（cron 给的 SHELL 是 /bin/sh）：拉起来了
+    let (ok, text) = home.run(&exe, "--stop");
+    assert!(ok, "{text}");
+    client.wait_closed();
+    wait_until("常驻进程退出", || !home.run(&exe, "--status").0);
+    let out = Command::new("/bin/sh")
+        .arg(&script)
+        .env("HOME", &home.dir)
+        .env("SHELL", "/bin/sh")
+        .env_remove("SSH_AUTH_SOCK")
+        .current_dir("/")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (ok, text) = home.run(&exe, "--status");
+    assert!(ok, "{text}");
+
+    let mut client = home.connect(&exe);
+    client.hello();
+    // 终端开的是账号登记的登录 shell，不是 cron 给的 sh：~/.bashrc 里加的 PATH（nvm 装的 claude）才有
+    let passwd = Command::new("sh")
+        .args(["-c", "getent passwd \"$(id -u)\" | cut -d: -f7"])
+        .output()
+        .unwrap();
+    let passwd = String::from_utf8_lossy(&passwd.stdout).trim().to_string();
+    if let Some(name) = passwd
+        .rsplit('/')
+        .next()
+        .filter(|_| passwd.starts_with('/'))
+    {
+        let (stream, opened) = client.open("boot-shell", &home.dir);
+        client.input(&opened.term, "echo shell=$0 ok-$((1+1))\n");
+        let seen = client.output_until(stream, "ok-2");
+        assert!(seen.contains(&format!("shell=-{name}")), "{passwd}：{seen}");
+        client.call("term_close", json!({ "term": opened.term }));
+    }
+
+    // 关掉：那一行和脚本都删掉，别的行不动
+    let status = client.call("autostart_set", json!({ "enabled": false }));
+    assert_eq!(status["autostart"], false);
+    assert_eq!(crontab().trim_end(), before.trim_end());
+    assert!(!script.exists());
+    // 什么都不剩时整份删掉，不留一份空的 crontab
+    let left = Command::new("crontab").arg("-l").output().unwrap();
+    assert_eq!(left.status.success(), !before.trim().is_empty());
+}
+
+/// 在 `dir` 里建一个有一个提交的仓库。
+fn make_repo(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}：{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(&["add", "a.txt"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "一",
+    ]);
+}
+
+#[test]
+fn 定时任务_sh_里提示词原样传进去_工作树用完删掉() {
+    let home = Home::new();
+    let exe = home.install("1.0.0-tasks");
+    let repo = home.dir.join("code").join("app");
+    make_repo(&repo);
+    let mut client = home.connect(&exe);
+    client.hello();
+    // 提示词里有引号、$、中文：放在环境变量里传，shell 不展开、不拆开
+    let prompt = "kuai-task-hello \"引号\" $HOME 'x' `id`";
+    let task = json!({
+        "id": "t1",
+        "name": "夜间 测试",
+        "prompt": prompt,
+        "repo": repo,
+        "preset": { "name": "echo", "command": "printf '%s\\n'" },
+        "launch": { "command": "printf '%s\\n'", "prompt": "arg" },
+        "schedule": { "kind": "manual" },
+        "worktree": "head",
+    });
+    client.call(
+        "task_apply",
+        json!({ "ops": [{ "op": "set", "task": task }] }),
+    );
+    let run = client.call("task_run", json!({ "id": "t1" }));
+    assert_eq!(run["outcome"], "started", "{run}");
+    let term = run["term"].as_str().unwrap().to_string();
+    let worktree = PathBuf::from(run["worktree"].as_str().unwrap());
+    assert!(worktree.is_dir(), "工作树没建：{worktree:?}");
+    assert_eq!(
+        worktree.parent().unwrap(),
+        repo.with_file_name("app.worktrees")
+    );
+    let name = worktree.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.starts_with("夜间-测试-"), "{name}");
+    let info = client.terms().into_iter().find(|t| t.term == term).unwrap();
+    assert_eq!(PathBuf::from(&info.cwd), worktree);
+    let stream = client.send(
+        "term_attach",
+        json!({ "term": term, "cols": 120, "rows": 36, "watch": true }),
+        &[],
+    );
+    // 命令行里只有变量名，原样的提示词只会出现在输出里
+    let seen = client.output_until(stream, "$HOME 'x' `id`");
+    assert!(seen.contains("KUAI_TASK_PROMPT"), "{seen:?}");
+    client.send("cancel", json!({ "id": stream }), &[]);
+
+    client.call("term_close", json!({ "term": term }));
+    let ended = client.call("task_get", json!({}))["runs"][0].clone();
+    assert!(ended["ended"].is_u64(), "{ended}");
+    assert_eq!(ended["screen"], true, "{ended}");
+    assert_eq!(ended["changes"], 0, "{ended}");
+    wait_until("没改动的工作树删掉", || !worktree.exists());
+    wait_until("空着的 app.worktrees 一起删掉", || {
+        !worktree.parent().unwrap().exists()
+    });
+    let branches = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["branch", "--list"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&branches.stdout).contains("夜间"),
+        "分支没删"
+    );
+    let id = client.send("task_screen", json!({ "run": ended["id"] }), &[]);
+    let (response, screen) = client.reply(id, "task_screen 的回答");
+    assert_eq!(response.error, None);
+    let screen = String::from_utf8_lossy(&screen);
+    assert!(screen.contains("$HOME 'x' `id`"), "{screen:?}");
+}

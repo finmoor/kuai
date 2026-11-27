@@ -38,6 +38,11 @@ impl Workspaces {
         }
     }
 
+    /// 状态文件在哪（任务文件放在它旁边）。
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     /// 平时用的那个文件（见 `fr_core::store::path`）。
     pub fn default_file() -> Workspaces {
         Self::new(store::path())

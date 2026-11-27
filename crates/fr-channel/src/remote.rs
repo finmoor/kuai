@@ -27,14 +27,15 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, anyhow, bail};
 use fr_core::hop;
 use fr_core::protocol::{
-    self, DirListing, FilePut, FilePutReply, FsEntry, FsStat, FsWrite, FsWritten, GitResult, Hello,
-    PROTOCOL_VERSION, Request, Response, SubRepos, TermExit, TermInfo, TermMarks, TermOpen,
-    TermOpened,
+    self, DaemonStatus, DirListing, FilePut, FilePutReply, FsEntry, FsStat, FsWrite, FsWritten,
+    GitResult, Hello, PROTOCOL_VERSION, Request, Response, SubRepos, TermExit, TermInfo, TermMarks,
+    TermOpen, TermOpened,
 };
 use fr_core::ssh::{
     ACCEPT_NEW_HOSTS, KEEP_OPTIONS, STAGE_OPTIONS, no_window, program as ssh_program,
 };
 use fr_core::store::{Op, Store};
+use fr_core::tasks::{Run, TaskFile, TaskOp};
 use futures::FutureExt as _;
 use futures::channel::{mpsc, oneshot};
 use futures::future::{self, BoxFuture};
@@ -42,8 +43,8 @@ use serde_json::{Value, json};
 
 use crate::binaries::{Binaries, Os};
 use crate::{
-    Backlog, ChangeStream, GitCancel, GitOutput, GitStream, StateStream, StreamItem, TermItem,
-    TermListStream, TermStream, UploadItem, UploadSource, UploadStream,
+    Backlog, ChangeStream, GitCancel, GitOutput, GitStream, StateStream, StreamItem, TaskStream,
+    TermItem, TermListStream, TermStream, UploadItem, UploadSource, UploadStream,
 };
 
 /// 启动脚本找到 kuaid 时先打这一行；前面的输出（比如 `.bashrc` 打印的东西）都跳过
@@ -97,6 +98,8 @@ enum Pending {
     State(mpsc::UnboundedSender<Result<Store>>),
     /// `term_watch`：每次推来的整份终端列表
     TermList(mpsc::UnboundedSender<Result<Vec<TermInfo>>>),
+    /// `task_watch`：每次推来的整份定时任务
+    Tasks(mpsc::UnboundedSender<Result<TaskFile>>),
     /// `relay_open`：经这条连接连的另一台服务器，ssh 的输出交给那条连接
     Relay(RelaySink),
 }
@@ -960,6 +963,72 @@ impl Connection {
         async move { parsed(call.await?.0) }.boxed()
     }
 
+    /// 订阅这台主机上的定时任务（协议 18）：先给现在的整份（带着主机现在的钟），之后每次有改动
+    /// （改了任务、开始或结束一次运行、运行中的会话有了新的输出）给一份新的。连接断了，流以一个错误结束。
+    pub fn task_watch(&self) -> TaskStream {
+        let (tx, rx) = mpsc::unbounded();
+        let id = self.inner.next_id();
+        self.inner
+            .pending
+            .lock()
+            .unwrap()
+            .insert(id, Pending::Tasks(tx.clone()));
+        let request = Request {
+            id,
+            method: "task_watch".into(),
+            params: json!({}),
+            bytes: 0,
+        };
+        if let Err(err) = self.inner.send(request, Vec::new()) {
+            self.inner.pending.lock().unwrap().remove(&id);
+            let _ = tx.unbounded_send(Err(err));
+        }
+        TaskStream {
+            rx,
+            _cancel: Box::new(CancelOnDrop {
+                inner: Arc::downgrade(&self.inner),
+                id,
+            }),
+        }
+    }
+
+    /// 依次执行这串对定时任务的改动，返回改完的整份。有一个做不了就都不算。
+    pub fn task_apply(&self, ops: Vec<TaskOp>) -> BoxFuture<'static, Result<TaskFile>> {
+        let call = self.call("task_apply", json!({ "ops": ops }), Vec::new());
+        async move { parsed(call.await?.0) }.boxed()
+    }
+
+    /// 立即运行一次。跳过、启动失败也返回这次的记录（`outcome` 写着），不算出错。
+    pub fn task_run(&self, id: &str) -> BoxFuture<'static, Result<Run>> {
+        let call = self.call("task_run", json!({ "id": id }), Vec::new());
+        async move { parsed(call.await?.0) }.boxed()
+    }
+
+    /// 一次运行结束时存下的画面：还原屏幕用的输出。
+    pub fn task_screen(&self, run: &str) -> BoxFuture<'static, Result<Vec<u8>>> {
+        let call = self.call("task_screen", json!({ "run": run }), Vec::new());
+        async move { Ok(call.await?.1) }.boxed()
+    }
+
+    /// 常驻进程的情况：运行了多久、时区、开机时启动开没开（协议 18）。
+    pub fn daemon_status(&self) -> BoxFuture<'static, Result<DaemonStatus>> {
+        let call = self.call("daemon_status", json!({}), Vec::new());
+        async move { parsed(call.await?.0) }.boxed()
+    }
+
+    /// 打开或关掉开机时启动，返回改完的情况。
+    pub fn autostart_set(&self, enabled: bool) -> BoxFuture<'static, Result<DaemonStatus>> {
+        let call = self.call("autostart_set", json!({ "enabled": enabled }), Vec::new());
+        async move { parsed(call.await?.0) }.boxed()
+    }
+
+    /// 让常驻进程结束所有终端会话并退出（重启常驻进程的前一半；之后重连时转接程序拉起新的）。
+    /// 它回了话就算办成，连接随后断开。
+    pub fn shutdown(&self) -> BoxFuture<'static, Result<()>> {
+        let call = self.call("shutdown", json!({}), Vec::new());
+        async move { call.await.map(|_| ()) }.boxed()
+    }
+
     pub fn ping(&self) -> BoxFuture<'static, Result<()>> {
         let call = self.call("ping", json!({}), Vec::new());
         async move { call.await.map(|_| ()) }.boxed()
@@ -1758,6 +1827,11 @@ impl Inner {
                         let _ = tx.unbounded_send(parsed(result["terms"].take()));
                     }
                 }
+                Some(Pending::Tasks(tx)) => {
+                    if let Some(file) = response.result.take() {
+                        let _ = tx.unbounded_send(parsed(file));
+                    }
+                }
                 Some(Pending::Relay(sink)) => sink.chunk(response.err, payload),
                 _ => {}
             }
@@ -1815,6 +1889,11 @@ impl Inner {
                     let _ = tx.unbounded_send(Err(err));
                 }
             }
+            Pending::Tasks(tx) => {
+                if let Err(err) = outcome {
+                    let _ = tx.unbounded_send(Err(err));
+                }
+            }
             Pending::Relay(sink) => sink.finish(outcome),
         }
     }
@@ -1847,6 +1926,9 @@ impl Inner {
                     let _ = tx.unbounded_send(Err(anyhow!(message.clone())));
                 }
                 Pending::TermList(tx) => {
+                    let _ = tx.unbounded_send(Err(anyhow!(message.clone())));
+                }
+                Pending::Tasks(tx) => {
                     let _ = tx.unbounded_send(Err(anyhow!(message.clone())));
                 }
                 Pending::Relay(sink) => sink.finish(Err(anyhow!(message.clone()))),

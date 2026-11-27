@@ -762,6 +762,14 @@ impl Focusable for TerminalView {
 }
 
 impl TerminalView {
+    /// 发出去的第一条消息（消息刻度里最早的那条）；还没发过是 None。「设为定时任务…」拿它当提示词。
+    pub fn first_message(&self) -> Option<String> {
+        self.marks
+            .first()
+            .map(|mark| mark.text.trim().to_string())
+            .filter(|text| !text.is_empty())
+    }
+
     pub fn new(
         launcher: impl Fn(&mut App) -> Result<Launch, String> + 'static,
         window: &mut Window,

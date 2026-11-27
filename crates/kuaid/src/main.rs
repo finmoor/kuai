@@ -8,6 +8,7 @@
 //!   客户端都断开、终端会话也都结束了，过一阵自己退出（见 `daemon`）。
 //! - `kuaid --stdio`：不常驻，只服务标准输入输出这一个客户端，读到头就退出。测试协议用。
 //! - `kuaid --status`、`kuaid --stop`：在服务器上看常驻进程的情况、让它结束。
+//! - `kuaid --boot`：开机时（Windows 上是登录时）由启动项运行，常驻进程没在跑就拉起来（见 `autostart`）。
 //!
 //! Linux 和 Windows 都能跑。Windows 上多两种：`kuaid --pty-host` 是终端托管进程，一个终端一个，
 //! 由常驻进程启动（见 `term::host`）；`kuaid --installed` 在刚装好这一版时清掉旧版本的目录。
@@ -18,7 +19,9 @@
 //! 协议 10 起还保存这台电脑的仓库列表和工作区（见 `workspaces`），并替连上来的客户端连这台电脑
 //! 配置的服务器（见 `relay`）：经跳板机时 ssh 把 kuaid 自己当 `ProxyCommand` 启动（`--ssh-hop`）。
 
+mod autostart;
 mod bridge;
+mod clock;
 mod conn;
 #[cfg(unix)]
 mod daemon;
@@ -29,6 +32,7 @@ mod dirs;
 mod files;
 mod out;
 mod relay;
+mod tasks;
 mod term;
 #[cfg(windows)]
 mod win;
@@ -36,7 +40,8 @@ mod workspaces;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const USAGE: &str = "用法：kuaid --connect | --daemon | --stdio | --status | --stop | --version";
+const USAGE: &str =
+    "用法：kuaid --connect | --daemon | --stdio | --status | --stop | --boot | --version";
 
 fn main() {
     // 被 git 或 ssh 当作 askpass 启动时：去问主进程，打出回答就退出
@@ -63,6 +68,13 @@ fn main() {
         ["--daemon", "--resume", state] => daemon::run(Some(state)),
         ["--status"] => bridge::status(),
         ["--stop"] => bridge::stop(),
+        ["--boot"] => bridge::boot(),
+        // 测试实例的开机时启动：带着它自己的 `~/.kuai` 在哪
+        ["--boot", "--home", home] => {
+            // SAFETY: 这时还没有开别的线程
+            unsafe { std::env::set_var("FR_KUAID_HOME", home) };
+            bridge::boot()
+        }
         #[cfg(windows)]
         ["--pty-host", launch] => term::host::run(launch),
         #[cfg(windows)]

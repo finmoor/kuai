@@ -39,6 +39,7 @@ mod side_split;
 #[cfg(target_os = "linux")]
 mod signals;
 mod tab_fit;
+mod tasks;
 mod term_board;
 mod term_end;
 mod term_memory;

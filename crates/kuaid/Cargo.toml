@@ -38,6 +38,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
     "Win32_System_Registry",
+    # 定时任务按本地时间运行：本地时间、时区
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
     "Win32_System_RemoteDesktop",
     "Win32_System_Threading",
 ] }

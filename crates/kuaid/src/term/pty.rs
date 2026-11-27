@@ -430,6 +430,34 @@ fn login_shell() -> String {
         .unwrap_or_else(|| "/bin/sh".into())
 }
 
+/// 账号登记的登录 shell（`/etc/passwd` 里的）。开机时由 cron 拉起的常驻进程，环境变量里的
+/// `SHELL` 是 cron 给的 `/bin/sh`，不是用户的：终端里就成了 sh，`~/.bashrc` 里加的 PATH（nvm 装的
+/// claude、codex）都没有。查不到、是 nologin 这类的是 None。
+pub fn passwd_shell() -> Option<String> {
+    let mut buf = vec![0u8; 16 * 1024];
+    // SAFETY: passwd 全是指针和数字，全零是合法的初值；getpwuid_r 只往 buf 里写，结果的指针都指进
+    // buf，用完之前 buf 一直在
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut entry,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &mut found,
+        )
+    };
+    if rc != 0 || found.is_null() || entry.pw_shell.is_null() {
+        return None;
+    }
+    // SAFETY: 上面确认过不是空指针，指向 buf 里以零结尾的字符串
+    let shell = unsafe { CStr::from_ptr(entry.pw_shell) }.to_str().ok()?;
+    let usable =
+        shell.starts_with('/') && !shell.ends_with("/nologin") && !shell.ends_with("/false");
+    usable.then(|| shell.to_string())
+}
+
 /// shell 的环境变量：kuaid 自己的那些，去掉只属于某一条 ssh 连接的和 kuaid 内部用的，
 /// 再加上终端的类型和调用方给的。
 fn shell_env(shell: &str, extra: &[(String, String)]) -> Vec<(String, String)> {

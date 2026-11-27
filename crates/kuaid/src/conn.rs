@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 use fr_core::exec::{self, Killer, OnStderr};
 use fr_core::protocol::{
-    self, DaemonInfo, FilePut, FsWrite, GitResult, Hello, PROTOCOL_VERSION, Request, Response,
-    TermOpen,
+    self, DaemonInfo, DaemonStatus, FilePut, FsWrite, GitResult, Hello, PROTOCOL_VERSION, Request,
+    Response, TermOpen,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -24,6 +24,7 @@ use crate::VERSION;
 use crate::files::{self, Uploads};
 use crate::out::Outbox;
 use crate::relay::Relays;
+use crate::tasks::Tasks;
 use crate::term::{Caller, Registry, Size};
 use crate::workspaces::Workspaces;
 
@@ -52,8 +53,12 @@ pub struct Shared {
     pub drop_dir: PathBuf,
     /// 这台电脑保存的仓库列表和工作区（协议 10）
     pub workspaces: Workspaces,
+    /// 定时任务（协议 18），存在仓库列表旁边
+    pub tasks: Tasks,
     /// 最近一次有客户端连着的时间：闲了多久从它算
     last_busy: Mutex<Instant>,
+    /// 这个程序什么时候开始运行的
+    started: Instant,
 }
 
 impl Shared {
@@ -75,6 +80,7 @@ impl Shared {
         drop_dir: PathBuf,
         workspaces: Workspaces,
     ) -> Arc<Shared> {
+        let tasks = Tasks::new(workspaces.path().with_file_name("tasks.json"));
         Arc::new(Shared {
             terms,
             conns: Mutex::default(),
@@ -83,7 +89,9 @@ impl Shared {
             build,
             drop_dir,
             workspaces,
+            tasks,
             last_busy: Mutex::new(Instant::now()),
+            started: Instant::now(),
         })
     }
 
@@ -94,7 +102,8 @@ impl Shared {
     /// 没有客户端连着、也没有终端会话，已经这样多久了。还有的话是 0。
     pub fn idle_for(&self) -> Duration {
         let mut last_busy = self.last_busy.lock().unwrap();
-        if self.clients() > 0 || self.terms.count() > 0 {
+        // 有按时运行的任务也不算闲着：退出了就没人按时运行它们了
+        if self.clients() > 0 || self.terms.count() > 0 || self.tasks.has_scheduled() {
             *last_busy = Instant::now();
             return Duration::ZERO;
         }
@@ -124,6 +133,24 @@ impl Shared {
             guarded: crate::win::redirect_guarded(),
             #[cfg(not(windows))]
             guarded: false,
+        }
+    }
+
+    /// `daemon_status`：常驻进程的情况、开机时启动开没开、几个定时任务。
+    pub fn status(&self) -> DaemonStatus {
+        let (autostart, autostart_error) = match crate::autostart::enabled() {
+            Ok(on) => (Some(on), String::new()),
+            Err(err) => (None, format!("{err:#}")),
+        };
+        let (tasks, task_terms) = self.tasks.counts();
+        DaemonStatus {
+            info: self.info(),
+            uptime: self.started.elapsed().as_secs(),
+            clock: crate::clock::now().clock,
+            autostart,
+            autostart_error,
+            tasks,
+            task_terms,
         }
     }
 
@@ -290,6 +317,11 @@ struct StateApply {
 }
 
 #[derive(Deserialize)]
+struct TaskApply {
+    ops: Vec<fr_core::tasks::TaskOp>,
+}
+
+#[derive(Deserialize)]
 struct RelayOpen {
     /// 这台电脑配置的服务器的 id
     server: String,
@@ -360,6 +392,7 @@ pub fn serve(shared: &Arc<Shared>, reader: impl Read, writer: impl Write + Send 
     }
     drop(watchers);
     shared.workspaces.unwatch(conn.id, None);
+    shared.tasks.unwatch(conn.id, None);
     shared.terms.unwatch(conn.id, None);
     shared.terms.detach(conn.id, None);
     conn.asks.lock().unwrap().clear();
@@ -387,6 +420,7 @@ fn handle(
                 }
                 watchers.remove(&target);
                 shared.workspaces.unwatch(conn.id, Some(target));
+                shared.tasks.unwatch(conn.id, Some(target));
                 shared.terms.unwatch(conn.id, Some(target));
                 shared.terms.detach(conn.id, Some(target));
                 conn.relays.kill(target);
@@ -418,6 +452,41 @@ fn handle(
             }
         }
         "state_watch" => shared.workspaces.watch(conn.id, id, &conn.out),
+        "task_watch" => shared.tasks.watch(conn.id, id, &conn.out),
+        "task_apply" => {
+            let applied = serde_json::from_value::<TaskApply>(request.params)
+                .context("task_apply 参数无效")
+                .and_then(|params| shared.tasks.apply(&params.ops))
+                .and_then(|file| Ok(serde_json::to_value(file)?));
+            conn.reply(id, applied);
+        }
+        // 立即运行：开终端可能要等一会儿（Windows 上要等托管进程起来），放到自己的线程里
+        "task_run" => {
+            let task = param("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let (conn, shared) = (conn.clone(), shared.clone());
+            std::thread::spawn(move || {
+                let run = shared.tasks.run_now(&shared, &task);
+                conn.reply(id, run.and_then(|run| Ok(serde_json::to_value(run)?)));
+            });
+        }
+        "task_screen" => {
+            let run = param("run").and_then(Value::as_str).unwrap_or_default();
+            match shared.tasks.screen(run) {
+                Ok(bytes) => {
+                    let response = Response {
+                        id,
+                        result: Some(json!({})),
+                        bytes: bytes.len() as u64,
+                        ..Default::default()
+                    };
+                    conn.send(&response, &bytes);
+                }
+                Err(err) => conn.reply(id, Err(err)),
+            }
+        }
         "term_watch" => shared.terms.watch(conn.id, id, &conn.out),
         "state_apply" => {
             let applied = serde_json::from_value::<StateApply>(request.params)
@@ -504,7 +573,7 @@ fn handle(
         "term_input" => {
             let term = param("term").and_then(Value::as_str).unwrap_or_default();
             if let Some(session) = shared.terms.get(term) {
-                session.input(payload);
+                session.typed(payload);
             }
         }
         "term_resize" => {
@@ -604,6 +673,17 @@ fn simple(shared: &Shared, request: &Request) -> Result<Value> {
         })?),
         "info" => Ok(serde_json::to_value(shared.info())?),
         "state_get" => Ok(serde_json::to_value(shared.workspaces.get())?),
+        "task_get" => Ok(serde_json::to_value(shared.tasks.get())?),
+        "daemon_status" => Ok(serde_json::to_value(shared.status())?),
+        "autostart_set" => {
+            let on = request
+                .params
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            crate::autostart::set(on)?;
+            Ok(serde_json::to_value(shared.status())?)
+        }
         "list_dir" => Ok(serde_json::to_value(crate::dirs::list_dir(
             param("path").unwrap_or(""),
             request
@@ -617,7 +697,9 @@ fn simple(shared: &Shared, request: &Request) -> Result<Value> {
             "programs": shared.terms.programs(param("term").unwrap_or_default())
         })),
         "term_close" => {
-            let closed = shared.terms.close(param("term").unwrap_or_default());
+            // 定时任务运行出来的：先存下最后的画面再结束，收拾工作树
+            let term = param("term").unwrap_or_default();
+            let closed = shared.tasks.close_term(shared, term) || shared.terms.close(term);
             Ok(json!({ "closed": closed }))
         }
         other => bail!("未知方法：{other}"),

@@ -207,6 +207,8 @@ struct State {
     ended: Option<Instant>,
     /// 屏幕上的字什么时候变过
     activity: Activity,
+    /// 客户端最后一次发来回车的时候（见 [`Session::typed`]）
+    entered: Option<Instant>,
     clients: Vec<Client>,
     /// 发出去的消息，从早到晚，最多 [`fr_core::protocol::TERM_MARKS`] 条（见 [`Session::input`]）
     marks: Vec<TermMark>,
@@ -396,6 +398,16 @@ impl Session {
         self.backend.write(bytes);
     }
 
+    /// 客户端发来的（`term_input`）：同 [`Self::input`]，带回车的另外记下时间。定时任务靠它分辨程序
+    /// 停下以后屏幕又变了，是程序自己接着在干，还是有人接着在用（见 [`Glance::entered`]）；程序问终端
+    /// 的话由客户端回答、焦点和鼠标的报告，都不带回车。
+    pub fn typed(&self, bytes: Vec<u8>) {
+        if bytes.contains(&b'\r') {
+            self.state.lock().unwrap().entered = Some(Instant::now());
+        }
+        self.input(bytes);
+    }
+
     pub fn resize(&self, size: Size) {
         let mut guard = self.state.lock().unwrap();
         let state = &mut *guard;
@@ -404,6 +416,29 @@ impl Session {
             state.activity.resized(&state.screen, Instant::now());
             self.backend.resize(size);
         }
+    }
+
+    /// 定时任务用：程序还在不在、光标在第几列（备用屏是 None）、屏幕上的字多久没变了（没变过是
+    /// None）、客户端多久以前按过回车。
+    pub fn glance(&self) -> Glance {
+        let state = self.state.lock().unwrap();
+        Glance {
+            alive: state.exit.is_none(),
+            column: state.screen.cursor_column(),
+            quiet: state.activity.last_change.map(|at| at.elapsed()),
+            entered: state.entered.map(|at| at.elapsed()),
+        }
+    }
+
+    /// 定时任务的运行记录里写的「最后一行」，`replies`：运行的是不是 AI 助手（见
+    /// [`Screen::summary_text`]）。
+    pub fn summary(&self, replies: bool) -> String {
+        self.state.lock().unwrap().screen.summary_text(replies)
+    }
+
+    /// 现在的画面（往回翻的记录加屏幕），在空白的终端里照着输出一遍就是这个样子。
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.state.lock().unwrap().screen.dump()
     }
 
     fn info(&self, procs: &programs::Procs) -> TermInfo {
@@ -452,9 +487,18 @@ impl Session {
     }
 }
 
+/// [`Session::glance`] 看到的。
+pub struct Glance {
+    pub alive: bool,
+    pub column: Option<usize>,
+    pub quiet: Option<Duration>,
+    /// 客户端多久以前在这个终端里按过回车（见 [`Session::typed`]；没按过是 None）
+    pub entered: Option<Duration>,
+}
+
 /// 会话的名字记成什么：Windows 上同一个目录有几种写法，统一成一种（见
 /// [`fr_core::dir::windows_key`]），本机的 Kuai 和别的电脑上的 Kuai 接上的才是同一个。
-fn session_key(key: &str) -> String {
+pub fn session_key(key: &str) -> String {
     match cfg!(windows) {
         true => fr_core::dir::windows_key(key),
         false => key.to_string(),
@@ -535,6 +579,9 @@ pub struct Frozen {
     pub dump: Vec<u8>,
     /// 发出去的消息
     pub marks: Vec<TermMark>,
+    /// 屏幕上的字多久没变了（没变过是 None）。接过来以后接着算：不然程序刚停下就换了程序的，
+    /// 要等屏幕再变一次才知道它停在什么时候，定时任务的用时会记到那时候
+    pub quiet: Option<Duration>,
 }
 
 /// 所有的终端会话。
@@ -731,20 +778,36 @@ impl Registry {
             }
             opening = self.0.opened.wait(opening).unwrap();
         };
+        let session = self.create(key, &params.cwd, size, env, params.shell.clone())?;
+        // 先接上再开始读输出：第一个字也不会漏
+        session.attach(caller, out, size, true, false);
+        session.backend.start(session.clone());
+        Ok(())
+    }
+
+    /// 起伪终端、登记一个新会话，还没开始读输出。
+    fn create(
+        &self,
+        key: String,
+        cwd: &str,
+        size: Size,
+        env: Vec<(String, String)>,
+        shell: Vec<String>,
+    ) -> Result<Arc<Session>> {
         let id = format!("t{}", self.0.next.fetch_add(1, Ordering::Relaxed));
         let backend = (self.0.spawner)(&Spawn {
             term: id.clone(),
-            cwd: params.cwd.clone(),
+            cwd: cwd.to_string(),
             size,
             env,
-            shell: params.shell.clone(),
+            shell,
         })
-        .with_context(|| format!("无法在 {} 中打开终端", params.cwd))?;
+        .with_context(|| format!("无法在 {cwd} 中打开终端"))?;
         let screen = Screen::new(size);
         let session = Arc::new(Session {
             id: id.clone(),
             key,
-            cwd: params.cwd.clone(),
+            cwd: cwd.to_string(),
             created: now_secs(),
             backend,
             state: Mutex::new(State {
@@ -752,16 +815,61 @@ impl Registry {
                 screen,
                 exit: None,
                 ended: None,
+                entered: None,
                 clients: Vec::new(),
                 marks: Vec::new(),
             }),
             registry: Arc::downgrade(&self.0),
         });
         self.0.sessions.lock().unwrap().insert(id, session.clone());
-        // 先接上再开始读输出：第一个字也不会漏
-        session.attach(caller, out, size, true, false);
+        Ok(session)
+    }
+
+    /// 定时任务开的会话：没有客户端接着，叫 `key`（已经有这个名字的会话就报错）。
+    pub fn open_detached(
+        &self,
+        key: &str,
+        cwd: &str,
+        size: Size,
+        env: Vec<(String, String)>,
+        shell: Vec<String>,
+    ) -> Result<Arc<Session>> {
+        let key = session_key(key);
+        {
+            let mut opening = self.0.opening.lock().unwrap();
+            if opening.held {
+                anyhow::bail!("kuaid 正在升级，请稍后再打开终端");
+            }
+            let taken = self
+                .0
+                .sessions
+                .lock()
+                .unwrap()
+                .values()
+                .any(|session| session.key == key);
+            if taken || !opening.keys.insert(key.clone()) {
+                anyhow::bail!("已有同名的终端会话");
+            }
+            opening.in_flight += 1;
+        }
+        let _opening = OpenGuard {
+            inner: &self.0,
+            key: key.clone(),
+        };
+        let session = self.create(key, cwd, size, env, shell)?;
         session.backend.start(session.clone());
-        Ok(())
+        Ok(session)
+    }
+
+    /// 已经有的会话的名字（定时任务挑没用过的序号）。
+    pub fn keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .all()
+            .iter()
+            .map(|session| session.key.clone())
+            .collect();
+        keys.extend(self.0.opening.lock().unwrap().keys.iter().cloned());
+        keys
     }
 
     /// `term_attach`：接上指定的会话。`watch` 是只看（见 [`Session::attach`]）。
@@ -941,6 +1049,7 @@ impl Registry {
                     exit: state.exit,
                     dump: state.screen.dump(),
                     marks: state.marks.clone(),
+                    quiet: state.activity.last_change.map(|at| at.elapsed()),
                 }
             })
             .collect();
@@ -953,6 +1062,10 @@ impl Registry {
         let mut screen = Screen::new(frozen.size);
         screen.advance(&frozen.dump);
         let alive = frozen.exit.is_none();
+        let mut activity = Activity::new(&screen);
+        activity.last_change = frozen
+            .quiet
+            .and_then(|quiet| Instant::now().checked_sub(quiet));
         let session = Arc::new(Session {
             id: frozen.id.clone(),
             key: frozen.key,
@@ -960,10 +1073,11 @@ impl Registry {
             created: frozen.created,
             backend,
             state: Mutex::new(State {
-                activity: Activity::new(&screen),
+                activity,
                 screen,
                 exit: frozen.exit,
                 ended: frozen.exit.map(|_| Instant::now()),
+                entered: None,
                 clients: Vec::new(),
                 marks: frozen.marks,
             }),
@@ -1544,6 +1658,8 @@ pub(crate) mod tests {
         let (next, mut frozen) = registry.freeze();
         assert_eq!(frozen.len(), 1);
         assert_eq!(frozen[0].handle, Some((7, 4242)));
+        assert!(frozen[0].quiet.is_some(), "屏幕变过：带上多久没变了");
+        frozen[0].quiet = Some(Duration::from_secs(30));
 
         // 新程序里：按拍下来的重建
         let (fresh, _) = fake_registry();
@@ -1551,6 +1667,9 @@ pub(crate) mod tests {
         let fake = Arc::new(Fake::default());
         fresh.adopt(frozen.remove(0), Box::new(fake.clone()));
         assert!(fake.session.lock().unwrap().is_some(), "没有接着读输出");
+        // 屏幕多久没变接着算（定时任务的用时靠它）
+        let quiet = fresh.get(&term).unwrap().glance().quiet.unwrap();
+        assert!((30..40).contains(&quiet.as_secs()), "{quiet:?}");
         let (out2, mut inbox2) = mailbox();
         open(&fresh, "/repo", 9, 1, &out2);
         let again = inbox2.opened();

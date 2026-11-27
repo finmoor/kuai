@@ -661,6 +661,7 @@ impl AppState {
             self.machines.remove(&key);
             self.links.remove(&key);
             self.watches.remove(&key);
+            self.forget_tasks(|k| *k == key);
         }
         cx.notify();
     }
@@ -818,6 +819,8 @@ impl AppState {
             self.note_merged(key);
         }
         let watch_key = key.to_string();
+        // 定时任务另外订阅（协议 18）
+        self.watch_tasks(key, conn.clone(), cx);
         let key = key.to_string();
         let task = cx.spawn(async move |this, cx| {
             if !ops.is_empty() {
@@ -923,6 +926,7 @@ impl AppState {
         }
         self.links.remove(key);
         self.watches.remove(key);
+        self.tasks_dropped(key);
         if key != LOCAL
             && let Some(machine) = self.machines.get_mut(key)
         {

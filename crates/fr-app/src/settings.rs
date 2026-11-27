@@ -242,6 +242,8 @@ pub enum Front {
     /// 工作区页
     #[default]
     Workspaces,
+    /// 任务页
+    Tasks,
     /// 一个仓库（或子仓库）的标签页
     Repo(RepoEntry),
 }

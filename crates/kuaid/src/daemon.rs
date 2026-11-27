@@ -1,8 +1,9 @@
 //! 常驻进程：听 `~/.kuai/run/kuaid.sock`，每个连上来的客户端一个线程。
 //!
 //! 同一个账号下只跑一个（靠 `kuaid.lock` 上的文件锁）。不开网络端口：套接字文件只有本人能连，
-//! 客户端经 ssh 登录后由转接程序（`kuaid --connect`）接进来。客户端都断开、终端会话也都没了，
-//! 过 [`IDLE`] 这么久自己退出；服务器重启后不会自己起来，下次有客户端连接时再由转接程序拉起。
+//! 客户端经 ssh 登录后由转接程序（`kuaid --connect`）接进来。客户端都断开、终端会话也都没了、
+//! 也没有启用的定时任务，过 [`IDLE`] 这么久自己退出。服务器重启后，开了开机时启动的由 crontab
+//! 拉起（`autostart.rs`），没开的等下次有客户端连接时再由转接程序拉起。
 //!
 //! 升级：新版本的转接程序发现常驻进程比自己旧，就让它原地换成新程序（`exec`）。进程号不变，
 //! 终端里的 shell 还是它的子进程，伪终端、监听的套接字、文件锁这几个文件描述符留着不关，
@@ -156,6 +157,9 @@ struct HandoffSession {
     /// 发出去的消息（协议 16 起）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     marks: Vec<TermMark>,
+    /// 屏幕上的字多久没变了，毫秒（协议 18 起；没变过的、更早的程序交过来的没有）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quiet_ms: Option<u64>,
 }
 
 fn minus_one() -> i32 {
@@ -218,8 +222,11 @@ impl Control for Daemon {
 
     fn shutdown(&self, shared: &Shared) -> ! {
         log("收到退出请求");
+        // 定时任务还开着的几次运行先存下最后的画面
+        let cleanups = shared.tasks.stopping(shared);
         // 等终端里的程序收到挂断退出，不理挂断的等它被强杀
         shared.terms.close_all(Duration::from_secs(3));
+        crate::tasks::Tasks::wait_cleanups(cleanups, Duration::from_secs(5));
         self.exit();
     }
 
@@ -292,6 +299,9 @@ pub fn run(resume: Option<&str>) -> Result<()> {
         upgrading: AtomicBool::new(false),
     };
     let shared = Shared::new(terms, Some(Box::new(daemon)), build);
+    crate::tasks::Tasks::start(&shared);
+    // 开着开机时启动的话，改成启动这一版
+    crate::autostart::refresh();
     shared.start_askpass(&paths.run);
 
     let for_idle = shared.clone();
@@ -390,6 +400,7 @@ fn write_handoff(
                 exit: f.exit.flatten(),
                 dump: f.dump.len() as u64,
                 marks: f.marks.clone(),
+                quiet_ms: f.quiet.map(|quiet| quiet.as_millis() as u64),
             })
             .collect(),
     };
@@ -461,6 +472,7 @@ fn resume_from(path: &Path, terms: &Registry) -> Result<(UnixListener, File, usi
                 exit,
                 dump,
                 marks: session.marks,
+                quiet: session.quiet_ms.map(Duration::from_millis),
             },
             backend,
         );
@@ -500,6 +512,7 @@ mod tests {
                     text: "git status".into(),
                     at: 1_700_000_000_123,
                 }],
+                quiet: Some(Duration::from_millis(12_345)),
             },
             Frozen {
                 id: "t4".into(),
@@ -511,6 +524,7 @@ mod tests {
                 exit: Some(Some(2)),
                 dump: b"bye".to_vec(),
                 marks: Vec::new(),
+                quiet: None,
             },
         ];
         write_handoff(&path, 5, 6, 7, &frozen).unwrap();
@@ -525,7 +539,9 @@ mod tests {
         assert_eq!((live.fd, live.pid, live.exited), (9, 4321, false));
         assert_eq!((live.cols, live.rows, live.dump), (100, 30, 8));
         assert_eq!(live.marks, frozen[0].marks, "发出去的消息带过去");
+        assert_eq!(live.quiet_ms, Some(12_345), "屏幕多久没变带过去");
         assert_eq!((ended.fd, ended.exited, ended.exit), (-1, true, Some(2)));
+        assert_eq!(ended.quiet_ms, None);
         assert_eq!(&text[end + 1..], b"\x1b[mhellobye");
         // 以后的版本多写了字段、少写了后加的字段，都读得了
         let future = r#"{"format":2,"listener":3,"lock":4,"added":true,"sessions":[{"id":"t1","cols":80,"rows":24,"x":1}]}"#;

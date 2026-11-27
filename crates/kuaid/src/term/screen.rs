@@ -25,6 +25,11 @@ const HISTORY: usize = 2000;
 const LAST_TEXT: usize = 200;
 /// 没写完的转义序列最多记这么长（剪贴板序列可以很长），再长就不管了
 const TAIL_LIMIT: usize = 256 * 1024;
+
+/// 这一行是不是 AI 助手的回复、调用的工具：Claude Code 以「●」开头，Codex 以「•」开头。
+pub fn is_reply(text: &str) -> bool {
+    text.starts_with(['\u{25cf}', '\u{2022}'])
+}
 /// 画样式要看的那几位（其余的是换行、宽字符占位这些排版标记）
 const STYLE: Flags = Flags::INVERSE
     .union(Flags::BOLD)
@@ -167,25 +172,87 @@ impl Screen {
         at.column.0 == 0 && (0..grid.columns()).all(|col| row[Column(col)].c == ' ')
     }
 
+    /// 光标在第几列（0 起）。用的是备用屏（全屏程序）时是 None。定时任务拿它看提示符出来没有。
+    pub fn cursor_column(&self) -> Option<usize> {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        Some(self.term.grid().cursor.point.column.0)
+    }
+
     /// 屏幕上最后一行有字的内容，终端列表里给人看一眼用：从下往上找，跳过空行和只有框线的行，
     /// 去掉两头的空白和框线（全屏程序爱画框），最多 [`LAST_TEXT`] 个字。
     pub fn last_text(&self) -> String {
+        self.texts(self.term.grid().screen_lines())
+            .next()
+            .unwrap_or_default()
+    }
+
+    /// 定时任务的运行记录里「最后一行」写什么。看光标上面的行：AI 助手的光标在输入框里，下面是状态栏；
+    /// 程序结束了，光标停在 shell 的提示符那一行，上面是它最后的输出。
+    /// - `replies`（运行的是 Claude Code、Codex 这类 AI 助手）：有它的回复（[`is_reply`]）时取最下面
+    ///   那一条。光标藏着（Windows 上的 Claude Code）、用的是备用屏（Linux 上的 Claude Code）也找；
+    /// - 不是上面那种、在主屏上、光标看得见：取光标上面最近一行有字的；
+    /// - 别的（光标藏着，比如弹出了要选的框；全屏程序；光标在第一行），同 [`Self::last_text`]。
+    pub fn summary_text(&self, replies: bool) -> String {
+        let mode = self.term.mode();
+        let cursor = self.term.grid().cursor.point.line.0;
+        if cursor <= 0 {
+            return self.last_text();
+        }
+        let above: Vec<String> = self.texts(cursor as usize).collect();
+        let reply = above.iter().find(|text| is_reply(text)).filter(|_| replies);
+        let near = above.first().filter(|_| {
+            mode.contains(TermMode::SHOW_CURSOR) && !mode.contains(TermMode::ALT_SCREEN)
+        });
+        match reply.or(near) {
+            Some(text) => text.clone(),
+            None => self.last_text(),
+        }
+    }
+
+    /// 屏幕上第 `end` 行以上有字的行，从下往上：太长折到下一行的连起来算一行，跳过空行和只有框线
+    /// 的行，去掉两头的空白和框线（全屏程序爱画框），每行最多 [`LAST_TEXT`] 个字。
+    fn texts(&self, end: usize) -> impl Iterator<Item = String> + '_ {
         let grid = self.term.grid();
+        let columns = grid.columns();
         // 制表线和方块字符
         let edge = |c: char| c.is_whitespace() || ('\u{2500}'..='\u{259f}').contains(&c);
-        (0..grid.screen_lines())
-            .rev()
-            .find_map(|line| {
-                let row = &grid[Line(line as i32)];
-                let text: String = (0..grid.columns())
-                    .map(|col| &row[Column(col)])
-                    .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-                    .map(|cell| cell.c)
-                    .collect();
+        let row_text = move |line: usize| -> String {
+            let row = &grid[Line(line as i32)];
+            (0..columns)
+                .map(|col| &row[Column(col)])
+                // 宽字的后半格；行尾放不下宽字时空出来的那一格
+                .filter(|cell| {
+                    !cell
+                        .flags
+                        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                })
+                .map(|cell| cell.c)
+                .collect()
+        };
+        // 这一行写满了、接着折到了下一行
+        let wraps = move |line: usize| {
+            grid[Line(line as i32)][Column(columns - 1)]
+                .flags
+                .contains(Flags::WRAPLINE)
+        };
+        let mut line = end.min(grid.screen_lines());
+        std::iter::from_fn(move || {
+            while line > 0 {
+                line -= 1;
+                let mut text = row_text(line);
+                while line > 0 && wraps(line - 1) {
+                    line -= 1;
+                    text.insert_str(0, &row_text(line));
+                }
                 let text = text.trim_matches(edge);
-                (!text.is_empty()).then(|| text.chars().take(LAST_TEXT).collect())
-            })
-            .unwrap_or_default()
+                if !text.is_empty() {
+                    return Some(text.chars().take(LAST_TEXT).collect());
+                }
+            }
+            None
+        })
     }
 
     /// 按回车的那一刻，屏幕上的输入区里写着的消息（见 [`fr_core::term_text::message`]）。全屏程序
@@ -815,6 +882,86 @@ mod tests {
         assert_eq!(screen.last_text(), "需要提交吗？");
         screen.advance(b"  ? for shortcuts  ");
         assert_eq!(screen.last_text(), "? for shortcuts");
+    }
+
+    #[test]
+    fn 运行记录的最后一行_看光标上面的() {
+        let screen = |text: &str| {
+            let mut screen = Screen::new(Size::new(60, 12));
+            screen.advance(text.as_bytes());
+            screen
+        };
+        // Claude Code 回复完：光标在输入框里，下面是框线和状态栏
+        let claude_text = concat!(
+            "\u{276f} Compute 6*7\r\n\r\n\u{25cf} kuai-42\r\n\r\n\u{273b} Churned for 2s \u{b7} done\r\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\r\n\u{276f} \r\n\u{2500}\u{2500}\u{2500}\u{2500}\r\n",
+            "  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)",
+            "\x1b[2A\x1b[3G"
+        );
+        let claude = screen(claude_text);
+        assert_eq!(
+            claude.last_text(),
+            "\u{23f5}\u{23f5} auto mode on (shift+tab to cycle)"
+        );
+        assert_eq!(claude.summary_text(true), "\u{25cf} kuai-42");
+        // Windows 上的 Claude Code 藏着光标（还是停在输入框里）：照样找它的回复
+        let hidden = screen(&format!("{claude_text}\x1b[?25l"));
+        assert_eq!(hidden.summary_text(true), "\u{25cf} kuai-42");
+        assert_eq!(
+            hidden.summary_text(false),
+            "\u{23f5}\u{23f5} auto mode on (shift+tab to cycle)"
+        );
+        // Linux 上的 Claude Code 用备用屏：也照样找
+        let alt = screen(&format!("\x1b[?1049h\x1b[H{claude_text}"));
+        assert_eq!(alt.summary_text(true), "\u{25cf} kuai-42");
+        assert_eq!(
+            alt.summary_text(false),
+            "\u{23f5}\u{23f5} auto mode on (shift+tab to cycle)"
+        );
+        // Codex：最后一条回复，不是下面「用了多久」那一行
+        let codex = screen(concat!(
+            "\u{2022} Ran git status\r\n  \u{2514} ?? kuai-note.txt\r\n\r\n\u{2022} done\r\n\r\n",
+            "  Worked for 26s \u{2022} 18:14\r\n\r\n\u{203a} Ask Codex to do anything\r\n\r\n",
+            "  GPT-6.2-Sol low \u{b7} ~/repo",
+            "\x1b[2A\x1b[3G"
+        ));
+        assert_eq!(codex.summary_text(true), "\u{2022} done");
+        // 程序报错退出、回到提示符：上面那行报错（比屏幕宽、折成了两行的，连起来）
+        let failed = screen(concat!(
+            "root@dev:~/app# claude --dangerously-skip-permissions \"$KUAI_TASK_PROMPT\"\r\n",
+            "--dangerously-skip-permissions cannot be used with root/sudo privileges\r\n",
+            "root@dev:~/app# "
+        ));
+        assert_eq!(failed.last_text(), "root@dev:~/app#");
+        assert_eq!(
+            failed.summary_text(true),
+            "--dangerously-skip-permissions cannot be used with root/sudo privileges"
+        );
+        let powershell = screen("PS C:\\work> Write-Output $env:P\r\nkuai-ok\r\nPS C:\\work> ");
+        assert_eq!(powershell.summary_text(false), "kuai-ok");
+        // 不是 AI 助手的程序输出里有「•」开头的行：照样取提示符上面那行
+        let script = screen("$ ./build.sh\r\n\u{2022} step 1\r\nall done\r\n$ ");
+        assert_eq!(script.summary_text(false), "all done");
+        // 行尾放不下的宽字折到下一行：空出来的那一格不算
+        let wide = format!("{}中文\r\n$ ", "x".repeat(59));
+        assert_eq!(
+            screen(&wide).summary_text(false),
+            format!("{}中文", "x".repeat(59))
+        );
+        // 弹出了要选的框（光标藏起来了）、上面没有回复：照最后一行
+        let dialog = screen(concat!(
+            "Trust this folder?\r\n\u{203a} 1. Trust and continue\r\n  2. Back\r\n\r\n",
+            "  enter continue \u{b7} esc back\x1b[?25l\x1b[3A"
+        ));
+        assert_eq!(dialog.summary_text(true), "enter continue \u{b7} esc back");
+        // 不是 AI 助手的全屏程序：照最后一行，不取光标上面那行；AI 助手照样找回复
+        let full = screen("\x1b[?1049h\x1b[Hmenu\r\n\u{2022} item\r\nstatus\x1b[3;1H");
+        assert_eq!(full.summary_text(false), "status");
+        assert_eq!(full.summary_text(true), "\u{2022} item");
+        // 光标在第一行：照最后一行
+        let top = screen("first\r\nsecond\x1b[1;1H");
+        assert_eq!(top.summary_text(false), "second");
+        assert_eq!(screen("").summary_text(true), "");
     }
 
     #[test]

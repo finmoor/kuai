@@ -1427,7 +1427,7 @@ impl ManagerView {
         self.scan.update(cx, |scan, cx| scan.want(&repos, cx));
     }
 
-    fn select(&mut self, machine: String, cx: &mut Context<Self>) {
+    pub fn select(&mut self, machine: String, cx: &mut Context<Self>) {
         self.selected = Some(machine);
         self.want_scan(cx);
         cx.notify();
@@ -2844,6 +2844,8 @@ impl Render for ManagerView {
             viewport < crate::repo_rows::COMPACT_BELOW,
             cx,
         );
+        // 常驻进程：在运行多久、开机时启动、重启（定时任务要它在）
+        let daemon = crate::tasks::daemon::render(&self.app, &selected, window, cx);
         h_flex()
             .size_full()
             .bg(background)
@@ -2877,6 +2879,7 @@ impl Render for ManagerView {
                                     self.render_notice(&selected, notice, colors, cx)
                                 }),
                             )
+                            .children(daemon)
                             .child(repos),
                     ),
             )

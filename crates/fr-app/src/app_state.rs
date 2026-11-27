@@ -114,6 +114,8 @@ pub struct AppState {
     /// 连上时用的、在弹窗里输入的密码或口令，等用户点「保存」（见 [`SecretTyped`]）。只在内存里，
     /// 下次连接这台时换掉
     typed_secrets: HashMap<String, String>,
+    /// 各台主机上的定时任务和常驻进程的情况（见 `tasks`）
+    pub(crate) tasks: crate::tasks::TaskState,
 }
 
 impl AppState {
@@ -143,6 +145,7 @@ impl AppState {
             local_machine: None,
             machine_ids: HashMap::new(),
             typed_secrets: HashMap::new(),
+            tasks: crate::tasks::TaskState::default(),
         };
         this.start_machines(cx);
         this
@@ -616,6 +619,7 @@ impl AppState {
         self.machines.retain(|k, _| !gone(k));
         self.links.retain(|k, _| !gone(k));
         self.watches.retain(|k, _| !gone(k));
+        self.forget_tasks(gone);
         // 浏览器里打开过的那几台上的网页：旧地址作废，不然读到的是新那台上同一路径的仓库
         crate::web_serve::forget_servers(|server| {
             server == key || (and_relayed && server.starts_with(&relayed))
