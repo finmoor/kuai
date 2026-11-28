@@ -290,6 +290,19 @@ fn main() -> Result<()> {
                     term.age,
                     term.title.unwrap_or_default(),
                 );
+                // 查「待查看」对不对时看：屏幕上的字多久没变了、多久没干活了、最后一行是什么
+                let ago = |ms: Option<u64>| {
+                    ms.map_or_else(
+                        || "不知道多久".to_string(),
+                        |ms| format!("{} 秒", ms / 1000),
+                    )
+                };
+                println!(
+                    "      屏幕 {} 没变 · {} 没干活 · 最后一行：{}",
+                    ago(term.idle_ms),
+                    ago(term.work_ms),
+                    term.last,
+                );
             }
         }
         return Ok(());

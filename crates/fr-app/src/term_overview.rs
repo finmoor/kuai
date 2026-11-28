@@ -36,11 +36,14 @@
 //! 里重名的自动加序号。侧栏里勾上 2～4 个可以并排查看（[`crate::term_split`]）；右键一个终端「与「…」
 //! 并排」、工具栏的「并排」是直接和显示着的那个并排，并排着时用「添加」、右键「加入并排」再加。
 //!
+//! 定时任务开出来的终端不列在这一页（也不在仓库的终端页），在任务页里看、接着输入；在那里「转为普通
+//! 会话」以后才列在这里（[`TermBoard`] 只给这两页列普通的终端）。
+//!
 //! 侧栏和仓库页的侧栏一样宽、一样的底色和字号，右边上面一条和仓库终端页的工具栏一样高，下面全是画面：
 //! 这样画面和仓库的终端页一样大，终端是几行几列就正好放得下，字不用缩小。侧栏右边有分隔条，拖它改的
 //! 就是仓库页侧栏的那个宽度（见 [`crate::side_split`]）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -105,7 +108,7 @@ pub enum Go {
         at: Option<(u32, u32)>,
         dir: bool,
     },
-    /// 到任务页看这个定时任务（终端上面那一条横条里的「查看任务」）
+    /// 到任务页看这个定时任务（「设为定时任务…」「新建定时任务…」存好以后）
     Task { machine: String, id: String },
 }
 
@@ -248,47 +251,8 @@ pub struct TermOverview {
     picks: Vec<TermSlot>,
     /// 正并排查看着
     split: Option<Split>,
-    /// 展开了的定时任务（`主机` + 0x1f + 任务的 id）：几次运行都列出来，不折成一行
-    unfolded: HashSet<String>,
     focus: FocusHandle,
     _observe: Subscription,
-}
-
-/// 折行记的键：哪台主机上的哪个任务。
-fn fold_key(machine: &str, task: &str) -> String {
-    format!("{machine}\u{1f}{task}")
-}
-
-/// 同一个任务的几次运行折成一行：只留最新的那一次（开得最晚的），它的 `folded` 记着折起来了几次。
-/// 展开了的任务（`unfolded`）照样都列，最新那一次的 `folded` 也记上（行尾的按钮写「收起」）。
-fn fold_runs(rows: Vec<Row>, unfolded: &HashSet<String>) -> Vec<Row> {
-    let mut newest: HashMap<String, (u64, usize)> = HashMap::new();
-    let mut count: HashMap<String, usize> = HashMap::new();
-    for row in &rows {
-        if let Some(mark) = &row.task {
-            let key = fold_key(&row.id.machine, &mark.task);
-            *count.entry(key.clone()).or_default() += 1;
-            let slot = newest.entry(key).or_insert((row.born, row.number as usize));
-            if (row.born, row.number as usize) > *slot {
-                *slot = (row.born, row.number as usize);
-            }
-        }
-    }
-    rows.into_iter()
-        .filter_map(|mut row| {
-            let Some(mark) = &row.task else {
-                return Some(row);
-            };
-            let key = fold_key(&row.id.machine, &mark.task);
-            let n = count.get(&key).copied().unwrap_or(1);
-            let head = newest.get(&key) == Some(&(row.born, row.number as usize));
-            if head {
-                row.folded = n - 1;
-                return Some(row);
-            }
-            unfolded.contains(&key).then_some(row)
-        })
-        .collect()
 }
 
 impl EventEmitter<Go> for TermOverview {}
@@ -377,35 +341,19 @@ fn term_menu(
             .map(|view| view.read(cx).split_entry(&slot, cx))
             .unwrap_or(SplitEntry::Nothing);
         let rename_label = crate::keymap::with_key(tr("重命名…（F2）"), "hub.rename", cx);
-        // 定时任务开出来的：「查看定时任务」；别的：「设为定时任务…」（带入预设、仓库和第一条消息）
+        // 「设为定时任务…」：带入预设、仓库和第一条消息。定时任务开出来的终端不在这一页（在任务页）
         let task_item = {
-            let row = view
+            let term = view
                 .upgrade()
-                .and_then(|view| view.read(cx).find(&slot, cx));
-            let view = view.clone();
-            match row
-                .as_ref()
-                .and_then(|row| row.task.clone().map(|mark| (row, mark)))
-            {
-                Some((row, mark)) => {
-                    let machine = row.id.machine.clone();
-                    PopupMenuItem::new(tr("查看定时任务")).on_click(move |_, _, cx| {
-                        let (machine, id) = (machine.clone(), mark.task.clone());
-                        view.update(cx, |_, cx| cx.emit(Go::Task { machine, id }))
-                            .ok();
-                    })
-                }
-                None => {
-                    let slot = slot.clone();
-                    let term = row.as_ref().map(|row| row.id.term.clone());
-                    PopupMenuItem::new(tr("设为定时任务…")).on_click(move |_, window, cx| {
-                        view.update(cx, |this, cx| {
-                            this.make_task(&slot, term.as_deref(), window, cx)
-                        })
-                        .ok();
-                    })
-                }
-            }
+                .and_then(|view| view.read(cx).find(&slot, cx))
+                .map(|row| row.id.term);
+            let (view, slot) = (view.clone(), slot.clone());
+            PopupMenuItem::new(tr("设为定时任务…")).on_click(move |_, window, cx| {
+                view.update(cx, |this, cx| {
+                    this.make_task(&slot, term.as_deref(), window, cx)
+                })
+                .ok();
+            })
         };
         let menu = menu
             .item(
@@ -746,7 +694,6 @@ impl TermOverview {
             renaming: None,
             picks: Vec::new(),
             split: None,
-            unfolded: HashSet::new(),
             focus: cx.focus_handle(),
             _observe: observe,
         }
@@ -917,11 +864,6 @@ impl TermOverview {
                 .filter(|row| self.matches(row))
                 .cloned()
                 .collect();
-            // 同一个定时任务的几次运行折成一行（筛「待查看」「运行中」时不折：筛出来的就是要看的）
-            let listed = match self.filter {
-                Filter::All => fold_runs(listed, &self.unfolded),
-                _ => listed,
-            };
             SideRepo {
                 entry: entry.clone(),
                 listed,
@@ -1289,24 +1231,6 @@ impl TermOverview {
     /// 换上显示的画面。换下来的还在忙（正在往里传文件、预设的命令还没输入）就先停着，忙完再放：
     /// 原来一换终端、离开这一页，传了一半的文件就停了。
     fn set_peek(&mut self, peek: Option<Peek>, cx: &mut Context<Self>) {
-        // 换到同一个定时任务较早的一次运行（折在最新那一行里）：那一组展开，侧栏里才看得到选中的是哪一行
-        if let Some(new) = &peek
-            && let Some(rows) = self.board.read(cx).terms_of(&new.slot.entry)
-            && let Some(row) = rows.iter().find(|row| row.number == new.slot.number)
-            && let Some(mark) = &row.task
-        {
-            let newer = rows.iter().any(|other| {
-                other.id.machine == row.id.machine
-                    && other
-                        .task
-                        .as_ref()
-                        .is_some_and(|other| other.task == mark.task)
-                    && (other.born, other.number) > (row.born, row.number)
-            });
-            if newer {
-                self.unfolded.insert(fold_key(&row.id.machine, &mark.task));
-            }
-        }
         if let Some(old) = self.peek.take() {
             let reused = peek
                 .as_ref()
@@ -3145,27 +3069,6 @@ impl TermOverview {
                 }),
             Program::Shell | Program::Unknown => None,
         };
-        let slot = match row.task.is_some() {
-            // 定时运行出来的：右下角一个小时钟
-            true => slot.relative().child(
-                div()
-                    .absolute()
-                    .right(px(-4.))
-                    .bottom(px(-3.))
-                    .size(px(9.))
-                    .rounded_full()
-                    .bg(theme.sidebar)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        Icon::new(IconName::Clock)
-                            .size(px(8.))
-                            .text_color(theme.muted_foreground),
-                    ),
-            ),
-            false => slot,
-        };
         if let Some(icon) = known {
             return slot.child(presets::icon(&icon).size(px(13.)).text_color(color));
         }
@@ -3236,127 +3139,6 @@ impl TermOverview {
             window,
             cx,
         );
-    }
-
-    /// 定时任务折起来的几次运行：「+2」，展开了是「收起」。点了展开、收起。
-    fn fold_chip(&self, index: usize, row: &Row, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let mark = row.task.as_ref()?;
-        let key = fold_key(&row.id.machine, &mark.task);
-        let open = self.unfolded.contains(&key);
-        // 只放在最新那一行（折起来时它带着更早的几次，`folded` 是几次）；展开后别的行不再各带一个
-        if row.folded == 0 {
-            return None;
-        }
-        let theme = cx.theme();
-        let (border, muted) = (theme.border, theme.muted_foreground);
-        let label: SharedString = match open {
-            true => tr("收起").into(),
-            false => format!("+{}", row.folded).into(),
-        };
-        let tip = match open {
-            true => tr("只显示最近一次运行"),
-            false => tr("同一个定时任务更早的运行，点击展开"),
-        };
-        Some(
-            div()
-                .id(("hub-fold", index))
-                .flex_none()
-                .ml(px(6.))
-                .px(px(5.))
-                .h(px(15.))
-                .flex()
-                .items_center()
-                .rounded(px(4.))
-                .border_1()
-                .border_color(border)
-                .text_size(px(10.5))
-                .text_color(muted)
-                .cursor_pointer()
-                .child(label)
-                .tooltip(move |window, cx| ui::tip(tip, window, cx))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    if !this.unfolded.remove(&key) {
-                        this.unfolded.insert(key.clone());
-                    }
-                    cx.notify();
-                }))
-                .into_any_element(),
-        )
-    }
-
-    /// 右边显示的是定时任务开出来的终端时，终端上面那一条：哪个任务、什么时候启动的（主机的时间）、
-    /// 在不在新工作树里，「查看任务」到任务页。
-    fn task_banner(&self, hub: &[RepoGroup], cx: &mut Context<Self>) -> Option<AnyElement> {
-        let peek = self.peek.as_ref()?;
-        let row = row_in(hub, &peek.slot)?;
-        let mark = row.task.clone()?;
-        let machine = row.id.machine.clone();
-        let theme = cx.theme();
-        let (muted, accent, border, secondary) = (
-            theme.muted_foreground,
-            theme.primary,
-            theme.border,
-            theme.secondary,
-        );
-        let app = self.app.read(cx);
-        let host = app.machine_name(&machine);
-        let now = app
-            .task_book(&machine)
-            .and_then(|book| book.file.clock.as_ref())
-            .map(crate::tasks::host_now);
-        let when = match now {
-            Some(now) => crate::tasks::text::when(&mark.at, &now),
-            None => format!("{:02}:{:02}", mark.at.hour, mark.at.minute),
-        };
-        // 本机的就是这台电脑的时间，不用另说
-        let mut text = match machine == LOCAL {
-            true => tf!(
-                "定时任务「{name}」于 {when} 启动",
-                name = mark.name.to_string(),
-                when
-            ),
-            false => tf!(
-                "定时任务「{name}」于 {when} 启动（{host} 时间）",
-                name = mark.name.to_string(),
-                when,
-                host = host.to_string()
-            ),
-        };
-        if mark.worktree {
-            text.push_str(tr(" · 在新工作树中"));
-        }
-        let (go_machine, go_id) = (machine, mark.task.clone());
-        Some(
-            h_flex()
-                .flex_none()
-                .h(px(28.))
-                .px(px(12.))
-                .gap(px(6.))
-                .border_b_1()
-                .border_color(border)
-                .bg(secondary.opacity(0.6))
-                .text_xs()
-                .text_color(muted)
-                .child(Icon::new(IconName::Clock).size(px(12.)))
-                .child(div().flex_1().min_w_0().truncate().child(text))
-                .child(
-                    div()
-                        .id("hub-task-banner-go")
-                        .flex_none()
-                        .text_color(accent)
-                        .cursor_pointer()
-                        .hover(|s| s.underline())
-                        .child(tr("查看任务"))
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(Go::Task {
-                                machine: go_machine.clone(),
-                                id: go_id.clone(),
-                            })
-                        })),
-                )
-                .into_any_element(),
-        )
     }
 
     /// 终端名字那一格：要人看一眼的加粗，主机没连着、程序结束了的淡一档；双击名字改名。正在改名时
@@ -3559,7 +3341,6 @@ impl TermOverview {
             .child(Self::term_icon(row, cx))
             .child(Self::space(6.))
             .child(self.term_label(("hub-term-name", index), row, !pinned, cx))
-            .children(self.fold_chip(index, row, cx))
             .child(tail);
         outer
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -5084,7 +4865,6 @@ impl TermOverview {
             .h_full()
             .bg(bg)
             .child(self.render_toolbar(hub, typing, cx))
-            .children(self.task_banner(hub, cx))
             .child(body)
             .into_any_element()
     }

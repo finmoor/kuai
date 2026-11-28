@@ -913,7 +913,11 @@ impl RepoView {
     ) {
         // 留着的先接回来，新的排在它们后面
         self.adopt_waiting(window, cx);
-        let used: Vec<u32> = self.terminals.tabs.iter().map(|tab| tab.number).collect();
+        let mut used: Vec<u32> = self.terminals.tabs.iter().map(|tab| tab.number).collect();
+        // 定时任务开出来的终端不在这一页，序号照样占着：同名的会话开出来只是接上它
+        if let Some(board) = &self.terminals.board {
+            used.extend(board.read(cx).taken_numbers(&self.entry));
+        }
         let number = free_number(&used);
         let slot = TermSlot {
             entry: self.entry.clone(),

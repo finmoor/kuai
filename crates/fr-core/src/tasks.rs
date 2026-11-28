@@ -52,8 +52,11 @@ pub struct Task {
     pub effort: String,
     #[serde(default)]
     pub confirm: Confirm,
-    /// 拼好的命令（[`crate::task::compose`]）
+    /// 拼好的命令（[`crate::task::compose`]）；`custom` 时是人写的（[`crate::task::custom_launch`]）
     pub launch: Launch,
+    /// 命令是自定义的（协议 19 起）：模型、思考深度、需要确认时不加进命令，编辑时也不按预设重新拼
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub custom: bool,
     /// Windows 主机上用哪个 shell（程序和参数，本机的 Kuai 设置里选的）；空着由 kuaid 定
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shell: Vec<String>,
@@ -70,6 +73,24 @@ pub struct Task {
     /// 停下时通知
     #[serde(default = "yes")]
     pub notify: bool,
+}
+
+impl Task {
+    /// 运行的是哪个程序（认得出的话）：命令是自定义的看命令本身，不然看预设。
+    pub fn style(&self) -> Option<ArgStyle> {
+        match self.custom {
+            true => ArgStyle::detect(&self.launch.command),
+            false => self.preset.style,
+        }
+    }
+
+    /// 运行的程序的命令（认是哪家 AI 助手用）：自定义的是写的那条，不然是预设的。
+    pub fn program_command(&self) -> &str {
+        match self.custom {
+            true => &self.launch.command,
+            false => &self.preset.command,
+        }
+    }
 }
 
 fn yes() -> bool {
@@ -203,6 +224,10 @@ pub struct Run {
     /// None 是还没结束或者没有工作树
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changes: Option<u32>,
+    /// 会话转成了普通会话（协议 19 起，[`TaskOp::Detach`]）：会话照常开着、列在会话页里，不再算这个
+    /// 任务的。`ended` 记的是转的时候，所以「保留会话」、跟着会话记最后一行这些都不再管它
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub detached: bool,
 }
 
 /// 一个修改动作。
@@ -215,6 +240,8 @@ pub enum TaskOp {
     Remove { id: String },
     /// 启用、暂停
     Enable { id: String, enabled: bool },
+    /// 把一次运行的会话转成普通会话（协议 19 起）：会话不结束，运行记成结束（[`Run::detached`]）
+    Detach { run: String },
 }
 
 /// 主机的钟：推给客户端时带上，客户端拿它算「下次运行」、显示时区。
@@ -309,6 +336,20 @@ impl TaskFile {
                         .with_context(|| tf!("任务 {id} 不存在", id))?
                         .enabled = *enabled;
                 }
+                TaskOp::Detach { run } => {
+                    let run = next.run_mut(run).context(tr("运行记录不存在"))?;
+                    if run.detached {
+                        continue;
+                    }
+                    if run.term.is_none() || run.ended.is_some() {
+                        bail!(tr("这次运行没有开着的会话"));
+                    }
+                    let now = now_secs();
+                    run.detached = true;
+                    run.ended = Some(now);
+                    // 还没停下过：用时记到转的时候
+                    run.seconds.get_or_insert(now.saturating_sub(run.started));
+                }
             }
         }
         let changed = next != *self;
@@ -344,6 +385,13 @@ impl TaskFile {
             .iter()
             .any(|task| task.enabled && !matches!(task.schedule, Schedule::Manual))
     }
+}
+
+/// 现在是 1970 年以来的第几秒。
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 /// 检查一个任务能不能存：名字、提示词、仓库、命令不能空，表达式不能写错。
@@ -507,6 +555,7 @@ mod tests {
                 "high",
                 Confirm::ReadOnly,
             ),
+            custom: false,
             shell: Vec::new(),
             schedule: Schedule::Daily {
                 time: Time::new(9, 0),
@@ -600,6 +649,87 @@ mod tests {
         }])
         .unwrap();
         assert!(!file.has_scheduled());
+    }
+
+    #[test]
+    fn 转为普通会话_运行记成结束_会话不算任务的了() {
+        let mut file = TaskFile::default();
+        file.apply(&[TaskOp::Set {
+            task: Box::new(task("a")),
+        }])
+        .unwrap();
+        let started = now_secs() - 90;
+        let open = file.add_run(Run {
+            task: "a".into(),
+            started,
+            term: Some("t3".into()),
+            ..Default::default()
+        });
+        let stopped = file.add_run(Run {
+            task: "a".into(),
+            started,
+            term: Some("t4".into()),
+            seconds: Some(40),
+            ..Default::default()
+        });
+        let version = file.version;
+        assert!(
+            file.apply(&[
+                TaskOp::Detach { run: open.clone() },
+                TaskOp::Detach {
+                    run: stopped.clone()
+                },
+            ])
+            .unwrap()
+        );
+        assert_eq!(file.version, version + 1);
+        let run = file.runs.iter().find(|run| run.id == open).unwrap();
+        assert!(run.detached);
+        let ended = run.ended.expect("记成结束");
+        assert!(ended >= started + 90);
+        assert_eq!(
+            run.seconds,
+            Some(ended - started),
+            "没停下过的用时记到转的时候"
+        );
+        assert_eq!(run.term.as_deref(), Some("t3"), "会话还是那一个");
+        let run = file.runs.iter().find(|run| run.id == stopped).unwrap();
+        assert_eq!(run.seconds, Some(40), "停下过的用时不动");
+        // 再转一遍不算改动
+        assert!(!file.apply(&[TaskOp::Detach { run: open }]).unwrap());
+        // 已经结束的、没开终端的、不存在的转不了
+        let ended = file.add_run(Run {
+            task: "a".into(),
+            term: Some("t5".into()),
+            ended: Some(started),
+            ..Default::default()
+        });
+        let skipped = file.add_run(Run {
+            task: "a".into(),
+            outcome: Outcome::Skipped,
+            ..Default::default()
+        });
+        for run in [ended, skipped] {
+            let err = file.apply(&[TaskOp::Detach { run }]).unwrap_err();
+            assert_eq!(err.to_string(), "这次运行没有开着的会话");
+        }
+        let err = file
+            .apply(&[TaskOp::Detach { run: "r99".into() }])
+            .unwrap_err();
+        assert_eq!(err.to_string(), "运行记录不存在");
+        // 存成的样子：没转的不写这一项
+        let json = serde_json::to_string(&TaskOp::Detach { run: "r1".into() }).unwrap();
+        assert_eq!(json, r#"{"op":"detach","run":"r1"}"#);
+        assert!(
+            !serde_json::to_string(&Run::default())
+                .unwrap()
+                .contains("detached")
+        );
+        assert!(
+            !serde_json::to_string(&task("a"))
+                .unwrap()
+                .contains("custom")
+        );
     }
 
     #[test]

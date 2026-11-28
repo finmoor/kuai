@@ -3,12 +3,13 @@
 //! 任务存在仓库所在的主机上，由那台的 kuaid 保存、到点运行；Kuai 连上一台就订阅它的
 //! （`task_watch`），哪台电脑改的都推过来整份。和仓库列表一样只放这次运行里读到的，断开了留着、只读。
 //!
-//! - 标题栏「任务」页（[`page`]）：按主机列出任务，右边是详情和运行记录。
+//! - 标题栏「任务」页（[`page`]）：按主机列出任务，右边是详情和运行记录；运行记录里点会话还开着的
+//!   那一次，右边换成它的终端，可以接着输入、「转为普通会话」（协议 19）。
 //! - 新建、编辑的对话框（[`editor`]）：保存时按终端预设拼好命令（`fr_core::task::compose`）一起存进
-//!   任务，主机上没有预设。
+//!   任务，主机上没有预设；「将运行」切到「自定义」时存的是人写的命令（`fr_core::task::custom_launch`）。
 //! - 主机页「常驻进程」一栏（[`daemon`]）：在运行多久、时区、开机时启动、重启。
-//! - 会话页里定时运行出来的终端（时钟角标、横条、几次运行折成一行）在 `term_overview`，从这里查
-//!   哪个终端是哪个任务的哪一次（[`AppState::task_run_of`]）。
+//! - 任务开出来的终端只在任务页里看：`term_board` 从这里查哪个终端是哪个任务的哪一次
+//!   （[`AppState::task_run_of`]），会话页、仓库的终端页不列它们，标题栏「任务」上数待查看的。
 
 pub mod daemon;
 pub mod editor;
@@ -171,7 +172,13 @@ impl AppState {
             .collect()
     }
 
-    /// 终端 `term`（主机 `key` 上的）是哪个任务的哪一次运行。
+    /// 主机 `key` 的常驻进程说的协议版本（连着时）：新加的操作看它能不能用。
+    pub fn task_protocol(&self, key: &str) -> Option<u32> {
+        let conn = self.links.get(key).filter(|conn| conn.is_alive())?;
+        Some(conn.hello.protocol)
+    }
+
+    /// 终端 `term`（主机 `key` 上的）是哪个任务的哪一次运行。已经结束、转成了普通会话的不算。
     pub fn task_run_of(&self, key: &str, term: &str) -> Option<(&fr_core::tasks::Task, &Run)> {
         let book = self.tasks.books.get(key)?;
         let run = book
@@ -387,6 +394,13 @@ pub fn busy(app: &AppState, board: &crate::term_board::TermBoard) -> bool {
                 .iter()
                 .any(|run| page::run_state(run, machine, true, board) == page::RunState::Running)
     })
+}
+
+/// 现在是 1970 年以来的第几秒（算还在运行的那一次已经运行了多久）。
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 /// 新任务的 id：`t` 加毫秒数，同一台上不重。

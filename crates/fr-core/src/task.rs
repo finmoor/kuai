@@ -157,8 +157,9 @@ fn word_len(text: &str) -> usize {
     text.len()
 }
 
-/// 程序的名字：去掉引号、目录、`.exe` `.cmd` `.bat` `.ps1`，小写。
-fn program_name(word: &str) -> String {
+/// 程序的名字：去掉引号、目录、`.exe` `.cmd` `.bat` `.ps1`，小写。客户端认终端里跑的是哪家
+/// （图标、待查看的提醒）也用它，两边认法一样。
+pub fn program_name(word: &str) -> String {
     let word = word.trim_matches(['"', '\'']);
     let name = word.rsplit(['/', '\\']).next().unwrap_or(word);
     let lower = name.to_ascii_lowercase();
@@ -314,6 +315,42 @@ pub fn compose(
     }
 }
 
+/// 人写的命令（任务的「将运行」切到「自定义」）：原样运行，不加模型、思考深度、「需要确认时」的
+/// 参数，只按运行的是哪个程序决定提示词怎么给，和 [`compose`] 一样：Antigravity CLI 跟在 `-i` 后面，
+/// OpenCode 的交互界面跟在 `--prompt` 后面，`opencode run` 直接跟在最后、运行结束即退出，Claude Code、
+/// Codex 直接跟在最后，认不出的程序启动以后粘贴进去。换行当成空格（命令是一行输入的）。
+pub fn custom_launch(text: &str) -> Launch {
+    let command = text.replace(['\r', '\n'], " ").trim().to_string();
+    let Some(style) = ArgStyle::detect(&command) else {
+        return Launch {
+            command,
+            prompt: PromptVia::Paste,
+            prompt_flag: String::new(),
+            exits: false,
+        };
+    };
+    let (prompt_flag, exits) = match style {
+        ArgStyle::Claude | ArgStyle::Codex => ("", false),
+        ArgStyle::Antigravity => ("-i", false),
+        ArgStyle::OpenCode if subcommand(&command) == Some("run") => ("", true),
+        ArgStyle::OpenCode => ("--prompt", false),
+    };
+    Launch {
+        command,
+        prompt: PromptVia::Arg,
+        prompt_flag: prompt_flag.to_string(),
+        exits,
+    }
+}
+
+/// 程序名后面的第一个词（`opencode run -m …` 的 `run`）。
+fn subcommand(command: &str) -> Option<&str> {
+    let (_, end) = program_span(command)?;
+    let rest = command[end..].trim_start();
+    let word = &rest[..word_len(rest)];
+    (!word.is_empty()).then_some(word)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,6 +500,49 @@ mod tests {
         assert_eq!(launch.prompt, PromptVia::Paste);
         assert_eq!(launch.line(Shell::Posix), "devbot chat");
         assert_eq!(launch.line(Shell::PowerShell), "devbot chat");
+    }
+
+    #[test]
+    fn 自定义的命令原样运行_只定提示词怎么给() {
+        let posix = |text: &str| custom_launch(text).line(Shell::Posix);
+        // 不加任何参数，提示词跟在最后
+        assert_eq!(
+            posix("claude --model opus --add-dir ../shared"),
+            r#"claude --model opus --add-dir ../shared "$KUAI_TASK_PROMPT""#
+        );
+        assert_eq!(
+            posix("  CODEX_HOME=~/.codex-b codex --no-alt-screen  "),
+            r#"CODEX_HOME=~/.codex-b codex --no-alt-screen "$KUAI_TASK_PROMPT""#
+        );
+        // Antigravity CLI 跟在 -i 后面
+        assert_eq!(
+            posix("agy --model gemini-4-hydrogen-high"),
+            r#"agy --model gemini-4-hydrogen-high -i "$KUAI_TASK_PROMPT""#
+        );
+        // OpenCode：交互界面用 --prompt；写了 run 的直接跟在最后，运行结束即退出
+        let launch = custom_launch("opencode --standalone");
+        assert_eq!(launch.prompt_flag, "--prompt");
+        assert!(!launch.exits);
+        let launch =
+            custom_launch("XDG_CONFIG_HOME=~/alt opencode run -m openai/gpt-6.2-sol#xhigh");
+        assert_eq!(launch.prompt_flag, "");
+        assert!(launch.exits);
+        assert_eq!(
+            launch.line(Shell::PowerShell),
+            "XDG_CONFIG_HOME=~/alt opencode run -m openai/gpt-6.2-sol#xhigh $env:KUAI_TASK_PROMPT"
+        );
+        // 认不出的程序启动以后粘贴
+        let launch = custom_launch("npx devbot@2 chat --fast");
+        assert_eq!(launch.prompt, PromptVia::Paste);
+        assert_eq!(launch.line(Shell::Posix), "npx devbot@2 chat --fast");
+        // 粘贴进来的换行当成空格
+        assert_eq!(
+            custom_launch("claude\n--model opus\r\n").command,
+            "claude --model opus"
+        );
+        assert_eq!(custom_launch("   ").command, "");
+        assert_eq!(subcommand("opencode"), None);
+        assert_eq!(subcommand(r#""C:\bin\opencode.exe" run"#), Some("run"));
     }
 
     #[test]

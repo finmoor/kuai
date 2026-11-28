@@ -102,6 +102,7 @@
 //! - `task_watch`：订阅。先回一条 `chunk: true`、`result` 是现在的整份，之后每次有改动（改了任务、
 //!   开始或结束一次运行、会话的最后一行变了）再回一条整份，直到被 `cancel`。
 //! - `task_apply`：参数 `{ops: [TaskOp]}`，依次执行，返回改完的整份。有一个做不了就都不算，回 `error`。
+//!   协议 19 起有 `detach`：一次运行的会话转成普通会话，会话不结束，运行记成结束。
 //! - `task_run`：参数 `{id}`，立即运行一次，返回这次的 [`crate::tasks::Run`]（跳过、启动失败时
 //!   `outcome` 写着，不回 `error`）。
 //! - `task_screen`：参数 `{run}`，返回 `{}`，后面跟着这次运行结束时存下的画面（还原屏幕用的输出）。
@@ -152,10 +153,17 @@ use serde_json::Value;
 /// `kind`（只删这一种，`file` 或 `dir`）；`fs_rename` 带 `replace` 时目录可以盖空目录。
 /// 18：定时任务（`task_get`、`task_watch`、`task_apply`、`task_run`、`task_screen`）；常驻进程的情况
 /// 和开机时启动（`daemon_status`、`autostart_set`）。
+/// 19：`task_apply` 认 [`crate::tasks::TaskOp::Detach`]（把一次运行的会话转成普通会话）；任务多了
+/// `custom`（命令是自定义的），运行记录多了 `detached`。旧的 kuaid 不认 `detach`，存任务时也会丢掉
+/// `custom`。终端列表多了 [`TermInfo::work_ms`]（多久没干活了，见 [`WORK_SINCE`]）。
 ///
 /// 客户端握手（`hello`）时带上自己的 `protocol`，kuaid 按它决定发不发新加的东西：kuaid 可以比客户端
 /// 新（另一台电脑上更新的 Kuai 换上的），旧客户端认不得的不能发给它。
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 19;
+
+/// kuaid 的协议从这一版起，终端列表带 [`TermInfo::work_ms`]：空着就是还没干过活。更旧的 kuaid 不带，
+/// 客户端只能按 `idle_ms`（屏幕上的字随便变一下都算）来算。
+pub const WORK_SINCE: u32 = 19;
 
 /// 客户端的协议从这一版起，kuaid 才在终端流里发消息刻度（[`TermMarks`]）、分段还原屏幕
 /// （[`TermOpened::restore`]）。更旧的客户端把终端流里带结果的消息都当成 [`TermOpened`]，收到刻度
@@ -369,6 +377,12 @@ pub struct TermInfo {
     /// 整秒的话差一两秒就比错了
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_ms: Option<u64>,
+    /// 距最近一次「干活」多久了（毫秒，协议 19 起，见 [`WORK_SINCE`]）：屏幕上的字连续变了几秒以上、
+    /// 或者有人按过回车之后的变化才算；闲着时一下子的变化（Claude Code 检查更新时底栏闪一下、闲久了
+    /// 加的提示）、Claude Code 自己压缩对话不算。客户端拿它算 AI 终端的运行中、静默、待查看和时间。
+    /// 空着是还没干过活，或者 kuaid 比 19 旧（那样就按 `idle_ms` 算）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_ms: Option<u64>,
     /// 屏幕上最后一行有字的内容（协议 11 起），列表里给人看一眼用
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub last: String,

@@ -1294,6 +1294,70 @@ fn 定时任务_有人接着看时程序结束_也存下画面() {
 }
 
 #[test]
+fn 定时任务_转为普通会话以后不算进保留会话_结束时不存画面() {
+    let mut home = Home::new();
+    home.env = vec![("FR_KUAID_TASK_TICK".into(), "300".into())];
+    let exe = home.install("1.0.0-tasks5");
+    let repo = home.dir.join("code").join("app");
+    make_repo(&repo);
+    let mut client = home.connect(&exe);
+    client.hello();
+    // 只保留一次的会话；上一次还在运行也照样运行
+    client.call(
+        "task_apply",
+        echo_task(
+            &repo,
+            json!({ "schedule": { "kind": "manual" }, "keep": 1, "overlap": "run" }),
+        ),
+    );
+    let run_of = |file: &Value, id: &Value| -> Value {
+        (file["runs"].as_array().unwrap().iter())
+            .find(|run| run["id"] == *id)
+            .cloned()
+            .unwrap()
+    };
+    let first = client.call("task_run", json!({ "id": "t1" }));
+    assert_eq!(first["outcome"], "started", "{first}");
+    let first_term = first["term"].as_str().unwrap().to_string();
+
+    // 转为普通会话：运行记成结束，会话还开着
+    let file = client.call(
+        "task_apply",
+        json!({ "ops": [{ "op": "detach", "run": first["id"] }] }),
+    );
+    let detached = run_of(&file, &first["id"]);
+    assert_eq!(detached["detached"], true, "{detached}");
+    assert!(detached["ended"].is_u64(), "{detached}");
+    assert!(client.terms().iter().any(|t| t.term == first_term));
+
+    // 再运行两次：超出「保留会话」的是第二次的会话，转过去的不动
+    let second = client.call("task_run", json!({ "id": "t1" }));
+    assert_eq!(second["outcome"], "started", "{second}");
+    let second_term = second["term"].as_str().unwrap().to_string();
+    let third = client.call("task_run", json!({ "id": "t1" }));
+    assert_eq!(third["outcome"], "started", "{third}");
+    wait_until("第二次的会话结束", || {
+        !client.terms().iter().any(|t| t.term == second_term)
+    });
+    assert!(
+        client.terms().iter().any(|t| t.term == first_term),
+        "转为普通会话的被结束了"
+    );
+    let file = client.call("task_get", json!({}));
+    assert_eq!(run_of(&file, &second["id"])["screen"], true);
+
+    // 结束转过去的会话：当成普通会话结束，不存画面
+    client.call("term_close", json!({ "term": first_term }));
+    wait_until("转过去的会话结束", || {
+        !client.terms().iter().any(|t| t.term == first_term)
+    });
+    let file = client.call("task_get", json!({}));
+    let run = run_of(&file, &first["id"]);
+    assert_eq!(run["screen"], Value::Null, "{run}");
+    assert_eq!(run["ended"], detached["ended"], "{run}");
+}
+
+#[test]
 fn 开机时启动_写进启动项_启动项拉起常驻进程() {
     let mut home = Home::new();
     // 不往真的启动项里写

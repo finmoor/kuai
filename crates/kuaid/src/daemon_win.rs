@@ -190,6 +190,9 @@ struct HandoffSession {
     /// 屏幕上的字多久没变了，毫秒（协议 18 起；没变过的、更早的程序交过来的没有）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     quiet_ms: Option<u64>,
+    /// 多久没干活了，毫秒（协议 19 起，见 `term::Frozen::work`；没干过的、更早的程序交过来的没有）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    work_ms: Option<u64>,
 }
 
 fn minus_one() -> i32 {
@@ -496,6 +499,7 @@ fn write_handoff(path: &Path, host_token: &str, next_term: u64, frozen: &[Frozen
                 dump: f.dump.len() as u64,
                 marks: f.marks.clone(),
                 quiet_ms: f.quiet.map(|quiet| quiet.as_millis() as u64),
+                work_ms: f.work.map(|work| work.as_millis() as u64),
             })
             .collect(),
     };
@@ -564,6 +568,7 @@ fn adopt(terms: &Registry, handoff: Handoff, dumps: Vec<Vec<u8>>, host_token: &s
                 dump,
                 marks: session.marks,
                 quiet: session.quiet_ms.map(Duration::from_millis),
+                work: session.work_ms.map(Duration::from_millis),
             },
             backend,
         );
@@ -626,6 +631,7 @@ mod tests {
                     at: 1_700_000_000_123,
                 }],
                 quiet: Some(Duration::from_millis(12_345)),
+                work: Some(Duration::from_millis(60_000)),
             },
             Frozen {
                 id: "t4".into(),
@@ -638,6 +644,7 @@ mod tests {
                 dump: b"bye".to_vec(),
                 marks: Vec::new(),
                 quiet: None,
+                work: None,
             },
         ];
         write_handoff(&path, "secret", 7, &frozen).unwrap();
@@ -652,8 +659,9 @@ mod tests {
         assert_eq!((live.cols, live.rows), (100, 30));
         assert_eq!(live.marks, frozen[0].marks, "发出去的消息带过去");
         assert_eq!(live.quiet_ms, Some(12_345), "屏幕多久没变带过去");
+        assert_eq!(live.work_ms, Some(60_000), "多久没干活带过去");
         assert_eq!((ended.port, ended.exited, ended.exit), (-1, true, Some(2)));
-        assert_eq!(ended.quiet_ms, None);
+        assert_eq!((ended.quiet_ms, ended.work_ms), (None, None));
         assert_eq!(dumps, [b"\x1b[mhello".to_vec(), b"bye".to_vec()]);
         // 以后的版本多写了字段、少写了后加的字段，都读得了
         let future =

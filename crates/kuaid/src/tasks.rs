@@ -9,6 +9,8 @@
 //!   里，见 `fr_core::task`），记一条运行记录。超出「保留会话」的旧会话：存下最后的画面再结束，
 //!   工作树里没有改动的连同分支删除。
 //! - 跟着：每次看时间顺便看一遍各次运行的会话，记下最后一行、用了多久、结束没有。
+//! - 转为普通会话（协议 19，`TaskOp::Detach`）：运行记成结束，会话不动。上面这几样都只管没结束的
+//!   运行，转过去的会话就不再算任务的：不算进「保留会话」、不跟着、结束它时不存画面也不删工作树。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -573,10 +575,10 @@ fn schedule_loop(shared: Weak<Shared>, tick: Duration) {
     }
 }
 
-/// 这个任务运行的是不是 AI 助手（预设认得出是 Claude Code、Codex 这类）：运行记录的「最后一行」
-/// 找它的回复（见 `Screen::summary_text`）。
+/// 这个任务运行的是不是 AI 助手（预设认得出是 Claude Code、Codex 这类；命令是自定义的看命令本身）：
+/// 运行记录的「最后一行」找它的回复（见 `Screen::summary_text`）。
 fn replies(task: &Task) -> bool {
-    task.preset.style.is_some()
+    task.style().is_some()
 }
 
 /// 运行记录的「最后一行」换成 `last`，改了返回 true。空的不换；AI 助手的运行已经记下了它的回复

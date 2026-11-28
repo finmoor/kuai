@@ -4,7 +4,15 @@
 //! 时间都是任务所在主机的时间：主机名后面、详情的标题下面写明是哪台的时间、哪个时区；和本机
 //! 时区不同时「下次运行」另写一遍本机时间。常驻进程不在这里配置：主机名右边只写一句这台上的任务
 //! 到点会不会运行，主机重启后不会运行时是黄色的，点了去主机页。
+//!
+//! 任务开出来的终端只在这一页里看（第四版原型 `scheduled-tasks-v4.html` 的方向 A，会话页、仓库的
+//! 终端页不列）：运行记录里点会话还在的那一次，右边换成它的终端，可以接着输入，「←」回到任务。
+//! 要长期接着用就「转为普通会话」（协议 19）：那次运行记成结束，终端挪进会话页，不再计入「保留会话」。
 
+use std::rc::Rc;
+use std::sync::Arc;
+
+use fr_channel::Channel;
 use fr_core::i18n::{tr, trc};
 use fr_core::schedule::{Schedule, Wall};
 use fr_core::task::PromptVia;
@@ -13,6 +21,7 @@ use fr_core::tf;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::notification::{Notification, NotificationType};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex,
@@ -22,23 +31,43 @@ use gpui_kit::*;
 
 use super::{host_now, local_now, text};
 use crate::app_state::AppState;
-use crate::machines::{LOCAL, own_entry};
+use crate::machines::{LOCAL, machine_of, own_entry};
 use crate::settings::RepoEntry;
-use crate::term_board::{TermBoard, TermId, TermState};
+use crate::term_board::{Shown, TermBoard, TermId, TermState};
+use crate::terminal::{LinkBase, TerminalEvent, TerminalView};
 use crate::ui;
 
 /// 左边顶上那一条的高度（和主机页、会话页一样）
 const HEAD_HEIGHT: f32 = 52.;
 /// 隔这么久重画一遍：「21 小时后」「现在 12:14」要跟着走
 const TICK: std::time::Duration = std::time::Duration::from_secs(20);
+/// 主机上的常驻进程从这一版协议起才能「转为普通会话」
+const DETACH_SINCE: u32 = 19;
 
 pub enum TaskPageEvent {
-    /// 到会话页看这个终端
+    /// 到会话页看这个终端（转为普通会话以后的）
     OpenTerminal(TermId),
     /// 到主机页看这台（设开机时启动）
     ShowHost(String),
     /// 在标签页中打开（工作树里有改动的那一次）
     OpenRepo(RepoEntry),
+    /// 运行的终端里按住 Ctrl 单击了仓库里的文件、目录：到那个仓库的文件页打开。`path` 相对仓库根，
+    /// `at` 是行号、列号（从 1 起）
+    OpenFile {
+        entry: RepoEntry,
+        path: String,
+        at: Option<(u32, u32)>,
+        dir: bool,
+    },
+}
+
+/// 打开着的那次运行的终端。只看着接上（[`TerminalView::watch`]）：不改它的大小，往里输入、点画面
+/// 以后才改成这里放得下的。
+struct RunPeek {
+    id: TermId,
+    view: Entity<TerminalView>,
+    /// 终端里按住 Ctrl 单击了仓库里的文件
+    _events: Subscription,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -54,6 +83,14 @@ pub struct TaskPage {
     filter: Filter,
     /// 选中的：哪台主机上的哪个任务
     selected: Option<(String, String)>,
+    /// 打开着的一次运行：哪台主机上的哪一次（运行记录的编号）。右边是它的终端，不是任务的详情
+    open_run: Option<(String, String)>,
+    /// 那次运行的终端画面；主机没连着、终端列表里还没有它、这一页没显示时没有
+    peek: Option<RunPeek>,
+    /// 这一页显示着
+    visible: bool,
+    /// 关掉终端画面时焦点放回这里，不然键盘没人接
+    focus: FocusHandle,
     tick: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -74,6 +111,8 @@ pub enum RunState {
     /// 主机没连着，不知道
     Unknown,
     Ended,
+    /// 会话转成了普通会话，在会话页里
+    Detached,
     Skipped,
     Failed,
 }
@@ -88,9 +127,23 @@ impl RunState {
             RunState::Idle => tr("空闲"),
             RunState::Unknown => tr("状态未知"),
             RunState::Ended => tr("已结束"),
+            RunState::Detached => tr("已转为会话"),
             RunState::Skipped => tr("已跳过"),
             RunState::Failed => tr("启动失败"),
         }
+    }
+
+    /// 会话还开着、能打开它的终端（运行记录里点了右边换成它）。
+    pub fn open(self) -> bool {
+        matches!(
+            self,
+            RunState::Running
+                | RunState::Waiting
+                | RunState::Seen
+                | RunState::Quiet
+                | RunState::Idle
+                | RunState::Unknown
+        )
     }
 
     fn color(self, cx: &App) -> Hsla {
@@ -111,6 +164,9 @@ pub fn run_state(run: &Run, machine: &str, live: bool, board: &TermBoard) -> Run
         Outcome::Skipped => return RunState::Skipped,
         Outcome::Failed => return RunState::Failed,
         Outcome::Started => {}
+    }
+    if run.detached {
+        return RunState::Detached;
     }
     if run.ended.is_some() {
         return RunState::Ended;
@@ -146,23 +202,41 @@ pub fn next_run(task: &TaskDef, now: &Wall) -> Option<Wall> {
 }
 
 impl TaskPage {
-    pub fn new(app: Entity<AppState>, board: Entity<TermBoard>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        app: Entity<AppState>,
+        board: Entity<TermBoard>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // 任务、终端列表变了：打开着的那次运行的画面跟上（结束了就回到详情）
         let subscriptions = vec![
-            cx.observe(&app, |_, _, cx| cx.notify()),
-            cx.observe(&board, |_, _, cx| cx.notify()),
+            cx.observe_in(&app, window, |this, _, window, cx| {
+                this.sync_run(window, cx);
+                cx.notify()
+            }),
+            cx.observe_in(&board, window, |this, _, window, cx| {
+                this.sync_run(window, cx);
+                cx.notify()
+            }),
         ];
         Self {
             app,
             board,
             filter: Filter::All,
             selected: None,
+            open_run: None,
+            peek: None,
+            visible: false,
+            focus: cx.focus_handle(),
             tick: None,
             _subscriptions: subscriptions,
         }
     }
 
-    /// 显示出来了：问一遍各台的常驻进程（主机名右边那句话要），隔一会儿重画一遍。
-    pub fn shown(&mut self, cx: &mut Context<Self>) {
+    /// 显示出来了：问一遍各台的常驻进程（主机名右边那句话要），隔一会儿重画一遍。打开着一次运行的，
+    /// 接上它的终端，焦点进去。
+    pub fn shown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.visible = true;
         self.app.update(cx, |app, cx| {
             for key in app.task_hosts() {
                 app.refresh_daemon(&key, cx);
@@ -176,27 +250,358 @@ impl TaskPage {
                 }
             }
         }));
+        self.sync_run(window, cx);
+        self.focus_run(window, cx);
     }
 
-    pub fn hidden(&mut self) {
+    /// 不显示了：不再接着终端，回来时重新接（打开着哪一次还记着）。
+    pub fn hidden(&mut self, cx: &mut Context<Self>) {
+        self.visible = false;
         self.tick = None;
+        self.peek = None;
+        cx.notify();
     }
 
-    /// 选中主机 `machine` 上的任务 `id`（会话页的「查看任务」）。
+    /// 选中主机 `machine` 上的任务 `id`（新建、编辑、「设为定时任务…」存好以后）。打开着的运行收起：
+    /// 存的时候对话框开着，焦点不在终端里。
     pub fn select(&mut self, machine: &str, id: &str, cx: &mut Context<Self>) {
+        self.open_run = None;
+        self.peek = None;
         self.selected = Some((machine.to_string(), id.to_string()));
         self.filter = Filter::All;
         cx.notify();
     }
 
-    /// 「新建任务」：放在选中的任务所在的那台，没有就是第一台连着的。
+    /// 打开主机 `machine` 上任务 `task` 的第 `run` 次运行的终端，焦点进去（运行记录里点了、提醒里的
+    /// 「前往」）。
+    pub fn open_run(
+        &mut self,
+        machine: &str,
+        task: &str,
+        run: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected = Some((machine.to_string(), task.to_string()));
+        self.filter = Filter::All;
+        self.open_run = Some((machine.to_string(), run.to_string()));
+        self.sync_run(window, cx);
+        self.focus_run(window, cx);
+        cx.notify();
+    }
+
+    /// 回到任务的详情（「←」、选了别的任务、那次运行结束了）。焦点在终端里的放回这一页。
+    fn close_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open_run.is_none() && self.peek.is_none() {
+            return;
+        }
+        if self.typing(window, cx) {
+            self.focus.focus(window, cx);
+        }
+        self.open_run = None;
+        self.peek = None;
+        cx.notify();
+    }
+
+    /// 焦点放进打开着的那次运行的终端里。
+    fn focus_run(&self, window: &mut Window, cx: &mut App) {
+        if let Some(peek) = &self.peek {
+            peek.view.focus_handle(cx).focus(window, cx);
+        }
+    }
+
+    /// 焦点在终端里：敲的字都归它。
+    fn typing(&self, window: &Window, cx: &App) -> bool {
+        self.peek
+            .as_ref()
+            .is_some_and(|peek| peek.view.focus_handle(cx).is_focused(window))
+    }
+
+    /// 告诉 [`TermBoard`] 正显示着哪个终端：打开着的那次运行的（这一页显示着时）。
+    pub fn shown_for_board(&self) -> Option<Shown> {
+        let peek = self.peek.as_ref().filter(|_| self.visible)?;
+        Some(Shown::Task(peek.id.clone()))
+    }
+
+    /// 打开着的那次运行：(主机, 任务, 运行)。
+    fn opened(&self, cx: &App) -> Option<(String, TaskDef, Run)> {
+        let (machine, run) = self.open_run.as_ref()?;
+        let book = self.app.read(cx).task_book(machine)?;
+        let run = book.file.runs.iter().find(|r| r.id == *run)?;
+        let task = book.file.task(&run.task)?;
+        Some((machine.clone(), task.clone(), run.clone()))
+    }
+
+    /// 那次运行开在哪个仓库里（新工作树里运行的是那个工作树）：终端里的路径按它认。
+    fn run_entry(&self, machine: &str, task: &TaskDef, run: &Run, cx: &App) -> RepoEntry {
+        let windows = self
+            .app
+            .read(cx)
+            .machine(machine)
+            .is_some_and(|m| m.windows);
+        let path = run.worktree.as_deref().unwrap_or(&task.repo);
+        own_entry(machine, windows, path)
+    }
+
+    /// 让打开着的那次运行的画面跟上：换了一次、终端改了大小、主机换了连接就重新接；那次运行结束了、
+    /// 转成了普通会话、记录没了，回到详情。主机没连着、终端列表里还没有它时先空着（画面上写原因）。
+    fn sync_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open_run.is_none() {
+            self.peek = None;
+            return;
+        }
+        let Some((machine, task, run)) = self.opened(cx) else {
+            return self.close_run(window, cx);
+        };
+        let Some(term) = run.term.clone().filter(|_| run.ended.is_none()) else {
+            return self.close_run(window, cx);
+        };
+        if !self.visible {
+            self.peek = None;
+            return;
+        }
+        let id = TermId {
+            machine: machine.clone(),
+            term,
+        };
+        let found = {
+            let board = self.board.read(cx);
+            board
+                .row(&id)
+                .zip(board.conn(&machine))
+                .map(|(row, conn)| (row.cols, row.rows, conn))
+        };
+        let typing = self.typing(window, cx);
+        let Some((cols, rows, conn)) = found else {
+            if typing {
+                self.focus.focus(window, cx);
+            }
+            self.peek = None;
+            return;
+        };
+        let size = Some((cols.max(2), rows.max(1)));
+        let current = self.peek.as_ref().is_some_and(|peek| {
+            let view = peek.view.read(cx);
+            peek.id == id
+                && view.size() == size
+                // 那台电脑换了连接（改了地址）：编号、大小一样也得重新接，不然输入还发给旧的那台
+                && view.conn().is_none_or(|old| Arc::ptr_eq(&old, &conn))
+        });
+        if current {
+            return;
+        }
+        let same = self.peek.as_ref().is_some_and(|peek| peek.id == id);
+        let view = cx.new(|cx| TerminalView::watch(&conn, &id.term, cols, rows, window, cx));
+        let entry = self.run_entry(&machine, &task, &run, cx);
+        let events = self.link_view(&view, entry, cx);
+        // 正往里输入时它改了大小（别处要过去了）、被别处重启了：换上新建的那个，焦点跟过去；大小跟着
+        // 别处，这边打字、点画面时再要回来（见 `TerminalView::wants_size`）
+        if typing {
+            match same {
+                true => {
+                    view.update(cx, |view, _| view.follow_size());
+                    view.focus_handle(cx).focus(window, cx);
+                }
+                false => self.focus.focus(window, cx),
+            }
+        }
+        self.peek = Some(RunPeek {
+            id,
+            view,
+            _events: events,
+        });
+    }
+
+    /// 告诉画面它开在哪个仓库（认终端里的路径用），按住 Ctrl 单击了仓库里的文件时到那个仓库的
+    /// 文件页打开它。
+    fn link_view(
+        &self,
+        view: &Entity<TerminalView>,
+        entry: RepoEntry,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        let local = entry.server.is_none();
+        let (board, machine) = (self.board.downgrade(), machine_of(&entry).to_string());
+        let base = LinkBase {
+            root: entry.path.clone(),
+            sub: String::new(),
+            local,
+            server: entry.server.clone(),
+            // 本机的直接看；服务器上的问那台的 kuaid（每次现拿连接：会断、会换）
+            channel: Rc::new(move |cx: &App| match local {
+                true => Some(Channel::Local),
+                false => board
+                    .upgrade()?
+                    .read(cx)
+                    .conn(&machine)
+                    .map(Channel::Remote),
+            }),
+        };
+        view.update(cx, |view, _| view.set_link_base(base));
+        cx.subscribe(view, move |_, _, event: &TerminalEvent, cx| match event {
+            TerminalEvent::OpenFile { path, at, dir } => cx.emit(TaskPageEvent::OpenFile {
+                entry: entry.clone(),
+                path: path.clone(),
+                at: *at,
+                dir: *dir,
+            }),
+        })
+    }
+
+    /// 「结束」：结束那次运行的终端（kuaid 先存下最后的画面，工作树里没有改动的删掉）。里面还有程序
+    /// 在跑的先问。
+    fn end_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((machine, task, run)) = self.opened(cx) else {
+            return;
+        };
+        let Some(term) = run.term.clone() else {
+            return;
+        };
+        let id = TermId {
+            machine: machine.clone(),
+            term,
+        };
+        let (row, conn) = {
+            let board = self.board.read(cx);
+            (board.row(&id), board.conn(&machine))
+        };
+        let app = self.app.read(cx);
+        let windows = app.machine(&machine).is_some_and(|m| m.windows);
+        let ending = crate::term_end::Ending {
+            conn,
+            repo: app.repo_name(&own_entry(&machine, windows, &task.repo)),
+            name: row
+                .as_ref()
+                .map_or_else(|| task.name.clone().into(), |row| row.label.clone()),
+            row,
+            term: Some(id.term.clone()),
+            exited: false,
+            restart: false,
+        };
+        crate::term_end::ask_first(self, ending, window, cx, move |this, window, cx| {
+            let Some(conn) = this.board.read(cx).conn(&id.machine) else {
+                let text = tf!("结束终端失败：{err}", err = tr("未连接"));
+                window.push_notification(Notification::error(text).autohide(false), cx);
+                return;
+            };
+            let closing = conn.term_close(&id.term);
+            cx.spawn_in(window, async move |this, cx| {
+                let Err(err) = closing.await else {
+                    return;
+                };
+                this.update_in(cx, |_, window, cx| {
+                    let text = tf!("结束终端失败：{err}", err = format!("{err:#}"));
+                    window.push_notification(Notification::error(text).autohide(false), cx);
+                })
+                .ok();
+            })
+            .detach();
+        });
+    }
+
+    /// 「转为普通会话」：先问一句（转过去就挪不回任务了），确定了那次运行记成结束，终端挪进会话页
+    /// （叫「任务名 时间」），不再计入「保留会话」。
+    fn detach_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((machine, task, run)) = self.opened(cx) else {
+            return;
+        };
+        let Some(term) = run.term.clone() else {
+            return;
+        };
+        let id = TermId {
+            machine: machine.clone(),
+            term,
+        };
+        let app = self.app.read(cx);
+        let now = app
+            .task_book(&machine)
+            .and_then(|book| book.file.clock.as_ref())
+            .map(host_now);
+        let label = format!("{} {}", task.name, text::short_when(&run.at, now.as_ref()));
+        let windows = app.machine(&machine).is_some_and(|m| m.windows);
+        let repo = app.repo_name(&own_entry(&machine, windows, &task.repo));
+        let page = cx.entity().downgrade();
+        let run = run.id;
+        // 不删东西、终端照常开着，按钮不用红的，回车就是确定
+        crate::manager::confirm_in(
+            tf!("将「{name}」转为普通会话？", name = label.as_str()),
+            tf!(
+                "终端将挪到会话页的「{repo}」下面，其中的程序继续运行，不再计入「保留会话」。此操作无法撤销。",
+                repo = repo.to_string()
+            ),
+            tr("转为普通会话"),
+            false,
+            window,
+            cx,
+            move |window, cx| {
+                let (run, id, label, repo) = (run.clone(), id.clone(), label.clone(), repo.clone());
+                page.update(cx, |page, cx| page.detach(run, id, label, repo, window, cx))
+                    .ok();
+            },
+        );
+    }
+
+    /// 问过以后真的转：`id` 是那次运行的终端，`label` 是转过去以后终端的名字。
+    fn detach(
+        &mut self,
+        run: String,
+        id: TermId,
+        label: String,
+        repo: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let machine = id.machine.clone();
+        let ops = vec![TaskOp::Detach { run: run.clone() }];
+        let done = self
+            .app
+            .update(cx, |app, cx| app.apply_tasks(&machine, ops, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            // 做不了的 `apply_tasks` 已经说过了
+            if done.await.is_none() {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                // 会话页里按任务的名字认得出是哪一个
+                this.board
+                    .update(cx, |board, cx| board.rename(&id, &label, cx));
+                // 还开着的是这一次才回到任务（运行记录推过来时 `sync_run` 也会关）
+                if this.open_run.as_ref() == Some(&(machine, run)) {
+                    this.close_run(window, cx);
+                }
+                let text = tf!(
+                    "已转为普通会话，在会话页的「{repo}」下面。",
+                    repo = repo.to_string()
+                );
+                let page = cx.entity().downgrade();
+                let note = ui::action_note(NotificationType::Success, text, move |_, _, _| {
+                    let (page, id) = (page.clone(), id.clone());
+                    Button::new("task-detached-go")
+                        .small()
+                        .primary()
+                        .label(tr("前往"))
+                        .on_click(move |_, _, cx| {
+                            page.update(cx, |_, cx| {
+                                cx.emit(TaskPageEvent::OpenTerminal(id.clone()))
+                            })
+                            .ok();
+                        })
+                })
+                .autohide(true);
+                window.push_notification(note, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 「新建任务」：主机、仓库都不替人填（选中的任务在哪台不代表新任务也放那台），要自己选。
     pub fn new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let machine = self.selected.as_ref().map(|(machine, _)| machine.clone());
         let page = cx.entity().downgrade();
         super::editor::open(
             self.app.clone(),
             super::editor::Start::New {
-                machine,
+                machine: None,
                 repo: None,
                 preset: None,
                 prompt: String::new(),
@@ -374,24 +779,32 @@ impl TaskPage {
         );
         let total = tasks.len();
         let enabled = tasks.iter().filter(|(_, task)| task.enabled).count();
-        let (running, can_add) = {
+        // 待查看的是几次运行，正在运行的是几个任务
+        let (waiting, running, can_add) = {
             let app = self.app.read(cx);
             let board = self.board.read(cx);
-            let running = tasks
-                .iter()
-                .filter(|(machine, task)| {
-                    app.task_book(machine).is_some_and(|book| {
-                        book.file.runs_of(&task.id).any(|run| {
-                            run_state(run, machine, book.live, board) == RunState::Running
-                        })
+            let states = |machine: &str, task: &TaskDef| -> Vec<RunState> {
+                app.task_book(machine)
+                    .map(|book| {
+                        book.file
+                            .runs_of(&task.id)
+                            .map(|run| run_state(run, machine, book.live, board))
+                            .collect()
                     })
-                })
-                .count();
-            (running, !app.task_hosts().is_empty())
+                    .unwrap_or_default()
+            };
+            let (mut waiting, mut running) = (0, 0);
+            for (machine, task) in tasks {
+                let states = states(machine, task);
+                waiting += states.iter().filter(|s| **s == RunState::Waiting).count();
+                running += usize::from(states.contains(&RunState::Running));
+            }
+            (waiting, running, !app.task_hosts().is_empty())
         };
-        let summary = match running {
-            0 => tf!("{n} 个任务", n = total),
-            _ => tf!("{n} 个任务，{m} 个正在运行", n = total, m = running),
+        let summary = match (waiting, running) {
+            (0, 0) => tf!("{n} 个任务", n = total),
+            (0, _) => tf!("{n} 个任务，{m} 个正在运行", n = total, m = running),
+            _ => tf!("{n} 个任务，{m} 次运行待查看", n = total, m = waiting),
         };
         let filter_button =
             |id: &'static str, filter: Filter, label: String, cx: &Context<Self>| {
@@ -726,7 +1139,8 @@ impl TaskPage {
             .when(on, |row| row.bg(selected_bg))
             .when(!on, |row| row.hover(|s| s.bg(hover)))
             .when(!task.enabled, |row| row.opacity(0.7))
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.close_run(window, cx);
                 this.selected = Some((target_machine.clone(), target_id.clone()));
                 cx.notify();
             }))
@@ -1061,12 +1475,29 @@ impl TaskPage {
             )
             .child(ui::clipped("task-preset", task.preset.name.clone()).text_sm())
             .into_any_element();
-        let model = match task.model.is_empty() {
-            true => value("task-model", tr("按程序设置").into()),
-            false => ui::clipped("task-model", task.model.clone())
+        // 命令是自定义的：这三样没加进命令，要的话写在命令里
+        let in_command = || {
+            div()
+                .text_sm()
+                .text_color(muted)
+                .child(tr("写在命令里"))
+                .into_any_element()
+        };
+        let model = match (task.custom, task.model.is_empty()) {
+            (true, _) => in_command(),
+            (false, true) => value("task-model", tr("按程序设置").into()),
+            (false, false) => ui::clipped("task-model", task.model.clone())
                 .text_sm()
                 .font_family(crate::fonts::mono())
                 .into_any_element(),
+        };
+        let effort = match task.custom {
+            true => in_command(),
+            false => value("task-effort", text::effort(&task.effort).into()),
+        };
+        let confirm = match task.custom {
+            true => in_command(),
+            false => value("task-confirm", text::confirm(task.confirm).into()),
         };
         let line = task.launch.line(fr_core::task::Shell::Posix);
         let command_row = h_flex()
@@ -1091,8 +1522,8 @@ impl TaskPage {
                     .bg(accent.opacity(0.12))
                     .text_color(accent)
                     .child(match task.launch.prompt {
-                        PromptVia::Arg => tr("提示词"),
-                        PromptVia::Paste => tr("提示词作为第一条消息粘贴"),
+                        PromptVia::Arg => text::prompt_chip(&task.launch),
+                        PromptVia::Paste => tr("提示词作为第一条消息粘贴").to_string(),
                     }),
             )
             .when(task.launch.exits, |row| {
@@ -1101,6 +1532,18 @@ impl TaskPage {
                         .flex_none()
                         .text_color(muted)
                         .child(tr("运行结束即退出")),
+                )
+            })
+            .when(task.custom, |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .px(px(6.))
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(border)
+                        .text_color(muted)
+                        .child(tr("自定义")),
                 )
             });
         let info = v_flex()
@@ -1114,14 +1557,8 @@ impl TaskPage {
                     .child(cell(tr("位置"), location))
                     .child(cell(tr("终端预设"), preset))
                     .child(cell(tr("模型"), model))
-                    .child(cell(
-                        tr("思考深度"),
-                        value("task-effort", text::effort(&task.effort).into()),
-                    ))
-                    .child(cell(
-                        tr("需要确认时"),
-                        value("task-confirm", text::confirm(task.confirm).into()),
-                    )),
+                    .child(cell(tr("思考深度"), effort))
+                    .child(cell(tr("需要确认时"), confirm)),
             )
             .child(command_row);
         let prompt = v_flex()
@@ -1257,7 +1694,7 @@ impl TaskPage {
         if runs.is_empty() {
             // AI 程序第一次在一个仓库里运行时先问信任不信任这个文件夹（Claude Code、Codex 都是，确认
             // 一次以后这个仓库和它的工作树都不再问）：没人在场的运行会停在那里，先试一次
-            let empty = match task.preset.style {
+            let empty = match task.style() {
                 Some(_) => tr(
                     "还没有运行过。程序首次在这个仓库中运行时可能会询问是否信任该文件夹，建议先点「立即运行」试一次，并在会话中确认。",
                 ),
@@ -1357,27 +1794,44 @@ impl TaskPage {
                 RunState::Failed => (run.reason.clone(), Some(danger)),
                 _ => (run.last.clone(), None),
             };
+            // 会话还开着的：点这一行（或者「打开」）右边换成它的终端
+            let opens = state.open() && run.term.is_some() && live;
+            let open = {
+                let (machine, task_id, run_id) =
+                    (machine.to_string(), task.id.clone(), run.id.clone());
+                move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                    this.open_run(&machine, &task_id, &run_id, window, cx)
+                }
+            };
+            // 转成了普通会话、会话还在：到会话页看它
+            let detached = run
+                .term
+                .as_ref()
+                .filter(|_| state == RunState::Detached)
+                .map(|term| TermId {
+                    machine: machine.to_string(),
+                    term: term.clone(),
+                })
+                .filter(|id| board.row(id).is_some());
             let action: Option<AnyElement> = match state {
-                RunState::Running
-                | RunState::Waiting
-                | RunState::Seen
-                | RunState::Quiet
-                | RunState::Idle
-                | RunState::Unknown
-                    if run.term.is_some() && live =>
-                {
-                    let id = TermId {
-                        machine: machine.to_string(),
-                        term: run.term.clone().unwrap_or_default(),
-                    };
+                _ if opens => {
+                    let open = open.clone();
                     Some(
-                        link_text(("task-run-open", ix), tr("打开会话"), accent)
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.emit(TaskPageEvent::OpenTerminal(id.clone()))
+                        link_text(("task-run-open", ix), tr("打开"), accent)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                open(this, window, cx)
                             }))
                             .into_any_element(),
                     )
                 }
+                RunState::Detached => detached.map(|id| {
+                    link_text(("task-run-session", ix), tr("打开会话"), accent)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(TaskPageEvent::OpenTerminal(id.clone()))
+                        }))
+                        .into_any_element()
+                }),
                 RunState::Ended if run.screen && live => {
                     let (machine, run, title) = (
                         machine.to_string(),
@@ -1405,7 +1859,10 @@ impl TaskPage {
                 _ => None,
             };
             let color = state.color(cx);
-            let hollow = matches!(state, RunState::Ended | RunState::Skipped);
+            let hollow = matches!(
+                state,
+                RunState::Ended | RunState::Skipped | RunState::Detached
+            );
             table = table.child(
                 h_flex()
                     .id(("task-run", ix))
@@ -1415,6 +1872,11 @@ impl TaskPage {
                     .text_xs()
                     .when(ix > 0, |row| row.border_t_1().border_color(border))
                     .hover(|s| s.bg(hover))
+                    .when(opens, |row| {
+                        row.cursor_pointer().on_click(
+                            cx.listener(move |this, _, window, cx| open(this, window, cx)),
+                        )
+                    })
                     .child(
                         col(128.)
                             .flex()
@@ -1469,6 +1931,184 @@ impl TaskPage {
             .gap(px(8.))
             .child(header)
             .child(table)
+            .into_any_element()
+    }
+
+    /// 打开着的一次运行：顶上一条（「←」回到任务、什么时候的运行、状态、用时和位置、「转为普通会话」
+    /// 「结束」），下面一行说明，再下面全是它的终端。
+    fn render_run(
+        &self,
+        machine: &str,
+        task: &TaskDef,
+        run: &Run,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let (muted, border, primary, secondary, bg, fg) = (
+            theme.muted_foreground,
+            theme.border,
+            theme.primary,
+            theme.secondary,
+            theme.background,
+            theme.foreground,
+        );
+        let app = self.app.read(cx);
+        let board = self.board.read(cx);
+        let book = app.task_book(machine);
+        let live = book.is_some_and(|book| book.live);
+        let now = book
+            .and_then(|book| book.file.clock.as_ref())
+            .map(host_now)
+            .unwrap_or_default();
+        let host = app.machine_name(machine);
+        let windows = app.machine(machine).is_some_and(|m| m.windows);
+        let repo = app.repo_name(&own_entry(machine, windows, &task.repo));
+        let detachable = app
+            .task_protocol(machine)
+            .is_some_and(|protocol| protocol >= DETACH_SINCE);
+        let state = run_state(run, machine, live, board);
+        let color = state.color(cx);
+        // 停下过就是记下的用时；还在干的写已经运行了多久
+        let took = match run.seconds {
+            Some(seconds) => tf!("用时 {took}", took = text::duration(seconds)),
+            None => tf!(
+                "已运行 {took}",
+                took = text::duration(super::now_secs().saturating_sub(run.started))
+            ),
+        };
+        let meta = format!("{took} · {host} / {repo}");
+        let back = h_flex()
+            .id("task-run-back")
+            .flex_shrink(1.)
+            .min_w(px(60.))
+            .gap(px(4.))
+            .px(px(6.))
+            .h(px(26.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .text_color(muted)
+            .hover(|s| s.bg(secondary).text_color(fg))
+            .child(Icon::new(IconName::ArrowLeft).size(px(14.)))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .child(task.name.clone()),
+            )
+            .tooltip(|window, cx| ui::tip(tr("回到任务"), window, cx))
+            .on_click(cx.listener(|this, _, window, cx| this.close_run(window, cx)));
+        let title = tf!("{when} 的运行", when = text::when(&run.at, &now));
+        let chip = h_flex()
+            .flex_none()
+            .gap(px(5.))
+            .text_xs()
+            .text_color(color)
+            .child(div().flex_none().size(px(7.)).rounded_full().bg(color))
+            .child(state.label());
+        let head = h_flex()
+            .flex_none()
+            .h(px(HEAD_HEIGHT))
+            .px(px(12.))
+            .gap(px(10.))
+            .border_b_1()
+            .border_color(border)
+            .child(back)
+            .child(div().flex_none().w(px(1.)).h(px(16.)).bg(border))
+            .child(
+                div()
+                    .flex_none()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            )
+            .child(chip)
+            .child(
+                ui::clipped("task-run-meta", meta)
+                    .flex_1()
+                    .text_xs()
+                    .text_color(muted),
+            )
+            .child(
+                Button::new("task-run-detach")
+                    .small()
+                    .icon(ui::icon(IconName::SquareArrowOutUpRight))
+                    .label(tr("转为普通会话"))
+                    .disabled(!live || !detachable)
+                    .when(live && !detachable, |b| {
+                        b.tooltip(tr("主机上的常驻进程版本较旧，升级后才能转为普通会话。"))
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| this.detach_run(window, cx))),
+            )
+            .child(
+                Button::new("task-run-end")
+                    .small()
+                    .icon(ui::icon(IconName::Square))
+                    .label(tr("结束"))
+                    .disabled(!live)
+                    .on_click(cx.listener(|this, _, window, cx| this.end_run(window, cx))),
+            );
+        let note = h_flex()
+            .flex_none()
+            .gap(px(6.))
+            .px(px(14.))
+            .py(px(6.))
+            .border_b_1()
+            .border_color(border)
+            .bg(secondary.opacity(0.5))
+            .text_xs()
+            .text_color(muted)
+            .child(Icon::new(IconName::Info).size(px(13.)))
+            .child(div().min_w_0().whitespace_normal().child(tf!(
+                "可以在这里接着输入。要长期接着用，转为普通会话：挪到会话页的「{repo}」下面，不再计入「保留会话」。",
+                repo = repo.to_string()
+            )));
+        let typing = self.typing(window, cx);
+        let centered = || {
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .px(px(24.))
+                .text_color(muted)
+                .text_size(px(13.))
+        };
+        let body = match &self.peek {
+            Some(peek) => div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                // 点进终端里焦点就换了（终端自己接的）：这一页跟着重画，顶上的细线才跟得上
+                .on_any_mouse_down(cx.listener(|_, _, _, cx| cx.notify()))
+                .child(peek.view.clone())
+                // 正在输入：画面顶上一条主色细线（和会话页一样）
+                .when(typing, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .h(px(2.))
+                            .bg(primary),
+                    )
+                })
+                .into_any_element(),
+            None if !live || state == RunState::Unknown => centered()
+                .child(Icon::new(IconName::Unplug).size(px(28.)))
+                .child(tf!("{host} 未连接，这次运行的终端状态未知。", host))
+                .into_any_element(),
+            None => centered().child(tr("正在连接终端…")).into_any_element(),
+        };
+        v_flex()
+            .size_full()
+            .bg(bg)
+            .child(head)
+            .child(note)
+            .child(body)
             .into_any_element()
     }
 }
@@ -1625,13 +2265,35 @@ impl Render for TaskPage {
             self.selected = Some((machine.clone(), task.id.clone()));
         }
         let side = self.render_side(width, &tasks, cx);
-        let main = match &current {
-            Some((machine, task)) => self.render_detail(machine, task, window, cx),
-            None => self.render_empty(cx),
+        // 打开着的那次运行（是选中的任务的、会话还开着）：右边是它的终端，不滚动
+        let opened = self.opened(cx).filter(|(machine, task, run)| {
+            run.ended.is_none()
+                && current
+                    .as_ref()
+                    .is_some_and(|(m, t)| m == machine && t.id == task.id)
+        });
+        let main = match (opened, &current) {
+            (Some((machine, task, run)), _) => div()
+                .id("task-main")
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .child(self.render_run(&machine, &task, &run, window, cx)),
+            (None, current) => div()
+                .id("task-main")
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .overflow_y_scroll()
+                .child(match current {
+                    Some((machine, task)) => self.render_detail(machine, task, window, cx),
+                    None => self.render_empty(cx),
+                }),
         };
         h_flex()
             .size_full()
             .bg(background)
+            .track_focus(&self.focus)
             .on_drag_move(cx.listener(
                 |this, event: &DragMoveEvent<crate::side_split::DragSide>, window, cx| {
                     crate::side_split::drag(&this.app, event, window, cx);
@@ -1639,15 +2301,7 @@ impl Render for TaskPage {
                 },
             ))
             .child(side)
-            .child(
-                div()
-                    .id("task-main")
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .overflow_y_scroll()
-                    .child(main),
-            )
+            .child(main)
     }
 }
 

@@ -314,6 +314,33 @@ impl Screen {
         Some((rows, at.line.0.max(0) as usize, shown))
     }
 
+    /// 屏幕上最后一行有字的那一行往上 `rows` 行里，有没有一行写着 `text`（英文字母不分大小写；只看
+    /// 一行里的，折行不连）。认 AI 助手输入框上下的转圈、提示在说什么用（见 `Activity::work`）。不看
+    /// 屏幕最底下：对话短的时候 Claude Code 的输入框、转圈都画在屏幕上半截，下面是空的。
+    pub fn shows_near_end(&self, rows: usize, text: &str) -> bool {
+        let grid = self.term.grid();
+        let columns = grid.columns();
+        let row_text = |line: usize| -> String {
+            let row = &grid[Line(line as i32)];
+            (0..columns)
+                .map(|col| &row[Column(col)])
+                .filter(|cell| {
+                    !cell
+                        .flags
+                        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                })
+                .map(|cell| cell.c)
+                .collect()
+        };
+        let Some(end) = (0..grid.screen_lines()).rfind(|&line| !row_text(line).trim().is_empty())
+        else {
+            return false;
+        };
+        let text = text.to_ascii_lowercase();
+        (end.saturating_sub(rows.saturating_sub(1))..=end)
+            .any(|line| row_text(line).to_ascii_lowercase().contains(&text))
+    }
+
     /// 屏幕上的字（连同往回翻的记录有多少行、在不在备用屏）的摘要：看程序的一块输出改没改屏幕上的
     /// 字（见 `Activity`）。光改颜色、反色，挪光标，改标题的不算。
     pub fn digest(&self) -> u64 {

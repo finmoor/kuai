@@ -2,7 +2,7 @@
 
 use fr_core::i18n::{tr, trc};
 use fr_core::schedule::{Schedule, Time, Wall};
-use fr_core::task::{ArgStyle, Confirm};
+use fr_core::task::{ArgStyle, Confirm, Launch};
 use fr_core::tasks::{Missed, Overlap};
 use fr_core::tf;
 
@@ -155,6 +155,15 @@ pub fn effort(effort: &str) -> String {
         "xhigh" => trc("思考深度", "超高").to_string(),
         "max" => trc("思考深度", "最高").to_string(),
         other => other.to_string(),
+    }
+}
+
+/// 「将运行」命令后面那个小牌：提示词前面要跟的参数（Antigravity CLI 的 `-i`、OpenCode 的
+/// `--prompt`）也写出来，免得以为命令后面直接跟提示词。
+pub fn prompt_chip(launch: &Launch) -> String {
+    match launch.prompt_flag.is_empty() {
+        true => tr("提示词").to_string(),
+        false => format!("{} {}", launch.prompt_flag, tr("提示词")),
     }
 }
 

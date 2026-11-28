@@ -12,6 +12,13 @@
 //!   不提醒：长时间不出字是常态。
 //! - 待查看：AI 终端（[`Kind::Agent`]）静默超过设置里给这家定的时长，之后还没看过。只有它进标题栏的
 //!   角标、发提醒。时长默认 Claude Code、Codex 3 分钟，别的 2 分钟（设置 → 终端 → 提醒）。
+//!
+//! AI 终端的「输出」只算干活（kuaid 的 `work_ms`，协议 19 起，见 [`Listed::active`]）：屏幕上的字
+//! 连续变了几秒以上，冒出了「esc to interrupt」（Claude Code、Codex 干活时写着），或者有人按过回车
+//! 之后的变化。闲着的 Claude Code 自己会改屏幕：检查更新时底栏闪一秒、闲久了底栏加提示、加一段回顾、
+//! 快到提示缓存过期时自己压缩对话。原来这些都算输出，看过的终端过一阵又成了待查看，「待查看 · N 分钟」
+//! 也从那一下重新算。现在运行中、静默多久、待查看多久都从干完活算起。kuaid 比 19 旧时照旧看屏幕上的
+//! 字变没变。
 //! - 状态未知：所在主机断开了。列表留着（会话页里灰掉，写「未连接」带「重新连接」），不进角标；
 //!   重连以后接着算。
 //!
@@ -19,6 +26,11 @@
 //! 在会话页里选中过，或者从会话页前往过。会话页里正选中的那个不提醒、不计入标题栏上的个数，
 //! 但在列表里仍写着「待查看」，选到别的、离开那一页以后才变：不然一打开会话页，自动选中的那个
 //! 马上变了，就看不出是哪个在等。
+//!
+//! 定时任务开出来、还算那个任务的终端（[`TaskMark`]）只在任务页里看：会话页、仓库终端页的列表
+//! （[`TermBoard::repos`]、[`TermBoard::terms_of`]）不列它们，标题栏上分开计数（「会话」是
+//! [`TermBoard::attention`]，「任务」是 [`TermBoard::task_attention`]）。在任务页「转为普通会话」以后
+//! 那次运行记成结束，终端就是普通的了。
 //!
 //! 离开期间：看过的时刻和「最后一次还在收这台的列表」的时刻记在盘上（[`term_memory`]）。
 //! 重开 Kuai、断线重连以后，离开期间有过新输出的 AI 终端标成「离开期间有更新」（[`Row::away`]），
@@ -34,6 +46,7 @@ use std::time::{Duration, Instant};
 
 use fr_channel::{Connection, TermInfo};
 use fr_core::i18n::tr;
+use fr_core::protocol::WORK_SINCE;
 use fr_core::tf;
 use futures::StreamExt as _;
 use gpui_kit::*;
@@ -199,6 +212,8 @@ pub enum Shown {
     Typing(TermId),
     /// 并排查看的几格（会话页、仓库终端页）：都算看过
     Split(Vec<TermId>),
+    /// 任务页里打开着的一次运行的终端：和仓库终端页上显示着的一样，一直算看过
+    Task(TermId),
 }
 
 /// 读到的一个终端。
@@ -206,11 +221,25 @@ struct Listed {
     info: TermInfo,
     /// 最近一次输出的时刻，按收到时的「多久没有输出」倒推的；不知道是 None
     last_output: Option<Instant>,
+    /// 最近一次干活的时刻，按 kuaid 给的「多久没干活了」（[`TermInfo::work_ms`]）倒推的；还没干过
+    /// 是 None。kuaid 比 [`WORK_SINCE`] 旧时没有这一项，和 `last_output` 一样
+    last_work: Option<Instant>,
     /// 它是哪个仓库的第几个终端（见 [`owner`]）。列表推过来、工作区和仓库列表变了时算好：原来每次
     /// 画都给每个终端把所有工作区的仓库对一遍，一帧里还要算好几遍
     owner: (RepoEntry, u32),
     /// 开出来的时刻（这台电脑的 Unix 秒），第一次读到时按「开了多久」倒推，之后不变
     born: u64,
+}
+
+impl Listed {
+    /// 算状态、「静默多久」「待查看多久」用的时刻：AI 终端看最近一次干活（闲着时屏幕上一下子的
+    /// 变化、Claude Code 自己压缩对话都不算），别的看最近一次输出。
+    fn active(&self, kind: Kind) -> Option<Instant> {
+        match kind {
+            Kind::Agent(_) => self.last_work,
+            Kind::Shell | Kind::Command => self.last_output,
+        }
+    }
 }
 
 /// 列表里的一行。
@@ -241,6 +270,7 @@ pub struct Row {
     pub seen: bool,
     /// 所在主机连着
     pub online: bool,
+    /// 最近一次输出的时刻：AI 终端是最近一次干活的（见 [`Listed::active`]）
     pub last_output: Option<Instant>,
     /// 开出来的时刻（这台电脑的 Unix 秒）
     pub born: u64,
@@ -248,11 +278,10 @@ pub struct Row {
     pub programs: Option<Vec<String>>,
     /// 定时任务开出来的：哪个任务的哪一次
     pub task: Option<TaskMark>,
-    /// 会话页里同一个任务的几次运行折成一行时，最新那一行后面折起来了几次（会话页自己填）
-    pub folded: usize,
 }
 
-/// 定时任务开出来的终端是哪个任务的哪一次（会话页的时钟角标、横条、折行用）。
+/// 定时任务开出来的终端是哪个任务的哪一次。这样的终端只在任务页里看（[`TermBoard::repos`]、
+/// [`TermBoard::terms_of`] 不列），提醒、标题栏「任务」上的个数也按它分开。
 #[derive(Clone, Debug, PartialEq)]
 pub struct TaskMark {
     pub task: String,
@@ -677,29 +706,39 @@ impl TermBoard {
         });
         let now = Instant::now();
         let old = self.lists.remove(machine).unwrap_or_default();
+        // kuaid 算得出多久没干活
+        let works = self
+            .watches
+            .get(machine)
+            .is_some_and(|(conn, _)| conn.hello.protocol >= WORK_SINCE);
         let app = self.app.read(cx);
-        let listed: Vec<Listed> = list
-            .into_iter()
-            .map(|info| {
-                let before = old.iter().find(|listed| listed.info.term == info.term);
-                // 正在输出时 kuaid 隔几秒才推一次，这个时刻会落后几秒；输出停下以后它还会推一次，
-                // 到判断状态的时候（停下 10 秒后）已经是准的
-                let fresh = info
-                    .idle_ms
-                    .and_then(|idle| now.checked_sub(Duration::from_millis(idle)));
-                let last_output = fresh.or(before.and_then(|listed| listed.last_output));
-                let born = before
-                    .map(|listed| listed.born)
-                    .unwrap_or_else(|| secs.saturating_sub(info.age));
-                let owner = owner(app, machine, &info.key);
-                Listed {
-                    info,
-                    last_output,
-                    owner,
-                    born,
-                }
-            })
-            .collect();
+        let listed: Vec<Listed> =
+            list.into_iter()
+                .map(|info| {
+                    let before = old.iter().find(|listed| listed.info.term == info.term);
+                    // 正在输出时 kuaid 隔几秒才推一次，这个时刻会落后几秒；输出停下以后它还会推一次，
+                    // 到判断状态的时候（停下 10 秒后）已经是准的
+                    let ago = |ms: u64| now.checked_sub(Duration::from_millis(ms));
+                    let last_output = (info.idle_ms.and_then(ago))
+                        .or(before.and_then(|listed| listed.last_output));
+                    let last_work = match works {
+                        true => (info.work_ms.and_then(ago))
+                            .or(before.and_then(|listed| listed.last_work)),
+                        false => last_output,
+                    };
+                    let born = before
+                        .map(|listed| listed.born)
+                        .unwrap_or_else(|| secs.saturating_sub(info.age));
+                    let owner = owner(app, machine, &info.key);
+                    Listed {
+                        info,
+                        last_output,
+                        last_work,
+                        owner,
+                        born,
+                    }
+                })
+                .collect();
         // 不在了的终端不用再记着
         let here = |id: &TermId| {
             id.machine != machine || listed.iter().any(|listed| listed.info.term == id.term)
@@ -748,23 +787,23 @@ impl TermBoard {
             {
                 self.seen.insert(id.clone(), at);
             }
-            let stopped = item
-                .last_output
-                .is_some_and(|at| now.saturating_duration_since(at) >= QUIET);
+            // AI 终端看干活：离开期间 Claude Code 检查更新、自己压缩对话不算「有更新」
+            let kind = self.kinds.get(&id).copied().unwrap_or(Kind::Command);
+            let active = item.active(kind);
+            let stopped = active.is_some_and(|at| now.saturating_duration_since(at) >= QUIET);
             let Some(until) = until else {
                 if stopped {
                     self.seen.insert(id, now);
                 }
                 continue;
             };
-            let after_leaving = item
-                .last_output
-                .is_some_and(|at| term_memory::to_ms(at, now, now_ms) > until);
+            let after_leaving =
+                active.is_some_and(|at| term_memory::to_ms(at, now, now_ms) > until);
             if !after_leaving {
                 // 离开期间没动过：接着离开前的样子（没看过的照样待查看）
                 continue;
             }
-            let agent = matches!(self.kinds.get(&id), Some(Kind::Agent(_)));
+            let agent = matches!(kind, Kind::Agent(_));
             if agent && mark_away {
                 if self.away.insert(id) {
                     flagged += 1;
@@ -844,7 +883,7 @@ impl TermBoard {
                 let start = match task {
                     Some(task) => Some(presets::Start {
                         name: task.name.clone(),
-                        command: task.preset.command.clone(),
+                        command: task.program_command().to_string(),
                         icon: task.preset.icon.clone(),
                         hue: task.preset.hue,
                     }),
@@ -936,7 +975,7 @@ impl TermBoard {
         // 先不记：它在列表里还得写着「待查看」，选到别的、离开这一页时才记（见 `set_shown`）
         if matches!(
             self.shown,
-            Some(Shown::Repo(..) | Shown::Typing(_) | Shown::Split(_))
+            Some(Shown::Repo(..) | Shown::Typing(_) | Shown::Split(_) | Shown::Task(_))
         ) {
             for id in &shown {
                 self.see(id.clone(), now);
@@ -961,7 +1000,7 @@ impl TermBoard {
                 let state = match online {
                     false => TermState::Unknown,
                     true => state_of(
-                        item.last_output,
+                        item.active(kind),
                         self.seen.get(&id).copied(),
                         kind,
                         wait,
@@ -1034,6 +1073,7 @@ impl TermBoard {
                     log::info!("正显示的终端：会话页里正在输入的 {}", id.term)
                 }
                 Some(Shown::Split(ids)) => log::info!("正显示的终端：并排的 {} 个", ids.len()),
+                Some(Shown::Task(id)) => log::info!("正显示的终端：任务页里的 {}", id.term),
             }
             self.recompute(cx);
             // 状态没变，标题栏上的个数也可能变了（正选中的那个不算）
@@ -1055,7 +1095,7 @@ impl TermBoard {
         };
         match &self.shown {
             None => Vec::new(),
-            Some(Shown::Term(id) | Shown::Typing(id)) => vec![id.clone()],
+            Some(Shown::Term(id) | Shown::Typing(id) | Shown::Task(id)) => vec![id.clone()],
             Some(Shown::Split(ids)) => ids.clone(),
             Some(Shown::Repo(entry, number)) => one(entry, *number).into_iter().collect(),
         }
@@ -1068,10 +1108,14 @@ impl TermBoard {
         cx.notify();
     }
 
-    /// 离开期间有更新的都算看过了（侧栏顶上那条的「全部标为已看」）。
+    /// 会话页里离开期间有更新的都算看过了（侧栏顶上那条的「全部标为已看」）。定时任务开出来的不在
+    /// 会话页里，不动。
     pub fn clear_away(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
-        let ids: Vec<TermId> = self.away.drain().collect();
+        let ids: Vec<TermId> = (self.away.iter())
+            .filter(|id| !self.is_task(id))
+            .cloned()
+            .collect();
         for id in ids {
             self.see(id, now);
         }
@@ -1079,12 +1123,17 @@ impl TermBoard {
         cx.notify();
     }
 
-    /// 离开期间有更新、还没看过的有几个（主机没连着的不算）。
+    /// 会话页里离开期间有更新、还没看过的有几个（主机没连着的、定时任务开出来的不算）。
     pub fn away_count(&self) -> usize {
         self.away
             .iter()
-            .filter(|id| !self.offline.contains(&id.machine))
+            .filter(|id| !self.offline.contains(&id.machine) && !self.is_task(id))
             .count()
+    }
+
+    /// 是定时任务开出来、还算那个任务的终端（只在任务页里看）。
+    pub fn is_task(&self, id: &TermId) -> bool {
+        self.task_marks.contains_key(id)
     }
 
     /// 那台电脑的终端列表订阅着没有（连着才订阅）。
@@ -1175,8 +1224,18 @@ impl TermBoard {
         self.watches.get(machine).map(|(conn, _)| conn.clone())
     }
 
-    /// 要人看一眼的有几个：待查看、离开期间有更新（正显示着的不算：正看着它）。
+    /// 会话页里要人看一眼的有几个（标题栏「会话」上的数）：待查看、离开期间有更新（正显示着的不算：
+    /// 正看着它）。定时任务开出来的另算（[`Self::task_attention`]）。
     pub fn attention(&self) -> usize {
+        self.wanting_look(false)
+    }
+
+    /// 定时任务开出来的终端里要人看一眼的有几个（标题栏「任务」上的数）。
+    pub fn task_attention(&self) -> usize {
+        self.wanting_look(true)
+    }
+
+    fn wanting_look(&self, tasks: bool) -> usize {
         let shown = self.shown_ids();
         let mut ids: HashSet<&TermId> = self
             .states
@@ -1189,7 +1248,7 @@ impl TermBoard {
                 .iter()
                 .filter(|id| !self.offline.contains(&id.machine)),
         );
-        ids.retain(|id| !shown.contains(id));
+        ids.retain(|id| !shown.contains(id) && self.is_task(id) == tasks);
         ids.len()
     }
 
@@ -1268,7 +1327,9 @@ impl TermBoard {
             .cloned()
             .unwrap_or_else(|| (tf!("终端 {n}", n = number.to_string()).into(), false));
         let task = self.task_marks.get(&id).cloned();
-        let seen = match (self.seen.get(&id), listed.last_output) {
+        let kind = self.kinds.get(&id).copied().unwrap_or(Kind::Command);
+        let active = listed.active(kind);
+        let seen = match (self.seen.get(&id), active) {
             (Some(seen), Some(at)) => *seen >= at,
             (Some(_), None) => true,
             (None, _) => false,
@@ -1276,7 +1337,7 @@ impl TermBoard {
         Row {
             away: self.away.contains(&id),
             seen,
-            kind: self.kinds.get(&id).copied().unwrap_or(Kind::Command),
+            kind,
             id,
             entry,
             number,
@@ -1288,15 +1349,15 @@ impl TermBoard {
             alive: listed.info.alive,
             state,
             online,
-            last_output: listed.last_output,
+            last_output: active,
             born: listed.born,
             programs: listed.info.programs.clone(),
             task,
-            folded: 0,
         }
     }
 
-    /// 在跑着的 AI 终端（主机连着的）：关窗口前问一句用。
+    /// 在跑着的 AI 终端（主机连着的）：关窗口前问一句用。定时任务开出来的不算：没人在场时照样运行，
+    /// 不该每次关窗口都为它们问。
     pub fn agents(&self) -> Vec<Row> {
         let mut rows: Vec<Row> = self
             .all_rows()
@@ -1319,7 +1380,8 @@ impl TermBoard {
 }
 
 impl TermBoard {
-    /// 全部终端：一台电脑一台电脑地排，同一台里按仓库、序号。
+    /// 全部普通的终端（定时任务开出来的不算，见 [`TaskMark`]）：一台电脑一台电脑地排，同一台里按
+    /// 仓库、序号。
     fn all_rows(&self) -> Vec<Row> {
         let mut machines: Vec<&String> = self.lists.keys().collect();
         machines.sort();
@@ -1328,6 +1390,7 @@ impl TermBoard {
             let mut list: Vec<Row> = self.lists[machine]
                 .iter()
                 .map(|listed| self.make_row(machine, listed))
+                .filter(|row| row.task.is_none())
                 .collect();
             list.sort_by(|a, b| (&a.entry.path, a.number).cmp(&(&b.entry.path, b.number)));
             rows.extend(list);
@@ -1335,7 +1398,7 @@ impl TermBoard {
         rows
     }
 
-    /// 这个仓库的终端，按序号。那台电脑的终端列表还没读到是 None。
+    /// 这个仓库的普通终端（定时任务开出来的不算），按序号。那台电脑的终端列表还没读到是 None。
     ///
     /// 按会话的名字认（Windows 上不分大小写、斜杠，见 [`terminal::session_number`]），不按 [`owner`]
     /// 认出的仓库：没登记过的子仓库 owner 认不出，给的是 kuaid 那种小写、正斜杠的写法，和打开的这个
@@ -1351,11 +1414,22 @@ impl TermBoard {
                 let mut row = self.make_row(machine, listed);
                 row.entry = entry.clone();
                 row.number = number;
-                Some(row)
+                row.task.is_none().then_some(row)
             })
             .collect();
         rows.sort_by_key(|row| row.number);
         Some(rows)
+    }
+
+    /// 这个仓库里已经用掉的终端序号，定时任务开出来的也算：新开终端要避开它们，同名的 `term_open`
+    /// 只是接上那个会话。
+    pub fn taken_numbers(&self, entry: &RepoEntry) -> Vec<u32> {
+        let lists = self.lists.get(machine_of(entry));
+        lists
+            .into_iter()
+            .flatten()
+            .filter_map(|listed| terminal::session_number(&entry.path, &listed.info.key))
+            .collect()
     }
 
     /// 全部工作区里的仓库和各自的终端，后面是各台主机上未加入工作区的仓库（主机仓库列表里不在
@@ -1557,6 +1631,7 @@ pub(crate) mod tests {
 
     use super::{Agent, ByRepo, Kind, TermState, free_number, group_unbound, kind_of, state_of};
     use super::{GroupKey, Program, RepoEntry, Row, TermId, WorkspaceKey, group_by_workspace};
+    use super::{Listed, TermInfo};
 
     /// 测试用的一行：不在乎的都给默认的。
     pub(crate) fn plain_row(id: TermId, entry: RepoEntry, number: u32) -> Row {
@@ -1579,7 +1654,6 @@ pub(crate) mod tests {
             born: 0,
             programs: None,
             task: None,
-            folded: 0,
         }
     }
 
@@ -1742,6 +1816,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn ai_终端看干活_闲着时屏幕一下子的变化不算() {
+        let now = Instant::now() + Duration::from_secs(3600);
+        let ago = |secs| Some(now - Duration::from_secs(secs));
+        // 屏幕两秒前刚变过（Claude Code 检查更新，底栏闪了一下），上一次干活是十分钟前
+        let listed = Listed {
+            info: TermInfo::default(),
+            last_output: ago(2),
+            last_work: ago(600),
+            owner: (
+                RepoEntry {
+                    server: None,
+                    path: "/a".into(),
+                },
+                1,
+            ),
+            born: 0,
+        };
+        let claude = Kind::Agent(Agent::Claude);
+        let wait = Duration::from_secs(180);
+        let state = |kind, seen| state_of(listed.active(kind), seen, kind, wait, now);
+        // 干完以后看过：还是静默，不因为那一下变回待查看；没看过：待查看，从干完算起
+        assert_eq!(state(claude, ago(300)), TermState::Quiet);
+        assert_eq!(state(claude, None), TermState::Waiting);
+        assert_eq!(listed.active(claude), ago(600));
+        // 别的终端照旧看屏幕上的字
+        assert_eq!(state(Kind::Command, None), TermState::Running);
+    }
+
+    #[test]
     fn 认出是哪家_ai_程序() {
         let names = |list: &[&str]| -> Vec<String> { list.iter().map(|s| s.to_string()).collect() };
         assert_eq!(Agent::of("claude"), Some(Agent::Claude));
@@ -1766,6 +1869,12 @@ pub(crate) mod tests {
             Kind::Agent(Agent::Codex)
         );
         assert_eq!(kind_of(Some(&names(&["node"])), true, None), Kind::Command);
+        // 命令写的是脚本（定时任务的自定义命令、npm 的 .cmd）：进程名是 cmd，按命令认
+        let script = crate::presets::Start::command("C:\\npm\\claude.cmd --model x");
+        assert_eq!(
+            kind_of(Some(&names(&["cmd"])), true, Some(&script)),
+            Kind::Agent(Agent::Claude)
+        );
         // 从 Codex 的预设开的终端里后来跑了 cargo：不算
         assert_eq!(
             kind_of(Some(&names(&["cargo"])), true, Some(&codex)),

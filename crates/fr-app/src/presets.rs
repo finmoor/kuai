@@ -326,23 +326,16 @@ impl Start {
     }
 }
 
-/// 命令运行的程序：第一个词（带空格的路径加了引号的，是引号里的）去掉目录、`.exe`，小写。
-/// `npm run dev` 是 `npm`。
+/// 命令运行的程序：第一个词（带空格的路径加了引号的，是引号里的）去掉目录、`.exe` `.cmd` 这类
+/// 后缀，小写，和定时任务认工具的规则一样（[`fr_core::task::program_name`]）。`npm run dev` 是
+/// `npm`，`C:\bin\claude.cmd` 是 `claude`。
 pub fn program_of(command: &str) -> String {
     let command = command.trim_start();
     let word = match command.chars().next() {
         Some(quote @ ('"' | '\'')) => command[1..].split(quote).next().unwrap_or_default(),
         _ => command.split_whitespace().next().unwrap_or_default(),
     };
-    let name = word
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(word)
-        .to_lowercase();
-    match name.strip_suffix(".exe") {
-        Some(stem) => stem.to_string(),
-        None => name,
-    }
+    fr_core::task::program_name(word)
 }
 
 // ---------- 全局的一份 ----------
@@ -1937,6 +1930,9 @@ mod tests {
         assert_eq!(program_of("C:\\Tools\\Claude.exe -c"), "claude");
         assert_eq!(program_of("\"/opt/x y/agy\""), "agy");
         assert_eq!(program_of("  "), "");
+        // npm 装的、自己写的脚本：和定时任务认工具一样去掉 .cmd、.ps1
+        assert_eq!(program_of("C:\\npm\\claude.cmd --model x"), "claude");
+        assert_eq!(program_of("\"D:\\my tools\\codex.ps1\""), "codex");
     }
 
     #[test]

@@ -46,6 +46,20 @@ const CHECK_EVERY: Duration = Duration::from_millis(250);
 /// 改了大小以后这么久以内屏幕上的字变了不算有输出：程序按新的大小整个重画（Claude Code 会），换一台
 /// 电脑往里输入、拖窗口时都会改大小
 const RESIZE_GRACE: Duration = Duration::from_secs(2);
+/// 屏幕上的字连续变了这么久，才算程序在干活（AI 助手干活时转圈、计时每秒都在变，见 [`Activity::work`]）
+const SUSTAINED: Duration = Duration::from_secs(3);
+/// 两次变化隔了这么久，后一次算新的一阵
+const BURST_GAP: Duration = Duration::from_secs(10);
+/// Claude Code 压缩对话时转圈写的话（2.1.332）。闲着快到提示缓存过期时它自己压缩，转好一阵
+const COMPACTING: &str = "Compacting conversation";
+/// AI 助手干活时写着、闲着时不写的提示：Claude Code（2.1.332）写在底栏，Codex（0.172）写在输入框上面
+/// 的状态行。它一冒出来就算干活，不用等连续变了 [`SUSTAINED`]：AI 自己接着干、两三秒就干完的也认得出
+/// （真的 Claude Code 后台命令跑完接着干，一阵只有一两秒）。压缩对话时底栏也写着，靠 [`COMPACTING`]
+/// 排除
+const INTERRUPT_HINT: &str = "esc to interrupt";
+/// 在最后一行有字的往上这么多行里找 [`COMPACTING`]、[`INTERRUPT_HINT`]：转圈、Codex 的状态行在输入框
+/// 和底栏上面
+const SPINNER_ROWS: usize = 12;
 
 /// 屏幕上的字什么时候变过：终端列表里的「多久没有输出了」（客户端据此算运行中、已停下）。
 ///
@@ -55,10 +69,25 @@ const RESIZE_GRACE: Duration = Duration::from_secs(2);
 /// 的字（连同往回翻的记录有多少行）的摘要变没变，一直在输出时隔 [`CHECK_EVERY`] 核对一次，停下后
 /// 由 [`Session::tick`] 补上最后一次。
 ///
+/// 字变了也不都是干了活，另记在 [`Self::work`]。
+///
 /// 不准的情况：往回翻的记录满了以后一直打一样的行（`yes`），屏幕上的字不变，会被当成停了。
 struct Activity {
     /// 屏幕上的字最近一次变了是什么时候（那块输出来的时候）。升级换程序后还没变过时是空的
     last_change: Option<Instant>,
+    /// 最近一次「干活」的变化（终端列表里的「多久没干活了」，客户端拿它算 AI 终端的运行中、静默、
+    /// 待查看）。一阵变化（前后两次隔不到 [`BURST_GAP`]）连续了 [`SUSTAINED`] 以上，或者这一阵里冒出了
+    /// [`INTERRUPT_HINT`]，或者这一阵前后有人按过回车，这一阵里的变化才算。闲着的 Claude Code 自己会
+    /// 改屏幕：检查更新时底栏闪一秒「Checking for updates…」，闲久了底栏加「new task? /clear to save …」，
+    /// 闲了半个钟头左右加一段「※ recap: …」，都是一下子，不算；快到提示缓存过期时自己压缩对话，转好
+    /// 一阵，靠转圈的字（[`COMPACTING`]）认出来，也不算。原来这些都算，看过的终端过一阵又成了「待查看」，
+    /// 时间也从那一下重新算
+    work: Option<Instant>,
+    /// 眼下这一阵变化
+    burst: Option<Burst>,
+    /// 上一次核对时最后几行里有没有 [`INTERRUPT_HINT`]：算的是它冒出来的那一下。一直在的不算，对话里
+    /// 正好写着这几个字时，闲着时的一下子变化不会因此算成干活
+    hint: bool,
     /// 上一次核对时的摘要、核对的时候
     digest: u64,
     checked: Option<Instant>,
@@ -68,10 +97,23 @@ struct Activity {
     resized: Option<Instant>,
 }
 
+/// 一阵变化（见 [`Activity::work`]）。
+#[derive(Clone, Copy)]
+struct Burst {
+    start: Instant,
+    /// 算干活了：这一阵之后的变化都记进 `work`
+    counted: bool,
+    /// 还没算上干活时屏幕上转着压缩对话的圈：这一阵不算（有人按过回车的除外）
+    compacting: bool,
+}
+
 impl Activity {
     fn new(screen: &Screen) -> Activity {
         Activity {
             last_change: None,
+            work: None,
+            burst: None,
+            hint: screen.shows_near_end(SPINNER_ROWS, INTERRUPT_HINT),
             digest: screen.digest(),
             checked: None,
             pending: None,
@@ -79,36 +121,73 @@ impl Activity {
         }
     }
 
-    /// 来了一块输出（已经交给了仿真器）：离上一次核对够久了就核对。
-    fn output(&mut self, screen: &Screen, now: Instant) {
+    /// 来了一块输出（已经交给了仿真器）：离上一次核对够久了就核对。`entered` 是最后一次往里按回车
+    /// 的时候（客户端发来的、定时任务自己敲的都算，见 `State::asked`）。
+    fn output(&mut self, screen: &Screen, now: Instant, entered: Option<Instant>) {
         self.pending = Some(now);
         if self
             .checked
             .is_none_or(|at| now.saturating_duration_since(at) >= CHECK_EVERY)
         {
-            self.check(screen, now);
+            self.check(screen, now, entered);
         }
     }
 
     /// 有没核对过的输出就核对：屏幕上的字变了，又不是刚改过大小，记下那块输出来的时候。
-    fn check(&mut self, screen: &Screen, now: Instant) {
+    fn check(&mut self, screen: &Screen, now: Instant, entered: Option<Instant>) {
         let Some(at) = self.pending.take() else {
             return;
         };
         let digest = screen.digest();
-        let resizing = self
-            .resized
-            .is_some_and(|resized| at.saturating_duration_since(resized) < RESIZE_GRACE);
-        if digest != self.digest && !resizing {
-            self.last_change = Some(at);
+        if digest != self.digest {
+            // 改大小以后的重画也跟着记下有没有，免得过后被当成冒出来
+            let hint = screen.shows_near_end(SPINNER_ROWS, INTERRUPT_HINT);
+            let appeared = hint && !self.hint;
+            self.hint = hint;
+            let resizing = self
+                .resized
+                .is_some_and(|resized| at.saturating_duration_since(resized) < RESIZE_GRACE);
+            if !resizing {
+                self.changed(screen, at, entered, appeared);
+            }
         }
         self.digest = digest;
         self.checked = Some(now);
     }
 
+    /// 屏幕上的字在 `at` 变了：记下，再看这一阵算不算干活（见 [`Self::work`]）。`appeared`：这一下
+    /// 冒出了 [`INTERRUPT_HINT`]。
+    fn changed(&mut self, screen: &Screen, at: Instant, entered: Option<Instant>, appeared: bool) {
+        let fresh = self
+            .last_change
+            .is_none_or(|last| at.saturating_duration_since(last) >= BURST_GAP);
+        self.last_change = Some(at);
+        let burst = match self.burst.as_mut() {
+            Some(burst) if !fresh => burst,
+            _ => self.burst.insert(Burst {
+                start: at,
+                counted: false,
+                compacting: false,
+            }),
+        };
+        // 回车按在这一阵开始前不久、或者这一阵里：是问了它的（人问的，或者定时任务敲的命令），马上算
+        let typed = entered.is_some_and(|enter| enter + BURST_GAP >= burst.start);
+        if !burst.counted && !typed && screen.shows_near_end(SPINNER_ROWS, COMPACTING) {
+            burst.compacting = true;
+        }
+        let sustained = at.saturating_duration_since(burst.start) >= SUSTAINED;
+        if typed || (!burst.compacting && (appeared || sustained)) {
+            burst.counted = true;
+        }
+        if burst.counted {
+            self.work = Some(at);
+        }
+    }
+
     /// 改了大小（仿真器已经按新的大小折好了行）：折行带来的变化不算。
     fn resized(&mut self, screen: &Screen, now: Instant) {
         self.digest = screen.digest();
+        self.hint = screen.shows_near_end(SPINNER_ROWS, INTERRUPT_HINT);
         self.resized = Some(now);
     }
 }
@@ -209,6 +288,9 @@ struct State {
     activity: Activity,
     /// 客户端最后一次发来回车的时候（见 [`Session::typed`]）
     entered: Option<Instant>,
+    /// 最后一次往里按回车的时候：客户端发来的，也算定时任务自己敲的命令、粘的提示词。这之后的输出
+    /// 算干活（见 [`Activity::work`]）
+    asked: Option<Instant>,
     clients: Vec<Client>,
     /// 发出去的消息，从早到晚，最多 [`fr_core::protocol::TERM_MARKS`] 条（见 [`Session::input`]）
     marks: Vec<TermMark>,
@@ -227,7 +309,9 @@ impl Session {
         let mut guard = self.state.lock().unwrap();
         let state = &mut *guard;
         let reply = state.screen.advance(bytes);
-        state.activity.output(&state.screen, Instant::now());
+        state
+            .activity
+            .output(&state.screen, Instant::now(), state.asked);
         // 没人接着（只看的不算）：程序问终端的话由我们回答，不然它会一直等
         let answer = !reply.is_empty() && !state.attended();
         // 连接已经断了的不再发（断开的连接随后会整个摘掉）
@@ -253,7 +337,9 @@ impl Session {
         let mut guard = self.state.lock().unwrap();
         let state = &mut *guard;
         state.screen.flush_sync();
-        state.activity.check(&state.screen, Instant::now());
+        state
+            .activity
+            .check(&state.screen, Instant::now(), state.asked);
         state.clients.retain(|client| !client.out.is_closed());
         catch_up(state);
     }
@@ -380,6 +466,9 @@ impl Session {
         if state.exit.is_some() {
             return;
         }
+        if bytes.contains(&b'\r') {
+            state.asked = Some(Instant::now());
+        }
         if bytes == b"\r"
             && let Some((text, continued)) = state.screen.entered()
         {
@@ -459,6 +548,10 @@ impl Session {
             idle_ms: state
                 .activity
                 .last_change
+                .map(|at| at.elapsed().as_millis() as u64),
+            work_ms: state
+                .activity
+                .work
                 .map(|at| at.elapsed().as_millis() as u64),
             last: state.screen.last_text(),
             programs: Some(programs),
@@ -582,6 +675,9 @@ pub struct Frozen {
     /// 屏幕上的字多久没变了（没变过是 None）。接过来以后接着算：不然程序刚停下就换了程序的，
     /// 要等屏幕再变一次才知道它停在什么时候，定时任务的用时会记到那时候
     pub quiet: Option<Duration>,
+    /// 多久没干活了（见 `Activity::work`；没干过的、更早的程序交过来的是 None）。接过来以后接着算，
+    /// 不然换了程序以后看过的又成了待查看
+    pub work: Option<Duration>,
 }
 
 /// 所有的终端会话。
@@ -816,6 +912,7 @@ impl Registry {
                 exit: None,
                 ended: None,
                 entered: None,
+                asked: None,
                 clients: Vec::new(),
                 marks: Vec::new(),
             }),
@@ -1050,6 +1147,7 @@ impl Registry {
                     dump: state.screen.dump(),
                     marks: state.marks.clone(),
                     quiet: state.activity.last_change.map(|at| at.elapsed()),
+                    work: state.activity.work.map(|at| at.elapsed()),
                 }
             })
             .collect();
@@ -1063,9 +1161,10 @@ impl Registry {
         screen.advance(&frozen.dump);
         let alive = frozen.exit.is_none();
         let mut activity = Activity::new(&screen);
-        activity.last_change = frozen
-            .quiet
-            .and_then(|quiet| Instant::now().checked_sub(quiet));
+        let ago = |past: Duration| Instant::now().checked_sub(past);
+        activity.last_change = frozen.quiet.and_then(ago);
+        // 更早的程序交过来的不知道多久没干活：当作最后一次变化就是，和那一版算的一样
+        activity.work = frozen.work.or(frozen.quiet).and_then(ago);
         let session = Arc::new(Session {
             id: frozen.id.clone(),
             key: frozen.key,
@@ -1078,6 +1177,7 @@ impl Registry {
                 exit: frozen.exit,
                 ended: frozen.exit.map(|_| Instant::now()),
                 entered: None,
+                asked: None,
                 clients: Vec::new(),
                 marks: frozen.marks,
             }),
@@ -1659,6 +1759,7 @@ pub(crate) mod tests {
         assert_eq!(frozen.len(), 1);
         assert_eq!(frozen[0].handle, Some((7, 4242)));
         assert!(frozen[0].quiet.is_some(), "屏幕变过：带上多久没变了");
+        assert_eq!(frozen[0].work, None, "没人按回车的一下子不算干活");
         frozen[0].quiet = Some(Duration::from_secs(30));
 
         // 新程序里：按拍下来的重建
@@ -1670,6 +1771,9 @@ pub(crate) mod tests {
         // 屏幕多久没变接着算（定时任务的用时靠它）
         let quiet = fresh.get(&term).unwrap().glance().quiet.unwrap();
         assert!((30..40).contains(&quiet.as_secs()), "{quiet:?}");
+        // 没带多久没干活（更早的程序交过来的就这样）：当作最后一次变化就是，和那一版算的一样
+        let work = fresh.list()[0].work_ms.unwrap();
+        assert!((30_000..40_000).contains(&work), "{work}");
         let (out2, mut inbox2) = mailbox();
         open(&fresh, "/repo", 9, 1, &out2);
         let again = inbox2.opened();
@@ -1762,28 +1866,157 @@ pub(crate) mod tests {
         let mut activity = Activity::new(&screen);
         // 提示符出来了：算
         screen.advance(b"PS C:\\> ");
-        activity.output(&screen, ms(0));
+        activity.output(&screen, ms(0), None);
         assert_eq!(activity.last_change, Some(ms(0)));
         // Claude Code 2.1.330 焦点出去时写的（在测试终端里抓的）：擦掉自己画的反色光标
         screen.advance(b"\x1b[7m \x1b[27m\x08\x1b[K\x1b[8C");
-        activity.output(&screen, ms(1000));
+        activity.output(&screen, ms(1000), None);
         assert_eq!(activity.last_change, Some(ms(0)));
         // 一直在输出：隔一会儿才核对，没核对的那块由 tick 补上，记的是它来的时候
         screen.advance(b"a");
-        activity.output(&screen, ms(1100));
+        activity.output(&screen, ms(1100), None);
         assert_eq!(activity.last_change, Some(ms(0)));
-        activity.check(&screen, ms(1600));
+        activity.check(&screen, ms(1600), None);
         assert_eq!(activity.last_change, Some(ms(1100)));
         // 改了大小以后程序整个重画：不算
         screen.resize(Size::new(30, 5));
         activity.resized(&screen, ms(5000));
         screen.advance(b"\r\x1b[Kredrawn");
-        activity.output(&screen, ms(5500));
+        activity.output(&screen, ms(5500), None);
         assert_eq!(activity.last_change, Some(ms(1100)));
         // 过了那一会儿再变：算
         screen.advance(b"!");
-        activity.output(&screen, ms(8000));
+        activity.output(&screen, ms(8000), None);
         assert_eq!(activity.last_change, Some(ms(8000)));
+    }
+
+    #[test]
+    fn 终端列表带多久没干活_按过回车之后的输出算() {
+        let (registry, fakes) = fake_registry();
+        let (out, mut inbox) = mailbox();
+        open(&registry, "/repo", 1, 1, &out);
+        inbox.opened();
+        let session = fakes.lock().unwrap()[0]
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        // 程序自己冒出来一行：屏幕变了，没干活
+        session.output(b"update available");
+        let list = registry.list();
+        assert!(list[0].idle_ms.is_some());
+        assert_eq!(list[0].work_ms, None);
+        // 客户端发来回车，程序答了：算
+        session.typed(b"hi\r".to_vec());
+        session.output(b"\r\nhello");
+        session.tick();
+        assert!(registry.list()[0].work_ms.is_some_and(|ms| ms < 5_000));
+    }
+
+    #[test]
+    fn 干活才记_一下子的变化和自己压缩对话不算() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        // 屏幕比内容高：对话短的时候 Claude Code 画在屏幕上半截，下面是空的（只看屏幕最底下几行时，
+        // 认不出压缩对话的转圈，在测试实例里录到过）
+        let mut screen = Screen::new(Size::new(60, 30));
+        let mut activity = Activity::new(&screen);
+        // 闲着的 Claude Code 2.1.332 检查更新：底栏闪一秒「Checking for updates…」又擦掉（在真的
+        // 会话里录到的）。字变了两次，连起来不到一阵，不算干活
+        screen.advance(b"\x1b[8;30HChecking for updates\xe2\x80\xa6");
+        activity.output(&screen, ms(0), None);
+        screen.advance(b"\x1b[8;30H\x1b[K");
+        activity.output(&screen, ms(1000), None);
+        assert_eq!(activity.last_change, Some(ms(1000)));
+        assert_eq!(activity.work, None);
+        // 自己接着干活（后台任务做完了接着写）：转圈的计时每秒在变，连着三秒才算，之后每次都记
+        for n in 0..5u64 {
+            screen.advance(format!("\x1b[6;1H* Working ({n}s)").as_bytes());
+            activity.output(&screen, ms(20_000 + n * 1000), None);
+            let counted = n >= 3;
+            assert_eq!(activity.work.is_some(), counted, "第 {n} 秒");
+        }
+        assert_eq!(activity.work, Some(ms(24_000)));
+        // 停了一阵以后又是一下子（闲久了底栏加的提示）：不算
+        screen.advance(b"\x1b[8;20Hnew task? /clear to save 148.9k tokens");
+        activity.output(&screen, ms(60_000), None);
+        assert_eq!(activity.last_change, Some(ms(60_000)));
+        assert_eq!(activity.work, Some(ms(24_000)));
+        // 闲着快到缓存过期时自己压缩对话：转好一阵，转圈写着 Compacting conversation，也不算
+        for n in 0..10u64 {
+            let spinner = format!("\x1b[6;1H* Compacting conversation\u{2026} ({n}s)");
+            screen.advance(spinner.as_bytes());
+            activity.output(&screen, ms(120_000 + n * 1000), None);
+        }
+        screen.advance(
+            b"\x1b[6;1H\x1b[K\x1b[5;1HCompacted while idle, before the prompt cache expired",
+        );
+        activity.output(&screen, ms(130_000), None);
+        assert_eq!(activity.last_change, Some(ms(130_000)));
+        assert_eq!(activity.work, Some(ms(24_000)));
+        // 有人按了回车（客户端发来的）：一下子就答完的也算
+        screen.advance(b"\x1b[7;1H> hi\x1b[6;1HHello!");
+        activity.output(&screen, ms(200_500), Some(ms(200_000)));
+        assert_eq!(activity.work, Some(ms(200_500)));
+        // 有人敲 /compact：是人要的压缩，算
+        for n in 0..2u64 {
+            let spinner = format!("\x1b[6;1H* Compacting conversation\u{2026} ({n}s)");
+            screen.advance(spinner.as_bytes());
+            activity.output(&screen, ms(300_000 + n * 1000), Some(ms(299_000)));
+        }
+        assert_eq!(activity.work, Some(ms(301_000)));
+    }
+
+    #[test]
+    fn 冒出_esc_to_interrupt_马上算干活_压缩时和一直在的不算() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        // Claude Code 2.1.332 的输入框和底栏（对话短，画在屏幕上半截）；干活时底栏多了 esc to interrupt
+        let idle = "\x1b[10;3H\u{23f5}\u{23f5} auto mode on (shift+tab to cycle)\x1b[K";
+        let busy =
+            "\x1b[10;3H\u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} esc to interrupt";
+        let mut screen = Screen::new(Size::new(70, 30));
+        screen.advance(format!("\x1b[8;1H\u{276f} {idle}").as_bytes());
+        let mut activity = Activity::new(&screen);
+        // 后台命令跑完，它自己接着干了两秒（在测试实例里录到的）：底栏一冒出 esc to interrupt 就算
+        screen.advance(format!("\x1b[6;1H\u{2722} Choreographing\u{2026}{busy}").as_bytes());
+        activity.output(&screen, ms(0), None);
+        assert_eq!(activity.work, Some(ms(0)));
+        screen.advance(format!("\x1b[6;1H\u{273b} Cooked for 2s\x1b[K{idle}").as_bytes());
+        activity.output(&screen, ms(2000), None);
+        assert_eq!(activity.work, Some(ms(2000)));
+        // 闲着快到缓存过期时自己压缩：转圈和底栏的 esc to interrupt 一起冒出来，转好一阵，不算
+        for n in 0..6u64 {
+            let frame =
+                format!("\x1b[6;1H\u{273b} Compacting conversation\u{2026} ({n}s)\x1b[K{busy}");
+            screen.advance(frame.as_bytes());
+            activity.output(&screen, ms(60_000 + n * 1000), None);
+        }
+        screen.advance(format!("\x1b[6;1HConversation compacted\x1b[K{idle}").as_bytes());
+        activity.output(&screen, ms(66_000), None);
+        assert_eq!(activity.last_change, Some(ms(66_000)));
+        assert_eq!(activity.work, Some(ms(2000)));
+        // 对话里正好写着这几个字（有人问了才答的，算）；之后闲着时底栏闪一下检查更新：这几个字一直
+        // 在屏幕上，不是冒出来的，不算
+        screen.advance(b"\x1b[5;1HPress esc to interrupt a reply.\x1b[K");
+        activity.output(&screen, ms(120_000), Some(ms(119_000)));
+        assert_eq!(activity.work, Some(ms(120_000)));
+        screen.advance("\x1b[10;50HChecking for updates\u{2026}".as_bytes());
+        activity.output(&screen, ms(200_000), None);
+        assert_eq!(activity.last_change, Some(ms(200_000)));
+        assert_eq!(activity.work, Some(ms(120_000)));
+
+        // Codex 0.172：状态行在输入框上面，底下还有两行；大小写不论
+        let mut screen = Screen::new(Size::new(80, 24));
+        screen.advance(
+            "\x1b[18;1H\u{203a} Ask Codex to do anything\x1b[20;3Hmodel \u{b7} ~/repo\x1b[21;3H? for shortcuts"
+                .as_bytes(),
+        );
+        let mut activity = Activity::new(&screen);
+        screen.advance("\x1b[16;1H\u{2022} Working (0s \u{2022} Esc to interrupt)".as_bytes());
+        activity.output(&screen, ms(0), None);
+        assert_eq!(activity.work, Some(ms(0)));
     }
 
     #[test]

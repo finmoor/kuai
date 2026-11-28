@@ -304,7 +304,7 @@ impl Workspace {
             cx.new(|cx| WorkspacePage::new(app.clone(), board.clone(), scan.clone(), window, cx));
         let settings_page = cx.new(|cx| SettingsPage::new(app.clone(), updater.clone(), cx));
         let overview = cx.new(|cx| TermOverview::new(app.clone(), board.clone(), window, cx));
-        let tasks_page = cx.new(|cx| TaskPage::new(app.clone(), board.clone(), cx));
+        let tasks_page = cx.new(|cx| TaskPage::new(app.clone(), board.clone(), window, cx));
         let quitting = Rc::new(Cell::new(false));
         let subscriptions = vec![
             cx.subscribe_in(&manager, window, |this, _, event, window, cx| match event {
@@ -357,6 +357,12 @@ impl Workspace {
                             .update(cx, |manager, cx| manager.select(machine, cx));
                     }
                     TaskPageEvent::OpenRepo(entry) => this.open(entry.clone(), window, cx),
+                    TaskPageEvent::OpenFile {
+                        entry,
+                        path,
+                        at,
+                        dir,
+                    } => this.open_repo_path(entry, path.clone(), *at, *dir, window, cx),
                 },
             ),
             // 设置变了：服务器改名要刷新标签上的名字；服务器被移除了，它上面的仓库的标签页跟着关掉；
@@ -397,9 +403,11 @@ impl Workspace {
                 this.sync_shown(window, cx);
                 cx.notify();
             }),
-            // 标题栏上「会话」那一项的个数跟着变；会话页里换了选中的，也要重新告诉 `board`
+            // 标题栏上「会话」那一项的个数跟着变；会话页里换了选中的、任务页里打开了一次运行的终端，
+            // 也要重新告诉 `board`
             cx.observe(&board, |_, _, cx| cx.notify()),
             cx.observe(&overview, |_, _, cx| cx.notify()),
+            cx.observe(&tasks_page, |_, _, cx| cx.notify()),
             cx.subscribe_in(
                 &overview,
                 window,
@@ -1670,10 +1678,11 @@ impl Workspace {
             self.manager.update(cx, |page, _| page.hidden());
         }
         if was == Some(Page::Tasks) {
-            self.tasks_page.update(cx, |page, _| page.hidden());
+            self.tasks_page.update(cx, |page, cx| page.hidden(cx));
         }
         if now == Some(Page::Tasks) {
-            self.tasks_page.update(cx, |page, cx| page.shown(cx));
+            self.tasks_page
+                .update(cx, |page, cx| page.shown(window, cx));
         }
         if now == Some(Page::Terms) {
             self.overview
@@ -2015,9 +2024,17 @@ impl Workspace {
         self.show_page(Page::Terms, window, cx);
     }
 
-    /// 提醒里的「前往」、点了系统通知：到会话页选中这个终端。
+    /// 提醒里的「前往」、点了系统通知：到会话页选中这个终端。定时任务开出来的到任务页打开那次运行。
     fn go_to_terminal(&mut self, row: &TermRow, window: &mut Window, cx: &mut Context<Self>) {
         log::info!("前往终端：{} 的第 {} 个", row.entry.path, row.number);
+        if let Some(mark) = &row.task {
+            let (machine, task, run) = (&row.id.machine, &mark.task, &mark.run);
+            self.show_page(Page::Tasks, window, cx);
+            self.tasks_page
+                .update(cx, |page, cx| page.open_run(machine, task, run, window, cx));
+            self.seen_terminal(row, window, cx);
+            return;
+        }
         self.show_terms(window, cx);
         let slot = row.slot();
         self.overview
@@ -2264,6 +2281,9 @@ impl Workspace {
         }
         if self.page == Page::Terms {
             return self.overview.read(cx).shown_for_board(window, cx);
+        }
+        if self.page == Page::Tasks {
+            return self.tasks_page.read(cx).shown_for_board();
         }
         let view = self.active_repo()?.shown(cx);
         let view = view.read(cx);
@@ -3365,9 +3385,11 @@ impl Workspace {
             .when(narrow, |tab| {
                 tab.tooltip(move |window, cx| ui::tip(workspaces_label, window, cx))
             });
-        // 定时任务：有正在运行的、等着查看的标一个点
+        // 定时任务：运行出来的终端有几次待查看就标几（它们不在会话页里，不算进「会话」上的数）；
+        // 没有待查看的、有任务正在运行时标一个点
         let tasks_label = trc("页面", "任务");
-        let busy = crate::tasks::busy(self.app.read(cx), self.board.read(cx));
+        let task_waiting = self.board.read(cx).task_attention();
+        let busy = task_waiting == 0 && crate::tasks::busy(self.app.read(cx), self.board.read(cx));
         let tasks = self
             .render_page_entry(
                 Page::Tasks,
@@ -3377,6 +3399,23 @@ impl Workspace {
                 narrow,
                 cx,
             )
+            .when(task_waiting > 0, |tab| {
+                tab.child(
+                    div()
+                        .flex_none()
+                        .px(px(5.))
+                        .h(px(16.))
+                        .min_w(px(16.))
+                        .rounded_full()
+                        .bg(warning)
+                        .text_color(gpui_kit::black())
+                        .text_size(px(10.5))
+                        .line_height(px(16.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_center()
+                        .child(task_waiting.to_string()),
+                )
+            })
             .when(busy, |tab| {
                 tab.child(
                     div()
@@ -3387,9 +3426,10 @@ impl Workspace {
                 )
             })
             .tooltip(move |window, cx| {
-                let text = match busy {
-                    true => tr("定时任务：有任务正在运行").to_string(),
-                    false => tasks_label.to_string(),
+                let text = match (task_waiting, busy) {
+                    (0, true) => tr("定时任务：有任务正在运行").to_string(),
+                    (0, false) => tasks_label.to_string(),
+                    (n, _) => tf!("定时任务：{n} 次运行待查看", n = n.to_string()),
                 };
                 ui::tip(text, window, cx)
             });
